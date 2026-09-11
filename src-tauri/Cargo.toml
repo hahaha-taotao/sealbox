@@ -1,0 +1,46 @@
+[package]
+name = "sealbox"
+version = "0.1.0"
+description = "Sealbox 印盒 — local credential vault"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "sealbox_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aes-gcm = "0.10"
+argon2 = "0.5"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+thiserror = "2"
+base64 = "0.22"
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+arboard = "3"
+keyring = "3"
+totp-rs = { version = "5", default-features = false, features = ["otpauth"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+  "Security_Credentials_UI",
+  "Foundation",
+] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

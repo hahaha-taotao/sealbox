@@ -1,0 +1,87 @@
+pub mod backup;
+pub mod clipboard;
+pub mod commands;
+pub mod crypto;
+pub mod db;
+pub mod hello;
+pub mod session;
+pub mod totp;
+pub mod vault;
+
+use commands::AppState;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::TrayIconBuilder;
+use tauri::{Emitter, Manager};
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .manage(AppState::new())
+        .invoke_handler(tauri::generate_handler![
+            commands::get_status,
+            commands::setup_vault,
+            commands::unlock_vault,
+            commands::unlock_hello,
+            commands::lock_vault,
+            commands::list_entries,
+            commands::create_entry,
+            commands::update_entry,
+            commands::delete_entries,
+            commands::restore_entries,
+            commands::list_folders,
+            commands::create_folder,
+            commands::list_tags,
+            commands::list_audit,
+            commands::copy_secret,
+            commands::reveal_secret,
+            commands::get_notes,
+            commands::tick_idle,
+            commands::gen_password,
+            commands::export_backup,
+            commands::import_backup,
+            commands::settings_get,
+            commands::settings_set,
+            commands::set_hello_enabled,
+            commands::change_master,
+            commands::window_control,
+        ])
+        .setup(|app| {
+            let handle = app.handle().clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let _ = handle.emit("tick", ());
+            });
+            let show = MenuItem::with_id(app, "show", "打开", true, None::<&str>)?;
+            let lock = MenuItem::with_id(app, "lock", "锁定", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show, &lock, &quit])?;
+            let _tray = TrayIconBuilder::new()
+                .icon(app.default_window_icon().cloned().unwrap())
+                .menu(&menu)
+                .show_menu_on_left_click(true)
+                .on_menu_event(|app, event| match event.id.as_ref() {
+                    "show" => {
+                        if let Some(w) = app.get_webview_window("main") {
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                        }
+                    }
+                    "lock" => {
+                        let _ = app.emit("lock-now", ());
+                    }
+                    "quit" => app.exit(0),
+                    _ => {}
+                })
+                .build(app)?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
