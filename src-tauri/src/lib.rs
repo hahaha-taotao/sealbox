@@ -4,6 +4,8 @@ pub mod commands;
 pub mod crypto;
 pub mod db;
 pub mod hello;
+pub mod mcp;
+pub mod redact;
 pub mod session;
 pub mod totp;
 pub mod vault;
@@ -49,6 +51,10 @@ pub fn run() {
             commands::settings_set,
             commands::set_hello_enabled,
             commands::change_master,
+            commands::mcp_status,
+            commands::mcp_start,
+            commands::mcp_stop,
+            commands::mcp_rotate_token,
             commands::window_control,
         ])
         .setup(|app| {
@@ -74,8 +80,7 @@ pub fn run() {
                     }
                     "lock" => {
                         if let Some(state) = app.try_state::<AppState>() {
-                            let mut session = state.session.lock().unwrap();
-                            session.lock();
+                            state.session.lock().unwrap().lock();
                         }
                         let _ = app.emit("lock-now", ());
                     }

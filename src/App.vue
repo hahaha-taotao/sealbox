@@ -14,8 +14,9 @@ import {
 } from "./lib/tauri";
 
 const status = ref<Status | null>(null);
-const page = ref<"home" | "vault" | "audit" | "settings">("vault");
-const history = ref<Array<"home" | "vault" | "audit" | "settings">>(["vault"]);
+type Page = "home" | "vault" | "audit" | "settings" | "mcp";
+const page = ref<Page>("vault");
+const history = ref<Page[]>(["vault"]);
 const historyIndex = ref(0);
 const password = ref("");
 const password2 = ref("");
@@ -79,6 +80,7 @@ const crumb = computed(() => {
   if (page.value === "home") return "首页";
   if (page.value === "audit") return "审计";
   if (page.value === "settings") return "设置";
+  if (page.value === "mcp") return "MCP";
   if (filter.trash) return "回收站";
   if (filter.kind === "website") return "网站账号";
   if (filter.kind === "api_token") return "API Token";
@@ -168,7 +170,46 @@ async function doEmptyTrash() {
   await refreshVault();
 }
 
-function goPage(next: "home" | "vault" | "audit" | "settings") {
+const mcp = ref<{ running: boolean; port: number; token: string; url: string } | null>(null);
+const mcpSnippet = computed(() => {
+  if (!mcp.value?.token) return "";
+  return `{
+  "mcpServers": {
+    "sealbox": {
+      "url": "${mcp.value.url}",
+      "headers": {
+        "Authorization": "Bearer ${mcp.value.token}"
+      }
+    }
+  }
+}`;
+});
+async function refreshMcp() {
+  mcp.value = await api.mcpStatus();
+}
+async function startMcp() {
+  mcp.value = await api.mcpStart();
+  showToast("MCP 已在本机启动");
+}
+async function stopMcp() {
+  mcp.value = await api.mcpStop();
+  showToast("MCP 已停止");
+}
+async function rotateMcp() {
+  if (!confirm("轮换 Token 后，Cursor / Claude Code 里的旧配置会失效，确定？")) return;
+  mcp.value = await api.mcpRotate();
+  showToast("已轮换 Token");
+}
+async function copyMcpSnippet() {
+  await navigator.clipboard.writeText(mcpSnippet.value);
+  showToast("配置已复制");
+}
+async function openMcp() {
+  goPage("mcp");
+  await refreshMcp();
+}
+
+function goPage(next: Page) {
   if (page.value === next) return;
   history.value = history.value.slice(0, historyIndex.value + 1);
   history.value.push(next);
@@ -536,6 +577,9 @@ onMounted(async () => {
         <button class="rail-btn" :class="{ active: page === 'audit' }" @click="openAudit">
           <span class="icon">≡</span><span>审计</span>
         </button>
+        <button class="rail-btn" :class="{ active: page === 'mcp' }" @click="openMcp">
+          <span class="icon">⬡</span><span>MCP</span>
+        </button>
         <div class="spacer" />
         <button class="rail-btn" :class="{ active: page === 'settings' }" @click="goPage('settings')">
           <span class="icon">⚙</span><span>设置</span>
@@ -662,6 +706,27 @@ onMounted(async () => {
               <div style="margin-top:12px"><button class="btn primary" @click="openCreate">新建凭据</button></div>
             </div>
           </div>
+        </div>
+      </section>
+
+      <section class="main" v-else-if="page === 'mcp'">
+        <div class="content" style="max-width:640px">
+          <h2>MCP 接入</h2>
+          <p class="crumb">仅监听 127.0.0.1。模型只能看到凭据名称，发 HTTP 时由本机代签并脱敏。</p>
+          <p>状态：{{ mcp?.running ? "运行中" : "已停止" }}　端口：{{ mcp?.port || "—" }}</p>
+          <div style="display:flex;gap:8px;margin:12px 0">
+            <button class="btn primary" v-if="!mcp?.running" @click="startMcp">启动</button>
+            <button class="btn" v-else @click="stopMcp">停止</button>
+            <button class="btn" @click="rotateMcp">轮换 Token</button>
+          </div>
+          <div class="field"><label>Bearer Token</label>
+            <input :value="mcp?.token || ''" readonly />
+          </div>
+          <div class="field"><label>Cursor / Claude Code 配置片段</label>
+            <textarea rows="12" readonly :value="mcpSnippet"></textarea>
+          </div>
+          <button class="btn" @click="copyMcpSnippet">复制配置</button>
+          <p class="crumb" style="margin-top:16px">工具：list_credentials、http_request、copy_secret。金库锁定时工具会失败并提示先解锁。</p>
         </div>
       </section>
 

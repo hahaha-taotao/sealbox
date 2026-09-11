@@ -1,6 +1,7 @@
 use crate::backup::{export_envelope, import_envelope};
 use crate::clipboard;
 use crate::hello;
+use crate::mcp::{self, McpState};
 use crate::session::Session;
 use crate::totp::{generate_password, ssh_fingerprint, totp_now};
 use crate::vault::{
@@ -8,18 +9,20 @@ use crate::vault::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 pub struct AppState {
-    pub session: Mutex<Session>,
+    pub session: Arc<Mutex<Session>>,
+    pub mcp: McpState,
     pub db_path: Mutex<Option<PathBuf>>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
-            session: Mutex::new(Session::default()),
+            session: Arc::new(Mutex::new(Session::default())),
+            mcp: McpState::default(),
             db_path: Mutex::new(None),
         }
     }
@@ -534,6 +537,59 @@ pub fn change_master(
         hello::enable_hello(vault, &dek)?;
     }
     Ok(())
+}
+
+#[derive(Serialize)]
+pub struct McpStatus {
+    pub running: bool,
+    pub port: u16,
+    pub token: String,
+    pub url: String,
+}
+
+fn mcp_status_of(state: &AppState) -> McpStatus {
+    let port = *state.mcp.port.lock().unwrap();
+    let token = state.mcp.token.lock().unwrap().clone();
+    McpStatus {
+        running: state.mcp.running.load(std::sync::atomic::Ordering::SeqCst),
+        port,
+        token: token.clone(),
+        url: format!("http://127.0.0.1:{port}/mcp"),
+    }
+}
+
+#[tauri::command]
+pub fn mcp_status(state: State<AppState>) -> McpStatus {
+    mcp_status_of(&state)
+}
+
+#[tauri::command]
+pub fn mcp_start(state: State<AppState>) -> Result<McpStatus, String> {
+    let port = mcp::start(&state.mcp, state.session.clone())?;
+    if let Ok(v) = state.session.lock().unwrap().vault() {
+        let _ = v.audit("mcp_start", None, &format!("port={port}"));
+    }
+    Ok(mcp_status_of(&state))
+}
+
+#[tauri::command]
+pub fn mcp_stop(state: State<AppState>) -> Result<McpStatus, String> {
+    mcp::stop(&state.mcp);
+    if let Ok(v) = state.session.lock().unwrap().vault() {
+        let _ = v.audit("mcp_stop", None, "ok");
+    }
+    Ok(mcp_status_of(&state))
+}
+
+#[tauri::command]
+pub fn mcp_rotate_token(state: State<AppState>) -> Result<McpStatus, String> {
+    *state.mcp.token.lock().unwrap() = mcp::new_token();
+    if state.mcp.running.load(std::sync::atomic::Ordering::SeqCst) {
+        mcp::stop(&state.mcp);
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        mcp::start(&state.mcp, state.session.clone())?;
+    }
+    Ok(mcp_status_of(&state))
 }
 
 #[tauri::command]

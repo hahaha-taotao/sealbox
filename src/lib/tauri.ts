@@ -111,4 +111,12 @@ export const api = {
   window: (action: string) => invoke("window_control", { action }),
   home: () =>
     invoke<{ counts: Counts; recent: EntryDto[]; expiring: EntryDto[] }>("home_overview"),
+  mcpStatus: () =>
+    invoke<{ running: boolean; port: number; token: string; url: string }>("mcp_status"),
+  mcpStart: () =>
+    invoke<{ running: boolean; port: number; token: string; url: string }>("mcp_start"),
+  mcpStop: () =>
+    invoke<{ running: boolean; port: number; token: string; url: string }>("mcp_stop"),
+  mcpRotate: () =>
+    invoke<{ running: boolean; port: number; token: string; url: string }>("mcp_rotate_token"),
 };
