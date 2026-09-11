@@ -295,6 +295,9 @@ fn primary_secret(payload: &SecretPayload) -> String {
         SecretPayload::Website { password, .. } => password.clone(),
         SecretPayload::ApiToken { token, .. } => token.clone(),
         SecretPayload::Ssh { private_key, .. } => private_key.clone(),
+        SecretPayload::Mailbox { password, .. } => password.clone(),
+        SecretPayload::MailAuth { auth_code, .. } => auth_code.clone(),
+        SecretPayload::Server { password, .. } => password.clone(),
     }
 }
 
@@ -303,6 +306,9 @@ fn account_of(payload: &SecretPayload) -> Option<String> {
         SecretPayload::Website { username, .. } => username.clone(),
         SecretPayload::ApiToken { account, .. } => account.clone(),
         SecretPayload::Ssh { .. } => None,
+        SecretPayload::Mailbox { email, .. } => Some(email.clone()),
+        SecretPayload::MailAuth { email, .. } => Some(email.clone()),
+        SecretPayload::Server { username, .. } => Some(username.clone()),
     }
 }
 

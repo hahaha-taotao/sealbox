@@ -98,6 +98,77 @@ fn three_kinds_roundtrip_and_trash() {
             },
         )
         .unwrap();
+    let mail = vault
+        .upsert_entry(
+            &dek,
+            UpsertEntry {
+                id: None,
+                kind: EntryKind::Mailbox,
+                title: "work-mail".into(),
+                account: None,
+                url: None,
+                folder_id: None,
+                tags: vec![],
+                pinned: false,
+                expires_at: None,
+                notes: None,
+                secret: SecretPayload::Mailbox {
+                    email: "me@example.com".into(),
+                    password: "mail-pass".into(),
+                    imap_host: Some("imap.example.com".into()),
+                    imap_port: Some(993),
+                    smtp_host: Some("smtp.example.com".into()),
+                    smtp_port: Some(465),
+                },
+            },
+        )
+        .unwrap();
+    vault
+        .upsert_entry(
+            &dek,
+            UpsertEntry {
+                id: None,
+                kind: EntryKind::MailAuth,
+                title: "qq-auth".into(),
+                account: None,
+                url: None,
+                folder_id: None,
+                tags: vec![],
+                pinned: false,
+                expires_at: None,
+                notes: None,
+                secret: SecretPayload::MailAuth {
+                    email: "me@qq.com".into(),
+                    provider: "qq".into(),
+                    auth_code: "auth-code-xyz".into(),
+                },
+            },
+        )
+        .unwrap();
+    vault
+        .upsert_entry(
+            &dek,
+            UpsertEntry {
+                id: None,
+                kind: EntryKind::Server,
+                title: "prod-box".into(),
+                account: None,
+                url: None,
+                folder_id: None,
+                tags: vec![],
+                pinned: false,
+                expires_at: None,
+                notes: None,
+                secret: SecretPayload::Server {
+                    host: "10.0.0.8".into(),
+                    port: Some(22),
+                    protocol: "ssh".into(),
+                    username: "root".into(),
+                    password: "server-pass".into(),
+                },
+            },
+        )
+        .unwrap();
     let ssh = vault
         .upsert_entry(
             &dek,
@@ -133,10 +204,23 @@ fn three_kinds_roundtrip_and_trash() {
         }
         _ => panic!("wrong kind"),
     }
+    match vault.get_secret(&dek, &mail.id).unwrap() {
+        SecretPayload::Mailbox { email, password, .. } => {
+            assert_eq!(email, "me@example.com");
+            assert_eq!(password, "mail-pass");
+        }
+        _ => panic!("wrong kind"),
+    }
+    let listed = vault.list_entries(&ListFilter::default()).unwrap();
+    let json = serde_json::to_string(&listed).unwrap();
+    assert!(!json.contains("mail-pass"));
+    assert!(!json.contains("auth-code-xyz"));
+    assert!(!json.contains("server-pass"));
+    assert_eq!(listed.len(), 6);
 
     vault.soft_delete(&[web.id.clone()]).unwrap();
     let active = vault.list_entries(&ListFilter::default()).unwrap();
-    assert_eq!(active.len(), 2);
+    assert_eq!(active.len(), 5);
     let trash = vault
         .list_entries(&ListFilter {
             trash: true,
@@ -145,7 +229,7 @@ fn three_kinds_roundtrip_and_trash() {
         .unwrap();
     assert_eq!(trash.len(), 1);
     vault.restore(&[web.id.clone()]).unwrap();
-    assert_eq!(vault.list_entries(&ListFilter::default()).unwrap().len(), 3);
+    assert_eq!(vault.list_entries(&ListFilter::default()).unwrap().len(), 6);
     vault.set_pinned(&web.id, true).unwrap();
     assert!(vault.list_entries(&ListFilter::default()).unwrap()[0].pinned);
     vault.soft_delete(&[web.id.clone()]).unwrap();

@@ -53,7 +53,7 @@ fn tools_list() -> Value {
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "可选，按键名/账号/网址筛选" },
-                        "kind": { "type": "string", "enum": ["website", "api_token", "ssh"] }
+                        "kind": { "type": "string", "enum": ["website", "api_token", "ssh", "mailbox", "mail_auth", "server"] }
                     }
                 }
             },
@@ -143,6 +143,9 @@ fn call_tool(session: &Mutex<Session>, name: &str, args: Value) -> Result<String
                 "website" => Some(EntryKind::Website),
                 "api_token" => Some(EntryKind::ApiToken),
                 "ssh" => Some(EntryKind::Ssh),
+                "mailbox" => Some(EntryKind::Mailbox),
+                "mail_auth" => Some(EntryKind::MailAuth),
+                "server" => Some(EntryKind::Server),
                 _ => None,
             });
             let vault = s.vault().map_err(|e| e.to_string())?;
@@ -187,6 +190,9 @@ fn call_tool(session: &Mutex<Session>, name: &str, args: Value) -> Result<String
                 SecretPayload::Website { password, .. } => password.clone(),
                 SecretPayload::ApiToken { token, .. } => token.clone(),
                 SecretPayload::Ssh { private_key, .. } => private_key.clone(),
+                SecretPayload::Mailbox { password, .. } => password.clone(),
+                SecretPayload::MailAuth { auth_code, .. } => auth_code.clone(),
+                SecretPayload::Server { password, .. } => password.clone(),
             };
             crate::clipboard::write_text(&text)?;
             s.remember_clipboard(&text);
@@ -243,8 +249,24 @@ fn call_tool(session: &Mutex<Session>, name: &str, args: Value) -> Result<String
                         )
                     ))
                 }
+                SecretPayload::Mailbox { email, password, .. }
+                | SecretPayload::Server {
+                    username: email,
+                    password,
+                    ..
+                } => {
+                    let raw = format!("{email}:{password}");
+                    Some(format!(
+                        "Basic {}",
+                        base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            raw.as_bytes()
+                        )
+                    ))
+                }
+                SecretPayload::MailAuth { auth_code, .. } => Some(auth_code.clone()),
                 SecretPayload::Ssh { .. } => {
-                    return Err("SSH 凭据不能用于 http_request，请选 API Token 或网站账号".into());
+                    return Err("SSH 凭据不能用于 http_request，请选 API Token、邮箱或服务器账号".into());
                 }
             };
             drop(s);

@@ -38,6 +38,9 @@ pub enum EntryKind {
     Website,
     ApiToken,
     Ssh,
+    Mailbox,
+    MailAuth,
+    Server,
 }
 
 impl EntryKind {
@@ -46,6 +49,9 @@ impl EntryKind {
             Self::Website => "website",
             Self::ApiToken => "api_token",
             Self::Ssh => "ssh",
+            Self::Mailbox => "mailbox",
+            Self::MailAuth => "mail_auth",
+            Self::Server => "server",
         }
     }
 
@@ -54,6 +60,9 @@ impl EntryKind {
             "website" => Ok(Self::Website),
             "api_token" => Ok(Self::ApiToken),
             "ssh" => Ok(Self::Ssh),
+            "mailbox" => Ok(Self::Mailbox),
+            "mail_auth" => Ok(Self::MailAuth),
+            "server" => Ok(Self::Server),
             _ => Err(VaultError::InvalidKind),
         }
     }
@@ -144,6 +153,26 @@ pub enum SecretPayload {
         private_key: String,
         passphrase: Option<String>,
         public_fingerprint: Option<String>,
+    },
+    Mailbox {
+        email: String,
+        password: String,
+        imap_host: Option<String>,
+        imap_port: Option<u16>,
+        smtp_host: Option<String>,
+        smtp_port: Option<u16>,
+    },
+    MailAuth {
+        email: String,
+        provider: String,
+        auth_code: String,
+    },
+    Server {
+        host: String,
+        port: Option<u16>,
+        protocol: String,
+        username: String,
+        password: String,
     },
 }
 
@@ -317,6 +346,18 @@ impl Vault {
                 input.account.clone(),
                 None,
             ),
+            SecretPayload::Mailbox { email, imap_host, smtp_host, .. } => {
+                let host = imap_host.clone().or(smtp_host.clone());
+                (false, None, Some(email.clone()), host)
+            }
+            SecretPayload::MailAuth { email, .. } => (false, None, Some(email.clone()), None),
+            SecretPayload::Server { host, username, port, protocol, .. } => {
+                let loc = match port {
+                    Some(p) => format!("{protocol}://{host}:{p}"),
+                    None => format!("{protocol}://{host}"),
+                };
+                (false, None, Some(username.clone()), Some(loc))
+            }
         };
         let secret_json = serde_json::to_vec(&input.secret)?;
         let secret_blob = encrypt(dek, &secret_json)?.to_bytes();
@@ -891,6 +932,21 @@ impl Vault {
             [],
             |r| r.get(0),
         )?;
+        let mailbox: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM entries WHERE deleted_at IS NULL AND kind='mailbox'",
+            [],
+            |r| r.get(0),
+        )?;
+        let mail_auth: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM entries WHERE deleted_at IS NULL AND kind='mail_auth'",
+            [],
+            |r| r.get(0),
+        )?;
+        let server: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM entries WHERE deleted_at IS NULL AND kind='server'",
+            [],
+            |r| r.get(0),
+        )?;
         let trash: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM entries WHERE deleted_at IS NOT NULL",
             [],
@@ -901,6 +957,9 @@ impl Vault {
             website,
             api_token,
             ssh,
+            mailbox,
+            mail_auth,
+            server,
             trash,
         })
     }
@@ -957,6 +1016,9 @@ pub struct Counts {
     pub website: i64,
     pub api_token: i64,
     pub ssh: i64,
+    pub mailbox: i64,
+    pub mail_auth: i64,
+    pub server: i64,
     pub trash: i64,
 }
 

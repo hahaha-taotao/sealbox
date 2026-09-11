@@ -54,6 +54,16 @@ const form = reactive({
   private_key: "",
   totp: "",
   key_type: "ed25519",
+  email: "",
+  imap_host: "",
+  imap_port: 993,
+  smtp_host: "",
+  smtp_port: 465,
+  provider: "qq",
+  auth_code: "",
+  host: "",
+  port: 22,
+  protocol: "ssh",
 });
 const reveal = ref<SecretPayload | null>(null);
 const revealFor = ref<string | null>(null);
@@ -85,6 +95,9 @@ const crumb = computed(() => {
   if (filter.kind === "website") return "网站账号";
   if (filter.kind === "api_token") return "API Token";
   if (filter.kind === "ssh") return "SSH";
+  if (filter.kind === "mailbox") return "邮箱";
+  if (filter.kind === "mail_auth") return "邮箱授权码";
+  if (filter.kind === "server") return "服务器";
   return "全部凭据";
 });
 
@@ -93,7 +106,14 @@ function letterColor(title: string) {
   return colors[(title.charCodeAt(0) || 0) % colors.length];
 }
 function kindLabel(k: EntryKind) {
-  return k === "website" ? "网站账号" : k === "api_token" ? "API Token" : "SSH";
+  switch (k) {
+    case "website": return "网站账号";
+    case "api_token": return "API Token";
+    case "ssh": return "SSH";
+    case "mailbox": return "邮箱";
+    case "mail_auth": return "邮箱授权码";
+    case "server": return "服务器";
+  }
 }
 function showToast(msg: string) {
   toast.value = msg;
@@ -266,6 +286,16 @@ function openCreate() {
     private_key: "",
     totp: "",
     key_type: "ed25519",
+    email: "",
+    imap_host: "",
+    imap_port: 993,
+    smtp_host: "",
+    smtp_port: 465,
+    provider: "qq",
+    auth_code: "",
+    host: "",
+    port: 22,
+    protocol: "ssh",
   });
   showForm.value = true;
 }
@@ -291,6 +321,25 @@ async function openEdit(row: EntryDto) {
     form.token = secret.token;
     form.service = secret.service;
     form.account = secret.account || form.account;
+  } else if (secret.type === "mailbox") {
+    form.email = secret.email;
+    form.password = secret.password;
+    form.imap_host = secret.imap_host || "";
+    form.imap_port = secret.imap_port || 993;
+    form.smtp_host = secret.smtp_host || "";
+    form.smtp_port = secret.smtp_port || 465;
+    form.account = secret.email;
+  } else if (secret.type === "mail_auth") {
+    form.email = secret.email;
+    form.provider = secret.provider;
+    form.auth_code = secret.auth_code;
+    form.account = secret.email;
+  } else if (secret.type === "server") {
+    form.host = secret.host;
+    form.port = secret.port || 22;
+    form.protocol = secret.protocol;
+    form.account = secret.username;
+    form.password = secret.password;
   } else {
     form.private_key = secret.private_key;
     form.key_type = secret.key_type;
@@ -310,6 +359,30 @@ function buildSecret(): SecretPayload {
   }
   if (form.kind === "api_token") {
     return { type: "api_token", service: form.service, account: form.account || null, token: form.token };
+  }
+  if (form.kind === "mailbox") {
+    return {
+      type: "mailbox",
+      email: form.email,
+      password: form.password,
+      imap_host: form.imap_host || null,
+      imap_port: form.imap_port || null,
+      smtp_host: form.smtp_host || null,
+      smtp_port: form.smtp_port || null,
+    };
+  }
+  if (form.kind === "mail_auth") {
+    return { type: "mail_auth", email: form.email, provider: form.provider, auth_code: form.auth_code };
+  }
+  if (form.kind === "server") {
+    return {
+      type: "server",
+      host: form.host,
+      port: form.port || null,
+      protocol: form.protocol,
+      username: form.account,
+      password: form.password,
+    };
   }
   return {
     type: "ssh",
@@ -589,7 +662,7 @@ onMounted(async () => {
       <section class="main" v-if="page === 'home'">
         <div class="content">
           <h2>概览</h2>
-          <p>全部 {{ status.counts?.total ?? 0 }} · 网站 {{ status.counts?.website ?? 0 }} · Token {{ status.counts?.api_token ?? 0 }} · SSH {{ status.counts?.ssh ?? 0 }} · 回收站 {{ status.counts?.trash ?? 0 }}</p>
+          <p>全部 {{ status.counts?.total ?? 0 }} · 网站 {{ status.counts?.website ?? 0 }} · Token {{ status.counts?.api_token ?? 0 }} · SSH {{ status.counts?.ssh ?? 0 }} · 邮箱 {{ status.counts?.mailbox ?? 0 }} · 授权码 {{ status.counts?.mail_auth ?? 0 }} · 服务器 {{ status.counts?.server ?? 0 }} · 回收站 {{ status.counts?.trash ?? 0 }}</p>
           <h3>最近使用</h3>
           <div class="table" v-if="recent.length">
             <table>
@@ -634,6 +707,15 @@ onMounted(async () => {
           </button>
           <button class="side-item" :class="{ active: filter.kind === 'ssh' }" @click="setFilter({ kind: 'ssh' })">
             <span>SSH</span><span class="count">{{ status.counts?.ssh }}</span>
+          </button>
+          <button class="side-item" :class="{ active: filter.kind === 'mailbox' }" @click="setFilter({ kind: 'mailbox' })">
+            <span>邮箱</span><span class="count">{{ status.counts?.mailbox }}</span>
+          </button>
+          <button class="side-item" :class="{ active: filter.kind === 'mail_auth' }" @click="setFilter({ kind: 'mail_auth' })">
+            <span>邮箱授权码</span><span class="count">{{ status.counts?.mail_auth }}</span>
+          </button>
+          <button class="side-item" :class="{ active: filter.kind === 'server' }" @click="setFilter({ kind: 'server' })">
+            <span>服务器</span><span class="count">{{ status.counts?.server }}</span>
           </button>
           <div class="side-label" v-if="tags.length">标签</div>
           <button class="side-item" v-for="t in tags" :key="t" :class="{ active: filter.tag === t }" @click="setFilter({ tag: t })">{{ t }}</button>
@@ -680,8 +762,9 @@ onMounted(async () => {
                   <td>
                     {{ row.account || row.fingerprint || "—" }}
                     <div v-if="revealFor === row.id && reveal" style="font-size:12px;color:var(--muted);margin-top:4px;word-break:break-all">
-                      <template v-if="reveal.type === 'website'">{{ reveal.password }}</template>
+                      <template v-if="reveal.type === 'website' || reveal.type === 'mailbox' || reveal.type === 'server'">{{ reveal.password }}</template>
                       <template v-else-if="reveal.type === 'api_token'">{{ reveal.token }}</template>
+                      <template v-else-if="reveal.type === 'mail_auth'">{{ reveal.auth_code }}</template>
                       <template v-else>已显示私钥</template>
                     </div>
                   </td>
@@ -777,13 +860,16 @@ onMounted(async () => {
           <select v-model="form.kind">
             <option value="website">网站账号</option>
             <option value="api_token">API Token</option>
-            <option value="ssh">SSH</option>
+            <option value="ssh">SSH 私钥</option>
+            <option value="mailbox">邮箱</option>
+            <option value="mail_auth">邮箱授权码</option>
+            <option value="server">服务器账号</option>
           </select>
         </div>
         <div class="field"><label>键名</label><input v-model="form.title" /></div>
-        <div class="field" v-if="form.kind !== 'ssh'"><label>账号</label><input v-model="form.account" /></div>
+        <div class="field" v-if="form.kind !== 'ssh' && form.kind !== 'mailbox' && form.kind !== 'mail_auth'"><label>{{ form.kind === 'server' ? '用户名' : '账号' }}</label><input v-model="form.account" /></div>
         <div class="field" v-if="form.kind === 'website'"><label>网址</label><input v-model="form.url" /></div>
-        <div class="field" v-if="form.kind === 'website'"><label>密码</label>
+        <div class="field" v-if="form.kind === 'website' || form.kind === 'mailbox' || form.kind === 'server'"><label>密码</label>
           <div style="display:flex;gap:8px">
             <input v-model="form.password" type="password" style="flex:1" />
             <button class="btn" @click="gen">生成</button>
@@ -801,6 +887,32 @@ onMounted(async () => {
         <div class="field" v-if="form.kind === 'api_token'"><label>Token</label><input v-model="form.token" /></div>
         <div class="field" v-if="form.kind === 'ssh'"><label>密钥类型</label><input v-model="form.key_type" /></div>
         <div class="field" v-if="form.kind === 'ssh'"><label>私钥</label><textarea v-model="form.private_key" rows="6" /></div>
+        <div class="field" v-if="form.kind === 'mailbox' || form.kind === 'mail_auth'"><label>邮箱地址</label><input v-model="form.email" placeholder="name@example.com" /></div>
+        <div class="field" v-if="form.kind === 'mailbox'"><label>IMAP 主机</label><input v-model="form.imap_host" placeholder="imap.example.com" /></div>
+        <div class="field" v-if="form.kind === 'mailbox'"><label>IMAP 端口</label><input v-model.number="form.imap_port" type="number" /></div>
+        <div class="field" v-if="form.kind === 'mailbox'"><label>SMTP 主机</label><input v-model="form.smtp_host" placeholder="smtp.example.com" /></div>
+        <div class="field" v-if="form.kind === 'mailbox'"><label>SMTP 端口</label><input v-model.number="form.smtp_port" type="number" /></div>
+        <div class="field" v-if="form.kind === 'mail_auth'"><label>服务商</label>
+          <select v-model="form.provider">
+            <option value="qq">QQ 邮箱</option>
+            <option value="163">网易 163</option>
+            <option value="gmail">Gmail</option>
+            <option value="outlook">Outlook</option>
+            <option value="custom">其他</option>
+          </select>
+        </div>
+        <div class="field" v-if="form.kind === 'mail_auth'"><label>授权码</label><input v-model="form.auth_code" type="password" /></div>
+        <div class="field" v-if="form.kind === 'server'"><label>协议</label>
+          <select v-model="form.protocol">
+            <option value="ssh">SSH</option>
+            <option value="rdp">RDP</option>
+            <option value="sftp">SFTP</option>
+            <option value="ftp">FTP</option>
+            <option value="vnc">VNC</option>
+          </select>
+        </div>
+        <div class="field" v-if="form.kind === 'server'"><label>主机</label><input v-model="form.host" placeholder="192.168.1.10 或 example.com" /></div>
+        <div class="field" v-if="form.kind === 'server'"><label>端口</label><input v-model.number="form.port" type="number" /></div>
         <div class="field"><label>文件夹</label>
           <select v-model="form.folder_id">
             <option value="">未归类</option>
