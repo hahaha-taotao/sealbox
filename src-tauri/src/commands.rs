@@ -478,10 +478,22 @@ pub fn register_hotkey(app: &AppHandle, hotkey: &str) -> Result<(), String> {
     let _ = app.global_shortcut().unregister_all();
     let app2 = app.clone();
     app.global_shortcut()
-        .on_shortcut(shortcut, move |_app, _sc, event| {
-            if event.state == ShortcutState::Pressed {
-                let _ = app2.emit("quick-search", ());
+        .on_shortcut(shortcut, move |app, _sc, event| {
+            if event.state != ShortcutState::Pressed {
+                return;
             }
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.unminimize();
+                let _ = win.show();
+                let _ = win.set_always_on_top(true);
+                let _ = win.set_focus();
+                let win2 = win.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(80));
+                    let _ = win2.set_always_on_top(false);
+                });
+            }
+            let _ = app2.emit("quick-search", ());
         })
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -628,6 +640,7 @@ pub fn window_control(app: AppHandle, action: String) -> Result<(), String> {
         }
         "close" => win.hide().map_err(map_err),
         "show" => {
+            let _ = win.unminimize();
             win.show().map_err(map_err)?;
             win.set_focus().map_err(map_err)
         }

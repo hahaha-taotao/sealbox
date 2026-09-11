@@ -589,9 +589,13 @@ onMounted(async () => {
     }
   });
   const unLock = await listen("lock-now", () => doLock());
-  const unQuick = await listen("quick-search", () => {
-    if (status.value?.unlocked) openQuick();
-    else api.window("show").catch(() => {});
+  const unQuick = await listen("quick-search", async () => {
+    await refreshStatus();
+    if (status.value?.unlocked) await openQuick();
+    else {
+      const el = document.querySelector(".unlock input") as HTMLInputElement | null;
+      el?.focus();
+    }
   });
   onUnmounted(() => {
     window.removeEventListener("keydown", onKey);
