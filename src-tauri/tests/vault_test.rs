@@ -146,11 +146,23 @@ fn three_kinds_roundtrip_and_trash() {
     assert_eq!(trash.len(), 1);
     vault.restore(&[web.id.clone()]).unwrap();
     assert_eq!(vault.list_entries(&ListFilter::default()).unwrap().len(), 3);
-
-    let old = Utc::now() - Duration::days(40);
+    vault.set_pinned(&web.id, true).unwrap();
+    assert!(vault.list_entries(&ListFilter::default()).unwrap()[0].pinned);
     vault.soft_delete(&[web.id.clone()]).unwrap();
-    // force deleted_at into the past via restore path is hard; purge uses deleted_at timestamp.
-    // Just ensure purge with future cutoff doesn't panic.
+    vault.empty_trash().unwrap();
+    assert_eq!(
+        vault
+            .list_entries(&ListFilter {
+                trash: true,
+                ..ListFilter::default()
+            })
+            .unwrap()
+            .len(),
+        0
+    );
+
+    vault.soft_delete(&[token.id.clone()]).unwrap();
+    let old = Utc::now() - Duration::days(40);
     vault.purge_expired_trash(old, 30).unwrap();
 }
 

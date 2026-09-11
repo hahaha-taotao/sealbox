@@ -32,6 +32,8 @@ pub fn run() {
             commands::update_entry,
             commands::delete_entries,
             commands::restore_entries,
+            commands::empty_trash,
+            commands::pin_entry,
             commands::list_folders,
             commands::create_folder,
             commands::list_tags,

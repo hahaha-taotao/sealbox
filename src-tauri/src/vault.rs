@@ -546,6 +546,22 @@ impl Vault {
         Ok(n)
     }
 
+    pub fn empty_trash(&self) -> Result<usize, VaultError> {
+        let n = self
+            .conn
+            .execute("DELETE FROM entries WHERE deleted_at IS NOT NULL", [])?;
+        self.audit("empty_trash", None, &format!("purged={n}"))?;
+        Ok(n)
+    }
+
+    pub fn set_pinned(&self, id: &str, pinned: bool) -> Result<(), VaultError> {
+        self.conn.execute(
+            "UPDATE entries SET pinned=?1, updated_at=?2 WHERE id=?3",
+            params![pinned as i64, now_rfc3339(), id],
+        )?;
+        Ok(())
+    }
+
     pub fn purge_expired_trash(&self, now: DateTime<Utc>, retention_days: i64) -> Result<usize, VaultError> {
         let cutoff = (now - Duration::days(retention_days)).to_rfc3339();
         let n = self.conn.execute(

@@ -15,6 +15,8 @@ import {
 
 const status = ref<Status | null>(null);
 const page = ref<"home" | "vault" | "audit" | "settings">("vault");
+const history = ref<Array<"home" | "vault" | "audit" | "settings">>(["vault"]);
+const historyIndex = ref(0);
 const password = ref("");
 const password2 = ref("");
 const error = ref("");
@@ -152,9 +154,46 @@ async function doLock() {
   await refreshStatus();
 }
 async function openAudit() {
-  page.value = "audit";
+  goPage("audit");
   audit.value = await api.audit();
 }
+async function togglePin(row: EntryDto) {
+  await api.pin(row.id, !row.pinned);
+  await refreshVault();
+}
+async function doEmptyTrash() {
+  if (!confirm("彻底删除回收站中的全部条目？不可恢复。")) return;
+  await api.emptyTrash();
+  selected.value.clear();
+  await refreshVault();
+}
+
+function goPage(next: "home" | "vault" | "audit" | "settings") {
+  if (page.value === next) return;
+  history.value = history.value.slice(0, historyIndex.value + 1);
+  history.value.push(next);
+  historyIndex.value = history.value.length - 1;
+  page.value = next;
+}
+function goBack() {
+  if (historyIndex.value <= 0) return;
+  historyIndex.value -= 1;
+  page.value = history.value[historyIndex.value];
+}
+function goForward() {
+  if (historyIndex.value >= history.value.length - 1) return;
+  historyIndex.value += 1;
+  page.value = history.value[historyIndex.value];
+}
+const passwordHint = computed(() => {
+  const p = password.value;
+  if (!p) return "";
+  if (p.length < 10) return "太短（至少 10 位）";
+  const classes = [/[a-z]/, /[A-Z]/, /\d/, /[^A-Za-z0-9]/].filter((r) => r.test(p)).length;
+  if (p.length >= 14 && classes >= 3) return "强度：强";
+  if (p.length >= 12 && classes >= 2) return "强度：中";
+  return "强度：弱（可用，建议更长或加符号）";
+});
 
 function setFilter(partial: Partial<ListFilter>) {
   Object.assign(filter, {
@@ -376,7 +415,7 @@ async function doChangeMaster() {
   }
 }
 async function loadHome() {
-  page.value = "home";
+  goPage("home");
   const h = await api.home();
   recent.value = h.recent;
   expiring.value = h.expiring;
@@ -443,6 +482,8 @@ onMounted(async () => {
   <div class="app">
     <header class="titlebar" data-tauri-drag-region>
       <div class="drag" data-tauri-drag-region>
+        <button class="nav-btn" :disabled="historyIndex <= 0" @click="goBack">←</button>
+        <button class="nav-btn" :disabled="historyIndex >= history.length - 1" @click="goForward">→</button>
         <strong>Sealbox</strong>
         <span class="crumb">保险库 &gt; <strong>{{ crumb }}</strong></span>
         <span v-if="status?.unlocked" class="status-dot" />
@@ -464,8 +505,10 @@ onMounted(async () => {
         <p>主密码至少 10 位，请务必记住——备份和解锁都靠它。</p>
         <p v-if="error" class="error">{{ error }}</p>
         <input v-model="password" type="password" placeholder="主密码" />
+        <p class="crumb" v-if="passwordHint">{{ passwordHint }}</p>
         <input v-model="password2" type="password" placeholder="再输入一次" @keyup.enter="doSetup" />
         <button class="btn primary" style="width:100%" @click="doSetup">创建</button>
+        <button class="btn" style="width:100%;margin-top:8px" @click="backupMode = 'import'; backupOpen = true">从备份导入</button>
       </div>
     </div>
 
@@ -487,14 +530,14 @@ onMounted(async () => {
         <button class="rail-btn" :class="{ active: page === 'home' }" @click="loadHome">
           <span class="icon">⌂</span><span>首页</span>
         </button>
-        <button class="rail-btn" :class="{ active: page === 'vault' }" @click="page = 'vault'">
+        <button class="rail-btn" :class="{ active: page === 'vault' }" @click="goPage('vault')">
           <span class="icon">▣</span><span>保险库</span>
         </button>
         <button class="rail-btn" :class="{ active: page === 'audit' }" @click="openAudit">
           <span class="icon">≡</span><span>审计</span>
         </button>
         <div class="spacer" />
-        <button class="rail-btn" :class="{ active: page === 'settings' }" @click="page = 'settings'">
+        <button class="rail-btn" :class="{ active: page === 'settings' }" @click="goPage('settings')">
           <span class="icon">⚙</span><span>设置</span>
         </button>
       </nav>
@@ -572,6 +615,9 @@ onMounted(async () => {
           <div class="toolbar" v-if="selected.size">
             <button class="btn danger" @click="remove([...selected])">移入回收站 ({{ selected.size }})</button>
           </div>
+          <div class="toolbar" v-if="filter.trash && entries.length">
+            <button class="btn danger" @click="doEmptyTrash">清空回收站</button>
+          </div>
           <div class="table">
             <table v-if="entries.length">
               <thead>
@@ -585,6 +631,7 @@ onMounted(async () => {
                   <td>
                     <span class="letter" :style="{ background: letterColor(row.title) }">{{ row.title.slice(0,1).toUpperCase() }}</span>
                     {{ row.title }}
+                    <button v-if="!filter.trash" class="pin" :class="{ on: row.pinned }" @click="togglePin(row)">{{ row.pinned ? "📌" : "📍" }}</button>
                   </td>
                   <td>
                     {{ row.account || row.fingerprint || "—" }}
@@ -696,6 +743,8 @@ onMounted(async () => {
           </select>
         </div>
         <div class="field"><label>标签（逗号分隔）</label><input v-model="form.tags" /></div>
+        <div class="field"><label>过期日期（可空）</label><input v-model="form.expires_at" type="date" /></div>
+        <div class="field"><label><input type="checkbox" v-model="form.pinned" /> 置顶</label></div>
         <div class="field"><label>备注</label><textarea v-model="form.notes" rows="3" /></div>
         <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
           <button class="btn" @click="showForm = false">取消</button>

@@ -226,6 +226,20 @@ pub fn restore_entries(state: State<AppState>, ids: Vec<String>) -> Result<usize
 }
 
 #[tauri::command]
+pub fn empty_trash(state: State<AppState>) -> Result<usize, String> {
+    let mut session = state.session.lock().unwrap();
+    session.touch();
+    session.vault().map_err(map_err)?.empty_trash().map_err(map_err)
+}
+
+#[tauri::command]
+pub fn pin_entry(state: State<AppState>, id: String, pinned: bool) -> Result<(), String> {
+    let mut session = state.session.lock().unwrap();
+    session.touch();
+    session.vault().map_err(map_err)?.set_pinned(&id, pinned).map_err(map_err)
+}
+
+#[tauri::command]
 pub fn list_folders(state: State<AppState>) -> Result<Vec<FolderDto>, String> {
     state
         .session
@@ -512,11 +526,14 @@ pub fn change_master(
 ) -> Result<(), String> {
     let mut session = state.session.lock().unwrap();
     let dek = *session.dek().map_err(|_| "需要先解锁".to_string())?;
-    session
-        .vault()
-        .map_err(map_err)?
+    let vault = session.vault().map_err(map_err)?;
+    vault
         .change_master_password(&dek, &old_password, &new_password)
-        .map_err(map_err)
+        .map_err(map_err)?;
+    if vault.hello_enabled().unwrap_or(false) {
+        hello::enable_hello(vault, &dek)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]

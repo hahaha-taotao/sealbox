@@ -34,6 +34,13 @@ button { cursor: pointer; }
   user-select: none;
 }
 .titlebar .drag { flex: 1; display: flex; align-items: center; gap: 12px; }
+.nav-btn {
+  width: 28px; height: 28px; border: 1px solid var(--line); border-radius: 8px;
+  background: #fff; color: var(--muted);
+}
+.nav-btn:disabled { opacity: 0.35; }
+.pin { border: 0; background: transparent; padding: 0 4px; }
+.pin.on { filter: none; }
 .crumb { color: var(--muted); font-size: 13px; }
 .crumb strong { color: var(--text); font-weight: 600; }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); display: inline-block; }
