@@ -19,6 +19,21 @@
         "minWidth": 960,
         "minHeight": 640,
         "decorations": false
+      },
+      {
+        "label": "quick",
+        "title": "Sealbox 速查",
+        "url": "quick.html",
+        "width": 440,
+        "height": 420,
+        "resizable": false,
+        "decorations": false,
+        "transparent": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "center": true,
+        "focus": true
       }
     ],
     "security": {

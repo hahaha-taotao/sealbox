@@ -482,18 +482,13 @@ pub fn register_hotkey(app: &AppHandle, hotkey: &str) -> Result<(), String> {
             if event.state != ShortcutState::Pressed {
                 return;
             }
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = win.unminimize();
+            if let Some(win) = app.get_webview_window("quick") {
                 let _ = win.show();
                 let _ = win.set_always_on_top(true);
+                let _ = win.unminimize();
                 let _ = win.set_focus();
-                let win2 = win.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(80));
-                    let _ = win2.set_always_on_top(false);
-                });
             }
-            let _ = app2.emit("quick-search", ());
+            let _ = app2.emit_to("quick", "quick-search", ());
         })
         .map_err(|e| e.to_string())?;
     Ok(())

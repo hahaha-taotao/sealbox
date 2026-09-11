@@ -101,6 +101,17 @@ pub fn run() {
                 api.prevent_close();
                 let _ = window.hide();
             }
+            if window.label() == "quick" {
+                if let tauri::WindowEvent::Focused(false) = event {
+                    let win = window.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(160));
+                        if !win.is_focused().unwrap_or(true) {
+                            let _ = win.hide();
+                        }
+                    });
+                }
+            }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

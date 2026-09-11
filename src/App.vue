@@ -67,24 +67,11 @@ const form = reactive({
 });
 const reveal = ref<SecretPayload | null>(null);
 const revealFor = ref<string | null>(null);
-const quickOpen = ref(false);
-const quickQuery = ref("");
-const quickIndex = ref(0);
 const backupOpen = ref(false);
 const backupMode = ref<"export" | "import">("export");
 const backupPath = ref("");
 const backupPassword = ref("");
 const backupOverwrite = ref(false);
-
-const quickHits = computed(() => {
-  const q = quickQuery.value.toLowerCase();
-  return entries.value.filter(
-    (e) =>
-      e.title.toLowerCase().includes(q) ||
-      (e.account || "").toLowerCase().includes(q) ||
-      (e.url || "").toLowerCase().includes(q),
-  );
-});
 
 const crumb = computed(() => {
   if (page.value === "home") return "首页";
@@ -478,20 +465,6 @@ async function runBackup() {
     showToast(String(e));
   }
 }
-async function openQuick() {
-  if (!status.value?.unlocked) return;
-  await refreshVault();
-  quickQuery.value = "";
-  quickIndex.value = 0;
-  quickOpen.value = true;
-}
-async function pickQuick() {
-  const hit = quickHits.value[quickIndex.value];
-  if (!hit) return;
-  await copy(hit.id);
-  quickOpen.value = false;
-}
-
 const settingsIdle = ref(15);
 const settingsClip = ref(20);
 const settingsHotkey = ref("Ctrl+Shift+Space");
@@ -563,15 +536,9 @@ async function pickBackupFile(mode: "export" | "import") {
 }
 
 function onKey(e: KeyboardEvent) {
-  if (e.ctrlKey && e.key.toLowerCase() === "f" && status.value?.unlocked && !quickOpen.value) {
+  if (e.ctrlKey && e.key.toLowerCase() === "f" && status.value?.unlocked) {
     const el = document.querySelector(".search") as HTMLInputElement | null;
     el?.focus();
-  }
-  if (quickOpen.value) {
-    if (e.key === "Escape") quickOpen.value = false;
-    if (e.key === "ArrowDown") quickIndex.value = Math.min(quickIndex.value + 1, Math.max(quickHits.value.length - 1, 0));
-    if (e.key === "ArrowUp") quickIndex.value = Math.max(quickIndex.value - 1, 0);
-    if (e.key === "Enter") pickQuick();
   }
 }
 
@@ -584,24 +551,14 @@ onMounted(async () => {
     const locked = await api.tick();
     if (locked) {
       entries.value = [];
-      quickOpen.value = false;
       await refreshStatus();
     }
   });
   const unLock = await listen("lock-now", () => doLock());
-  const unQuick = await listen("quick-search", async () => {
-    await refreshStatus();
-    if (status.value?.unlocked) await openQuick();
-    else {
-      const el = document.querySelector(".unlock input") as HTMLInputElement | null;
-      el?.focus();
-    }
-  });
   onUnmounted(() => {
     window.removeEventListener("keydown", onKey);
     unTick();
     unLock();
-    unQuick();
   });
 });
 </script>
@@ -977,16 +934,6 @@ onMounted(async () => {
           <button class="btn" @click="backupOpen = false">取消</button>
           <button class="btn primary" @click="runBackup">确定</button>
         </div>
-      </div>
-    </div>
-    <div class="dialog-mask" v-if="quickOpen" @click.self="quickOpen = false">
-      <div class="dialog" style="width:420px">
-        <input class="search" v-model="quickQuery" placeholder="搜索并回车复制…" autofocus />
-        <div v-for="(row, i) in quickHits" :key="row.id" class="side-item" :class="{ active: i === quickIndex }" @click="quickIndex = i; pickQuick()">
-          <span>{{ row.title }}</span>
-          <span class="count">{{ kindLabel(row.kind) }}</span>
-        </div>
-        <p class="crumb" v-if="!quickHits.length">没有匹配</p>
       </div>
     </div>
     <div class="toast" v-if="toast">{{ toast }}</div>
