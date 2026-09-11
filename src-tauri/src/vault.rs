@@ -888,6 +888,51 @@ impl Vault {
             trash,
         })
     }
+
+    pub fn recent_entries(&self, limit: i64) -> Result<Vec<EntryDto>, VaultError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM entries WHERE deleted_at IS NULL AND last_used_at IS NOT NULL
+             ORDER BY last_used_at DESC LIMIT ?1",
+        )?;
+        let ids: Vec<String> = stmt
+            .query_map(params![limit], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        ids.into_iter().map(|id| self.get_dto(&id)).collect()
+    }
+
+    pub fn expiring_entries(&self, within_days: i64) -> Result<Vec<EntryDto>, VaultError> {
+        let until = (Utc::now() + Duration::days(within_days)).to_rfc3339();
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM entries WHERE deleted_at IS NULL AND expires_at IS NOT NULL
+             AND expires_at <= ?1 ORDER BY expires_at ASC LIMIT 20",
+        )?;
+        let ids: Vec<String> = stmt
+            .query_map(params![until], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        ids.into_iter().map(|id| self.get_dto(&id)).collect()
+    }
+
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>, VaultError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM settings WHERE key=?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<(), VaultError> {
+        self.conn.execute(
+            "INSERT INTO settings(key, value) VALUES(?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -9,7 +9,7 @@ use crate::vault::{
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 pub struct AppState {
     pub session: Mutex<Session>,
@@ -69,6 +69,20 @@ pub fn get_status(app: AppHandle, state: State<AppState>) -> Result<Status, Stri
     } else {
         false
     };
+    if unlocked {
+        let idle = session.vault().ok().and_then(|v| v.get_setting("idle_secs").ok()).flatten();
+        let clip = session.vault().ok().and_then(|v| v.get_setting("clipboard_secs").ok()).flatten();
+        let hk = session.vault().ok().and_then(|v| v.get_setting("hotkey").ok()).flatten();
+        if let Some(idle) = idle.and_then(|s| s.parse::<u64>().ok()) {
+            session.idle_secs = idle.max(60);
+        }
+        if let Some(clip) = clip.and_then(|s| s.parse::<u64>().ok()) {
+            session.clipboard_secs = clip.clamp(5, 120);
+        }
+        if let Some(hk) = hk {
+            session.hotkey = hk;
+        }
+    }
     let counts = if unlocked {
         session.vault().ok().and_then(|v| v.counts().ok())
     } else {
@@ -81,6 +95,25 @@ pub fn get_status(app: AppHandle, state: State<AppState>) -> Result<Status, Stri
         hello_available: hello::hello_available(),
         counts,
     })
+}
+
+#[tauri::command]
+pub fn home_overview(state: State<AppState>) -> Result<HomeOverview, String> {
+    let mut session = state.session.lock().unwrap();
+    session.maybe_idle_lock();
+    let vault = session.vault().map_err(map_err)?;
+    Ok(HomeOverview {
+        counts: vault.counts().map_err(map_err)?,
+        recent: vault.recent_entries(8).map_err(map_err)?,
+        expiring: vault.expiring_entries(30).map_err(map_err)?,
+    })
+}
+
+#[derive(Serialize)]
+pub struct HomeOverview {
+    pub counts: Counts,
+    pub recent: Vec<EntryDto>,
+    pub expiring: Vec<EntryDto>,
 }
 
 #[tauri::command]
@@ -397,16 +430,66 @@ pub fn settings_get(state: State<AppState>) -> Settings {
     Settings {
         idle_secs: s.idle_secs,
         clipboard_secs: s.clipboard_secs,
-        hotkey: "Ctrl+Shift+Space".into(),
+        hotkey: s.hotkey.clone(),
     }
 }
 
 #[tauri::command]
-pub fn settings_set(state: State<AppState>, settings: Settings) -> Result<(), String> {
+pub fn settings_set(app: AppHandle, state: State<AppState>, settings: Settings) -> Result<(), String> {
     let mut s = state.session.lock().unwrap();
     s.idle_secs = settings.idle_secs.max(60);
     s.clipboard_secs = settings.clipboard_secs.clamp(5, 120);
+    s.hotkey = settings.hotkey.clone();
+    if let Ok(v) = s.vault() {
+        let _ = v.set_setting("idle_secs", &s.idle_secs.to_string());
+        let _ = v.set_setting("clipboard_secs", &s.clipboard_secs.to_string());
+        let _ = v.set_setting("hotkey", &s.hotkey);
+    }
+    drop(s);
+    register_hotkey(&app, &settings.hotkey)
+}
+
+pub fn register_hotkey(app: &AppHandle, hotkey: &str) -> Result<(), String> {
+    use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+    let shortcut = parse_hotkey(hotkey)?;
+    let _ = app.global_shortcut().unregister_all();
+    let app2 = app.clone();
+    app.global_shortcut()
+        .on_shortcut(shortcut, move |_app, _sc, event| {
+            if event.state == ShortcutState::Pressed {
+                let _ = app2.emit("quick-search", ());
+            }
+        })
+        .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn parse_hotkey(s: &str) -> Result<tauri_plugin_global_shortcut::Shortcut, String> {
+    use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
+    let lower = s.to_ascii_lowercase();
+    let mut mods = Modifiers::empty();
+    if lower.contains("ctrl") {
+        mods |= Modifiers::CONTROL;
+    }
+    if lower.contains("shift") {
+        mods |= Modifiers::SHIFT;
+    }
+    if lower.contains("alt") {
+        mods |= Modifiers::ALT;
+    }
+    if lower.contains("super") || lower.contains("meta") || lower.contains("win") {
+        mods |= Modifiers::SUPER;
+    }
+    let code = if lower.contains("space") {
+        Code::Space
+    } else if lower.contains("keyk") || lower.ends_with("+k") {
+        Code::KeyK
+    } else if lower.contains("keyp") || lower.ends_with("+p") {
+        Code::KeyP
+    } else {
+        Code::Space
+    };
+    Ok(Shortcut::new(Some(mods), code))
 }
 
 #[tauri::command]
@@ -449,6 +532,10 @@ pub fn window_control(app: AppHandle, action: String) -> Result<(), String> {
             }
         }
         "close" => win.hide().map_err(map_err),
+        "show" => {
+            win.show().map_err(map_err)?;
+            win.set_focus().map_err(map_err)
+        }
         _ => Ok(()),
     }
 }

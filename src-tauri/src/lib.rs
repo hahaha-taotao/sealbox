@@ -17,9 +17,12 @@ use tauri::{Emitter, Manager};
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
+            commands::home_overview,
             commands::setup_vault,
             commands::unlock_vault,
             commands::unlock_hello,
@@ -68,12 +71,17 @@ pub fn run() {
                         }
                     }
                     "lock" => {
+                        if let Some(state) = app.try_state::<AppState>() {
+                            let mut session = state.session.lock().unwrap();
+                            session.lock();
+                        }
                         let _ = app.emit("lock-now", ());
                     }
                     "quit" => app.exit(0),
                     _ => {}
                 })
                 .build(app)?;
+            let _ = commands::register_hotkey(app.handle(), "Ctrl+Shift+Space");
             Ok(())
         })
         .on_window_event(|window, event| {

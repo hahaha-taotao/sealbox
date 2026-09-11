@@ -107,4 +107,6 @@ export const api = {
   changeMaster: (oldPassword: string, newPassword: string) =>
     invoke("change_master", { oldPassword, newPassword }),
   window: (action: string) => invoke("window_control", { action }),
+  home: () =>
+    invoke<{ counts: Counts; recent: EntryDto[]; expiring: EntryDto[] }>("home_overview"),
 };

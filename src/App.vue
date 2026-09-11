@@ -331,26 +331,76 @@ async function pickQuick() {
 
 const settingsIdle = ref(15);
 const settingsClip = ref(20);
+const settingsHotkey = ref("Ctrl+Shift+Space");
+const oldMaster = ref("");
+const newMaster = ref("");
+const newMaster2 = ref("");
+const recent = ref<EntryDto[]>([]);
+const expiring = ref<EntryDto[]>([]);
+
 async function loadSettings() {
   const s = await api.settingsGet();
   settingsIdle.value = Math.round(s.idle_secs / 60);
   settingsClip.value = s.clipboard_secs;
+  settingsHotkey.value = s.hotkey;
 }
 async function saveSettings() {
-  await api.settingsSet({
-    idle_secs: settingsIdle.value * 60,
-    clipboard_secs: settingsClip.value,
-    hotkey: "Ctrl+Shift+Space",
-  });
-  showToast("设置已保存");
+  try {
+    await api.settingsSet({
+      idle_secs: settingsIdle.value * 60,
+      clipboard_secs: settingsClip.value,
+      hotkey: settingsHotkey.value,
+    });
+    showToast("设置已保存");
+  } catch (e) {
+    showToast("热键可能被占用：" + String(e));
+  }
+}
+async function doChangeMaster() {
+  if (newMaster.value.length < 10) {
+    showToast("新主密码至少 10 位");
+    return;
+  }
+  if (newMaster.value !== newMaster2.value) {
+    showToast("两次新密码不一致");
+    return;
+  }
+  try {
+    await api.changeMaster(oldMaster.value, newMaster.value);
+    oldMaster.value = "";
+    newMaster.value = "";
+    newMaster2.value = "";
+    showToast("主密码已更新");
+  } catch (e) {
+    showToast(String(e));
+  }
+}
+async function loadHome() {
+  page.value = "home";
+  const h = await api.home();
+  recent.value = h.recent;
+  expiring.value = h.expiring;
+  status.value = { ...(status.value as Status), counts: h.counts };
+}
+async function pickBackupFile(mode: "export" | "import") {
+  const { save, open } = await import("@tauri-apps/plugin-dialog");
+  if (mode === "export") {
+    const p = await save({
+      defaultPath: "sealbox.svbak",
+      filters: [{ name: "Sealbox backup", extensions: ["svbak"] }],
+    });
+    if (p) backupPath.value = p;
+  } else {
+    const p = await open({
+      multiple: false,
+      filters: [{ name: "Sealbox backup", extensions: ["svbak"] }],
+    });
+    if (typeof p === "string") backupPath.value = p;
+  }
 }
 
 function onKey(e: KeyboardEvent) {
-  if (e.ctrlKey && e.shiftKey && e.code === "Space") {
-    e.preventDefault();
-    openQuick();
-  }
-  if (e.ctrlKey && e.key.toLowerCase() === "f" && status.value?.unlocked) {
+  if (e.ctrlKey && e.key.toLowerCase() === "f" && status.value?.unlocked && !quickOpen.value) {
     const el = document.querySelector(".search") as HTMLInputElement | null;
     el?.focus();
   }
@@ -376,10 +426,15 @@ onMounted(async () => {
     }
   });
   const unLock = await listen("lock-now", () => doLock());
+  const unQuick = await listen("quick-search", () => {
+    if (status.value?.unlocked) openQuick();
+    else api.window("show").catch(() => {});
+  });
   onUnmounted(() => {
     window.removeEventListener("keydown", onKey);
     unTick();
     unLock();
+    unQuick();
   });
 });
 </script>
@@ -429,7 +484,7 @@ onMounted(async () => {
 
     <div class="body" v-else>
       <nav class="rail">
-        <button class="rail-btn" :class="{ active: page === 'home' }" @click="page = 'home'">
+        <button class="rail-btn" :class="{ active: page === 'home' }" @click="loadHome">
           <span class="icon">⌂</span><span>首页</span>
         </button>
         <button class="rail-btn" :class="{ active: page === 'vault' }" @click="page = 'vault'">
@@ -447,8 +502,33 @@ onMounted(async () => {
       <section class="main" v-if="page === 'home'">
         <div class="content">
           <h2>概览</h2>
-          <p>全部 {{ status.counts?.total ?? 0 }} · 网站 {{ status.counts?.website ?? 0 }} · Token {{ status.counts?.api_token ?? 0 }} · SSH {{ status.counts?.ssh ?? 0 }}</p>
-          <p class="crumb">回收站 {{ status.counts?.trash ?? 0 }} 条</p>
+          <p>全部 {{ status.counts?.total ?? 0 }} · 网站 {{ status.counts?.website ?? 0 }} · Token {{ status.counts?.api_token ?? 0 }} · SSH {{ status.counts?.ssh ?? 0 }} · 回收站 {{ status.counts?.trash ?? 0 }}</p>
+          <h3>最近使用</h3>
+          <div class="table" v-if="recent.length">
+            <table>
+              <tbody>
+                <tr v-for="row in recent" :key="row.id">
+                  <td>{{ row.title }}</td>
+                  <td>{{ row.account || "—" }}</td>
+                  <td>{{ fmtTime(row.last_used_at) }}</td>
+                  <td><button class="btn" @click="copy(row.id)">复制</button></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="crumb" v-else>还没有使用记录</p>
+          <h3>30 天内过期</h3>
+          <div class="table" v-if="expiring.length">
+            <table>
+              <tbody>
+                <tr v-for="row in expiring" :key="'e'+row.id">
+                  <td>{{ row.title }}</td>
+                  <td>{{ fmtTime(row.expires_at) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="crumb" v-else>没有即将过期的条目</p>
         </div>
       </section>
 
@@ -561,13 +641,19 @@ onMounted(async () => {
           <h2>设置</h2>
           <div class="field"><label>空闲锁定（分钟）</label><input type="number" v-model.number="settingsIdle" /></div>
           <div class="field"><label>剪贴板清空（秒）</label><input type="number" v-model.number="settingsClip" /></div>
+          <div class="field"><label>全局热键</label><input v-model="settingsHotkey" placeholder="Ctrl+Shift+Space" /></div>
           <button class="btn primary" @click="saveSettings">保存</button>
           <div class="field" style="margin-top:24px">
             <label>Windows Hello</label>
             <button class="btn" @click="api.setHello(true).then(() => showToast('已开启'))">开启</button>
             <button class="btn" @click="api.setHello(false).then(() => showToast('已关闭'))">关闭</button>
           </div>
-          <p class="crumb" style="margin-top:16px">全局速查：窗口聚焦时 Ctrl+Shift+Space。关闭窗口会藏到托盘。</p>
+          <h3 style="margin-top:28px">修改主密码</h3>
+          <div class="field"><label>当前主密码</label><input v-model="oldMaster" type="password" /></div>
+          <div class="field"><label>新主密码</label><input v-model="newMaster" type="password" /></div>
+          <div class="field"><label>确认新主密码</label><input v-model="newMaster2" type="password" /></div>
+          <button class="btn" @click="doChangeMaster">更新主密码</button>
+          <p class="crumb" style="margin-top:16px">关闭窗口进入托盘。全局热键默认 Ctrl+Shift+Space，即使窗口不在前台也能打开速查。</p>
         </div>
       </section>
     </div>
@@ -627,7 +713,12 @@ onMounted(async () => {
             <option value="import">导入备份</option>
           </select>
         </div>
-        <div class="field"><label>文件路径（.svbak）</label><input v-model="backupPath" placeholder="D:\sealbox.svbak" /></div>
+        <div class="field"><label>文件路径（.svbak）</label>
+          <div style="display:flex;gap:8px">
+            <input v-model="backupPath" placeholder="选择或输入路径" style="flex:1" />
+            <button class="btn" @click="pickBackupFile(backupMode)">浏览</button>
+          </div>
+        </div>
         <div class="field"><label>主密码</label><input v-model="backupPassword" type="password" /></div>
         <div class="field" v-if="backupMode === 'import'">
           <label><input type="checkbox" v-model="backupOverwrite" /> 覆盖已有同 id 条目</label>

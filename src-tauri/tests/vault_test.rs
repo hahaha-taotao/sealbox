@@ -155,6 +155,18 @@ fn three_kinds_roundtrip_and_trash() {
 }
 
 #[test]
+fn recent_and_expiring() {
+    let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+    let mut soon = sample_website("expires-soon", None);
+    soon.expires_at = Some((Utc::now() + Duration::days(3)).to_rfc3339());
+    let row = vault.upsert_entry(&dek, soon).unwrap();
+    vault.bump_use(&row.id).unwrap();
+    assert_eq!(vault.recent_entries(5).unwrap().len(), 1);
+    assert_eq!(vault.expiring_entries(30).unwrap().len(), 1);
+    assert!(vault.expiring_entries(1).unwrap().is_empty());
+}
+
+#[test]
 fn change_master_password() {
     let (vault, dek) = Vault::create_in_memory("old password long enough").unwrap();
     vault
