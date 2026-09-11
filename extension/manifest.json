@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Sealbox 印盒",
+  "version": "0.1.0",
+  "description": "按当前网址从本地 Sealbox 填充或登记网站密码。密钥不离开本机。",
+  "action": {
+    "default_title": "Sealbox",
+    "default_popup": "popup.html"
+  },
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

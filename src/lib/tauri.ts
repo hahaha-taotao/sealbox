@@ -126,11 +126,13 @@ export const api = {
   home: () =>
     invoke<{ counts: Counts; recent: EntryDto[]; expiring: EntryDto[] }>("home_overview"),
   mcpStatus: () =>
-    invoke<{ running: boolean; port: number; token: string; url: string }>("mcp_status"),
+    invoke<{ running: boolean; port: number; token: string; url: string; fill_token: string; fill_url: string }>("mcp_status"),
   mcpStart: () =>
-    invoke<{ running: boolean; port: number; token: string; url: string }>("mcp_start"),
+    invoke<{ running: boolean; port: number; token: string; url: string; fill_token: string; fill_url: string }>("mcp_start"),
   mcpStop: () =>
-    invoke<{ running: boolean; port: number; token: string; url: string }>("mcp_stop"),
+    invoke<{ running: boolean; port: number; token: string; url: string; fill_token: string; fill_url: string }>("mcp_stop"),
   mcpRotate: () =>
-    invoke<{ running: boolean; port: number; token: string; url: string }>("mcp_rotate_token"),
+    invoke<{ running: boolean; port: number; token: string; url: string; fill_token: string; fill_url: string }>("mcp_rotate_token"),
+  fillRotate: () =>
+    invoke<{ running: boolean; port: number; token: string; url: string; fill_token: string; fill_url: string }>("fill_rotate_token"),
 };

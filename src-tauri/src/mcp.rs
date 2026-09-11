@@ -1,3 +1,4 @@
+use crate::fill;
 use crate::redact::{redact_text, secrets_from_payload};
 use crate::session::Session;
 use crate::vault::{EntryKind, ListFilter, SecretPayload, SortBy};
@@ -18,6 +19,7 @@ pub struct McpState {
     pub running: Arc<AtomicBool>,
     pub port: Arc<Mutex<u16>>,
     pub token: Arc<Mutex<String>>,
+    pub fill_token: Arc<Mutex<String>>,
 }
 
 impl Default for McpState {
@@ -26,6 +28,7 @@ impl Default for McpState {
             running: Arc::new(AtomicBool::new(false)),
             port: Arc::new(Mutex::new(DEFAULT_PORT)),
             token: Arc::new(Mutex::new(String::new())),
+            fill_token: Arc::new(Mutex::new(String::new())),
         }
     }
 }
@@ -312,6 +315,7 @@ fn call_tool(session: &Mutex<Session>, name: &str, args: Value) -> Result<String
 
 struct HttpReq {
     method: String,
+    path: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
@@ -321,11 +325,15 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpReq, String> {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
     reader.read_line(&mut request_line).map_err(|e| e.to_string())?;
-    let method = request_line
-        .split_whitespace()
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_ascii_uppercase();
+    let path = parts
         .next()
-        .unwrap_or("")
-        .to_ascii_uppercase();
+        .unwrap_or("/")
+        .split('?')
+        .next()
+        .unwrap_or("/")
+        .to_string();
     let mut headers = Vec::new();
     let mut content_length = 0usize;
     loop {
@@ -349,6 +357,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpReq, String> {
     }
     Ok(HttpReq {
         method,
+        path,
         headers,
         body,
     })
@@ -363,16 +372,17 @@ fn write_http(stream: &mut TcpStream, status: &str, body: &[u8]) {
     let _ = stream.write_all(body);
 }
 
-fn handle_client(mut stream: TcpStream, session: Arc<Mutex<Session>>, token: String) {
+fn handle_client(
+    mut stream: TcpStream,
+    session: Arc<Mutex<Session>>,
+    token: String,
+    fill_token: String,
+) {
     let Ok(req) = read_http_request(&mut stream) else {
         return;
     };
     if req.method == "OPTIONS" {
         write_http(&mut stream, "204 No Content", b"");
-        return;
-    }
-    if req.method != "POST" {
-        write_http(&mut stream, "405 Method Not Allowed", b"{}");
         return;
     }
     let auth = req
@@ -381,6 +391,40 @@ fn handle_client(mut stream: TcpStream, session: Arc<Mutex<Session>>, token: Str
         .find(|(k, _)| k == "authorization")
         .map(|(_, v)| v.as_str())
         .unwrap_or("");
+    if req.path.starts_with("/fill") {
+        if req.method != "POST" {
+            write_http(&mut stream, "405 Method Not Allowed", b"{}");
+            return;
+        }
+        if auth != format!("Bearer {fill_token}") {
+            write_http(
+                &mut stream,
+                "401 Unauthorized",
+                br#"{"error":"invalid fill token"}"#,
+            );
+            return;
+        }
+        match fill::handle_fill_http(&session, &req.path, &req.body) {
+            Ok(v) => {
+                let bytes = serde_json::to_vec(&v).unwrap_or_else(|_| b"{}".to_vec());
+                write_http(&mut stream, "200 OK", &bytes);
+            }
+            Err((code, msg)) => {
+                let body = serde_json::to_vec(&json!({ "ok": false, "error": msg })).unwrap_or_default();
+                let status = match code {
+                    403 => "403 Forbidden",
+                    404 => "404 Not Found",
+                    _ => "400 Bad Request",
+                };
+                write_http(&mut stream, status, &body);
+            }
+        }
+        return;
+    }
+    if req.method != "POST" {
+        write_http(&mut stream, "405 Method Not Allowed", b"{}");
+        return;
+    }
     if auth != format!("Bearer {token}") {
         write_http(
             &mut stream,
@@ -414,8 +458,13 @@ pub fn start(mcp: &McpState, session: Arc<Mutex<Session>>) -> Result<u16, String
         if token.is_empty() {
             *token = new_token();
         }
+        let mut fill = mcp.fill_token.lock().unwrap();
+        if fill.is_empty() {
+            *fill = fill::new_fill_token();
+        }
     }
     let token_clone = mcp.token.lock().unwrap().clone();
+    let fill_clone = mcp.fill_token.lock().unwrap().clone();
     let listener = TcpListener::bind(("127.0.0.1", DEFAULT_PORT))
         .or_else(|_| TcpListener::bind("127.0.0.1:0"))
         .map_err(|e| e.to_string())?;
@@ -433,7 +482,8 @@ pub fn start(mcp: &McpState, session: Arc<Mutex<Session>>) -> Result<u16, String
                     }
                     let session = session.clone();
                     let token = token_clone.clone();
-                    thread::spawn(move || handle_client(stream, session, token));
+                    let fill_token = fill_clone.clone();
+                    thread::spawn(move || handle_client(stream, session, token, fill_token));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(50));

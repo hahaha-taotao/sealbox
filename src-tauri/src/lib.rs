@@ -3,6 +3,7 @@ pub mod clipboard;
 pub mod commands;
 pub mod crypto;
 pub mod db;
+pub mod fill;
 pub mod hello;
 pub mod mcp;
 pub mod redact;
@@ -55,6 +56,7 @@ pub fn run() {
             commands::mcp_start,
             commands::mcp_stop,
             commands::mcp_rotate_token,
+            commands::fill_rotate_token,
             commands::window_control,
         ])
         .setup(|app| {
@@ -89,6 +91,9 @@ pub fn run() {
                 })
                 .build(app)?;
             let _ = commands::register_hotkey(app.handle(), "Ctrl+Shift+Space");
+            if let Some(state) = app.try_state::<AppState>() {
+                let _ = mcp::start(&state.mcp, state.session.clone());
+            }
             Ok(())
         })
         .on_window_event(|window, event| {

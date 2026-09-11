@@ -551,16 +551,21 @@ pub struct McpStatus {
     pub port: u16,
     pub token: String,
     pub url: String,
+    pub fill_token: String,
+    pub fill_url: String,
 }
 
 fn mcp_status_of(state: &AppState) -> McpStatus {
     let port = *state.mcp.port.lock().unwrap();
     let token = state.mcp.token.lock().unwrap().clone();
+    let fill_token = state.mcp.fill_token.lock().unwrap().clone();
     McpStatus {
         running: state.mcp.running.load(std::sync::atomic::Ordering::SeqCst),
         port,
         token: token.clone(),
         url: format!("http://127.0.0.1:{port}/mcp"),
+        fill_token: fill_token.clone(),
+        fill_url: format!("http://127.0.0.1:{port}/fill"),
     }
 }
 
@@ -590,6 +595,17 @@ pub fn mcp_stop(state: State<AppState>) -> Result<McpStatus, String> {
 #[tauri::command]
 pub fn mcp_rotate_token(state: State<AppState>) -> Result<McpStatus, String> {
     *state.mcp.token.lock().unwrap() = mcp::new_token();
+    if state.mcp.running.load(std::sync::atomic::Ordering::SeqCst) {
+        mcp::stop(&state.mcp);
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        mcp::start(&state.mcp, state.session.clone())?;
+    }
+    Ok(mcp_status_of(&state))
+}
+
+#[tauri::command]
+pub fn fill_rotate_token(state: State<AppState>) -> Result<McpStatus, String> {
+    *state.mcp.fill_token.lock().unwrap() = crate::fill::new_fill_token();
     if state.mcp.running.load(std::sync::atomic::Ordering::SeqCst) {
         mcp::stop(&state.mcp);
         std::thread::sleep(std::time::Duration::from_millis(120));

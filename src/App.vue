@@ -190,7 +190,7 @@ async function doEmptyTrash() {
   await refreshVault();
 }
 
-const mcp = ref<{ running: boolean; port: number; token: string; url: string } | null>(null);
+const mcp = ref<{ running: boolean; port: number; token: string; url: string; fill_token: string; fill_url: string } | null>(null);
 const mcpSnippet = computed(() => {
   if (!mcp.value?.token) return "";
   return `{
@@ -223,6 +223,16 @@ async function rotateMcp() {
 async function copyMcpSnippet() {
   await navigator.clipboard.writeText(mcpSnippet.value);
   showToast("配置已复制");
+}
+async function copyFillToken() {
+  if (!mcp.value?.fill_token) return;
+  await navigator.clipboard.writeText(mcp.value.fill_token);
+  showToast("填表 Token 已复制");
+}
+async function rotateFill() {
+  if (!confirm("轮换填表 Token 后，浏览器插件里的旧 Token 会失效，确定？")) return;
+  mcp.value = await api.fillRotate();
+  showToast("已轮换填表 Token");
 }
 async function openMcp() {
   goPage("mcp");
@@ -809,7 +819,17 @@ onMounted(async () => {
             <textarea rows="12" readonly :value="mcpSnippet"></textarea>
           </div>
           <button class="btn" @click="copyMcpSnippet">复制配置</button>
-          <p class="crumb" style="margin-top:16px">工具：list_credentials、http_request、copy_secret。金库锁定时工具会失败并提示先解锁。</p>
+          <h3 style="margin-top:28px">浏览器插件</h3>
+          <p class="crumb">Chrome / Edge：打开 chrome://extensions → 加载已解压的扩展程序 → 选择仓库里的 extension 目录。把下面 Token 贴进插件弹窗。</p>
+          <div class="field"><label>填表 Token</label>
+            <div style="display:flex;gap:8px">
+              <input :value="mcp?.fill_token || ''" readonly style="flex:1" />
+              <button class="btn" @click="copyFillToken">复制</button>
+              <button class="btn" @click="rotateFill">轮换</button>
+            </div>
+          </div>
+          <p class="crumb">接口：{{ mcp?.fill_url || "http://127.0.0.1:17891/fill" }}。应用启动后自动监听本机端口。</p>
+          <p class="crumb" style="margin-top:16px">MCP 工具：list_credentials、http_request、copy_secret。金库锁定时工具会失败并提示先解锁。</p>
         </div>
       </section>
 

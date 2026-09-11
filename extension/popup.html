@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <h1>Sealbox</h1>
+    <p id="status">连接本机金库…</p>
+    <div id="matches"></div>
+    <hr />
+    <h2>登记当前站点</h2>
+    <input id="title" placeholder="名称" />
+    <input id="username" placeholder="账号" />
+    <input id="password" type="password" placeholder="密码" />
+    <button id="save">一键登记到金库</button>
+    <hr />
+    <h2>插件设置</h2>
+    <input id="token" placeholder="填表 Token（fill_…）" />
+    <input id="port" placeholder="端口，默认 17891" />
+    <button id="saveCfg">保存连接</button>
+    <p class="hint">在 Sealbox 左侧「MCP」复制填表 Token。金库须已解锁。</p>
+    <script src="popup.js"></script>
+  </body>
+</html>
