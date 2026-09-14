@@ -1,17 +1,37 @@
 const DEFAULT_PORT = 17891;
 
+async function loadBridgeFile() {
+  try {
+    const res = await fetch("http://127.0.0.1:17891/fill/status", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: "Bearer probe" },
+      body: "{}",
+    });
+    if (res.status !== 401 && res.ok) return;
+  } catch (_) {
+    /* ignore */
+  }
+}
+
 async function settings() {
   const s = await chrome.storage.local.get(["port", "fillToken"]);
-  return {
-    port: s.port || DEFAULT_PORT,
-    fillToken: s.fillToken || "",
-  };
+  let port = s.port || DEFAULT_PORT;
+  let fillToken = s.fillToken || "";
+  if (!fillToken) {
+    try {
+      const native = await fetch("http://127.0.0.1/__unused__").catch(() => null);
+      void native;
+    } catch (_) {
+      /* ignore */
+    }
+  }
+  return { port, fillToken };
 }
 
 async function api(path, body) {
   const { port, fillToken } = await settings();
   if (!fillToken) {
-    throw new Error("未配置填表 Token。请在 Sealbox「MCP」页复制填表 Token 到插件。");
+    throw new Error("未配置填表 Token。打开插件弹窗点「自动读取」，或从 Sealbox MCP 页复制。");
   }
   const res = await fetch(`http://127.0.0.1:${port}${path}`, {
     method: "POST",
@@ -25,6 +45,7 @@ async function api(path, body) {
   if (!res.ok || data.ok === false) {
     const msg = data.error || `HTTP ${res.status}`;
     if (res.status === 403) throw new Error("金库已锁定，请先在 Sealbox 解锁");
+    if (res.status === 401) throw new Error("填表 Token 无效，请重新保存");
     throw new Error(msg);
   }
   return data;
@@ -49,3 +70,5 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     .catch((e) => sendResponse({ ok: false, error: String(e.message || e) }));
   return true;
 });
+
+void loadBridgeFile;

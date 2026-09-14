@@ -36,12 +36,21 @@ document.getElementById("save").onclick = async () => {
   refresh();
 };
 
+async function ensureContent(tabId) {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+  } catch (_) {
+    /* restricted page */
+  }
+}
+
 async function refresh() {
   const tab = await currentTab();
   document.getElementById("title").value = tab?.title || "";
+  if (tab?.id) await ensureContent(tab.id);
   try {
     const st = await chrome.runtime.sendMessage({ type: "status" });
-    if (!st?.ok) return showError(st?.error || "无法连接 Sealbox");
+    if (!st?.ok) return showError(st?.error || "无法连接 Sealbox，请确认应用已启动并解锁");
     if (!st.unlocked) return showError("金库已锁定，请先解锁 Sealbox");
     document.getElementById("status").textContent = "已连接 · 金库已解锁";
     const m = await chrome.runtime.sendMessage({ type: "match", url: tab?.url || "" });
@@ -50,19 +59,23 @@ async function refresh() {
     (m.matches || []).forEach((item) => {
       const row = document.createElement("div");
       row.className = "match";
-      row.innerHTML = `<span>${item.title}<br><small>${item.username}</small></span>`;
+      row.innerHTML = `<span>${item.title}<br><small>${item.username || ""}</small></span>`;
       const btn = document.createElement("button");
       btn.textContent = "填充";
       btn.onclick = async () => {
-        const r = await chrome.tabs.sendMessage(tab.id, { type: "fill-now", id: item.id });
-        if (!r?.ok) showError(r?.error || "填充失败");
-        else window.close();
+        try {
+          const r = await chrome.tabs.sendMessage(tab.id, { type: "fill-now", id: item.id });
+          if (!r?.ok) showError(r?.error || "填充失败");
+          else window.close();
+        } catch (e) {
+          showError("当前页无法注入脚本（浏览器内部页或不支持）");
+        }
       };
       row.appendChild(btn);
       box.appendChild(row);
     });
     if (!(m.matches || []).length) {
-      box.textContent = "当前地址没有匹配的网站账号";
+      box.textContent = "当前地址没有匹配的网站账号。请确认条目类型是「网站账号」，网址填的是该站点域名。";
     }
     const fields = await chrome.tabs.sendMessage(tab.id, { type: "read-fields" }).catch(() => null);
     if (fields?.username) document.getElementById("username").value = fields.username;

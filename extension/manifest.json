@@ -7,8 +7,8 @@
     "default_title": "Sealbox",
     "default_popup": "popup.html"
   },
-  "permissions": ["storage", "activeTab", "scripting"],
-  "host_permissions": ["http://127.0.0.1/*"],
+  "permissions": ["storage", "activeTab", "scripting", "tabs"],
+  "host_permissions": ["http://127.0.0.1/*", "http://*/*", "https://*/*"],
   "background": {
     "service_worker": "background.js"
   },
@@ -16,7 +16,8 @@
     {
       "matches": ["http://*/*", "https://*/*"],
       "js": ["content.js"],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true
     }
   ]
 }

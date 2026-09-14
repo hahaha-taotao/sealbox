@@ -38,11 +38,26 @@ pub fn host_of(url: &str) -> Option<String> {
     }
 }
 
+fn registrable(host: &str) -> String {
+    let h = host.trim_start_matches("www.");
+    let parts: Vec<&str> = h.split('.').collect();
+    if parts.len() >= 2 {
+        format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1])
+    } else {
+        h.to_string()
+    }
+}
+
 fn score_host(page_host: &str, stored: &str) -> i32 {
+    if page_host.is_empty() || stored.is_empty() {
+        return 0;
+    }
     let a = page_host.trim_start_matches("www.");
     let b = stored.trim_start_matches("www.");
     if a == b {
         100
+    } else if registrable(a) == registrable(b) {
+        90
     } else if a.ends_with(&format!(".{b}")) || b.ends_with(&format!(".{a}")) {
         80
     } else if a.contains(b) || b.contains(a) {
@@ -76,8 +91,13 @@ pub fn match_websites(session: &Mutex<Session>, page_url: &str) -> Result<Vec<Fi
     for e in list {
         let stored_host = e.url.as_deref().and_then(host_of).unwrap_or_default();
         let mut score = score_host(&host, &stored_host);
-        if score == 0 && e.title.to_ascii_lowercase().contains(&host) {
-            score = 20;
+        let title_l = e.title.to_ascii_lowercase();
+        let acc_l = e.account.clone().unwrap_or_default().to_ascii_lowercase();
+        if score == 0 {
+            let page_reg = registrable(&host);
+            if title_l.contains(&host) || title_l.contains(&page_reg) || acc_l.contains(&host) {
+                score = 30;
+            }
         }
         if score > 0 {
             out.push(FillMatch {
@@ -222,6 +242,12 @@ pub fn new_fill_token() -> String {
     format!("fill_{}", Uuid::new_v4().simple())
 }
 
+pub fn write_bridge_file(dir: &std::path::Path, port: u16, fill_token: &str) {
+    let path = dir.join("fill.json");
+    let body = serde_json::json!({ "port": port, "fillToken": fill_token });
+    let _ = std::fs::write(path, body.to_string());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,6 +257,7 @@ mod tests {
     fn host_and_score() {
         assert_eq!(host_of("https://www.github.com/login").as_deref(), Some("www.github.com"));
         assert!(score_host("github.com", "www.github.com") >= 80);
+        assert!(score_host("login.taobao.com", "www.taobao.com") >= 80);
         assert_eq!(score_host("example.com", "other.net"), 0);
     }
 
@@ -265,6 +292,8 @@ mod tests {
         let mutex = Mutex::new(session);
         let hits = match_websites(&mutex, "https://github.com/login").unwrap();
         assert_eq!(hits.len(), 1);
+        let sub = match_websites(&mutex, "https://login.github.com/").unwrap();
+        assert_eq!(sub.len(), 1);
         assert_eq!(hits[0].username, "octocat");
         let sec = reveal_for_fill(&mutex, &hits[0].id).unwrap();
         assert_eq!(sec.password, "gh-pass");

@@ -72,6 +72,20 @@ pub fn get_status(app: AppHandle, state: State<AppState>) -> Result<Status, Stri
     } else {
         false
     };
+    if initialized {
+        if let Ok(v) = session.vault() {
+            if let Ok(Some(tok)) = v.get_setting("fill_token") {
+                if !tok.is_empty() {
+                    *state.mcp.fill_token.lock().unwrap() = tok;
+                }
+            }
+            if let Ok(Some(tok)) = v.get_setting("mcp_token") {
+                if !tok.is_empty() {
+                    *state.mcp.token.lock().unwrap() = tok;
+                }
+            }
+        }
+    }
     if unlocked {
         let idle = session.vault().ok().and_then(|v| v.get_setting("idle_secs").ok()).flatten();
         let clip = session.vault().ok().and_then(|v| v.get_setting("clipboard_secs").ok()).flatten();
@@ -146,6 +160,9 @@ pub fn unlock_vault(app: AppHandle, state: State<AppState>, password: String) ->
             let _ = vault.audit("unlock", None, "ok");
             let _ = vault.purge_expired_trash(chrono::Utc::now(), 30);
             session.set_unlocked(vault, dek);
+            drop(session);
+            persist_tokens(&state);
+            let _ = mcp::start(&state.mcp, state.session.clone());
             Ok(())
         }
         Err(e) => {
@@ -167,7 +184,31 @@ pub fn unlock_hello(app: AppHandle, state: State<AppState>) -> Result<(), String
     let dek = vault.unlock_with_hello_key(&key).map_err(map_err)?;
     let _ = vault.audit("unlock_hello", None, "ok");
     state.session.lock().unwrap().set_unlocked(vault, dek);
+    persist_tokens(&state);
+    let _ = mcp::start(&state.mcp, state.session.clone());
     Ok(())
+}
+
+fn persist_tokens(state: &AppState) {
+    if let Ok(s) = state.session.lock() {
+        if let Ok(v) = s.vault() {
+            let fill = state.mcp.fill_token.lock().unwrap().clone();
+            let mcp_tok = state.mcp.token.lock().unwrap().clone();
+            if !fill.is_empty() {
+                let _ = v.set_setting("fill_token", &fill);
+            }
+            if !mcp_tok.is_empty() {
+                let _ = v.set_setting("mcp_token", &mcp_tok);
+            }
+            if let Ok(dir) = std::env::var("APPDATA") {
+                crate::fill::write_bridge_file(
+                    &std::path::PathBuf::from(dir).join("com.sealbox.app"),
+                    *state.mcp.port.lock().unwrap(),
+                    &fill,
+                );
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -586,6 +627,13 @@ pub fn mcp_start(state: State<AppState>) -> Result<McpStatus, String> {
     let port = mcp::start(&state.mcp, state.session.clone())?;
     if let Ok(v) = state.session.lock().unwrap().vault() {
         let _ = v.audit("mcp_start", None, &format!("port={port}"));
+        if let Ok(dir) = std::env::var("APPDATA") {
+            crate::fill::write_bridge_file(
+                &std::path::PathBuf::from(dir).join("com.sealbox.app"),
+                port,
+                &state.mcp.fill_token.lock().unwrap(),
+            );
+        }
     }
     Ok(mcp_status_of(&state))
 }
@@ -601,7 +649,11 @@ pub fn mcp_stop(state: State<AppState>) -> Result<McpStatus, String> {
 
 #[tauri::command]
 pub fn mcp_rotate_token(state: State<AppState>) -> Result<McpStatus, String> {
-    *state.mcp.token.lock().unwrap() = mcp::new_token();
+    let tok = mcp::new_token();
+    *state.mcp.token.lock().unwrap() = tok.clone();
+    if let Ok(v) = state.session.lock().unwrap().vault() {
+        let _ = v.set_setting("mcp_token", &tok);
+    }
     if state.mcp.running.load(std::sync::atomic::Ordering::SeqCst) {
         mcp::stop(&state.mcp);
         std::thread::sleep(std::time::Duration::from_millis(120));
@@ -612,7 +664,11 @@ pub fn mcp_rotate_token(state: State<AppState>) -> Result<McpStatus, String> {
 
 #[tauri::command]
 pub fn fill_rotate_token(state: State<AppState>) -> Result<McpStatus, String> {
-    *state.mcp.fill_token.lock().unwrap() = crate::fill::new_fill_token();
+    let tok = crate::fill::new_fill_token();
+    *state.mcp.fill_token.lock().unwrap() = tok.clone();
+    if let Ok(v) = state.session.lock().unwrap().vault() {
+        let _ = v.set_setting("fill_token", &tok);
+    }
     if state.mcp.running.load(std::sync::atomic::Ordering::SeqCst) {
         mcp::stop(&state.mcp);
         std::thread::sleep(std::time::Duration::from_millis(120));

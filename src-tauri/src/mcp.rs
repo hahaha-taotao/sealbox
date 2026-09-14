@@ -454,13 +454,37 @@ pub fn start(mcp: &McpState, session: Arc<Mutex<Session>>) -> Result<u16, String
         return Ok(*mcp.port.lock().unwrap());
     }
     {
+        if let Ok(s) = session.lock() {
+            if let Ok(v) = s.vault() {
+                if let Ok(Some(tok)) = v.get_setting("mcp_token") {
+                    if !tok.is_empty() {
+                        *mcp.token.lock().unwrap() = tok;
+                    }
+                }
+                if let Ok(Some(tok)) = v.get_setting("fill_token") {
+                    if !tok.is_empty() {
+                        *mcp.fill_token.lock().unwrap() = tok;
+                    }
+                }
+            }
+        }
         let mut token = mcp.token.lock().unwrap();
         if token.is_empty() {
             *token = new_token();
+            if let Ok(s) = session.lock() {
+                if let Ok(v) = s.vault() {
+                    let _ = v.set_setting("mcp_token", &token);
+                }
+            }
         }
         let mut fill = mcp.fill_token.lock().unwrap();
         if fill.is_empty() {
             *fill = fill::new_fill_token();
+            if let Ok(s) = session.lock() {
+                if let Ok(v) = s.vault() {
+                    let _ = v.set_setting("fill_token", &fill);
+                }
+            }
         }
     }
     let token_clone = mcp.token.lock().unwrap().clone();
@@ -471,6 +495,9 @@ pub fn start(mcp: &McpState, session: Arc<Mutex<Session>>) -> Result<u16, String
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     *mcp.port.lock().unwrap() = port;
     mcp.running.store(true, Ordering::SeqCst);
+    if let Some(dir) = dirs_next_appdata() {
+        fill::write_bridge_file(&dir, port, &fill_clone);
+    }
     let running = mcp.running.clone();
     thread::spawn(move || {
         listener.set_nonblocking(true).ok();
@@ -493,6 +520,11 @@ pub fn start(mcp: &McpState, session: Arc<Mutex<Session>>) -> Result<u16, String
         }
     });
     Ok(port)
+}
+
+fn dirs_next_appdata() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("APPDATA")?;
+    Some(std::path::PathBuf::from(base).join("com.sealbox.app"))
 }
 
 pub fn stop(mcp: &McpState) {

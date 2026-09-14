@@ -1,35 +1,45 @@
 function isVisible(el) {
-  if (!el) return false;
+  if (!el || el.disabled || el.readOnly) return false;
   const st = getComputedStyle(el);
-  if (st.display === "none" || st.visibility === "hidden" || st.opacity === "0") return false;
+  if (st.display === "none" || st.visibility === "hidden" || Number(st.opacity) === 0) return false;
   const r = el.getBoundingClientRect();
-  return r.width > 0 && r.height > 0;
+  return r.width > 8 && r.height > 8;
 }
 
-function findFields() {
-  const passwords = [...document.querySelectorAll('input[type="password"]')].filter(isVisible);
+function allInputs(root = document) {
+  return [...root.querySelectorAll("input, textarea")];
+}
+
+function findFields(root = document) {
+  const passwords = allInputs(root)
+    .filter((el) => el instanceof HTMLInputElement)
+    .filter((el) => el.type === "password" || el.autocomplete === "current-password" || el.autocomplete === "new-password")
+    .filter(isVisible);
   if (!passwords.length) return null;
   const password = passwords[passwords.length - 1];
   const form = password.form;
-  const scope = form || document;
+  const scope = form || root;
+  const candidates = allInputs(scope)
+    .filter((el) => el instanceof HTMLInputElement)
+    .filter(isVisible)
+    .filter((el) => el !== password && el.type !== "hidden" && el.type !== "submit" && el.type !== "button");
   const user =
-    scope.querySelector('input[type="email"]') ||
-    scope.querySelector('input[name*="user" i]') ||
-    scope.querySelector('input[name*="login" i]') ||
-    scope.querySelector('input[name*="email" i]') ||
-    scope.querySelector('input[autocomplete="username"]') ||
-    [...scope.querySelectorAll('input[type="text"]')].filter(isVisible)[0] ||
+    candidates.find((el) => el.type === "email") ||
+    candidates.find((el) => /user|login|email|account|phone|mobile/i.test(`${el.name} ${el.id} ${el.placeholder} ${el.autocomplete}`)) ||
+    candidates.find((el) => el.type === "text" || el.type === "tel") ||
     null;
   return { user, password, form };
 }
 
 function setValue(el, value) {
   if (!el) return;
-  const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  el.focus();
+  const proto = HTMLInputElement.prototype;
   const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
   setter ? setter.call(el, value) : (el.value = value);
-  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, data: value }));
   el.dispatchEvent(new Event("change", { bubbles: true }));
+  el.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true }));
 }
 
 function bar() {
@@ -39,7 +49,7 @@ function bar() {
   el.id = "sealbox-bar";
   el.style.cssText =
     "position:fixed;z-index:2147483647;right:16px;bottom:16px;background:#1f2329;color:#fff;padding:10px 12px;border-radius:10px;font:13px/1.4 Segoe UI,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.25);max-width:280px;";
-  document.documentElement.appendChild(el);
+  (document.body || document.documentElement).appendChild(el);
   return el;
 }
 
@@ -50,25 +60,50 @@ function hideBar() {
 async function fillId(id) {
   const res = await chrome.runtime.sendMessage({ type: "secret", id });
   if (!res?.ok) throw new Error(res?.error || "无法读取凭据");
-  const fields = findFields();
+  const fields = findFields() || findFieldsInFrames();
   if (!fields) throw new Error("页面上没有密码框");
   setValue(fields.user, res.entry.username);
   setValue(fields.password, res.entry.password);
   hideBar();
 }
 
+function findFieldsInFrames() {
+  const top = findFields(document);
+  if (top) return top;
+  for (const f of document.querySelectorAll("iframe")) {
+    try {
+      const doc = f.contentDocument;
+      if (doc) {
+        const inner = findFields(doc);
+        if (inner) return inner;
+      }
+    } catch (_) {
+      /* cross-origin */
+    }
+  }
+  return null;
+}
+
+let lastKey = "";
 async function detect() {
-  const fields = findFields();
+  const fields = findFieldsInFrames();
   if (!fields) return;
   const res = await chrome.runtime.sendMessage({ type: "match", url: location.href });
-  if (!res?.ok || !res.matches?.length) return;
+  if (!res?.ok) return;
+  const key = (res.matches || []).map((m) => m.id).join(",");
+  if (key === lastKey && document.getElementById("sealbox-bar")) return;
+  lastKey = key;
+  if (!res.matches?.length) {
+    hideBar();
+    return;
+  }
   const el = bar();
   el.innerHTML = "";
   const title = document.createElement("div");
   title.textContent = `Sealbox · ${res.matches.length} 个匹配`;
   title.style.marginBottom = "6px";
   el.appendChild(title);
-  res.matches.slice(0, 4).forEach((m) => {
+  res.matches.slice(0, 5).forEach((m) => {
     const b = document.createElement("button");
     b.textContent = `填充 ${m.username || m.title}`;
     b.style.cssText =
@@ -84,32 +119,30 @@ async function detect() {
 }
 
 function captureSubmit() {
-  const fields = findFields();
-  if (!fields?.form) return;
-  fields.form.addEventListener(
+  document.addEventListener(
     "submit",
-    () => {
-      const username = fields.user?.value || "";
-      const password = fields.password?.value || "";
-      if (!password) return;
-      chrome.runtime.sendMessage({
-        type: "maybe-save",
-        url: location.href,
-        title: document.title,
-        username,
-        password,
-      });
+    (e) => {
+      const form = e.target instanceof HTMLFormElement ? e.target : null;
+      const fields = (form && findFields(form)) || findFieldsInFrames();
+      if (!fields?.password?.value) return;
       chrome.storage.session.set({
-        pendingSave: { url: location.href, title: document.title, username, password },
+        pendingSave: {
+          url: location.href,
+          title: document.title,
+          username: fields.user?.value || "",
+          password: fields.password.value,
+        },
       });
     },
-    { capture: true },
+    true,
   );
 }
 
 detect().catch(() => {});
 captureSubmit();
-setTimeout(() => detect().catch(() => {}), 1500);
+const mo = new MutationObserver(() => detect().catch(() => {}));
+mo.observe(document.documentElement, { childList: true, subtree: true });
+setInterval(() => detect().catch(() => {}), 2500);
 
 chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
   if (msg.type === "fill-now") {
@@ -119,7 +152,7 @@ chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
     return true;
   }
   if (msg.type === "read-fields") {
-    const f = findFields();
+    const f = findFieldsInFrames();
     sendResponse({
       ok: true,
       username: f?.user?.value || "",
