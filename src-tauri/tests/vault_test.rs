@@ -169,6 +169,31 @@ fn three_kinds_roundtrip_and_trash() {
             },
         )
         .unwrap();
+    vault
+        .upsert_entry(
+            &dek,
+            UpsertEntry {
+                id: None,
+                kind: EntryKind::Database,
+                title: "prod-mysql".into(),
+                account: None,
+                url: None,
+                folder_id: None,
+                tags: vec![],
+                pinned: false,
+                expires_at: None,
+                notes: None,
+                secret: SecretPayload::Database {
+                    engine: "mysql".into(),
+                    host: "10.0.0.9".into(),
+                    port: Some(3306),
+                    database: "app".into(),
+                    username: "app".into(),
+                    password: "db-pass-secret".into(),
+                },
+            },
+        )
+        .unwrap();
     let ssh = vault
         .upsert_entry(
             &dek,
@@ -216,11 +241,12 @@ fn three_kinds_roundtrip_and_trash() {
     assert!(!json.contains("mail-pass"));
     assert!(!json.contains("auth-code-xyz"));
     assert!(!json.contains("server-pass"));
-    assert_eq!(listed.len(), 6);
+    assert!(!json.contains("db-pass-secret"));
+    assert_eq!(listed.len(), 7);
 
     vault.soft_delete(&[web.id.clone()]).unwrap();
     let active = vault.list_entries(&ListFilter::default()).unwrap();
-    assert_eq!(active.len(), 5);
+    assert_eq!(active.len(), 6);
     let trash = vault
         .list_entries(&ListFilter {
             trash: true,
@@ -229,7 +255,7 @@ fn three_kinds_roundtrip_and_trash() {
         .unwrap();
     assert_eq!(trash.len(), 1);
     vault.restore(&[web.id.clone()]).unwrap();
-    assert_eq!(vault.list_entries(&ListFilter::default()).unwrap().len(), 6);
+    assert_eq!(vault.list_entries(&ListFilter::default()).unwrap().len(), 7);
     vault.set_pinned(&web.id, true).unwrap();
     assert!(vault.list_entries(&ListFilter::default()).unwrap()[0].pinned);
     vault.soft_delete(&[web.id.clone()]).unwrap();

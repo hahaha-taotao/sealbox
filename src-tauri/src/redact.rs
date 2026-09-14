@@ -61,6 +61,7 @@ pub fn secrets_from_payload(payload: &SecretPayload) -> Vec<String> {
         SecretPayload::Mailbox { password, .. } => vec![password.clone()],
         SecretPayload::MailAuth { auth_code, .. } => vec![auth_code.clone()],
         SecretPayload::Server { password, .. } => vec![password.clone()],
+        SecretPayload::Database { password, .. } => vec![password.clone()],
     }
 }
 

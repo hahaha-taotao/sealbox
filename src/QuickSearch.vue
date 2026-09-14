@@ -31,6 +31,7 @@ function kindLabel(k: EntryKind) {
     case "mailbox": return "邮箱";
     case "mail_auth": return "授权码";
     case "server": return "服务器";
+    case "database": return "数据库";
   }
 }
 

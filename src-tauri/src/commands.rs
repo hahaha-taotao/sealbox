@@ -339,6 +339,7 @@ fn primary_secret(payload: &SecretPayload) -> String {
         SecretPayload::Mailbox { password, .. } => password.clone(),
         SecretPayload::MailAuth { auth_code, .. } => auth_code.clone(),
         SecretPayload::Server { password, .. } => password.clone(),
+        SecretPayload::Database { password, .. } => password.clone(),
     }
 }
 
@@ -350,6 +351,7 @@ fn account_of(payload: &SecretPayload) -> Option<String> {
         SecretPayload::Mailbox { email, .. } => Some(email.clone()),
         SecretPayload::MailAuth { email, .. } => Some(email.clone()),
         SecretPayload::Server { username, .. } => Some(username.clone()),
+        SecretPayload::Database { username, .. } => Some(username.clone()),
     }
 }
 

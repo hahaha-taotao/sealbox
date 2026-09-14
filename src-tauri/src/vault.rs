@@ -41,6 +41,7 @@ pub enum EntryKind {
     Mailbox,
     MailAuth,
     Server,
+    Database,
 }
 
 impl EntryKind {
@@ -52,6 +53,7 @@ impl EntryKind {
             Self::Mailbox => "mailbox",
             Self::MailAuth => "mail_auth",
             Self::Server => "server",
+            Self::Database => "database",
         }
     }
 
@@ -63,6 +65,7 @@ impl EntryKind {
             "mailbox" => Ok(Self::Mailbox),
             "mail_auth" => Ok(Self::MailAuth),
             "server" => Ok(Self::Server),
+            "database" => Ok(Self::Database),
             _ => Err(VaultError::InvalidKind),
         }
     }
@@ -171,6 +174,14 @@ pub enum SecretPayload {
         host: String,
         port: Option<u16>,
         protocol: String,
+        username: String,
+        password: String,
+    },
+    Database {
+        engine: String,
+        host: String,
+        port: Option<u16>,
+        database: String,
         username: String,
         password: String,
     },
@@ -357,6 +368,24 @@ impl Vault {
                     None => format!("{protocol}://{host}"),
                 };
                 (false, None, Some(username.clone()), Some(loc))
+            }
+            SecretPayload::Database {
+                engine,
+                host,
+                port,
+                database,
+                username,
+                ..
+            } => {
+                let loc = match (host.is_empty(), port, database.is_empty()) {
+                    (true, _, false) => format!("{engine}:{database}"),
+                    (true, _, true) => engine.clone(),
+                    (false, Some(p), false) => format!("{engine}://{host}:{p}/{database}"),
+                    (false, Some(p), true) => format!("{engine}://{host}:{p}"),
+                    (false, None, false) => format!("{engine}://{host}/{database}"),
+                    (false, None, true) => format!("{engine}://{host}"),
+                };
+                (false, Some(engine.clone()), Some(username.clone()), Some(loc))
             }
         };
         let secret_json = serde_json::to_vec(&input.secret)?;
@@ -947,6 +976,11 @@ impl Vault {
             [],
             |r| r.get(0),
         )?;
+        let database: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM entries WHERE deleted_at IS NULL AND kind='database'",
+            [],
+            |r| r.get(0),
+        )?;
         let trash: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM entries WHERE deleted_at IS NOT NULL",
             [],
@@ -960,6 +994,7 @@ impl Vault {
             mailbox,
             mail_auth,
             server,
+            database,
             trash,
         })
     }
@@ -1019,6 +1054,7 @@ pub struct Counts {
     pub mailbox: i64,
     pub mail_auth: i64,
     pub server: i64,
+    pub database: i64,
     pub trash: i64,
 }
 

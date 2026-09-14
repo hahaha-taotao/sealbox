@@ -56,7 +56,7 @@ fn tools_list() -> Value {
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "可选，按键名/账号/网址筛选" },
-                        "kind": { "type": "string", "enum": ["website", "api_token", "ssh", "mailbox", "mail_auth", "server"] }
+                        "kind": { "type": "string", "enum": ["website", "api_token", "ssh", "mailbox", "mail_auth", "server", "database"] }
                     }
                 }
             },
@@ -149,6 +149,7 @@ fn call_tool(session: &Mutex<Session>, name: &str, args: Value) -> Result<String
                 "mailbox" => Some(EntryKind::Mailbox),
                 "mail_auth" => Some(EntryKind::MailAuth),
                 "server" => Some(EntryKind::Server),
+                "database" => Some(EntryKind::Database),
                 _ => None,
             });
             let vault = s.vault().map_err(|e| e.to_string())?;
@@ -196,6 +197,7 @@ fn call_tool(session: &Mutex<Session>, name: &str, args: Value) -> Result<String
                 SecretPayload::Mailbox { password, .. } => password.clone(),
                 SecretPayload::MailAuth { auth_code, .. } => auth_code.clone(),
                 SecretPayload::Server { password, .. } => password.clone(),
+                SecretPayload::Database { password, .. } => password.clone(),
             };
             crate::clipboard::write_text(&text)?;
             s.remember_clipboard(&text);
@@ -254,6 +256,11 @@ fn call_tool(session: &Mutex<Session>, name: &str, args: Value) -> Result<String
                 }
                 SecretPayload::Mailbox { email, password, .. }
                 | SecretPayload::Server {
+                    username: email,
+                    password,
+                    ..
+                }
+                | SecretPayload::Database {
                     username: email,
                     password,
                     ..

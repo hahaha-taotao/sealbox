@@ -64,6 +64,8 @@ const form = reactive({
   host: "",
   port: 22,
   protocol: "ssh",
+  engine: "mysql",
+  db_name: "",
 });
 const reveal = ref<SecretPayload | null>(null);
 const revealFor = ref<string | null>(null);
@@ -85,6 +87,7 @@ const crumb = computed(() => {
   if (filter.kind === "mailbox") return "邮箱";
   if (filter.kind === "mail_auth") return "邮箱授权码";
   if (filter.kind === "server") return "服务器";
+  if (filter.kind === "database") return "数据库";
   return "全部凭据";
 });
 
@@ -100,7 +103,25 @@ function kindLabel(k: EntryKind) {
     case "mailbox": return "邮箱";
     case "mail_auth": return "邮箱授权码";
     case "server": return "服务器";
+    case "database": return "数据库";
   }
+}
+const DB_ENGINES: { id: string; label: string; port: number }[] = [
+  { id: "mysql", label: "MySQL / MariaDB", port: 3306 },
+  { id: "postgres", label: "PostgreSQL", port: 5432 },
+  { id: "sqlserver", label: "SQL Server", port: 1433 },
+  { id: "oracle", label: "Oracle", port: 1521 },
+  { id: "mongodb", label: "MongoDB", port: 27017 },
+  { id: "redis", label: "Redis", port: 6379 },
+  { id: "sqlite", label: "SQLite", port: 0 },
+  { id: "clickhouse", label: "ClickHouse", port: 8123 },
+  { id: "elasticsearch", label: "Elasticsearch", port: 9200 },
+  { id: "dameng", label: "达梦 DM", port: 5236 },
+  { id: "custom", label: "其他", port: 0 },
+];
+function onEngineChange() {
+  const e = DB_ENGINES.find((x) => x.id === form.engine);
+  if (e && e.port) form.port = e.port;
 }
 function showToast(msg: string) {
   toast.value = msg;
@@ -293,6 +314,8 @@ function openCreate() {
     host: "",
     port: 22,
     protocol: "ssh",
+    engine: "mysql",
+    db_name: "",
   });
   showForm.value = true;
 }
@@ -337,6 +360,13 @@ async function openEdit(row: EntryDto) {
     form.protocol = secret.protocol;
     form.account = secret.username;
     form.password = secret.password;
+  } else if (secret.type === "database") {
+    form.engine = secret.engine;
+    form.host = secret.host;
+    form.port = secret.port || 0;
+    form.db_name = secret.database;
+    form.account = secret.username;
+    form.password = secret.password;
   } else {
     form.private_key = secret.private_key;
     form.key_type = secret.key_type;
@@ -377,6 +407,17 @@ function buildSecret(): SecretPayload {
       host: form.host,
       port: form.port || null,
       protocol: form.protocol,
+      username: form.account,
+      password: form.password,
+    };
+  }
+  if (form.kind === "database") {
+    return {
+      type: "database",
+      engine: form.engine,
+      host: form.host,
+      port: form.port || null,
+      database: form.db_name,
       username: form.account,
       password: form.password,
     };
@@ -633,7 +674,7 @@ onMounted(async () => {
       <section class="main" v-if="page === 'home'">
         <div class="content">
           <h2>概览</h2>
-          <p>全部 {{ status.counts?.total ?? 0 }} · 网站 {{ status.counts?.website ?? 0 }} · Token {{ status.counts?.api_token ?? 0 }} · SSH {{ status.counts?.ssh ?? 0 }} · 邮箱 {{ status.counts?.mailbox ?? 0 }} · 授权码 {{ status.counts?.mail_auth ?? 0 }} · 服务器 {{ status.counts?.server ?? 0 }} · 回收站 {{ status.counts?.trash ?? 0 }}</p>
+          <p>全部 {{ status.counts?.total ?? 0 }} · 网站 {{ status.counts?.website ?? 0 }} · Token {{ status.counts?.api_token ?? 0 }} · SSH {{ status.counts?.ssh ?? 0 }} · 邮箱 {{ status.counts?.mailbox ?? 0 }} · 授权码 {{ status.counts?.mail_auth ?? 0 }} · 服务器 {{ status.counts?.server ?? 0 }} · 数据库 {{ status.counts?.database ?? 0 }} · 回收站 {{ status.counts?.trash ?? 0 }}</p>
           <h3>最近使用</h3>
           <div class="table" v-if="recent.length">
             <table>
@@ -688,6 +729,9 @@ onMounted(async () => {
           <button class="side-item" :class="{ active: filter.kind === 'server' }" @click="setFilter({ kind: 'server' })">
             <span>服务器</span><span class="count">{{ status.counts?.server }}</span>
           </button>
+          <button class="side-item" :class="{ active: filter.kind === 'database' }" @click="setFilter({ kind: 'database' })">
+            <span>数据库</span><span class="count">{{ status.counts?.database }}</span>
+          </button>
           <div class="side-label" v-if="tags.length">标签</div>
           <button class="side-item" v-for="t in tags" :key="t" :class="{ active: filter.tag === t }" @click="setFilter({ tag: t })">{{ t }}</button>
           <div class="side-label">文件夹 <a href="#" @click.prevent="newFolder">新建</a></div>
@@ -733,7 +777,7 @@ onMounted(async () => {
                   <td>
                     {{ row.account || row.fingerprint || "—" }}
                     <div v-if="revealFor === row.id && reveal" style="font-size:12px;color:var(--muted);margin-top:4px;word-break:break-all">
-                      <template v-if="reveal.type === 'website' || reveal.type === 'mailbox' || reveal.type === 'server'">{{ reveal.password }}</template>
+                      <template v-if="reveal.type === 'website' || reveal.type === 'mailbox' || reveal.type === 'server' || reveal.type === 'database'">{{ reveal.password }}</template>
                       <template v-else-if="reveal.type === 'api_token'">{{ reveal.token }}</template>
                       <template v-else-if="reveal.type === 'mail_auth'">{{ reveal.auth_code }}</template>
                       <template v-else>已显示私钥</template>
@@ -845,12 +889,13 @@ onMounted(async () => {
             <option value="mailbox">邮箱</option>
             <option value="mail_auth">邮箱授权码</option>
             <option value="server">服务器账号</option>
+            <option value="database">数据库</option>
           </select>
         </div>
         <div class="field"><label>键名</label><input v-model="form.title" /></div>
-        <div class="field" v-if="form.kind !== 'ssh' && form.kind !== 'mailbox' && form.kind !== 'mail_auth'"><label>{{ form.kind === 'server' ? '用户名' : '账号' }}</label><input v-model="form.account" /></div>
+        <div class="field" v-if="form.kind !== 'ssh' && form.kind !== 'mailbox' && form.kind !== 'mail_auth'"><label>{{ form.kind === 'server' || form.kind === 'database' ? '用户名' : '账号' }}</label><input v-model="form.account" /></div>
         <div class="field" v-if="form.kind === 'website'"><label>网址</label><input v-model="form.url" /></div>
-        <div class="field" v-if="form.kind === 'website' || form.kind === 'mailbox' || form.kind === 'server'"><label>密码</label>
+        <div class="field" v-if="form.kind === 'website' || form.kind === 'mailbox' || form.kind === 'server' || form.kind === 'database'"><label>密码</label>
           <div style="display:flex;gap:8px">
             <input v-model="form.password" type="password" style="flex:1" />
             <button class="btn" @click="gen">生成</button>
@@ -894,6 +939,14 @@ onMounted(async () => {
         </div>
         <div class="field" v-if="form.kind === 'server'"><label>主机</label><input v-model="form.host" placeholder="192.168.1.10 或 example.com" /></div>
         <div class="field" v-if="form.kind === 'server'"><label>端口</label><input v-model.number="form.port" type="number" /></div>
+        <div class="field" v-if="form.kind === 'database'"><label>数据库类型</label>
+          <select v-model="form.engine" @change="onEngineChange">
+            <option v-for="e in DB_ENGINES" :key="e.id" :value="e.id">{{ e.label }}</option>
+          </select>
+        </div>
+        <div class="field" v-if="form.kind === 'database' && form.engine !== 'sqlite'"><label>主机</label><input v-model="form.host" placeholder="127.0.0.1 或 db.example.com" /></div>
+        <div class="field" v-if="form.kind === 'database' && form.engine !== 'sqlite'"><label>端口</label><input v-model.number="form.port" type="number" /></div>
+        <div class="field" v-if="form.kind === 'database'"><label>{{ form.engine === 'sqlite' ? '文件路径' : form.engine === 'oracle' ? '服务名 / SID' : form.engine === 'redis' ? '库编号（可空）' : '库名' }}</label><input v-model="form.db_name" :placeholder="form.engine === 'sqlite' ? 'D:\\data\\app.db' : 'appdb'" /></div>
         <div class="field"><label>文件夹</label>
           <select v-model="form.folder_id">
             <option value="">未归类</option>

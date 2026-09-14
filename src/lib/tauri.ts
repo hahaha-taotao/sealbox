@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type EntryKind = "website" | "api_token" | "ssh" | "mailbox" | "mail_auth" | "server";
+export type EntryKind = "website" | "api_token" | "ssh" | "mailbox" | "mail_auth" | "server" | "database";
 
 export interface EntryDto {
   id: string;
@@ -50,6 +50,7 @@ export interface Counts {
   mailbox: number;
   mail_auth: number;
   server: number;
+  database: number;
   trash: number;
 }
 
@@ -75,7 +76,16 @@ export type SecretPayload =
       smtp_port?: number | null;
     }
   | { type: "mail_auth"; email: string; provider: string; auth_code: string }
-  | { type: "server"; host: string; port?: number | null; protocol: string; username: string; password: string };
+  | { type: "server"; host: string; port?: number | null; protocol: string; username: string; password: string }
+  | {
+      type: "database";
+      engine: string;
+      host: string;
+      port?: number | null;
+      database: string;
+      username: string;
+      password: string;
+    };
 
 export interface UpsertEntry {
   id?: string | null;

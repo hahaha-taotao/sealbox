@@ -114,6 +114,7 @@ tr:hover td { background: #fafbff; }
 .pill.mailbox { background: #e0f2fe; color: #0369a1; }
 .pill.mail_auth { background: #fce7f3; color: #be185d; }
 .pill.server { background: #ecfccb; color: #3f6212; }
+.pill.database { background: #f3e8ff; color: #7c3aed; }
 .row-actions { display: flex; gap: 4px; opacity: 0.7; }
 .row-actions button { border: 0; background: transparent; padding: 4px; color: var(--muted); }
 .row-actions button:hover { color: var(--brand); }
