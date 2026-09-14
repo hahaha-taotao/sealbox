@@ -289,6 +289,28 @@ fn recent_and_expiring() {
 }
 
 #[test]
+fn list_filter_accepts_partial_json_from_quick_search() {
+    let filter: ListFilter =
+        serde_json::from_str(r#"{"query":"","trash":false,"sort":"use_count"}"#)
+            .expect("quick search payload should deserialize");
+    assert_eq!(filter.query.as_deref(), Some(""));
+    assert!(!filter.trash);
+    assert!(!filter.uncategorized);
+    assert!(filter.kind.is_none());
+    assert!(filter.folder_id.is_none());
+    assert!(filter.tag.is_none());
+    assert!(matches!(filter.sort, SortBy::UseCount));
+
+    let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+    vault
+        .upsert_entry(&dek, sample_website("跳板机", None))
+        .unwrap();
+    let listed = vault.list_entries(&filter).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].title, "跳板机");
+}
+
+#[test]
 fn change_master_password() {
     let (vault, dek) = Vault::create_in_memory("old password long enough").unwrap();
     vault

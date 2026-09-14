@@ -90,6 +90,7 @@ pub struct EntryDto {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ListFilter {
     pub query: Option<String>,
     pub kind: Option<EntryKind>,
@@ -114,9 +115,10 @@ impl Default for ListFilter {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SortBy {
+    #[default]
     UseCount,
     Updated,
     Title,

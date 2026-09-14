@@ -45,10 +45,24 @@ async function hide() {
 
 async function refresh() {
   status.value = await api.status();
-  if (status.value.unlocked) {
-    entries.value = await api.list({ query: "", trash: false, sort: "use_count" });
-  } else {
+  if (!status.value.unlocked) {
     entries.value = [];
+    return;
+  }
+  try {
+    entries.value = await api.list({
+      query: null,
+      kind: null,
+      folder_id: null,
+      uncategorized: false,
+      tag: null,
+      trash: false,
+      sort: "use_count",
+    });
+    error.value = "";
+  } catch (e) {
+    entries.value = [];
+    error.value = String(e);
   }
 }
 
@@ -132,6 +146,7 @@ onMounted(async () => {
 
     <div v-else class="quick-body">
       <input v-model="query" class="search" placeholder="搜索后回车复制…" autofocus @input="index = 0" />
+      <p v-if="error" class="error">{{ error }}</p>
       <div class="quick-list">
         <button
           v-for="(row, i) in hits"
