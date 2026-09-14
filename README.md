@@ -37,7 +37,7 @@ npm run tauri dev
 
 1. 运行并解锁 Sealbox。
 2. 打开 `chrome://extensions`（Edge：`edge://extensions`），打开「开发者模式」，加载已解压的扩展，选择 `extension` 文件夹。
-3. 在 Sealbox 左侧 **MCP** 页复制「填表 Token」，粘贴到插件弹窗并保存。
+3. 解锁金库后打开插件，会自动连接本机，不必填写 Token。
 4. 打开登录页：右下角会出现匹配条目，点「填充」；或在插件里「一键登记到金库」。
 
 金库锁定时无法填充或登记。填表 Token 与 MCP Token 分开，可单独轮换。

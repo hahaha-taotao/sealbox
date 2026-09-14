@@ -781,8 +781,8 @@ onMounted(async () => {
           </div>
           <button class="btn" @click="copyMcpSnippet">复制配置</button>
           <h3 style="margin-top:28px">浏览器插件</h3>
-          <p class="crumb">Chrome / Edge：打开 chrome://extensions → 加载已解压的扩展程序 → 选择仓库里的 extension 目录。把下面 Token 贴进插件弹窗。</p>
-          <div class="field"><label>填表 Token</label>
+          <p class="crumb">Chrome / Edge：打开 chrome://extensions → 加载已解压的扩展程序 → 选择仓库里的 extension 目录。解锁金库后，插件会自动配对，不必填写 Token。</p>
+          <div class="field"><label>填表 Token（备用，一般不用复制）</label>
             <div style="display:flex;gap:8px">
               <input :value="mcp?.fill_token || ''" readonly style="flex:1" />
               <button class="btn" @click="copyFillToken">复制</button>

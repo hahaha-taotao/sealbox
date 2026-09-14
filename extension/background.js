@@ -1,58 +1,55 @@
 const DEFAULT_PORT = 17891;
 
-async function loadBridgeFile() {
-  try {
-    const res = await fetch("http://127.0.0.1:17891/fill/status", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: "Bearer probe" },
-      body: "{}",
-    });
-    if (res.status !== 401 && res.ok) return;
-  } catch (_) {
-    /* ignore */
+async function pair() {
+  const stored = await chrome.storage.local.get(["port"]);
+  const port = stored.port || DEFAULT_PORT;
+  const res = await fetch(`http://127.0.0.1:${port}/fill/pair`, { method: "POST" });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.fillToken) {
+    if (res.status === 403) throw new Error("金库已锁定，请先解锁 Sealbox");
+    throw new Error(data.error || "无法连接 Sealbox，请确认应用已启动");
   }
+  await chrome.storage.local.set({ fillToken: data.fillToken, port: data.port || port });
+  return { port: data.port || port, fillToken: data.fillToken };
 }
 
 async function settings() {
   const s = await chrome.storage.local.get(["port", "fillToken"]);
-  let port = s.port || DEFAULT_PORT;
-  let fillToken = s.fillToken || "";
-  if (!fillToken) {
-    try {
-      const native = await fetch("http://127.0.0.1/__unused__").catch(() => null);
-      void native;
-    } catch (_) {
-      /* ignore */
-    }
+  if (s.fillToken) {
+    return { port: s.port || DEFAULT_PORT, fillToken: s.fillToken };
   }
-  return { port, fillToken };
+  return pair();
 }
 
 async function api(path, body) {
-  const { port, fillToken } = await settings();
-  if (!fillToken) {
-    throw new Error("未配置填表 Token。打开插件弹窗点「自动读取」，或从 Sealbox MCP 页复制。");
+  let { port, fillToken } = await settings();
+  const call = (token) =>
+    fetch(`http://127.0.0.1:${port}${path}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(body || {}),
+    });
+  let res = await call(fillToken);
+  if (res.status === 401) {
+    const fresh = await pair();
+    port = fresh.port;
+    fillToken = fresh.fillToken;
+    res = await call(fillToken);
   }
-  const res = await fetch(`http://127.0.0.1:${port}${path}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${fillToken}`,
-    },
-    body: JSON.stringify(body || {}),
-  });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.ok === false) {
-    const msg = data.error || `HTTP ${res.status}`;
-    if (res.status === 403) throw new Error("金库已锁定，请先在 Sealbox 解锁");
-    if (res.status === 401) throw new Error("填表 Token 无效，请重新保存");
-    throw new Error(msg);
+    if (res.status === 403) throw new Error("金库已锁定，请先解锁 Sealbox");
+    throw new Error(data.error || `HTTP ${res.status}`);
   }
   return data;
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
+    if (msg.type === "pair") return pair();
     if (msg.type === "status") return api("/fill/status", {});
     if (msg.type === "match") return api("/fill/match", { url: msg.url });
     if (msg.type === "secret") return api("/fill/secret", { id: msg.id });
@@ -70,5 +67,3 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     .catch((e) => sendResponse({ ok: false, error: String(e.message || e) }));
   return true;
 });
-
-void loadBridgeFile;

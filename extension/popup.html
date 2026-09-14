@@ -6,7 +6,7 @@
   </head>
   <body>
     <h1>Sealbox</h1>
-    <p id="status">连接本机金库…</p>
+    <p id="status">正在自动连接本机金库…</p>
     <div id="matches"></div>
     <hr />
     <h2>登记当前站点</h2>
@@ -14,12 +14,7 @@
     <input id="username" placeholder="账号" />
     <input id="password" type="password" placeholder="密码" />
     <button id="save">一键登记到金库</button>
-    <hr />
-    <h2>插件设置</h2>
-    <input id="token" placeholder="填表 Token（fill_…）" />
-    <input id="port" placeholder="端口，默认 17891" />
-    <button id="saveCfg">保存连接</button>
-    <p class="hint">在 Sealbox 左侧「MCP」复制填表 Token。金库须已解锁。</p>
+    <p class="hint">只要 Sealbox 已解锁，插件会自动配对，不必填写 Token。</p>
     <script src="popup.js"></script>
   </body>
 </html>

@@ -7,21 +7,6 @@ function showError(msg) {
   document.getElementById("status").innerHTML = `<span id="error">${msg}</span>`;
 }
 
-async function loadCfg() {
-  const s = await chrome.storage.local.get(["fillToken", "port"]);
-  document.getElementById("token").value = s.fillToken || "";
-  document.getElementById("port").value = s.port || "";
-}
-
-document.getElementById("saveCfg").onclick = async () => {
-  await chrome.storage.local.set({
-    fillToken: document.getElementById("token").value.trim(),
-    port: Number(document.getElementById("port").value) || 17891,
-  });
-  document.getElementById("status").textContent = "连接已保存";
-  refresh();
-};
-
 document.getElementById("save").onclick = async () => {
   const tab = await currentTab();
   const res = await chrome.runtime.sendMessage({
@@ -49,10 +34,14 @@ async function refresh() {
   document.getElementById("title").value = tab?.title || "";
   if (tab?.id) await ensureContent(tab.id);
   try {
+    const paired = await chrome.runtime.sendMessage({ type: "pair" });
+    if (!paired?.fillToken && !paired?.ok && paired?.error) {
+      return showError(paired.error);
+    }
     const st = await chrome.runtime.sendMessage({ type: "status" });
     if (!st?.ok) return showError(st?.error || "无法连接 Sealbox，请确认应用已启动并解锁");
     if (!st.unlocked) return showError("金库已锁定，请先解锁 Sealbox");
-    document.getElementById("status").textContent = "已连接 · 金库已解锁";
+    document.getElementById("status").textContent = "已自动连接 · 金库已解锁";
     const m = await chrome.runtime.sendMessage({ type: "match", url: tab?.url || "" });
     const box = document.getElementById("matches");
     box.innerHTML = "";
@@ -67,7 +56,7 @@ async function refresh() {
           const r = await chrome.tabs.sendMessage(tab.id, { type: "fill-now", id: item.id });
           if (!r?.ok) showError(r?.error || "填充失败");
           else window.close();
-        } catch (e) {
+        } catch (_) {
           showError("当前页无法注入脚本（浏览器内部页或不支持）");
         }
       };
@@ -75,7 +64,7 @@ async function refresh() {
       box.appendChild(row);
     });
     if (!(m.matches || []).length) {
-      box.textContent = "当前地址没有匹配的网站账号。请确认条目类型是「网站账号」，网址填的是该站点域名。";
+      box.textContent = "当前地址没有匹配的网站账号。请确认条目类型是「网站账号」，网址含该站点域名。";
     }
     const fields = await chrome.tabs.sendMessage(tab.id, { type: "read-fields" }).catch(() => null);
     if (fields?.username) document.getElementById("username").value = fields.username;
@@ -85,4 +74,4 @@ async function refresh() {
   }
 }
 
-loadCfg().then(refresh);
+refresh();

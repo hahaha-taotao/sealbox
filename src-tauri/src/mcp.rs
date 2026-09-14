@@ -375,8 +375,7 @@ fn write_http(stream: &mut TcpStream, status: &str, body: &[u8]) {
 fn handle_client(
     mut stream: TcpStream,
     session: Arc<Mutex<Session>>,
-    token: String,
-    fill_token: String,
+    mcp: McpState,
 ) {
     let Ok(req) = read_http_request(&mut stream) else {
         return;
@@ -389,13 +388,35 @@ fn handle_client(
         .headers
         .iter()
         .find(|(k, _)| k == "authorization")
-        .map(|(_, v)| v.as_str())
-        .unwrap_or("");
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+    if req.path == "/fill/pair" {
+        let unlocked = session.lock().map(|s| s.is_unlocked()).unwrap_or(false);
+        if !unlocked {
+            write_http(
+                &mut stream,
+                "403 Forbidden",
+                br#"{"ok":false,"error":"vault locked"}"#,
+            );
+            return;
+        }
+        let fill_token = mcp.fill_token.lock().unwrap().clone();
+        let port = *mcp.port.lock().unwrap();
+        let body = serde_json::to_vec(&json!({
+            "ok": true,
+            "fillToken": fill_token,
+            "port": port
+        }))
+        .unwrap_or_default();
+        write_http(&mut stream, "200 OK", &body);
+        return;
+    }
     if req.path.starts_with("/fill") {
         if req.method != "POST" {
             write_http(&mut stream, "405 Method Not Allowed", b"{}");
             return;
         }
+        let fill_token = mcp.fill_token.lock().unwrap().clone();
         if auth != format!("Bearer {fill_token}") {
             write_http(
                 &mut stream,
@@ -425,6 +446,7 @@ fn handle_client(
         write_http(&mut stream, "405 Method Not Allowed", b"{}");
         return;
     }
+    let token = mcp.token.lock().unwrap().clone();
     if auth != format!("Bearer {token}") {
         write_http(
             &mut stream,
@@ -487,8 +509,7 @@ pub fn start(mcp: &McpState, session: Arc<Mutex<Session>>) -> Result<u16, String
             }
         }
     }
-    let token_clone = mcp.token.lock().unwrap().clone();
-    let fill_clone = mcp.fill_token.lock().unwrap().clone();
+    let fill_now = mcp.fill_token.lock().unwrap().clone();
     let listener = TcpListener::bind(("127.0.0.1", DEFAULT_PORT))
         .or_else(|_| TcpListener::bind("127.0.0.1:0"))
         .map_err(|e| e.to_string())?;
@@ -496,9 +517,10 @@ pub fn start(mcp: &McpState, session: Arc<Mutex<Session>>) -> Result<u16, String
     *mcp.port.lock().unwrap() = port;
     mcp.running.store(true, Ordering::SeqCst);
     if let Some(dir) = dirs_next_appdata() {
-        fill::write_bridge_file(&dir, port, &fill_clone);
+        fill::write_bridge_file(&dir, port, &fill_now);
     }
     let running = mcp.running.clone();
+    let mcp_accept = mcp.clone();
     thread::spawn(move || {
         listener.set_nonblocking(true).ok();
         while running.load(Ordering::SeqCst) {
@@ -508,9 +530,8 @@ pub fn start(mcp: &McpState, session: Arc<Mutex<Session>>) -> Result<u16, String
                         continue;
                     }
                     let session = session.clone();
-                    let token = token_clone.clone();
-                    let fill_token = fill_clone.clone();
-                    thread::spawn(move || handle_client(stream, session, token, fill_token));
+                    let mcp = mcp_accept.clone();
+                    thread::spawn(move || handle_client(stream, session, mcp));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(50));
