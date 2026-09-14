@@ -24,18 +24,42 @@ pub struct FillSecret {
 
 pub fn host_of(url: &str) -> Option<String> {
     let u = url.trim();
+    if u.is_empty() || !u.contains('.') && !u.contains("://") && !u.starts_with("localhost") {
+        return None;
+    }
     let rest = u
         .strip_prefix("https://")
         .or_else(|| u.strip_prefix("http://"))
         .unwrap_or(u);
-    let host = rest.split(['/', '?', '#']).next()?.trim();
-    let host = host.split('@').next_back()?.trim();
+    let hostport = rest.split(['/', '?', '#']).next()?.trim();
+    let host = hostport.split('@').next_back()?.trim();
     let host = host.split(':').next()?.trim().to_ascii_lowercase();
-    if host.is_empty() {
+    if host.is_empty() || host == "localhost" {
         None
     } else {
         Some(host)
     }
+}
+
+fn path_of(url: &str) -> String {
+    let u = url.trim();
+    let rest = u
+        .strip_prefix("https://")
+        .or_else(|| u.strip_prefix("http://"))
+        .unwrap_or(u);
+    let path = if let Some(i) = rest.find('/') {
+        rest[i..].split(['?', '#']).next().unwrap_or("/")
+    } else {
+        "/"
+    };
+    let mut p = path.to_ascii_lowercase();
+    if p.is_empty() {
+        p = "/".into();
+    }
+    if p != "/" && p.ends_with('/') {
+        p.pop();
+    }
+    p
 }
 
 fn registrable(host: &str) -> String {
@@ -48,23 +72,53 @@ fn registrable(host: &str) -> String {
     }
 }
 
-fn score_host(page_host: &str, stored: &str) -> i32 {
-    if page_host.is_empty() || stored.is_empty() {
-        return 0;
+fn same_site(page_host: &str, stored_host: &str) -> bool {
+    if page_host.is_empty() || stored_host.is_empty() {
+        return false;
     }
     let a = page_host.trim_start_matches("www.");
-    let b = stored.trim_start_matches("www.");
+    let b = stored_host.trim_start_matches("www.");
     if a == b {
-        100
-    } else if registrable(a) == registrable(b) {
-        90
-    } else if a.ends_with(&format!(".{b}")) || b.ends_with(&format!(".{a}")) {
-        80
-    } else if a.contains(b) || b.contains(a) {
-        40
-    } else {
-        0
+        return true;
     }
+    if a.ends_with(&format!(".{b}")) || b.ends_with(&format!(".{a}")) {
+        return true;
+    }
+    let ra = registrable(a);
+    let rb = registrable(b);
+    ra == rb && ra.contains('.')
+}
+
+fn path_matches(page_path: &str, stored_path: &str) -> bool {
+    if stored_path == "/" {
+        return true;
+    }
+    page_path == stored_path || page_path.starts_with(&format!("{stored_path}/"))
+}
+
+fn score_url(page_url: &str, stored_url: &str) -> i32 {
+    let Some(page_host) = host_of(page_url) else {
+        return 0;
+    };
+    let Some(stored_host) = host_of(stored_url) else {
+        return 0;
+    };
+    if !same_site(&page_host, &stored_host) {
+        return 0;
+    }
+    let page_path = path_of(page_url);
+    let stored_path = path_of(stored_url);
+    if !path_matches(&page_path, &stored_path) {
+        return 0;
+    }
+    let host_score = if page_host.trim_start_matches("www.") == stored_host.trim_start_matches("www.")
+    {
+        50
+    } else {
+        30
+    };
+    let path_score = if stored_path == "/" { 20 } else { 50 };
+    host_score + path_score
 }
 
 pub fn match_websites(session: &Mutex<Session>, page_url: &str) -> Result<Vec<FillMatch>, String> {
@@ -74,7 +128,6 @@ pub fn match_websites(session: &Mutex<Session>, page_url: &str) -> Result<Vec<Fi
         return Err("locked".into());
     }
     s.touch();
-    let host = host_of(page_url).unwrap_or_default();
     let vault = s.vault().map_err(|e| e.to_string())?;
     let list = vault
         .list_entries(&ListFilter {
@@ -89,16 +142,10 @@ pub fn match_websites(session: &Mutex<Session>, page_url: &str) -> Result<Vec<Fi
         .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     for e in list {
-        let stored_host = e.url.as_deref().and_then(host_of).unwrap_or_default();
-        let mut score = score_host(&host, &stored_host);
-        let title_l = e.title.to_ascii_lowercase();
-        let acc_l = e.account.clone().unwrap_or_default().to_ascii_lowercase();
-        if score == 0 {
-            let page_reg = registrable(&host);
-            if title_l.contains(&host) || title_l.contains(&page_reg) || acc_l.contains(&host) {
-                score = 30;
-            }
-        }
+        let Some(stored) = e.url.as_deref().filter(|u| !u.trim().is_empty()) else {
+            continue;
+        };
+        let score = score_url(page_url, stored);
         if score > 0 {
             out.push(FillMatch {
                 id: e.id,
@@ -256,9 +303,24 @@ mod tests {
     #[test]
     fn host_and_score() {
         assert_eq!(host_of("https://www.github.com/login").as_deref(), Some("www.github.com"));
-        assert!(score_host("github.com", "www.github.com") >= 80);
-        assert!(score_host("login.taobao.com", "www.taobao.com") >= 80);
-        assert_eq!(score_host("example.com", "other.net"), 0);
+        assert!(score_url("https://github.com/login", "https://www.github.com") >= 70);
+        assert!(score_url("https://login.taobao.com/", "https://www.taobao.com") >= 50);
+        assert_eq!(score_url("https://example.com", "https://other.net"), 0);
+        assert_eq!(
+            score_url(
+                "https://heat.example.com/billing/login",
+                "https://heat.example.com/iam"
+            ),
+            0
+        );
+        assert!(
+            score_url(
+                "https://heat.example.com/iam/login",
+                "https://heat.example.com/iam"
+            ) >= 90
+        );
+        assert_eq!(host_of("iam"), None);
+        assert_eq!(score_url("https://foo.iam.com/x", "iam"), 0);
     }
 
     #[test]
