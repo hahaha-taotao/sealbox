@@ -23,21 +23,45 @@ pub struct FillSecret {
 }
 
 pub fn host_of(url: &str) -> Option<String> {
+    origin_of(url).map(|(host, _port)| host)
+}
+
+/// Host without leading www, plus explicit or default port.
+fn origin_of(url: &str) -> Option<(String, u16)> {
     let u = url.trim();
-    if u.is_empty() || !u.contains('.') && !u.contains("://") && !u.starts_with("localhost") {
+    if u.is_empty() {
         return None;
     }
-    let rest = u
-        .strip_prefix("https://")
-        .or_else(|| u.strip_prefix("http://"))
-        .unwrap_or(u);
+    let (scheme, rest) = if let Some(r) = u.strip_prefix("https://") {
+        ("https", r)
+    } else if let Some(r) = u.strip_prefix("http://") {
+        ("http", r)
+    } else if u.contains("://") {
+        return None;
+    } else {
+        ("https", u)
+    };
     let hostport = rest.split(['/', '?', '#']).next()?.trim();
-    let host = hostport.split('@').next_back()?.trim();
-    let host = host.split(':').next()?.trim().to_ascii_lowercase();
-    if host.is_empty() || host == "localhost" {
+    let hostport = hostport.split('@').next_back()?.trim();
+    if hostport.is_empty() {
+        return None;
+    }
+    let default_port = if scheme == "http" { 80 } else { 443 };
+    let (host, port) = if let Some((h, p)) = hostport.rsplit_once(':') {
+        if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) {
+            (h, p.parse().ok()?)
+        } else {
+            (hostport, default_port)
+        }
+    } else {
+        (hostport, default_port)
+    };
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+    let host = host.trim_start_matches("www.");
+    if host.is_empty() || host == "localhost" || !host.contains('.') {
         None
     } else {
-        Some(host)
+        Some((host.to_string(), port))
     }
 }
 
@@ -62,33 +86,6 @@ fn path_of(url: &str) -> String {
     p
 }
 
-fn registrable(host: &str) -> String {
-    let h = host.trim_start_matches("www.");
-    let parts: Vec<&str> = h.split('.').collect();
-    if parts.len() >= 2 {
-        format!("{}.{}", parts[parts.len() - 2], parts[parts.len() - 1])
-    } else {
-        h.to_string()
-    }
-}
-
-fn same_site(page_host: &str, stored_host: &str) -> bool {
-    if page_host.is_empty() || stored_host.is_empty() {
-        return false;
-    }
-    let a = page_host.trim_start_matches("www.");
-    let b = stored_host.trim_start_matches("www.");
-    if a == b {
-        return true;
-    }
-    if a.ends_with(&format!(".{b}")) || b.ends_with(&format!(".{a}")) {
-        return true;
-    }
-    let ra = registrable(a);
-    let rb = registrable(b);
-    ra == rb && ra.contains('.')
-}
-
 fn path_matches(page_path: &str, stored_path: &str) -> bool {
     if stored_path == "/" {
         return true;
@@ -97,13 +94,13 @@ fn path_matches(page_path: &str, stored_path: &str) -> bool {
 }
 
 fn score_url(page_url: &str, stored_url: &str) -> i32 {
-    let Some(page_host) = host_of(page_url) else {
+    let Some(page) = origin_of(page_url) else {
         return 0;
     };
-    let Some(stored_host) = host_of(stored_url) else {
+    let Some(stored) = origin_of(stored_url) else {
         return 0;
     };
-    if !same_site(&page_host, &stored_host) {
+    if page != stored {
         return 0;
     }
     let page_path = path_of(page_url);
@@ -111,14 +108,11 @@ fn score_url(page_url: &str, stored_url: &str) -> i32 {
     if !path_matches(&page_path, &stored_path) {
         return 0;
     }
-    let host_score = if page_host.trim_start_matches("www.") == stored_host.trim_start_matches("www.")
-    {
-        50
+    if stored_path == "/" {
+        70
     } else {
-        30
-    };
-    let path_score = if stored_path == "/" { 20 } else { 50 };
-    host_score + path_score
+        100
+    }
 }
 
 pub fn match_websites(session: &Mutex<Session>, page_url: &str) -> Result<Vec<FillMatch>, String> {
@@ -214,11 +208,47 @@ pub fn save_from_browser(
     }
     let dek = *s.dek().map_err(|e| e.to_string())?;
     let vault = s.vault().map_err(|e| e.to_string())?;
+    let existing = vault
+        .list_entries(&ListFilter {
+            query: None,
+            kind: Some(EntryKind::Website),
+            folder_id: None,
+            uncategorized: false,
+            tag: None,
+            trash: false,
+            sort: SortBy::UseCount,
+        })
+        .map_err(|e| e.to_string())?;
+    let origin = origin_of(url);
+    let mut reuse_id = None;
+    let mut totp_secret = None;
+    let mut folder_id = None;
+    let mut tags = vec!["browser".into()];
+    let mut pinned = false;
+    let mut expires_at = None;
+    for e in existing {
+        let Some(stored) = e.url.as_deref() else {
+            continue;
+        };
+        if origin.is_some() && origin == origin_of(stored) && e.account.as_deref() == Some(username)
+        {
+            reuse_id = Some(e.id.clone());
+            folder_id = e.folder_id;
+            tags = e.tags;
+            pinned = e.pinned;
+            expires_at = e.expires_at;
+            if let Ok(SecretPayload::Website { totp_secret: t, .. }) = vault.get_secret(&dek, &e.id)
+            {
+                totp_secret = t;
+            }
+            break;
+        }
+    }
     let dto = vault
         .upsert_entry(
             &dek,
             UpsertEntry {
-                id: None,
+                id: reuse_id,
                 kind: EntryKind::Website,
                 title: if title.trim().is_empty() {
                     host_of(url).unwrap_or_else(|| "website".into())
@@ -227,16 +257,16 @@ pub fn save_from_browser(
                 },
                 account: Some(username.to_string()),
                 url: Some(url.to_string()),
-                folder_id: None,
-                tags: vec!["browser".into()],
-                pinned: false,
-                expires_at: None,
+                folder_id,
+                tags,
+                pinned,
+                expires_at,
                 notes: None,
                 secret: SecretPayload::Website {
                     url: Some(url.to_string()),
                     username: Some(username.to_string()),
                     password: password.to_string(),
-                    totp_secret: None,
+                    totp_secret,
                 },
             },
         )
@@ -302,9 +332,20 @@ mod tests {
 
     #[test]
     fn host_and_score() {
-        assert_eq!(host_of("https://www.github.com/login").as_deref(), Some("www.github.com"));
+        assert_eq!(host_of("https://www.github.com/login").as_deref(), Some("github.com"));
         assert!(score_url("https://github.com/login", "https://www.github.com") >= 70);
-        assert!(score_url("https://login.taobao.com/", "https://www.taobao.com") >= 50);
+        assert_eq!(score_url("https://login.taobao.com/", "https://www.taobao.com"), 0);
+        assert_eq!(
+            score_url("https://csm.hhughg.com:8280/", "https://iam.hhughg.com:8381"),
+            0
+        );
+        assert!(
+            score_url("https://csm.hhughg.com:8280/", "https://csm.hhughg.com:8280") >= 70
+        );
+        assert_eq!(
+            score_url("https://csm.hhughg.com:8280/", "https://csm.hhughg.com:8281"),
+            0
+        );
         assert_eq!(score_url("https://example.com", "https://other.net"), 0);
         assert_eq!(
             score_url(
@@ -355,7 +396,9 @@ mod tests {
         let hits = match_websites(&mutex, "https://github.com/login").unwrap();
         assert_eq!(hits.len(), 1);
         let sub = match_websites(&mutex, "https://login.github.com/").unwrap();
-        assert_eq!(sub.len(), 1);
+        assert!(sub.is_empty());
+        let other = match_websites(&mutex, "https://csm.hhughg.com:8280/").unwrap();
+        assert!(other.is_empty());
         assert_eq!(hits[0].username, "octocat");
         let sec = reveal_for_fill(&mutex, &hits[0].id).unwrap();
         assert_eq!(sec.password, "gh-pass");
