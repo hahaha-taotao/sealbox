@@ -127,6 +127,10 @@ function showToast(msg: string) {
   toast.value = msg;
   setTimeout(() => (toast.value = ""), 1800);
 }
+function hideSecret() {
+  reveal.value = null;
+  revealFor.value = null;
+}
 function fmtTime(s: string | null) {
   if (!s) return "—";
   return s.replace("T", " ").slice(0, 16);
@@ -460,12 +464,12 @@ async function copy(id: string, field = "secret") {
   await refreshVault();
 }
 async function revealRow(row: EntryDto) {
+  if (revealFor.value === row.id) {
+    hideSecret();
+    return;
+  }
   reveal.value = await api.reveal(row.id);
   revealFor.value = row.id;
-  setTimeout(() => {
-    reveal.value = null;
-    revealFor.value = null;
-  }, 10000);
 }
 async function remove(ids: string[]) {
   if (!confirm("移入回收站？")) return;
@@ -654,20 +658,52 @@ onMounted(async () => {
     <div class="body" v-else>
       <nav class="rail">
         <button class="rail-btn" :class="{ active: page === 'home' }" @click="loadHome">
-          <span class="icon">⌂</span><span>首页</span>
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="m3 10 9-7 9 7" />
+              <path d="M5 9.5V21h14V9.5" />
+              <path d="M9 21v-6h6v6" />
+            </svg>
+          </span>
+          <span>首页</span>
         </button>
         <button class="rail-btn" :class="{ active: page === 'vault' }" @click="goPage('vault')">
-          <span class="icon">▣</span><span>保险库</span>
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="4" y="3" width="16" height="18" rx="2" />
+              <path d="M8 7h8M8 11h8M8 15h5" />
+            </svg>
+          </span>
+          <span>保险库</span>
         </button>
         <button class="rail-btn" :class="{ active: page === 'audit' }" @click="openAudit">
-          <span class="icon">≡</span><span>审计</span>
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 19V5M4 19h16" />
+              <path d="m7 15 3-3 3 2 6-7" />
+              <path d="M16 7h3v3" />
+            </svg>
+          </span>
+          <span>审计</span>
         </button>
         <button class="rail-btn" :class="{ active: page === 'mcp' }" @click="openMcp">
-          <span class="icon">⬡</span><span>MCP</span>
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="m12 3 8 4.5v9L12 21l-8-4.5v-9L12 3Z" />
+              <path d="m8 9 4 2.25L16 9M12 11.25V16" />
+            </svg>
+          </span>
+          <span>MCP</span>
         </button>
         <div class="spacer" />
         <button class="rail-btn" :class="{ active: page === 'settings' }" @click="goPage('settings')">
-          <span class="icon">⚙</span><span>设置</span>
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.64 5.64l1.42 1.42M16.94 16.94l1.42 1.42M18.36 5.64l-1.42 1.42M7.06 16.94l-1.42 1.42" />
+              <circle cx="12" cy="12" r="4" />
+            </svg>
+          </span>
+          <span>设置</span>
         </button>
       </nav>
 
@@ -788,13 +824,62 @@ onMounted(async () => {
                   <td>{{ row.use_count }}</td>
                   <td>{{ row.expires_at ? fmtTime(row.expires_at) : "永不" }}</td>
                   <td class="row-actions">
-                    <button title="复制" @click="copy(row.id)">复制</button>
-                    <button title="复制账号" @click="copy(row.id, 'account')">账号</button>
-                    <button v-if="row.has_totp" @click="copy(row.id, 'totp')">TOTP</button>
-                    <button v-if="filter.trash" @click="restore([row.id])">还原</button>
-                    <button v-else @click="revealRow(row)">显示</button>
-                    <button v-if="!filter.trash" @click="openEdit(row)">编辑</button>
-                    <button v-if="!filter.trash" class="danger" @click="remove([row.id])">删</button>
+                    <button type="button" title="复制密码" aria-label="复制密码" @click="copy(row.id)">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <rect x="9" y="9" width="13" height="13" rx="2" />
+                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                      </svg>
+                    </button>
+                    <button type="button" title="复制账号" aria-label="复制账号" @click="copy(row.id, 'account')">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+                        <circle cx="12" cy="7" r="4" />
+                      </svg>
+                    </button>
+                    <button v-if="row.has_totp" type="button" title="复制 TOTP" aria-label="复制 TOTP" @click="copy(row.id, 'totp')">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <circle cx="12" cy="12" r="10" />
+                        <polyline points="12 6 12 12 16 14" />
+                      </svg>
+                    </button>
+                    <button v-if="filter.trash" type="button" title="还原" aria-label="还原" @click="restore([row.id])">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                        <path d="M3 3v5h5" />
+                      </svg>
+                    </button>
+                    <button
+                      v-else
+                      type="button"
+                      :class="{ on: revealFor === row.id }"
+                      :title="revealFor === row.id ? '隐藏' : '显示'"
+                      :aria-label="revealFor === row.id ? '隐藏' : '显示'"
+                      :aria-pressed="revealFor === row.id"
+                      @click="revealRow(row)"
+                    >
+                      <svg v-if="revealFor === row.id" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94" />
+                        <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" />
+                        <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24" />
+                        <line x1="1" y1="1" x2="23" y2="23" />
+                      </svg>
+                      <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                        <circle cx="12" cy="12" r="3" />
+                      </svg>
+                    </button>
+                    <button v-if="!filter.trash" type="button" title="编辑" aria-label="编辑" @click="openEdit(row)">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M12 20h9" />
+                        <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
+                      </svg>
+                    </button>
+                    <button v-if="!filter.trash" type="button" class="danger" title="移入回收站" aria-label="移入回收站" @click="remove([row.id])">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <polyline points="3 6 5 6 21 6" />
+                        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                      </svg>
+                    </button>
                   </td>
                 </tr>
               </tbody>

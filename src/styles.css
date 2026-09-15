@@ -70,6 +70,15 @@ button { cursor: pointer; }
   padding: 8px 0 6px; color: var(--muted); display: flex; flex-direction: column; align-items: center; gap: 4px;
 }
 .rail-btn span { font-size: 11px; }
+.rail-btn .icon {
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+.rail-btn .icon svg { width: 20px; height: 20px; display: block; }
 .rail-btn.active, .rail-btn:hover { background: #eef0ff; color: var(--brand); }
 
 .main { flex: 1; display: flex; min-width: 0; }
@@ -115,10 +124,28 @@ tr:hover td { background: #fafbff; }
 .pill.mail_auth { background: #fce7f3; color: #be185d; }
 .pill.server { background: #ecfccb; color: #3f6212; }
 .pill.database { background: #f3e8ff; color: #7c3aed; }
-.row-actions { display: flex; gap: 4px; opacity: 0.7; }
-.row-actions button { border: 0; background: transparent; padding: 4px; color: var(--muted); }
-.row-actions button:hover { color: var(--brand); }
-.row-actions .danger:hover { color: var(--danger); }
+.row-actions {
+  display: flex;
+  gap: 8px;
+  white-space: nowrap;
+  width: 1%;
+}
+.row-actions button {
+  width: 28px;
+  height: 28px;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: var(--muted);
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.row-actions button:hover { color: var(--brand); background: #eef0ff; }
+.row-actions button.on { color: var(--brand); background: #eef0ff; }
+.row-actions .danger:hover { color: var(--danger); background: #fff1f2; }
+.row-actions svg { width: 16px; height: 16px; display: block; }
 
 .empty { padding: 64px; text-align: center; color: var(--muted); }
 
