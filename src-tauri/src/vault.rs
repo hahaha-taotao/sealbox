@@ -576,12 +576,19 @@ impl Vault {
         }
     }
 
-    pub fn list_entries(&self, filter: &ListFilter) -> Result<Vec<EntryDto>, VaultError> {
-        let mut sql = String::from(
-            "SELECT e.id, e.kind, e.title, e.account, e.url, e.folder_id, e.pinned,
-                    e.expires_at, e.use_count, e.last_used_at, e.updated_at, e.has_totp, e.fingerprint
-             FROM entries e",
-        );
+    fn list_from_sql(&self, select: &str) -> String {
+        let mut sql = String::from(select);
+        sql.push_str(" FROM entries e");
+        sql
+    }
+
+    fn apply_list_scope(
+        &self,
+        sql: &mut String,
+        bind: &mut Vec<Box<dyn rusqlite::ToSql>>,
+        filter: &ListFilter,
+        kinds: &[EntryKind],
+    ) {
         if filter.tag.is_some() {
             sql.push_str(
                 " JOIN entry_tags et ON et.entry_id = e.id JOIN tags t ON t.id = et.tag_id",
@@ -593,7 +600,6 @@ impl Vault {
         } else {
             sql.push_str("e.deleted_at IS NULL");
         }
-        let kinds = filter.selected_kinds();
         if kinds.len() == 1 {
             sql.push_str(" AND e.kind = ?");
         } else if kinds.len() > 1 {
@@ -601,13 +607,24 @@ impl Vault {
             sql.push_str(&vec!["?"; kinds.len()].join(","));
             sql.push(')');
         }
+        for kind in kinds {
+            bind.push(Box::new(kind.as_str().to_string()));
+        }
         if filter.uncategorized {
             sql.push_str(" AND e.folder_id IS NULL");
         } else if filter.folder_id.is_some() {
             sql.push_str(" AND e.folder_id = ?");
         }
+        if let Some(fid) = &filter.folder_id {
+            if !filter.uncategorized {
+                bind.push(Box::new(fid.clone()));
+            }
+        }
         if filter.tag.is_some() {
             sql.push_str(" AND t.name = ?");
+        }
+        if let Some(tag) = &filter.tag {
+            bind.push(Box::new(tag.clone()));
         }
         if filter
             .query
@@ -624,26 +641,6 @@ impl Vault {
                       )",
             );
         }
-        sql.push_str(" ORDER BY e.pinned DESC, ");
-        sql.push_str(match filter.sort {
-            SortBy::UseCount => "e.use_count DESC, e.updated_at DESC",
-            SortBy::Updated => "e.updated_at DESC",
-            SortBy::Title => "e.title COLLATE NOCASE ASC",
-        });
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let mut bind: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        for kind in &kinds {
-            bind.push(Box::new(kind.as_str().to_string()));
-        }
-        if let Some(fid) = &filter.folder_id {
-            if !filter.uncategorized {
-                bind.push(Box::new(fid.clone()));
-            }
-        }
-        if let Some(tag) = &filter.tag {
-            bind.push(Box::new(tag.clone()));
-        }
         if let Some(q) = &filter.query {
             if !q.is_empty() {
                 let like = format!("%{q}%");
@@ -654,6 +651,24 @@ impl Vault {
                 bind.push(Box::new(like));
             }
         }
+    }
+
+    pub fn list_entries(&self, filter: &ListFilter) -> Result<Vec<EntryDto>, VaultError> {
+        let kinds = filter.selected_kinds();
+        let mut sql = self.list_from_sql(
+            "SELECT e.id, e.kind, e.title, e.account, e.url, e.folder_id, e.pinned,
+                    e.expires_at, e.use_count, e.last_used_at, e.updated_at, e.has_totp, e.fingerprint",
+        );
+        let mut bind: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        self.apply_list_scope(&mut sql, &mut bind, filter, &kinds);
+        sql.push_str(" ORDER BY e.pinned DESC, ");
+        sql.push_str(match filter.sort {
+            SortBy::UseCount => "e.use_count DESC, e.updated_at DESC",
+            SortBy::Updated => "e.updated_at DESC",
+            SortBy::Title => "e.title COLLATE NOCASE ASC",
+        });
+
+        let mut stmt = self.conn.prepare(&sql)?;
         let bind_refs: Vec<&dyn rusqlite::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
         let rows = stmt.query_map(bind_refs.as_slice(), |r| {
             Ok(EntryDto {
@@ -1100,62 +1115,44 @@ impl Vault {
     }
 
     pub fn counts(&self) -> Result<Counts, VaultError> {
-        let total: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM entries WHERE deleted_at IS NULL",
-            [],
-            |r| r.get(0),
-        )?;
-        let website: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM entries WHERE deleted_at IS NULL AND kind='website'",
-            [],
-            |r| r.get(0),
-        )?;
-        let api_token: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM entries WHERE deleted_at IS NULL AND kind='api_token'",
-            [],
-            |r| r.get(0),
-        )?;
-        let ssh: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM entries WHERE deleted_at IS NULL AND kind='ssh'",
-            [],
-            |r| r.get(0),
-        )?;
-        let mailbox: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM entries WHERE deleted_at IS NULL AND kind='mailbox'",
-            [],
-            |r| r.get(0),
-        )?;
-        let mail_auth: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM entries WHERE deleted_at IS NULL AND kind='mail_auth'",
-            [],
-            |r| r.get(0),
-        )?;
-        let server: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM entries WHERE deleted_at IS NULL AND kind='server'",
-            [],
-            |r| r.get(0),
-        )?;
-        let database: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM entries WHERE deleted_at IS NULL AND kind='database'",
-            [],
-            |r| r.get(0),
-        )?;
-        let trash: i64 = self.conn.query_row(
+        self.counts_for(&ListFilter::default())
+    }
+
+    pub fn counts_for(&self, filter: &ListFilter) -> Result<Counts, VaultError> {
+        let mut scoped = filter.clone();
+        scoped.kind = None;
+        scoped.kinds.clear();
+        let mut sql = self.list_from_sql("SELECT e.kind, COUNT(*)");
+        let mut bind: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        self.apply_list_scope(&mut sql, &mut bind, &scoped, &[]);
+        sql.push_str(" GROUP BY e.kind");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let bind_refs: Vec<&dyn rusqlite::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(bind_refs.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        let mut counts = Counts::default();
+        for row in rows {
+            let (kind, n) = row?;
+            match kind.as_str() {
+                "website" => counts.website = n,
+                "api_token" => counts.api_token = n,
+                "ssh" => counts.ssh = n,
+                "mailbox" => counts.mailbox = n,
+                "mail_auth" => counts.mail_auth = n,
+                "server" => counts.server = n,
+                "database" => counts.database = n,
+                _ => {}
+            }
+            counts.total += n;
+        }
+        counts.trash = self.conn.query_row(
             "SELECT COUNT(*) FROM entries WHERE deleted_at IS NOT NULL",
             [],
             |r| r.get(0),
         )?;
-        Ok(Counts {
-            total,
-            website,
-            api_token,
-            ssh,
-            mailbox,
-            mail_auth,
-            server,
-            database,
-            trash,
-        })
+        Ok(counts)
     }
 
     pub fn recent_entries(&self, limit: i64) -> Result<Vec<EntryDto>, VaultError> {
@@ -1268,7 +1265,7 @@ impl Vault {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Counts {
     pub total: i64,
     pub website: i64,

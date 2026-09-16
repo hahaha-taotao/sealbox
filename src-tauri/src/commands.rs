@@ -318,6 +318,17 @@ pub fn list_entries(state: State<AppState>, filter: ListFilter) -> Result<Vec<En
 }
 
 #[tauri::command]
+pub fn list_counts(state: State<AppState>, filter: ListFilter) -> Result<Counts, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    session
+        .vault()
+        .map_err(map_err)?
+        .counts_for(&filter)
+        .map_err(map_err)
+}
+
+#[tauri::command]
 pub fn create_entry(state: State<AppState>, mut input: UpsertEntry) -> Result<EntryDto, String> {
     if let SecretPayload::Ssh {
         private_key,

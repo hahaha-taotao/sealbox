@@ -476,6 +476,28 @@ fn list_filter_kinds_and_folder_combine() {
         .unwrap();
     assert_eq!(by_legacy_kind.len(), 1);
     assert_eq!(by_legacy_kind[0].title, "未归类 SSH");
+
+    let folder_counts = vault
+        .counts_for(&ListFilter {
+            folder_id: Some(personal.id.clone()),
+            ..ListFilter::default()
+        })
+        .unwrap();
+    assert_eq!(folder_counts.total, 2);
+    assert_eq!(folder_counts.website, 1);
+    assert_eq!(folder_counts.api_token, 1);
+    assert_eq!(folder_counts.ssh, 0);
+    assert_eq!(folder_counts.trash, 0);
+
+    let uncategorized = vault
+        .counts_for(&ListFilter {
+            uncategorized: true,
+            ..ListFilter::default()
+        })
+        .unwrap();
+    assert_eq!(uncategorized.total, 1);
+    assert_eq!(uncategorized.ssh, 1);
+    assert_eq!(uncategorized.website, 0);
 }
 
 #[test]

@@ -118,6 +118,7 @@ export const api = {
   unlockHello: () => invoke("unlock_hello"),
   lock: () => invoke("lock_vault"),
   list: (filter: ListFilter) => invoke<EntryDto[]>("list_entries", { filter }),
+  counts: (filter: ListFilter) => invoke<Counts>("list_counts", { filter }),
   create: (input: UpsertEntry) => invoke<EntryDto>("create_entry", { input }),
   remove: (ids: string[]) => invoke<number>("delete_entries", { ids }),
   restore: (ids: string[]) => invoke<number>("restore_entries", { ids }),

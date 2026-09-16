@@ -5,6 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   api,
   type AuditEvent,
+  type Counts,
   type EntryDto,
   type EntryKind,
   type FolderDto,
@@ -25,6 +26,7 @@ const password2 = ref("");
 const error = ref("");
 const toast = ref("");
 const entries = ref<EntryDto[]>([]);
+const scopedCounts = ref<Counts | null>(null);
 const folders = ref<FolderDto[]>([]);
 const tags = ref<string[]>([]);
 const audit = ref<AuditEvent[]>([]);
@@ -139,7 +141,7 @@ function kindLabel(k: EntryKind) {
   }
 }
 function kindCount(k: EntryKind) {
-  return status.value?.counts?.[k] ?? 0;
+  return scopedCounts.value?.[k] ?? 0;
 }
 const allFilterActive = computed(
   () => !filter.trash && !filter.folder_id && !filter.uncategorized && !filter.tag,
@@ -236,11 +238,17 @@ async function refreshStatus() {
 }
 async function refreshVault() {
   const kinds = selectedKindIds.value;
-  entries.value = await api.list({
+  const scoped = {
     ...filter,
     query: filter.query || null,
     kinds,
     kind: kinds.length === 1 ? kinds[0] : null,
+  };
+  entries.value = await api.list(scoped);
+  scopedCounts.value = await api.counts({
+    ...scoped,
+    kinds: [],
+    kind: null,
   });
   folders.value = await api.folders();
   tags.value = await api.tags();
@@ -808,6 +816,7 @@ function applyLockedUi() {
   clearSecrets();
   backupOpen.value = false;
   entries.value = [];
+  scopedCounts.value = null;
   audit.value = [];
   recent.value = [];
   expiring.value = [];

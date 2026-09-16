@@ -39,6 +39,7 @@ pub fn run() {
             commands::unlock_hello,
             commands::lock_vault,
             commands::list_entries,
+            commands::list_counts,
             commands::create_entry,
             commands::update_entry,
             commands::delete_entries,
