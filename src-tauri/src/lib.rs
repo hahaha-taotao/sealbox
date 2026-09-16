@@ -5,7 +5,10 @@ pub mod crypto;
 pub mod db;
 pub mod fill;
 pub mod hello;
+pub mod http_guard;
+pub mod lock;
 pub mod mcp;
+pub mod passphrase_words;
 pub mod redact;
 pub mod session;
 pub mod totp;
@@ -18,6 +21,11 @@ use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(lock::emergency_lock));
+        default_hook(info);
+    }));
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -57,6 +65,15 @@ pub fn run() {
             commands::mcp_stop,
             commands::mcp_rotate_token,
             commands::fill_rotate_token,
+            commands::reveal_mcp_token,
+            commands::reveal_fill_token,
+            commands::copy_mcp_token,
+            commands::copy_fill_token,
+            commands::copy_mcp_snippet,
+            commands::fill_open_pairing,
+            commands::fill_pairing_status,
+            commands::mcp_http_logs,
+            commands::mcp_tools,
             commands::window_control,
         ])
         .setup(|app| {
@@ -82,7 +99,7 @@ pub fn run() {
                     }
                     "lock" => {
                         if let Some(state) = app.try_state::<AppState>() {
-                            state.session.lock().unwrap().lock();
+                            lock::lock_everything(&state.session, &state.mcp);
                         }
                         let _ = app.emit("lock-now", ());
                     }

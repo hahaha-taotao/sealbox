@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        overflow: hidden;
+      }
+      #card {
+        background: #1f2329;
+        color: #fff;
+        padding: 10px 12px;
+        border-radius: 10px;
+        font: 13px/1.4 "Segoe UI", sans-serif;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+      }
+      #title { margin-bottom: 6px; }
+      button {
+        display: block;
+        width: 100%;
+        margin: 4px 0;
+        padding: 6px 8px;
+        border: 0;
+        border-radius: 6px;
+        background: #5b5bd6;
+        color: #fff;
+        cursor: pointer;
+        font: inherit;
+        text-align: left;
+        overflow: hidden;
+      }
+      #close {
+        background: transparent;
+        color: #aaa;
+        margin-top: 4px;
+      }
+      #hint { margin-top: 6px; color: #aaa; font-size: 11px; }
+      #error { color: #fca5a5; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <div id="card">
+      <div id="title">Sealbox</div>
+      <div id="list"></div>
+      <div id="error" hidden></div>
+      <div id="hint">点账号即可填充</div>
+      <button id="close" type="button">关闭</button>
+    </div>
+    <script src="overlay.js"></script>
+  </body>
+</html>

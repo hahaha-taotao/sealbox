@@ -67,13 +67,15 @@ async function refresh() {
 }
 
 async function unlock() {
+  if (!status.value?.initialized) return;
   error.value = "";
   try {
     await api.unlock(password.value);
     password.value = "";
     await refresh();
-  } catch {
-    error.value = "主密码不正确";
+  } catch (e) {
+    const msg = String(e);
+    error.value = msg.includes("not initialized") ? "尚未创建金库" : "主密码不正确";
   }
 }
 
@@ -90,7 +92,10 @@ function onKey(e: KeyboardEvent) {
     hide();
     return;
   }
-  if (!status.value?.unlocked) {
+  if (!status.value?.initialized) {
+    return;
+  }
+  if (!status.value.unlocked) {
     if (e.key === "Enter") unlock();
     return;
   }
@@ -121,9 +126,15 @@ onMounted(async () => {
       el?.focus();
     }, 30);
   });
+  const unLock = await listen("lock-now", async () => {
+    entries.value = [];
+    password.value = "";
+    await refresh();
+  });
   onUnmounted(() => {
     window.removeEventListener("keydown", onKey);
     un();
+    unLock();
   });
 });
 </script>
@@ -136,6 +147,11 @@ onMounted(async () => {
     </div>
 
     <div v-if="!status" class="quick-body crumb">加载中…</div>
+
+    <div v-else-if="!status.initialized" class="quick-body">
+      <p class="crumb">尚未创建金库</p>
+      <p class="crumb">请先打开主窗口完成初始化，不要在此输入密码。</p>
+    </div>
 
     <div v-else-if="!status.unlocked" class="quick-body">
       <p class="crumb">金库已锁定</p>

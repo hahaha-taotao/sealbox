@@ -7,17 +7,26 @@
     "default_title": "Sealbox",
     "default_popup": "popup.html"
   },
-  "permissions": ["storage", "activeTab", "scripting", "tabs"],
+  "permissions": ["storage", "activeTab", "scripting", "webNavigation"],
   "host_permissions": ["http://127.0.0.1/*", "http://*/*", "https://*/*"],
   "background": {
     "service_worker": "background.js"
   },
+  "commands": {
+    "fill-current": {
+      "suggested_key": {
+        "default": "Alt+Shift+F"
+      },
+      "description": "打开当前页的账号选择并填充"
+    }
+  },
   "content_scripts": [
     {
       "matches": ["http://*/*", "https://*/*"],
-      "js": ["content.js"],
+      "js": ["fill-logic.cjs", "page-fill.js", "content.js"],
       "run_at": "document_idle",
-      "all_frames": true
+      "all_frames": true,
+      "match_about_blank": true
     }
   ]
 }

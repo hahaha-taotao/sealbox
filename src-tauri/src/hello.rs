@@ -35,7 +35,9 @@ pub fn delete_hello_key() -> Result<(), String> {
 
 pub fn enable_hello(vault: &Vault, dek: &[u8; 32]) -> Result<(), String> {
     let key = random_key();
-    vault.set_hello(dek, Some(&key)).map_err(|e| e.to_string())?;
+    vault
+        .set_hello(dek, Some(&key))
+        .map_err(|e| e.to_string())?;
     store_hello_key(&key)
 }
 

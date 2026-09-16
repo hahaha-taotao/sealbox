@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 fn token_like() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"(?i)(ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|gho_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----)").unwrap()
+        Regex::new(r"(?i)(ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|gho_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|fill_[A-Fa-f0-9]{32}|sbx_[A-Fa-f0-9]{32}|-----BEGIN [A-Z ]*PRIVATE KEY-----)").unwrap()
     })
 }
 
@@ -75,6 +75,16 @@ mod tests {
         let out = redact_text(text, &["secret-value-xyz"]);
         assert!(!out.contains("ghp_"));
         assert!(!out.contains("secret-value-xyz"));
+        assert!(out.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redacts_fill_and_mcp_tokens() {
+        let fill = "fill_0123456789abcdef0123456789abcdef";
+        let mcp = "sbx_0123456789abcdef0123456789abcdef";
+        let out = redact_text(&format!("got {fill} and {mcp}"), &[]);
+        assert!(!out.contains(fill));
+        assert!(!out.contains(mcp));
         assert!(out.contains("[REDACTED]"));
     }
 }

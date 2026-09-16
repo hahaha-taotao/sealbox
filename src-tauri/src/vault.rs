@@ -5,6 +5,7 @@ use crate::db;
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -22,6 +23,8 @@ pub enum VaultError {
     AlreadyExists,
     #[error("vault not initialized")]
     NotInitialized,
+    #[error("金库已锁定")]
+    Locked,
     #[error("master password incorrect")]
     BadPassword,
     #[error("entry not found")]
@@ -30,6 +33,10 @@ pub enum VaultError {
     InvalidKind,
     #[error("master password too short")]
     PasswordTooShort,
+    #[error("备份文件损坏或格式不正确")]
+    CorruptBackup,
+    #[error("备份密钥拉伸参数超出允许范围")]
+    InvalidBackupKdf,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -213,9 +220,10 @@ impl Vault {
         if master_password.chars().count() < 10 {
             return Err(VaultError::PasswordTooShort);
         }
-        if std::path::Path::new(path).exists() {
+        if Self::is_initialized(path) {
             return Err(VaultError::AlreadyExists);
         }
+        remove_db_files(path);
         if let Some(parent) = std::path::Path::new(path).parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -233,9 +241,21 @@ impl Vault {
     }
 
     pub fn open(path: &str) -> Result<Self, VaultError> {
-        Ok(Self {
-            conn: db::open(path)?,
-        })
+        if !std::path::Path::new(path).exists() {
+            return Err(VaultError::NotInitialized);
+        }
+        let conn = match db::open_existing(path) {
+            Ok(conn) => conn,
+            Err(_) if !std::path::Path::new(path).exists() => {
+                return Err(VaultError::NotInitialized);
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let vault = Self { conn };
+        if !vault.has_meta() {
+            return Err(VaultError::NotInitialized);
+        }
+        Ok(vault)
     }
 
     fn init_meta(conn: &Connection, master_password: &str) -> Result<[u8; 32], VaultError> {
@@ -263,6 +283,26 @@ impl Vault {
 
     pub fn exists(path: &str) -> bool {
         std::path::Path::new(path).exists()
+    }
+
+    pub fn is_initialized(path: &str) -> bool {
+        if !std::path::Path::new(path).exists() {
+            return false;
+        }
+        match Self::open(path) {
+            Ok(_) => true,
+            Err(VaultError::NotInitialized) => false,
+            Err(_) => true,
+        }
+    }
+
+    fn has_meta(&self) -> bool {
+        self.conn
+            .query_row("SELECT 1 FROM vault_meta WHERE id = 1", [], |_| Ok(()))
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     pub fn unlock(&self, master_password: &str) -> Result<[u8; 32], VaultError> {
@@ -348,9 +388,12 @@ impl Vault {
                 username.clone().or(input.account.clone()),
                 url.clone().or(input.url.clone()),
             ),
-            SecretPayload::ApiToken { account, .. } => {
-                (false, None, account.clone().or(input.account.clone()), None)
-            }
+            SecretPayload::ApiToken { account, .. } => (
+                false,
+                None,
+                account.clone().or(input.account.clone()),
+                input.url.clone(),
+            ),
             SecretPayload::Ssh {
                 public_fingerprint, ..
             } => (
@@ -359,12 +402,23 @@ impl Vault {
                 input.account.clone(),
                 None,
             ),
-            SecretPayload::Mailbox { email, imap_host, smtp_host, .. } => {
+            SecretPayload::Mailbox {
+                email,
+                imap_host,
+                smtp_host,
+                ..
+            } => {
                 let host = imap_host.clone().or(smtp_host.clone());
                 (false, None, Some(email.clone()), host)
             }
             SecretPayload::MailAuth { email, .. } => (false, None, Some(email.clone()), None),
-            SecretPayload::Server { host, username, port, protocol, .. } => {
+            SecretPayload::Server {
+                host,
+                username,
+                port,
+                protocol,
+                ..
+            } => {
                 let loc = match port {
                     Some(p) => format!("{protocol}://{host}:{p}"),
                     None => format!("{protocol}://{host}"),
@@ -387,7 +441,12 @@ impl Vault {
                     (false, None, false) => format!("{engine}://{host}/{database}"),
                     (false, None, true) => format!("{engine}://{host}"),
                 };
-                (false, Some(engine.clone()), Some(username.clone()), Some(loc))
+                (
+                    false,
+                    Some(engine.clone()),
+                    Some(username.clone()),
+                    Some(loc),
+                )
             }
         };
         let secret_json = serde_json::to_vec(&input.secret)?;
@@ -459,7 +518,11 @@ impl Vault {
         } else {
             "create"
         };
-        self.audit(action, Some(&id), &format!("{} {}", input.kind.as_str(), input.title))?;
+        self.audit(
+            action,
+            Some(&id),
+            &format!("{} {}", input.kind.as_str(), input.title),
+        )?;
         self.get_dto(&id)
     }
 
@@ -505,7 +568,9 @@ impl Vault {
              FROM entries e",
         );
         if filter.tag.is_some() {
-            sql.push_str(" JOIN entry_tags et ON et.entry_id = e.id JOIN tags t ON t.id = et.tag_id");
+            sql.push_str(
+                " JOIN entry_tags et ON et.entry_id = e.id JOIN tags t ON t.id = et.tag_id",
+            );
         }
         sql.push_str(" WHERE ");
         if filter.trash {
@@ -524,7 +589,12 @@ impl Vault {
         if filter.tag.is_some() {
             sql.push_str(" AND t.name = ?");
         }
-        if filter.query.as_ref().map(|q| !q.is_empty()).unwrap_or(false) {
+        if filter
+            .query
+            .as_ref()
+            .map(|q| !q.is_empty())
+            .unwrap_or(false)
+        {
             sql.push_str(
                 " AND (e.title LIKE ? OR IFNULL(e.account,'') LIKE ? OR IFNULL(e.url,'') LIKE ?
                        OR e.id IN (
@@ -634,7 +704,11 @@ impl Vault {
         Ok(())
     }
 
-    pub fn purge_expired_trash(&self, now: DateTime<Utc>, retention_days: i64) -> Result<usize, VaultError> {
+    pub fn purge_expired_trash(
+        &self,
+        now: DateTime<Utc>,
+        retention_days: i64,
+    ) -> Result<usize, VaultError> {
         let cutoff = (now - Duration::days(retention_days)).to_rfc3339();
         let n = self.conn.execute(
             "DELETE FROM entries WHERE deleted_at IS NOT NULL AND deleted_at <= ?1",
@@ -678,9 +752,7 @@ impl Vault {
     }
 
     pub fn list_tags(&self) -> Result<Vec<String>, VaultError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT name FROM tags ORDER BY name")?;
+        let mut stmt = self.conn.prepare("SELECT name FROM tags ORDER BY name")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
@@ -701,7 +773,12 @@ impl Vault {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
-    pub fn audit(&self, action: &str, entry_id: Option<&str>, detail: &str) -> Result<(), VaultError> {
+    pub fn audit(
+        &self,
+        action: &str,
+        entry_id: Option<&str>,
+        detail: &str,
+    ) -> Result<(), VaultError> {
         self.conn.execute(
             "INSERT INTO audit_events (id, at, action, entry_id, detail) VALUES (?1,?2,?3,?4,?5)",
             params![
@@ -716,11 +793,11 @@ impl Vault {
     }
 
     pub fn hello_enabled(&self) -> Result<bool, VaultError> {
-        let v: i64 = self
-            .conn
-            .query_row("SELECT hello_enabled FROM vault_meta WHERE id=1", [], |r| {
-                r.get(0)
-            })?;
+        let v: i64 =
+            self.conn
+                .query_row("SELECT hello_enabled FROM vault_meta WHERE id=1", [], |r| {
+                    r.get(0)
+                })?;
         Ok(v != 0)
     }
 
@@ -801,11 +878,12 @@ impl Vault {
         })
     }
 
-    pub fn insert_reencrypted_entry(
+    fn insert_reencrypted_entry(
         &self,
         source_dek: &[u8; 32],
         dest_dek: &[u8; 32],
         entry: &BackupEntry,
+        folder_id: Option<&str>,
         overwrite: bool,
     ) -> Result<bool, VaultError> {
         let exists: Option<String> = self
@@ -848,7 +926,7 @@ impl Vault {
                 &entry.title,
                 &entry.account,
                 &entry.url,
-                &entry.folder_id,
+                folder_id,
                 entry.pinned as i64,
                 &entry.expires_at,
                 entry.use_count,
@@ -862,8 +940,10 @@ impl Vault {
                 new_notes,
             ],
         )?;
-        self.conn
-            .execute("DELETE FROM entry_tags WHERE entry_id=?1", params![&entry.id])?;
+        self.conn.execute(
+            "DELETE FROM entry_tags WHERE entry_id=?1",
+            params![&entry.id],
+        )?;
         for tag in &entry.tags {
             let tag_id = self.ensure_tag(tag)?;
             self.conn.execute(
@@ -874,14 +954,69 @@ impl Vault {
         Ok(true)
     }
 
-    pub fn ensure_folder_named(&self, name: &str) -> Result<String, VaultError> {
+    pub fn import_reencrypted_snapshot(
+        &self,
+        source_dek: &[u8; 32],
+        dest_dek: &[u8; 32],
+        snapshot: &BackupSnapshot,
+        overwrite: bool,
+    ) -> Result<(usize, usize), VaultError> {
+        struct TxGuard<'a> {
+            conn: &'a Connection,
+            finished: bool,
+        }
+        impl Drop for TxGuard<'_> {
+            fn drop(&mut self) {
+                if !self.finished {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                }
+            }
+        }
+
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let mut tx = TxGuard {
+            conn: &self.conn,
+            finished: false,
+        };
+
+        let mut folder_map = HashMap::new();
+        for folder in &snapshot.folders {
+            let dest_id = self.ensure_folder_named(&folder.name)?;
+            folder_map.insert(folder.id.clone(), dest_id);
+        }
+
+        let mut imported = 0usize;
+        let mut skipped = 0usize;
+        for entry in &snapshot.entries {
+            let folder_id = entry
+                .folder_id
+                .as_ref()
+                .and_then(|id| folder_map.get(id).map(String::as_str));
+            match self.insert_reencrypted_entry(source_dek, dest_dek, entry, folder_id, overwrite) {
+                Ok(true) => imported += 1,
+                Ok(false) => skipped += 1,
+                Err(VaultError::Crypto(_) | VaultError::Json(_)) => {
+                    return Err(VaultError::CorruptBackup);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        self.audit(
+            "import",
+            None,
+            &format!("imported={imported} skipped={skipped} overwrite={overwrite}"),
+        )?;
+        self.conn.execute_batch("COMMIT")?;
+        tx.finished = true;
+        Ok((imported, skipped))
+    }
+
+    fn ensure_folder_named(&self, name: &str) -> Result<String, VaultError> {
         let existing: Option<String> = self
             .conn
-            .query_row(
-                "SELECT id FROM folders WHERE name=?1",
-                params![name],
-                |r| r.get(0),
-            )
+            .query_row("SELECT id FROM folders WHERE name=?1", params![name], |r| {
+                r.get(0)
+            })
             .optional()?;
         if let Some(id) = existing {
             return Ok(id);
@@ -900,8 +1035,10 @@ impl Vault {
             return Ok(id);
         }
         let id = Uuid::new_v4().to_string();
-        self.conn
-            .execute("INSERT INTO tags (id, name) VALUES (?1,?2)", params![&id, name])?;
+        self.conn.execute(
+            "INSERT INTO tags (id, name) VALUES (?1,?2)",
+            params![&id, name],
+        )?;
         Ok(id)
     }
 
@@ -1045,6 +1182,70 @@ impl Vault {
         )?;
         Ok(())
     }
+
+    fn looks_like_encrypted_setting(value: &str) -> bool {
+        hex::decode(value)
+            .ok()
+            .and_then(|bytes| Encrypted::from_bytes(&bytes).ok())
+            .is_some()
+    }
+
+    fn decrypt_setting_value(&self, dek: &[u8; 32], value: &str) -> Result<String, VaultError> {
+        let bytes = hex::decode(value)
+            .map_err(|_| VaultError::Crypto(crate::crypto::CryptoError::Truncated))?;
+        let enc = Encrypted::from_bytes(&bytes)?;
+        let plain = decrypt(dek, &enc)?;
+        String::from_utf8(plain)
+            .map_err(|_| VaultError::Crypto(crate::crypto::CryptoError::Decrypt))
+    }
+
+    pub fn get_secret_setting(
+        &self,
+        dek: &[u8; 32],
+        key: &str,
+    ) -> Result<Option<String>, VaultError> {
+        let enc_key = format!("{key}_enc");
+        if let Some(value) = self.get_setting(&enc_key)? {
+            if let Ok(plain) = self.decrypt_setting_value(dek, &value) {
+                if !plain.is_empty() {
+                    let _ = self
+                        .conn
+                        .execute("DELETE FROM settings WHERE key=?1", params![key]);
+                    return Ok(Some(plain));
+                }
+            }
+        }
+        let Some(legacy) = self.get_setting(key)? else {
+            return Ok(None);
+        };
+        if legacy.is_empty() {
+            return Ok(None);
+        }
+        if Self::looks_like_encrypted_setting(&legacy) {
+            if let Ok(plain) = self.decrypt_setting_value(dek, &legacy) {
+                if !plain.is_empty() {
+                    self.set_secret_setting(dek, key, &plain)?;
+                    return Ok(Some(plain));
+                }
+            }
+            return Ok(None);
+        }
+        self.set_secret_setting(dek, key, &legacy)?;
+        Ok(Some(legacy))
+    }
+
+    pub fn set_secret_setting(
+        &self,
+        dek: &[u8; 32],
+        key: &str,
+        value: &str,
+    ) -> Result<(), VaultError> {
+        let enc = encrypt(dek, value.as_bytes())?;
+        self.set_setting(&format!("{key}_enc"), &hex::encode(enc.to_bytes()))?;
+        self.conn
+            .execute("DELETE FROM settings WHERE key=?1", params![key])?;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1091,4 +1292,10 @@ pub struct BackupEntry {
 
 fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
+}
+
+fn remove_db_files(path: &str) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let _ = std::fs::remove_file(format!("{path}{suffix}"));
+    }
 }

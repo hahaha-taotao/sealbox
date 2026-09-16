@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   api,
   type AuditEvent,
@@ -8,13 +9,14 @@ import {
   type EntryKind,
   type FolderDto,
   type ListFilter,
+  type McpStatus,
   type SecretPayload,
   type Status,
   type UpsertEntry,
 } from "./lib/tauri";
 
 const status = ref<Status | null>(null);
-type Page = "home" | "vault" | "audit" | "settings" | "mcp";
+type Page = "home" | "vault" | "audit" | "settings" | "mcp" | "plugin";
 const page = ref<Page>("vault");
 const history = ref<Page[]>(["vault"]);
 const historyIndex = ref(0);
@@ -67,6 +69,22 @@ const form = reactive({
   engine: "mysql",
   db_name: "",
 });
+const generatorOpen = ref(false);
+const generatorBusy = ref(false);
+const generator = reactive({
+  mode: "password" as "password" | "passphrase",
+  length: 20,
+  upper: true,
+  lower: true,
+  digits: true,
+  symbols: true,
+  ensureEach: true,
+  wordCount: 4,
+  separator: "-",
+});
+const generatorNoClasses = computed(
+  () => generator.mode === "password" && !generator.upper && !generator.lower && !generator.digits && !generator.symbols,
+);
 const reveal = ref<SecretPayload | null>(null);
 const revealFor = ref<string | null>(null);
 const backupOpen = ref(false);
@@ -80,6 +98,7 @@ const crumb = computed(() => {
   if (page.value === "audit") return "审计";
   if (page.value === "settings") return "设置";
   if (page.value === "mcp") return "MCP";
+  if (page.value === "plugin") return "插件";
   if (filter.trash) return "回收站";
   if (filter.kind === "website") return "网站账号";
   if (filter.kind === "api_token") return "API Token";
@@ -106,6 +125,21 @@ function kindLabel(k: EntryKind) {
     case "database": return "数据库";
   }
 }
+const KIND_ITEMS: { id: EntryKind; label: string }[] = [
+  { id: "website", label: "网站账号" },
+  { id: "api_token", label: "API Token" },
+  { id: "ssh", label: "SSH" },
+  { id: "mailbox", label: "邮箱" },
+  { id: "mail_auth", label: "邮箱授权码" },
+  { id: "server", label: "服务器" },
+  { id: "database", label: "数据库" },
+];
+function kindCount(k: EntryKind) {
+  return status.value?.counts?.[k] ?? 0;
+}
+const allFilterActive = computed(
+  () => !filter.kind && !filter.trash && !filter.folder_id && !filter.uncategorized && !filter.tag,
+);
 const DB_ENGINES: { id: string; label: string; port: number }[] = [
   { id: "mysql", label: "MySQL / MariaDB", port: 3306 },
   { id: "postgres", label: "PostgreSQL", port: 5432 },
@@ -127,9 +161,66 @@ function showToast(msg: string) {
   toast.value = msg;
   setTimeout(() => (toast.value = ""), 1800);
 }
+const REVEAL_HIDE_MS = 20_000;
+let revealTimer: ReturnType<typeof setTimeout> | null = null;
 function hideSecret() {
   reveal.value = null;
   revealFor.value = null;
+  if (revealTimer) {
+    clearTimeout(revealTimer);
+    revealTimer = null;
+  }
+}
+function scheduleRevealHide() {
+  if (revealTimer) clearTimeout(revealTimer);
+  revealTimer = setTimeout(hideSecret, REVEAL_HIDE_MS);
+}
+function resetGenerator() {
+  Object.assign(generator, {
+    mode: "password",
+    length: 20,
+    upper: true,
+    lower: true,
+    digits: true,
+    symbols: true,
+    ensureEach: true,
+    wordCount: 4,
+    separator: "-",
+  });
+  generatorOpen.value = false;
+  generatorBusy.value = false;
+}
+function resetFormFields() {
+  resetGenerator();
+  Object.assign(form, {
+    kind: "website" as EntryKind,
+    title: "",
+    account: "",
+    url: "",
+    folder_id: "",
+    tags: "",
+    notes: "",
+    pinned: false,
+    expires_at: "",
+    password: "",
+    token: "",
+    service: "github",
+    private_key: "",
+    totp: "",
+    key_type: "ed25519",
+    email: "",
+    imap_host: "",
+    imap_port: 993,
+    smtp_host: "",
+    smtp_port: 465,
+    provider: "qq",
+    auth_code: "",
+    host: "",
+    port: 22,
+    protocol: "ssh",
+    engine: "mysql",
+    db_name: "",
+  });
 }
 function fmtTime(s: string | null) {
   if (!s) return "—";
@@ -182,11 +273,6 @@ async function doHello() {
     error.value = String(e);
   }
 }
-async function doLock() {
-  await api.lock();
-  entries.value = [];
-  await refreshStatus();
-}
 async function openAudit() {
   goPage("audit");
   audit.value = await api.audit();
@@ -202,53 +288,206 @@ async function doEmptyTrash() {
   await refreshVault();
 }
 
-const mcp = ref<{ running: boolean; port: number; token: string; url: string; fill_token: string; fill_url: string } | null>(null);
-const mcpSnippet = computed(() => {
-  if (!mcp.value?.token) return "";
-  return `{
-  "mcpServers": {
-    "sealbox": {
-      "url": "${mcp.value.url}",
-      "headers": {
-        "Authorization": "Bearer ${mcp.value.token}"
-      }
-    }
-  }
-}`;
-});
+const mcp = ref<McpStatus | null>(null);
+const pairing = ref<{ active: boolean; code: string | null; expires_in_secs: number; port: number } | null>(null);
+const pairingError = ref("");
+const pairingBusy = ref(false);
+const revealedFillToken = ref("");
+const revealedMcpToken = ref("");
+const revealedMcpSnippet = ref("");
+const httpLogs = ref<
+  {
+    id: string;
+    at: string;
+    credential_id: string;
+    method: string;
+    url: string;
+    status: number;
+    bytes: number;
+    sha256: string;
+    body: string;
+  }[]
+>([]);
+const openHttpLog = ref<string | null>(null);
+const mcpTools = ref<{ name: string; description: string }[]>([]);
+let pairingTimer: ReturnType<typeof setInterval> | null = null;
+function hideBridgeTokens() {
+  revealedFillToken.value = "";
+  revealedMcpToken.value = "";
+  revealedMcpSnippet.value = "";
+}
 async function refreshMcp() {
+  hideBridgeTokens();
   mcp.value = await api.mcpStatus();
+  try {
+    mcpTools.value = await api.mcpTools();
+  } catch {
+    mcpTools.value = [];
+  }
+  try {
+    httpLogs.value = await api.mcpHttpLogs();
+  } catch {
+    httpLogs.value = [];
+  }
 }
 async function startMcp() {
+  hideBridgeTokens();
   mcp.value = await api.mcpStart();
   showToast("MCP 已在本机启动");
 }
 async function stopMcp() {
+  hideBridgeTokens();
   mcp.value = await api.mcpStop();
   showToast("MCP 已停止");
 }
 async function rotateMcp() {
   if (!confirm("轮换 Token 后，Cursor / Claude Code 里的旧配置会失效，确定？")) return;
+  hideBridgeTokens();
   mcp.value = await api.mcpRotate();
   showToast("已轮换 Token");
 }
 async function copyMcpSnippet() {
-  await navigator.clipboard.writeText(mcpSnippet.value);
-  showToast("配置已复制");
+  try {
+    await api.copyMcpSnippet();
+    showToast("配置已复制，将按剪贴板超时清空");
+  } catch (e) {
+    showToast(String(e));
+  }
 }
 async function copyFillToken() {
-  if (!mcp.value?.fill_token) return;
-  await navigator.clipboard.writeText(mcp.value.fill_token);
-  showToast("填表 Token 已复制");
+  try {
+    await api.copyFillToken();
+    showToast("填表 Token 已复制，将按剪贴板超时清空");
+  } catch (e) {
+    showToast(String(e));
+  }
+}
+async function copyMcpToken() {
+  try {
+    await api.copyMcpToken();
+    showToast("MCP Token 已复制，将按剪贴板超时清空");
+  } catch (e) {
+    showToast(String(e));
+  }
+}
+async function toggleMcpToken() {
+  if (revealedMcpToken.value) {
+    revealedMcpToken.value = "";
+    revealedMcpSnippet.value = "";
+    return;
+  }
+  try {
+    revealedMcpToken.value = await api.revealMcpToken();
+    revealedMcpSnippet.value = `{
+  "mcpServers": {
+    "sealbox": {
+      "url": "${mcp.value?.url || ""}",
+      "headers": {
+        "Authorization": "Bearer ${revealedMcpToken.value}"
+      }
+    }
+  }
+}`;
+  } catch (e) {
+    showToast(String(e));
+  }
+}
+async function toggleFillToken() {
+  if (revealedFillToken.value) {
+    revealedFillToken.value = "";
+    return;
+  }
+  try {
+    revealedFillToken.value = await api.revealFillToken();
+  } catch (e) {
+    showToast(String(e));
+  }
 }
 async function rotateFill() {
-  if (!confirm("轮换填表 Token 后，浏览器插件里的旧 Token 会失效，确定？")) return;
+  if (!confirm("轮换填表 Token 后，已配对的浏览器插件会失效，需要重新输入配对码。确定？")) return;
+  hideBridgeTokens();
   mcp.value = await api.fillRotate();
   showToast("已轮换填表 Token");
+}
+function stopPairingTimer() {
+  if (pairingTimer) {
+    clearInterval(pairingTimer);
+    pairingTimer = null;
+  }
+}
+function pairingLabel(code: string | null | undefined) {
+  const raw = String(code || "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+  if (raw.length < 4) return raw;
+  return `${raw.slice(0, 4)} ${raw.slice(4)}`;
+}
+async function refreshPairing() {
+  try {
+    const next = await api.fillPairingStatus();
+    if (next?.active && next.code) {
+      pairing.value = next;
+      pairingError.value = "";
+      return;
+    }
+    pairing.value = null;
+    stopPairingTimer();
+  } catch {
+    stopPairingTimer();
+  }
+}
+async function openFillPairing() {
+  if (pairingBusy.value) return;
+  pairingBusy.value = true;
+  pairingError.value = "";
+  try {
+    const next = await api.fillOpenPairing();
+    const code = String(next?.code || "").trim();
+    if (!code) {
+      pairingError.value = "未能打开配对窗口，请确认金库已解锁，并重新启动一次 Sealbox。";
+      showToast(pairingError.value);
+      return;
+    }
+    pairing.value = {
+      active: true,
+      code,
+      expires_in_secs: Number(next.expires_in_secs) || 60,
+      port: next.port,
+    };
+    showToast("配对码已生成");
+    stopPairingTimer();
+    const openedAt = Date.now();
+    const total = pairing.value.expires_in_secs;
+    pairingTimer = setInterval(() => {
+      const left = Math.max(0, total - Math.floor((Date.now() - openedAt) / 1000));
+      if (left <= 0) {
+        pairing.value = null;
+        stopPairingTimer();
+        return;
+      }
+      if (pairing.value) pairing.value = { ...pairing.value, expires_in_secs: left, active: true };
+    }, 250);
+    await nextTick();
+    document.getElementById("pairing-code-box")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  } catch (e) {
+    pairing.value = null;
+    pairingError.value = String(e);
+    showToast(pairingError.value);
+  } finally {
+    pairingBusy.value = false;
+  }
+}
+async function copyPairingCode() {
+  if (!pairing.value?.code) return;
+  await navigator.clipboard.writeText(pairing.value.code);
+  showToast("配对码已复制");
 }
 async function openMcp() {
   goPage("mcp");
   await refreshMcp();
+}
+async function openPlugin() {
+  goPage("plugin");
+  await refreshMcp();
+  await refreshPairing();
 }
 
 function goPage(next: Page) {
@@ -290,40 +529,18 @@ function setFilter(partial: Partial<ListFilter>) {
   refreshVault();
 }
 
+function closeForm() {
+  showForm.value = false;
+  editing.value = null;
+  resetFormFields();
+}
 function openCreate() {
   editing.value = null;
-  Object.assign(form, {
-    kind: "website",
-    title: "",
-    account: "",
-    url: "",
-    folder_id: "",
-    tags: "",
-    notes: "",
-    pinned: false,
-    expires_at: "",
-    password: "",
-    token: "",
-    service: "github",
-    private_key: "",
-    totp: "",
-    key_type: "ed25519",
-    email: "",
-    imap_host: "",
-    imap_port: 993,
-    smtp_host: "",
-    smtp_port: 465,
-    provider: "qq",
-    auth_code: "",
-    host: "",
-    port: 22,
-    protocol: "ssh",
-    engine: "mysql",
-    db_name: "",
-  });
+  resetFormFields();
   showForm.value = true;
 }
 async function openEdit(row: EntryDto) {
+  resetGenerator();
   editing.value = row;
   const secret = await api.reveal(row.id);
   const notes = await api.notes(row.id);
@@ -453,7 +670,7 @@ async function saveEntry() {
     secret: buildSecret(),
   };
   await api.create(input);
-  showForm.value = false;
+  closeForm();
   showToast("已保存");
   await refreshVault();
 }
@@ -470,6 +687,7 @@ async function revealRow(row: EntryDto) {
   }
   reveal.value = await api.reveal(row.id);
   revealFor.value = row.id;
+  scheduleRevealHide();
 }
 async function remove(ids: string[]) {
   if (!confirm("移入回收站？")) return;
@@ -482,7 +700,28 @@ async function restore(ids: string[]) {
   await refreshVault();
 }
 async function gen() {
-  form.password = await api.genPassword({ length: 20, upper: true, lower: true, digits: true, symbols: true });
+  if (generatorBusy.value) return;
+  generator.length = Math.round(Math.min(128, Math.max(8, Number(generator.length) || 20)));
+  generator.wordCount = Math.round(Math.min(8, Math.max(3, Number(generator.wordCount) || 4)));
+  generator.separator = generator.separator || "-";
+  generatorBusy.value = true;
+  try {
+    form.password = await api.genPassword({
+      mode: generator.mode,
+      length: generator.length,
+      upper: generator.upper,
+      lower: generator.lower,
+      digits: generator.digits,
+      symbols: generator.symbols,
+      ensureEach: generator.ensureEach,
+      wordCount: generator.wordCount,
+      separator: generator.separator,
+    });
+  } catch (e) {
+    showToast(`生成失败：${String(e)}`);
+  } finally {
+    generatorBusy.value = false;
+  }
 }
 async function newFolder() {
   const name = prompt("文件夹名称");
@@ -500,6 +739,9 @@ async function runBackup() {
       await api.exportBackup(backupPassword.value, backupPath.value);
       showToast("已导出备份");
     } else {
+      if (backupOverwrite.value && !confirm("覆盖导入会替换同 id 的现有条目，且无法撤销。确定继续？")) {
+        return;
+      }
       const [n, skip] = await api.importBackup(backupPassword.value, backupPath.value, backupOverwrite.value);
       showToast(`导入 ${n} 条，跳过 ${skip} 条`);
       await refreshVault();
@@ -518,6 +760,47 @@ const newMaster = ref("");
 const newMaster2 = ref("");
 const recent = ref<EntryDto[]>([]);
 const expiring = ref<EntryDto[]>([]);
+
+function hideVisibleSecrets() {
+  hideSecret();
+  closeForm();
+  hideBridgeTokens();
+}
+
+function clearSecrets() {
+  hideVisibleSecrets();
+  closeForm();
+  backupPassword.value = "";
+  pairing.value = null;
+  pairingError.value = "";
+  stopPairingTimer();
+  httpLogs.value = [];
+  openHttpLog.value = null;
+  oldMaster.value = "";
+  newMaster.value = "";
+  newMaster2.value = "";
+}
+
+function applyLockedUi() {
+  clearSecrets();
+  backupOpen.value = false;
+  entries.value = [];
+  audit.value = [];
+  recent.value = [];
+  expiring.value = [];
+  selected.value = new Set();
+  mcp.value = null;
+}
+
+async function doLock() {
+  applyLockedUi();
+  try {
+    await api.lock();
+  } catch {
+    /* already locked from tray / idle */
+  }
+  await refreshStatus();
+}
 
 async function loadSettings() {
   const s = await api.settingsGet();
@@ -587,23 +870,35 @@ function onKey(e: KeyboardEvent) {
   }
 }
 
+function onVisibility() {
+  if (document.visibilityState === "hidden") hideVisibleSecrets();
+}
+
 onMounted(async () => {
   await refreshStatus();
   if (status.value?.unlocked) await refreshVault();
   await loadSettings();
   window.addEventListener("keydown", onKey);
+  document.addEventListener("visibilitychange", onVisibility);
+  const unFocus = await getCurrentWindow().onFocusChanged((event) => {
+    if (!event.payload) hideVisibleSecrets();
+  });
   const unTick = await listen("tick", async () => {
     const locked = await api.tick();
     if (locked) {
-      entries.value = [];
+      applyLockedUi();
       await refreshStatus();
     }
   });
   const unLock = await listen("lock-now", () => doLock());
   onUnmounted(() => {
+    applyLockedUi();
     window.removeEventListener("keydown", onKey);
+    document.removeEventListener("visibilitychange", onVisibility);
+    unFocus();
     unTick();
     unLock();
+    stopPairingTimer();
   });
 });
 </script>
@@ -695,6 +990,17 @@ onMounted(async () => {
           </span>
           <span>MCP</span>
         </button>
+        <button class="rail-btn" :class="{ active: page === 'plugin' }" @click="openPlugin">
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 2v6" />
+              <path d="M8 8h8" />
+              <rect x="4" y="8" width="16" height="12" rx="2" />
+              <path d="M8 14h.01M12 14h.01M16 14h.01" />
+            </svg>
+          </span>
+          <span>插件</span>
+        </button>
         <div class="spacer" />
         <button class="rail-btn" :class="{ active: page === 'settings' }" @click="goPage('settings')">
           <span class="icon" aria-hidden="true">
@@ -742,52 +1048,79 @@ onMounted(async () => {
 
       <section class="main" v-else-if="page === 'vault'">
         <aside class="sidebar">
-          <div class="side-label">分类</div>
-          <button class="side-item" :class="{ active: !filter.kind && !filter.trash && !filter.folder_id && !filter.uncategorized && !filter.tag }" @click="setFilter({})">
-            <span>全部凭据</span><span class="count">{{ status.counts?.total }}</span>
-          </button>
-          <div class="side-label">类型</div>
-          <button class="side-item" :class="{ active: filter.kind === 'api_token' }" @click="setFilter({ kind: 'api_token' })">
-            <span>API Token</span><span class="count">{{ status.counts?.api_token }}</span>
-          </button>
-          <button class="side-item" :class="{ active: filter.kind === 'website' }" @click="setFilter({ kind: 'website' })">
-            <span>网站账号</span><span class="count">{{ status.counts?.website }}</span>
-          </button>
-          <button class="side-item" :class="{ active: filter.kind === 'ssh' }" @click="setFilter({ kind: 'ssh' })">
-            <span>SSH</span><span class="count">{{ status.counts?.ssh }}</span>
-          </button>
-          <button class="side-item" :class="{ active: filter.kind === 'mailbox' }" @click="setFilter({ kind: 'mailbox' })">
-            <span>邮箱</span><span class="count">{{ status.counts?.mailbox }}</span>
-          </button>
-          <button class="side-item" :class="{ active: filter.kind === 'mail_auth' }" @click="setFilter({ kind: 'mail_auth' })">
-            <span>邮箱授权码</span><span class="count">{{ status.counts?.mail_auth }}</span>
-          </button>
-          <button class="side-item" :class="{ active: filter.kind === 'server' }" @click="setFilter({ kind: 'server' })">
-            <span>服务器</span><span class="count">{{ status.counts?.server }}</span>
-          </button>
-          <button class="side-item" :class="{ active: filter.kind === 'database' }" @click="setFilter({ kind: 'database' })">
-            <span>数据库</span><span class="count">{{ status.counts?.database }}</span>
-          </button>
-          <div class="side-label" v-if="tags.length">标签</div>
-          <button class="side-item" v-for="t in tags" :key="t" :class="{ active: filter.tag === t }" @click="setFilter({ tag: t })">{{ t }}</button>
-          <div class="side-label">文件夹 <a href="#" @click.prevent="newFolder">新建</a></div>
-          <button class="side-item" :class="{ active: filter.uncategorized }" @click="setFilter({ uncategorized: true })">未归类</button>
-          <button class="side-item" v-for="f in folders" :key="f.id" :class="{ active: filter.folder_id === f.id }" @click="setFilter({ folder_id: f.id })">{{ f.name }}</button>
-          <div class="side-label">其他</div>
-          <button class="side-item" :class="{ active: filter.trash }" @click="setFilter({ trash: true })">
-            回收站<span class="count">{{ status.counts?.trash }}</span>
-          </button>
-          <button class="side-item" @click="backupMode = 'export'; backupOpen = true">备份 / 还原</button>
+          <div class="side-nav">
+            <button class="side-item" :class="{ active: allFilterActive }" type="button" @click="setFilter({})">
+              <span>全部凭据</span><span class="count">{{ status.counts?.total ?? 0 }}</span>
+            </button>
+          </div>
+          <div class="side-scroll">
+            <div class="side-section">
+              <div class="side-label">类型</div>
+              <button
+                class="side-item"
+                v-for="item in KIND_ITEMS"
+                :key="item.id"
+                type="button"
+                :class="{ active: filter.kind === item.id }"
+                :title="item.label"
+                @click="setFilter({ kind: item.id })"
+              >
+                <span>{{ item.label }}</span><span class="count">{{ kindCount(item.id) }}</span>
+              </button>
+            </div>
+            <div class="side-section" v-if="tags.length">
+              <div class="side-label">标签</div>
+              <button
+                class="side-item"
+                v-for="t in tags"
+                :key="t"
+                type="button"
+                :class="{ active: filter.tag === t }"
+                :title="t"
+                @click="setFilter({ tag: t })"
+              >
+                <span>{{ t }}</span>
+              </button>
+            </div>
+            <div class="side-section">
+              <div class="side-label">
+                <span>文件夹</span>
+                <button class="side-link" type="button" @click="newFolder">新建</button>
+              </div>
+              <button class="side-item" type="button" :class="{ active: filter.uncategorized }" @click="setFilter({ uncategorized: true })">
+                <span>未归类</span>
+              </button>
+              <button
+                class="side-item"
+                v-for="f in folders"
+                :key="f.id"
+                type="button"
+                :class="{ active: filter.folder_id === f.id }"
+                :title="f.name"
+                @click="setFilter({ folder_id: f.id })"
+              >
+                <span>{{ f.name }}</span>
+              </button>
+            </div>
+          </div>
+          <div class="side-foot">
+            <button class="side-item" type="button" :class="{ active: filter.trash }" @click="setFilter({ trash: true })">
+              <span>回收站</span><span class="count">{{ status.counts?.trash ?? 0 }}</span>
+            </button>
+            <button class="side-item" type="button" @click="backupMode = 'export'; backupOpen = true">
+              <span>备份 / 还原</span>
+            </button>
+          </div>
         </aside>
-        <div class="content">
+        <div class="content vault-content">
           <div class="toolbar">
             <input class="search" v-model="filter.query" placeholder="搜索键名 / 账号 / 网址… (Ctrl+F)" @keyup.enter="refreshVault" />
-            <select class="btn" v-model="filter.sort" @change="refreshVault">
+            <select class="select" v-model="filter.sort" @change="refreshVault">
               <option value="use_count">使用次数</option>
               <option value="updated">修改时间</option>
               <option value="title">键名</option>
             </select>
-            <button class="btn primary" @click="openCreate">+ 新建凭据</button>
+            <button class="btn primary" type="button" @click="openCreate">新建凭据</button>
           </div>
           <div class="toolbar" v-if="selected.size">
             <button class="btn danger" @click="remove([...selected])">移入回收站 ({{ selected.size }})</button>
@@ -806,9 +1139,24 @@ onMounted(async () => {
                 <tr v-for="row in entries" :key="row.id">
                   <td><input type="checkbox" :checked="selected.has(row.id)" @change="selected.has(row.id) ? selected.delete(row.id) : selected.add(row.id)" /></td>
                   <td>
-                    <span class="letter" :style="{ background: letterColor(row.title) }">{{ row.title.slice(0,1).toUpperCase() }}</span>
-                    {{ row.title }}
-                    <button v-if="!filter.trash" class="pin" :class="{ on: row.pinned }" @click="togglePin(row)">{{ row.pinned ? "📌" : "📍" }}</button>
+                    <div class="title-cell">
+                      <span class="letter" :style="{ background: letterColor(row.title) }">{{ row.title.slice(0,1).toUpperCase() }}</span>
+                      <span class="title-text" :title="row.title">{{ row.title }}</span>
+                      <button
+                        v-if="!filter.trash"
+                        class="icon-btn pin"
+                        type="button"
+                        :class="{ on: row.pinned }"
+                        :title="row.pinned ? '取消置顶' : '置顶'"
+                        :aria-label="row.pinned ? '取消置顶' : '置顶'"
+                        @click="togglePin(row)"
+                      >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                          <path d="M12 17v5" />
+                          <path d="M9 3h6l-1 7h3l-5 6-5-6h3z" />
+                        </svg>
+                      </button>
+                    </div>
                   </td>
                   <td>
                     {{ row.account || row.fingerprint || "—" }}
@@ -824,25 +1172,25 @@ onMounted(async () => {
                   <td>{{ row.use_count }}</td>
                   <td>{{ row.expires_at ? fmtTime(row.expires_at) : "永不" }}</td>
                   <td class="row-actions">
-                    <button type="button" title="复制密码" aria-label="复制密码" @click="copy(row.id)">
+                    <button class="icon-btn" type="button" title="复制密码" aria-label="复制密码" @click="copy(row.id)">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <rect x="9" y="9" width="13" height="13" rx="2" />
                         <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
                       </svg>
                     </button>
-                    <button type="button" title="复制账号" aria-label="复制账号" @click="copy(row.id, 'account')">
+                    <button class="icon-btn" type="button" title="复制账号" aria-label="复制账号" @click="copy(row.id, 'account')">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
                         <circle cx="12" cy="7" r="4" />
                       </svg>
                     </button>
-                    <button v-if="row.has_totp" type="button" title="复制 TOTP" aria-label="复制 TOTP" @click="copy(row.id, 'totp')">
+                    <button v-if="row.has_totp" class="icon-btn" type="button" title="复制 TOTP" aria-label="复制 TOTP" @click="copy(row.id, 'totp')">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <circle cx="12" cy="12" r="10" />
                         <polyline points="12 6 12 12 16 14" />
                       </svg>
                     </button>
-                    <button v-if="filter.trash" type="button" title="还原" aria-label="还原" @click="restore([row.id])">
+                    <button v-if="filter.trash" class="icon-btn" type="button" title="还原" aria-label="还原" @click="restore([row.id])">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
                         <path d="M3 3v5h5" />
@@ -850,6 +1198,7 @@ onMounted(async () => {
                     </button>
                     <button
                       v-else
+                      class="icon-btn"
                       type="button"
                       :class="{ on: revealFor === row.id }"
                       :title="revealFor === row.id ? '隐藏' : '显示'"
@@ -868,13 +1217,13 @@ onMounted(async () => {
                         <circle cx="12" cy="12" r="3" />
                       </svg>
                     </button>
-                    <button v-if="!filter.trash" type="button" title="编辑" aria-label="编辑" @click="openEdit(row)">
+                    <button v-if="!filter.trash" class="icon-btn" type="button" title="编辑" aria-label="编辑" @click="openEdit(row)">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <path d="M12 20h9" />
                         <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z" />
                       </svg>
                     </button>
-                    <button v-if="!filter.trash" type="button" class="danger" title="移入回收站" aria-label="移入回收站" @click="remove([row.id])">
+                    <button v-if="!filter.trash" class="icon-btn danger" type="button" title="移入回收站" aria-label="移入回收站" @click="remove([row.id])">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <polyline points="3 6 5 6 21 6" />
                         <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
@@ -893,38 +1242,122 @@ onMounted(async () => {
       </section>
 
       <section class="main" v-else-if="page === 'mcp'">
-        <div class="content" style="max-width:640px">
-          <h2>MCP 接入</h2>
-          <p class="crumb">仅监听 127.0.0.1。模型只能看到凭据名称，发 HTTP 时由本机代签并脱敏。</p>
-          <p>状态：{{ mcp?.running ? "运行中" : "已停止" }}　端口：{{ mcp?.port || "—" }}</p>
-          <div style="display:flex;gap:8px;margin:12px 0">
-            <button class="btn primary" v-if="!mcp?.running" @click="startMcp">启动</button>
-            <button class="btn" v-else @click="stopMcp">停止</button>
-            <button class="btn" @click="rotateMcp">轮换 Token</button>
-          </div>
-          <div class="field"><label>Bearer Token</label>
-            <input :value="mcp?.token || ''" readonly />
-          </div>
-          <div class="field"><label>Cursor / Claude Code 配置片段</label>
-            <textarea rows="12" readonly :value="mcpSnippet"></textarea>
-          </div>
-          <button class="btn" @click="copyMcpSnippet">复制配置</button>
-          <h3 style="margin-top:28px">浏览器插件</h3>
-          <p class="crumb">Chrome / Edge：打开 chrome://extensions → 加载已解压的扩展程序 → 选择仓库里的 extension 目录。解锁金库后，插件会自动配对，不必填写 Token。</p>
-          <div class="field"><label>填表 Token（备用，一般不用复制）</label>
-            <div style="display:flex;gap:8px">
-              <input :value="mcp?.fill_token || ''" readonly style="flex:1" />
-              <button class="btn" @click="copyFillToken">复制</button>
-              <button class="btn" @click="rotateFill">轮换</button>
+        <div class="content content-page mcp-page">
+          <div class="mcp-head">
+            <div>
+              <h2>MCP 接入</h2>
+            </div>
+            <div class="mcp-status">
+              <span class="mcp-dot" :class="{ on: mcp?.running }" />
+              <span>{{ mcp?.running ? "运行中" : "已停止" }} · {{ mcp?.port || "—" }}</span>
+              <button class="btn primary" v-if="!mcp?.running" type="button" @click="startMcp">启动</button>
+              <button class="btn" v-else type="button" @click="stopMcp">停止</button>
+              <button class="btn" type="button" @click="rotateMcp">轮换 MCP Token</button>
             </div>
           </div>
-          <p class="crumb">接口：{{ mcp?.fill_url || "http://127.0.0.1:17891/fill" }}。应用启动后自动监听本机端口。</p>
-          <p class="crumb" style="margin-top:16px">MCP 工具：list_credentials、http_request、copy_secret。金库锁定时工具会失败并提示先解锁。</p>
+          <div class="mcp-card">
+            <h3>Cursor / Claude Code</h3>
+            <p class="crumb">金库锁定时工具会失败并提示先解锁。</p>
+            <div class="field">
+              <label>Bearer Token</label>
+              <div class="secret-row">
+                <input :value="revealedMcpToken || '••••••••'" readonly />
+                <button class="btn" type="button" :disabled="!mcp?.has_token" @click="toggleMcpToken">{{ revealedMcpToken ? "隐藏" : "显示" }}</button>
+                <button class="btn" type="button" :disabled="!mcp?.has_token" @click="copyMcpToken">复制</button>
+              </div>
+            </div>
+            <div class="field">
+              <label>配置片段</label>
+              <textarea class="mcp-snippet" rows="10" readonly :value="revealedMcpSnippet || '显示 Token 后才会填入配置片段。复制走后端剪贴板超时。'"></textarea>
+            </div>
+            <button class="btn" type="button" :disabled="!mcp?.has_token" @click="copyMcpSnippet">复制配置</button>
+          </div>
+          <div class="mcp-card">
+            <h3>工具列表</h3>
+            <p class="crumb">当前 MCP 对模型暴露的工具，与 tools/list 一致。</p>
+            <div class="tool-list" v-if="mcpTools.length">
+              <div class="tool-item" v-for="tool in mcpTools" :key="tool.name">
+                <code class="tool-name">{{ tool.name }}</code>
+                <p class="crumb">{{ tool.description }}</p>
+              </div>
+            </div>
+            <p class="crumb" v-else>还没有读到工具定义。</p>
+          </div>
+          <div class="mcp-card mcp-logs">
+            <h3>http_request 响应</h3>
+            <p class="crumb">完整正文只在这里查看，锁定金库后清空。模型侧只有状态码、长度和 SHA256。</p>
+            <button class="btn" style="margin:8px 0 12px" type="button" @click="refreshMcp">刷新日志</button>
+            <div class="table" v-if="httpLogs.length">
+              <table>
+                <thead><tr><th>时间</th><th>方法</th><th>状态</th><th>网址</th><th></th></tr></thead>
+                <tbody>
+                  <tr v-for="log in httpLogs" :key="log.id">
+                    <td>{{ fmtTime(log.at) }}</td>
+                    <td>{{ log.method }}</td>
+                    <td>{{ log.status }} / {{ log.bytes }} B</td>
+                    <td>{{ log.url }}</td>
+                    <td><button class="btn" type="button" @click="openHttpLog = openHttpLog === log.id ? null : log.id">{{ openHttpLog === log.id ? "收起" : "查看" }}</button></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="crumb" v-else>还没有代发记录。</p>
+            <div class="field" v-if="httpLogs.find((l) => l.id === openHttpLog)">
+              <label>sha256 {{ httpLogs.find((l) => l.id === openHttpLog)?.sha256 }}</label>
+              <textarea rows="10" readonly :value="httpLogs.find((l) => l.id === openHttpLog)?.body || ''"></textarea>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="main" v-else-if="page === 'plugin'">
+        <div class="content content-page mcp-page">
+          <div class="mcp-head">
+            <div>
+              <h2>插件</h2>
+              <p class="crumb">Chrome / Edge 浏览器扩展。配对码一次性有效，填表 Token 与 MCP Token 分开。读取明文和写入条目都会按当前页面网址复核。</p>
+            </div>
+          </div>
+          <div class="mcp-card" style="max-width:640px">
+            <h3>浏览器扩展</h3>
+            <p class="crumb">打开 <code>chrome://extensions</code>（Edge：<code>edge://extensions</code>），打开开发者模式，加载已解压的扩展，选择仓库里的 <code>extension</code> 目录。点配对后，60 秒内把一次性配对码填进扩展。</p>
+            <div class="mcp-actions">
+              <button class="btn primary" type="button" :disabled="pairingBusy" @click="openFillPairing">{{ pairingBusy ? "正在打开…" : "配对" }}</button>
+              <button class="btn" type="button" @click="rotateFill">轮换填表 Token</button>
+            </div>
+            <p class="error" v-if="pairingError">{{ pairingError }}</p>
+            <div id="pairing-code-box" class="pairing-box" v-if="pairing?.active && pairing.code">
+              <div class="pairing-meta">
+                <span>一次性配对码</span>
+                <span>{{ pairing.expires_in_secs }} 秒后失效</span>
+              </div>
+              <div class="pairing-code-row">
+                <div class="pairing-code" aria-label="配对码">{{ pairingLabel(pairing.code) }}</div>
+                <button class="icon-btn" type="button" title="复制配对码" aria-label="复制配对码" @click="copyPairingCode">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="9" y="9" width="13" height="13" rx="2" />
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                  </svg>
+                </button>
+              </div>
+              <p class="crumb" style="margin:8px 0 0;text-align:center">用过即作废。过期后会自动消失。</p>
+            </div>
+            <p class="crumb" v-else>当前没有开放的配对窗口。</p>
+            <div class="field">
+              <label>填表 Token</label>
+              <div class="secret-row">
+                <input :value="revealedFillToken || '••••••••'" readonly />
+                <button class="btn" type="button" :disabled="!mcp?.has_fill_token" @click="toggleFillToken">{{ revealedFillToken ? "隐藏" : "显示" }}</button>
+                <button class="btn" type="button" :disabled="!mcp?.has_fill_token" @click="copyFillToken">复制</button>
+              </div>
+            </div>
+            <p class="crumb">{{ mcp?.fill_url || "http://127.0.0.1:17891/fill" }} · 只接受 Host 为 127.0.0.1 的本机请求</p>
+          </div>
         </div>
       </section>
 
       <section class="main" v-else-if="page === 'audit'">
-        <div class="content">
+        <div class="content content-page">
           <h2>审计</h2>
           <div class="table">
             <table>
@@ -942,28 +1375,71 @@ onMounted(async () => {
       </section>
 
       <section class="main" v-else>
-        <div class="content" style="max-width:480px">
-          <h2>设置</h2>
-          <div class="field"><label>空闲锁定（分钟）</label><input type="number" v-model.number="settingsIdle" /></div>
-          <div class="field"><label>剪贴板清空（秒）</label><input type="number" v-model.number="settingsClip" /></div>
-          <div class="field"><label>全局热键</label><input v-model="settingsHotkey" placeholder="Ctrl+Shift+Space" /></div>
-          <button class="btn primary" @click="saveSettings">保存</button>
-          <div class="field" style="margin-top:24px">
-            <label>Windows Hello</label>
-            <button class="btn" @click="api.setHello(true).then(() => showToast('已开启'))">开启</button>
-            <button class="btn" @click="api.setHello(false).then(() => showToast('已关闭'))">关闭</button>
+        <div class="content content-page settings-page">
+          <div class="mcp-head">
+            <div>
+              <h2>设置</h2>
+              <p class="crumb">关闭窗口进入托盘。全局热键即使窗口不在前台也能打开速查。</p>
+            </div>
           </div>
-          <h3 style="margin-top:28px">修改主密码</h3>
-          <div class="field"><label>当前主密码</label><input v-model="oldMaster" type="password" /></div>
-          <div class="field"><label>新主密码</label><input v-model="newMaster" type="password" /></div>
-          <div class="field"><label>确认新主密码</label><input v-model="newMaster2" type="password" /></div>
-          <button class="btn" @click="doChangeMaster">更新主密码</button>
-          <p class="crumb" style="margin-top:16px">关闭窗口进入托盘。全局热键默认 Ctrl+Shift+Space，即使窗口不在前台也能打开速查。</p>
+          <div class="settings-grid">
+            <div class="mcp-card">
+              <h3>锁定与快捷键</h3>
+              <p class="crumb">空闲超时后自动锁库；复制秘密后按设定秒数清空剪贴板。</p>
+              <div class="settings-fields">
+                <div class="field">
+                  <label>空闲锁定（分钟）</label>
+                  <input type="number" min="1" v-model.number="settingsIdle" />
+                </div>
+                <div class="field">
+                  <label>剪贴板清空（秒）</label>
+                  <input type="number" min="5" max="120" v-model.number="settingsClip" />
+                </div>
+                <div class="field settings-span">
+                  <label>全局热键</label>
+                  <input v-model="settingsHotkey" placeholder="Ctrl+Shift+Space" />
+                </div>
+              </div>
+              <button class="btn primary" type="button" @click="saveSettings">保存</button>
+            </div>
+            <div class="mcp-card">
+              <h3>Windows Hello</h3>
+              <p class="crumb">用本机生物识别作为第二把钥匙。备份文件仍只能用主密码解开。</p>
+              <p class="hello-status">
+                <span class="mcp-dot" :class="{ on: status.hello_enabled }" />
+                <span v-if="!status.hello_available">当前设备不可用</span>
+                <span v-else-if="status.hello_enabled">已开启</span>
+                <span v-else>未开启</span>
+              </p>
+              <div class="mcp-actions">
+                <button class="btn primary" type="button" :disabled="!status.hello_available" @click="api.setHello(true).then(() => { showToast('已开启'); refreshStatus(); })">开启</button>
+                <button class="btn" type="button" @click="api.setHello(false).then(() => { showToast('已关闭'); refreshStatus(); })">关闭</button>
+              </div>
+            </div>
+          </div>
+          <div class="mcp-card settings-master">
+            <h3>修改主密码</h3>
+            <p class="crumb">至少 10 位。更新后，旧主密码立刻失效。</p>
+            <div class="settings-fields">
+              <div class="field">
+                <label>当前主密码</label>
+                <input v-model="oldMaster" type="password" />
+              </div>
+              <div class="field">
+                <label>新主密码</label>
+                <input v-model="newMaster" type="password" />
+              </div>
+              <div class="field">
+                <label>确认新主密码</label>
+                <input v-model="newMaster2" type="password" @keyup.enter="doChangeMaster" />
+              </div>
+            </div>
+            <button class="btn primary" type="button" @click="doChangeMaster">更新主密码</button>
+          </div>
         </div>
       </section>
-    </div>
 
-    <div class="dialog-mask" v-if="showForm" @click.self="showForm = false">
+      <div class="dialog-mask" v-if="showForm" @click.self="closeForm">
       <div class="dialog">
         <h3>{{ editing ? "编辑凭据" : "新建凭据" }}</h3>
         <div class="field"><label>类型</label>
@@ -980,10 +1456,49 @@ onMounted(async () => {
         <div class="field"><label>键名</label><input v-model="form.title" /></div>
         <div class="field" v-if="form.kind !== 'ssh' && form.kind !== 'mailbox' && form.kind !== 'mail_auth'"><label>{{ form.kind === 'server' || form.kind === 'database' ? '用户名' : '账号' }}</label><input v-model="form.account" /></div>
         <div class="field" v-if="form.kind === 'website'"><label>网址</label><input v-model="form.url" /></div>
-        <div class="field" v-if="form.kind === 'website' || form.kind === 'mailbox' || form.kind === 'server' || form.kind === 'database'"><label>密码</label>
-          <div style="display:flex;gap:8px">
-            <input v-model="form.password" type="password" style="flex:1" />
-            <button class="btn" @click="gen">生成</button>
+        <div class="field" v-if="form.kind === 'website' || form.kind === 'mailbox' || form.kind === 'server' || form.kind === 'database'">
+          <label>密码</label>
+          <div class="secret-row generator-row">
+            <input v-model="form.password" type="password" />
+            <button class="btn" type="button" :disabled="generatorBusy" @click="gen">{{ generatorBusy ? '生成中…' : '生成' }}</button>
+            <button class="btn generator-toggle" type="button" :aria-expanded="generatorOpen" @click="generatorOpen = !generatorOpen">
+              {{ generatorOpen ? '收起选项' : '选项' }}
+            </button>
+          </div>
+          <div v-if="generatorOpen" class="generator-panel">
+            <div class="generator-head">
+              <strong>生成器选项</strong>
+              <span class="crumb">生成结果会覆盖当前密码</span>
+            </div>
+            <div class="generator-mode">
+              <label class="check"><input v-model="generator.mode" type="radio" value="password" /> 随机密码</label>
+              <label class="check"><input v-model="generator.mode" type="radio" value="passphrase" /> 口令短语</label>
+            </div>
+            <div v-if="generator.mode === 'password'" class="generator-options">
+              <div class="field generator-length">
+                <label for="generator-length">长度</label>
+                <input id="generator-length" v-model.number="generator.length" type="number" min="8" max="128" />
+              </div>
+              <div class="generator-checks">
+                <label class="check"><input v-model="generator.lower" type="checkbox" /> 小写字母</label>
+                <label class="check"><input v-model="generator.upper" type="checkbox" /> 大写字母</label>
+                <label class="check"><input v-model="generator.digits" type="checkbox" /> 数字</label>
+                <label class="check"><input v-model="generator.symbols" type="checkbox" /> 符号</label>
+                <label class="check generator-check-wide"><input v-model="generator.ensureEach" type="checkbox" /> 每类字符至少一个</label>
+              </div>
+              <p v-if="generatorNoClasses" class="generator-hint">未选择字符类别，将使用字母和数字作为安全回退。</p>
+            </div>
+            <div v-else class="generator-options">
+              <div class="field generator-length">
+                <label for="generator-word-count">词数</label>
+                <input id="generator-word-count" v-model.number="generator.wordCount" type="number" min="3" max="8" />
+              </div>
+              <div class="field generator-separator">
+                <label for="generator-separator">分隔符</label>
+                <input id="generator-separator" v-model="generator.separator" maxlength="8" placeholder="-" />
+              </div>
+              <p class="generator-hint">使用内置英文词表生成易读的随机口令短语。</p>
+            </div>
           </div>
         </div>
         <div class="field" v-if="form.kind === 'website'"><label>TOTP 密钥（可选）</label><input v-model="form.totp" /></div>
@@ -994,6 +1509,9 @@ onMounted(async () => {
             <option value="gitlab">GitLab</option>
             <option value="custom">自定义</option>
           </select>
+        </div>
+        <div class="field" v-if="form.kind === 'api_token'"><label>允许的网址（自定义服务必填）</label>
+          <input v-model="form.url" placeholder="https://api.example.com" />
         </div>
         <div class="field" v-if="form.kind === 'api_token'"><label>Token</label><input v-model="form.token" /></div>
         <div class="field" v-if="form.kind === 'ssh'"><label>密钥类型</label><input v-model="form.key_type" /></div>
@@ -1040,15 +1558,15 @@ onMounted(async () => {
         </div>
         <div class="field"><label>标签（逗号分隔）</label><input v-model="form.tags" /></div>
         <div class="field"><label>过期日期（可空）</label><input v-model="form.expires_at" type="date" /></div>
-        <div class="field"><label><input type="checkbox" v-model="form.pinned" /> 置顶</label></div>
         <div class="field"><label>备注</label><textarea v-model="form.notes" rows="3" /></div>
         <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
-          <button class="btn" @click="showForm = false">取消</button>
+          <button class="btn" @click="closeForm">取消</button>
           <button class="btn primary" @click="saveEntry">保存</button>
         </div>
       </div>
     </div>
-    <div class="dialog-mask" v-if="backupOpen" @click.self="backupOpen = false">
+    </div>
+    <div class="dialog-mask" v-if="backupOpen && status && (status.unlocked || !status.initialized)" @click.self="backupOpen = false">
       <div class="dialog">
         <h3>备份 / 还原</h3>
         <div class="field">
@@ -1066,7 +1584,11 @@ onMounted(async () => {
         </div>
         <div class="field"><label>主密码</label><input v-model="backupPassword" type="password" /></div>
         <div class="field" v-if="backupMode === 'import'">
-          <label><input type="checkbox" v-model="backupOverwrite" /> 覆盖已有同 id 条目</label>
+          <label class="check">
+            <input type="checkbox" v-model="backupOverwrite" />
+            覆盖已有同 id 条目
+          </label>
+          <p class="crumb" v-if="backupOverwrite" style="margin:6px 0 0 23px">会替换本地同 id 条目。确定时还会再确认一次。</p>
         </div>
         <div style="display:flex;gap:8px;justify-content:flex-end">
           <button class="btn" @click="backupOpen = false">取消</button>

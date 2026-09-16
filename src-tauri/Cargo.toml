@@ -46,5 +46,7 @@ windows = { version = "0.58", features = [
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+# Unwind so Drop (DEK zeroize) and the panic hook can still run. abort
+# skipped Session::drop and left the process dead with the key in RAM.
+panic = "unwind"
 strip = true

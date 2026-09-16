@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -9,6 +9,19 @@ pub enum DbError {
 
 pub fn open(path: &str) -> Result<Connection, DbError> {
     let conn = Connection::open(path)?;
+    prepare(conn)
+}
+
+/// Open an existing database file. Unlike [`open`], this never creates a new file.
+pub fn open_existing(path: &str) -> Result<Connection, DbError> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags(path, flags)?;
+    prepare(conn)
+}
+
+fn prepare(conn: Connection) -> Result<Connection, DbError> {
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;
          PRAGMA journal_mode = WAL;",

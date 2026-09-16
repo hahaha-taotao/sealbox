@@ -11,6 +11,12 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub const ARGON_M_COST: u32 = 19_456;
 pub const ARGON_T_COST: u32 = 2;
 pub const ARGON_P_COST: u32 = 1;
+pub const ARGON_IMPORT_M_COST_MIN: u32 = 19_456;
+pub const ARGON_IMPORT_M_COST_MAX: u32 = 65_536;
+pub const ARGON_IMPORT_T_COST_MIN: u32 = ARGON_T_COST;
+pub const ARGON_IMPORT_T_COST_MAX: u32 = 8;
+pub const ARGON_IMPORT_P_COST_MIN: u32 = ARGON_P_COST;
+pub const ARGON_IMPORT_P_COST_MAX: u32 = 4;
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
 
@@ -22,6 +28,8 @@ pub enum CryptoError {
     Decrypt,
     #[error("key derivation failed")]
     Kdf,
+    #[error("KDF parameters out of range")]
+    KdfOutOfRange,
     #[error("wrapped key has invalid length")]
     BadKeyLength,
     #[error("ciphertext too short")]
@@ -72,6 +80,19 @@ impl Default for ArgonParams {
             m_cost: ARGON_M_COST,
             t_cost: ARGON_T_COST,
             p_cost: ARGON_P_COST,
+        }
+    }
+}
+
+impl ArgonParams {
+    pub fn validate_import_bounds(&self) -> Result<(), CryptoError> {
+        if (ARGON_IMPORT_M_COST_MIN..=ARGON_IMPORT_M_COST_MAX).contains(&self.m_cost)
+            && (ARGON_IMPORT_T_COST_MIN..=ARGON_IMPORT_T_COST_MAX).contains(&self.t_cost)
+            && (ARGON_IMPORT_P_COST_MIN..=ARGON_IMPORT_P_COST_MAX).contains(&self.p_cost)
+        {
+            Ok(())
+        } else {
+            Err(CryptoError::KdfOutOfRange)
         }
     }
 }

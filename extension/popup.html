@@ -6,15 +6,29 @@
   </head>
   <body>
     <h1>Sealbox</h1>
-    <p id="status">正在自动连接本机金库…</p>
+    <p id="status">正在连接本机金库…</p>
+    <div id="pair-box">
+      <input id="code" placeholder="一次性配对码" autocomplete="off" />
+      <button id="pair">配对</button>
+    </div>
+    <p class="hint">先在 Sealbox「插件」页点「配对」，60 秒内把配对码填到这里。配对不依赖当前网页。</p>
+    <div id="pending" hidden></div>
     <div id="matches"></div>
+    <button id="fill-now" class="ghost" type="button">填充当前页（Alt+Shift+F）</button>
     <hr />
     <h2>登记当前站点</h2>
+    <p class="hint">打开弹窗时会读取当前页已填的账号密码，确认后再点登记。</p>
     <input id="title" placeholder="名称" />
-    <input id="username" placeholder="账号" />
-    <input id="password" type="password" placeholder="密码" />
+    <input id="username" placeholder="账号" autocomplete="off" />
+    <input id="password" type="password" placeholder="密码" autocomplete="off" />
+    <input id="notes" placeholder="备注（可选）" autocomplete="off" />
     <button id="save">一键登记到金库</button>
-    <p class="hint">只要 Sealbox 已解锁，插件会自动配对，不必填写 Token。</p>
+    <p id="save-msg" class="msg" hidden></p>
+    <hr />
+    <h2>排除站点</h2>
+    <p class="hint">每行一个域名，支持 *.corp.example。这些站点不弹出填充条，也不询问保存。</p>
+    <textarea id="exclude" rows="4" placeholder="每行一个，例如 intranet.example.com"></textarea>
+    <p id="settings-msg" class="msg" hidden></p>
     <script src="popup.js"></script>
   </body>
 </html>

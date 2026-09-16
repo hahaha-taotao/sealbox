@@ -1,7 +1,9 @@
 use chrono::{Duration, Utc};
+use sealbox_lib::db;
 use sealbox_lib::vault::{
-    EntryKind, ListFilter, SecretPayload, SortBy, UpsertEntry, Vault,
+    EntryKind, ListFilter, SecretPayload, SortBy, UpsertEntry, Vault, VaultError,
 };
+use std::path::PathBuf;
 
 fn sample_website(title: &str, notes: Option<&str>) -> UpsertEntry {
     UpsertEntry {
@@ -24,12 +26,65 @@ fn sample_website(title: &str, notes: Option<&str>) -> UpsertEntry {
     }
 }
 
+fn temp_db_path() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "sealbox-open-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join("vault.db")
+}
+
 #[test]
 fn create_and_unlock() {
     let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
     let dek2 = vault.unlock("correct horse battery staple extra").unwrap();
     assert_eq!(dek, dek2);
     assert!(vault.unlock("wrong password extra").is_err());
+}
+
+#[test]
+fn open_missing_file_returns_not_initialized_without_creating() {
+    let path = temp_db_path();
+    assert!(!path.exists());
+    match Vault::open(path.to_str().unwrap()) {
+        Err(VaultError::NotInitialized) => {}
+        Ok(_) => panic!("expected NotInitialized, open succeeded"),
+        Err(e) => panic!("expected NotInitialized, got {e}"),
+    }
+    assert!(
+        db::open_existing(path.to_str().unwrap()).is_err(),
+        "open_existing must not create a database"
+    );
+    assert!(
+        !path.exists(),
+        "unlock/open must not create an empty vault.db"
+    );
+    assert!(!Vault::is_initialized(path.to_str().unwrap()));
+}
+
+#[test]
+fn empty_sqlite_leftover_is_not_initialized_and_can_be_replaced() {
+    let path = temp_db_path();
+    db::open(path.to_str().unwrap()).unwrap();
+    assert!(path.exists());
+    assert!(
+        !Vault::is_initialized(path.to_str().unwrap()),
+        "schema-only leftover must not count as an initialized vault"
+    );
+
+    let dek = Vault::create(path.to_str().unwrap(), "correct horse battery staple extra")
+        .expect("setup must be able to replace an uninitialized leftover");
+    let vault = Vault::open(path.to_str().unwrap()).unwrap();
+    assert_eq!(
+        vault.unlock("correct horse battery staple extra").unwrap(),
+        dek
+    );
+    assert!(Vault::is_initialized(path.to_str().unwrap()));
 }
 
 #[test]
@@ -75,7 +130,9 @@ fn list_dto_has_no_password_and_search_skips_notes() {
 #[test]
 fn three_kinds_roundtrip_and_trash() {
     let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
-    let web = vault.upsert_entry(&dek, sample_website("jira", None)).unwrap();
+    let web = vault
+        .upsert_entry(&dek, sample_website("jira", None))
+        .unwrap();
     let token = vault
         .upsert_entry(
             &dek,
@@ -123,6 +180,29 @@ fn three_kinds_roundtrip_and_trash() {
             },
         )
         .unwrap();
+    let custom = vault
+        .upsert_entry(
+            &dek,
+            UpsertEntry {
+                id: None,
+                kind: EntryKind::ApiToken,
+                title: "internal-api".into(),
+                account: Some("bot".into()),
+                url: Some("https://api.example.com".into()),
+                folder_id: None,
+                tags: vec![],
+                pinned: false,
+                expires_at: None,
+                notes: None,
+                secret: SecretPayload::ApiToken {
+                    service: "custom".into(),
+                    account: Some("bot".into()),
+                    token: "custom-token-value".into(),
+                },
+            },
+        )
+        .unwrap();
+    assert_eq!(custom.url.as_deref(), Some("https://api.example.com"));
     vault
         .upsert_entry(
             &dek,
@@ -224,13 +304,17 @@ fn three_kinds_roundtrip_and_trash() {
         _ => panic!("wrong kind"),
     }
     match vault.get_secret(&dek, &ssh.id).unwrap() {
-        SecretPayload::Ssh { public_fingerprint, .. } => {
+        SecretPayload::Ssh {
+            public_fingerprint, ..
+        } => {
             assert_eq!(public_fingerprint.as_deref(), Some("SHA256:abcd"));
         }
         _ => panic!("wrong kind"),
     }
     match vault.get_secret(&dek, &mail.id).unwrap() {
-        SecretPayload::Mailbox { email, password, .. } => {
+        SecretPayload::Mailbox {
+            email, password, ..
+        } => {
             assert_eq!(email, "me@example.com");
             assert_eq!(password, "mail-pass");
         }
@@ -242,11 +326,11 @@ fn three_kinds_roundtrip_and_trash() {
     assert!(!json.contains("auth-code-xyz"));
     assert!(!json.contains("server-pass"));
     assert!(!json.contains("db-pass-secret"));
-    assert_eq!(listed.len(), 7);
+    assert_eq!(listed.len(), 8);
 
     vault.soft_delete(&[web.id.clone()]).unwrap();
     let active = vault.list_entries(&ListFilter::default()).unwrap();
-    assert_eq!(active.len(), 6);
+    assert_eq!(active.len(), 7);
     let trash = vault
         .list_entries(&ListFilter {
             trash: true,
@@ -255,7 +339,7 @@ fn three_kinds_roundtrip_and_trash() {
         .unwrap();
     assert_eq!(trash.len(), 1);
     vault.restore(&[web.id.clone()]).unwrap();
-    assert_eq!(vault.list_entries(&ListFilter::default()).unwrap().len(), 7);
+    assert_eq!(vault.list_entries(&ListFilter::default()).unwrap().len(), 8);
     vault.set_pinned(&web.id, true).unwrap();
     assert!(vault.list_entries(&ListFilter::default()).unwrap()[0].pinned);
     vault.soft_delete(&[web.id.clone()]).unwrap();
@@ -319,4 +403,33 @@ fn change_master_password() {
     assert!(vault.unlock("old password long enough").is_err());
     let dek2 = vault.unlock("new password long enough").unwrap();
     assert_eq!(dek, dek2);
+}
+
+#[test]
+fn secret_settings_encrypt_and_migrate_plaintext() {
+    let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+    vault.set_setting("mcp_token", "sbx_plain_legacy").unwrap();
+    let got = vault
+        .get_secret_setting(&dek, "mcp_token")
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, "sbx_plain_legacy");
+    assert!(vault.get_setting("mcp_token").unwrap().is_none());
+    let enc = vault.get_setting("mcp_token_enc").unwrap().unwrap();
+    assert!(!enc.contains("sbx_plain_legacy"));
+    vault
+        .set_secret_setting(&dek, "fill_token", "fill_0123456789abcdef0123456789abcdef")
+        .unwrap();
+    assert_eq!(
+        vault
+            .get_secret_setting(&dek, "fill_token")
+            .unwrap()
+            .as_deref(),
+        Some("fill_0123456789abcdef0123456789abcdef")
+    );
+    let wrong = [0u8; 32];
+    assert!(vault
+        .get_secret_setting(&wrong, "fill_token")
+        .unwrap()
+        .is_none());
 }

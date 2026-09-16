@@ -62,6 +62,15 @@ export interface Status {
   counts: Counts | null;
 }
 
+export interface McpStatus {
+  running: boolean;
+  port: number;
+  url: string;
+  fill_url: string;
+  has_token: boolean;
+  has_fill_token: boolean;
+}
+
 export type SecretPayload =
   | { type: "website"; url?: string | null; username?: string | null; password: string; totp_secret?: string | null }
   | { type: "api_token"; service: string; account?: string | null; token: string }
@@ -121,8 +130,17 @@ export const api = {
   reveal: (id: string) => invoke<SecretPayload>("reveal_secret", { id }),
   notes: (id: string) => invoke<string | null>("get_notes", { id }),
   tick: () => invoke<boolean>("tick_idle"),
-  genPassword: (opts: { length: number; upper: boolean; lower: boolean; digits: boolean; symbols: boolean }) =>
-    invoke<string>("gen_password", { opts }),
+  genPassword: (opts: {
+    mode?: "password" | "passphrase";
+    length?: number;
+    upper?: boolean;
+    lower?: boolean;
+    digits?: boolean;
+    symbols?: boolean;
+    ensureEach?: boolean;
+    wordCount?: number;
+    separator?: string;
+  }) => invoke<string>("gen_password", { opts }),
   exportBackup: (password: string, path: string) => invoke("export_backup", { password, path }),
   importBackup: (password: string, path: string, overwrite: boolean) =>
     invoke<[number, number]>("import_backup", { password, path, overwrite }),
@@ -135,14 +153,33 @@ export const api = {
   window: (action: string) => invoke("window_control", { action }),
   home: () =>
     invoke<{ counts: Counts; recent: EntryDto[]; expiring: EntryDto[] }>("home_overview"),
-  mcpStatus: () =>
-    invoke<{ running: boolean; port: number; token: string; url: string; fill_token: string; fill_url: string }>("mcp_status"),
-  mcpStart: () =>
-    invoke<{ running: boolean; port: number; token: string; url: string; fill_token: string; fill_url: string }>("mcp_start"),
-  mcpStop: () =>
-    invoke<{ running: boolean; port: number; token: string; url: string; fill_token: string; fill_url: string }>("mcp_stop"),
-  mcpRotate: () =>
-    invoke<{ running: boolean; port: number; token: string; url: string; fill_token: string; fill_url: string }>("mcp_rotate_token"),
-  fillRotate: () =>
-    invoke<{ running: boolean; port: number; token: string; url: string; fill_token: string; fill_url: string }>("fill_rotate_token"),
+  mcpStatus: () => invoke<McpStatus>("mcp_status"),
+  mcpStart: () => invoke<McpStatus>("mcp_start"),
+  mcpStop: () => invoke<McpStatus>("mcp_stop"),
+  mcpRotate: () => invoke<McpStatus>("mcp_rotate_token"),
+  fillRotate: () => invoke<McpStatus>("fill_rotate_token"),
+  revealMcpToken: () => invoke<string>("reveal_mcp_token"),
+  revealFillToken: () => invoke<string>("reveal_fill_token"),
+  copyMcpToken: () => invoke("copy_mcp_token"),
+  copyFillToken: () => invoke("copy_fill_token"),
+  copyMcpSnippet: () => invoke("copy_mcp_snippet"),
+  fillOpenPairing: () =>
+    invoke<{ active: boolean; code: string | null; expires_in_secs: number; port: number }>("fill_open_pairing"),
+  fillPairingStatus: () =>
+    invoke<{ active: boolean; code: string | null; expires_in_secs: number; port: number }>("fill_pairing_status"),
+  mcpTools: () => invoke<{ name: string; description: string }[]>("mcp_tools"),
+  mcpHttpLogs: () =>
+    invoke<
+      {
+        id: string;
+        at: string;
+        credential_id: string;
+        method: string;
+        url: string;
+        status: number;
+        bytes: number;
+        sha256: string;
+        body: string;
+      }[]
+    >("mcp_http_logs"),
 };
