@@ -101,6 +101,8 @@ pub struct EntryDto {
 pub struct ListFilter {
     pub query: Option<String>,
     pub kind: Option<EntryKind>,
+    #[serde(default)]
+    pub kinds: Vec<EntryKind>,
     pub folder_id: Option<String>,
     pub uncategorized: bool,
     pub tag: Option<String>,
@@ -113,12 +115,25 @@ impl Default for ListFilter {
         Self {
             query: None,
             kind: None,
+            kinds: Vec::new(),
             folder_id: None,
             uncategorized: false,
             tag: None,
             trash: false,
             sort: SortBy::UseCount,
         }
+    }
+}
+
+impl ListFilter {
+    pub fn selected_kinds(&self) -> Vec<EntryKind> {
+        let mut out = self.kinds.clone();
+        if let Some(kind) = &self.kind {
+            if !out.iter().any(|item| item == kind) {
+                out.push(kind.clone());
+            }
+        }
+        out
     }
 }
 
@@ -578,8 +593,13 @@ impl Vault {
         } else {
             sql.push_str("e.deleted_at IS NULL");
         }
-        if filter.kind.is_some() {
+        let kinds = filter.selected_kinds();
+        if kinds.len() == 1 {
             sql.push_str(" AND e.kind = ?");
+        } else if kinds.len() > 1 {
+            sql.push_str(" AND e.kind IN (");
+            sql.push_str(&vec!["?"; kinds.len()].join(","));
+            sql.push(')');
         }
         if filter.uncategorized {
             sql.push_str(" AND e.folder_id IS NULL");
@@ -613,8 +633,8 @@ impl Vault {
 
         let mut stmt = self.conn.prepare(&sql)?;
         let mut bind: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        if let Some(k) = &filter.kind {
-            bind.push(Box::new(k.as_str().to_string()));
+        for kind in &kinds {
+            bind.push(Box::new(kind.as_str().to_string()));
         }
         if let Some(fid) = &filter.folder_id {
             if !filter.uncategorized {

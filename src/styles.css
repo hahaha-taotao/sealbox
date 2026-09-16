@@ -312,6 +312,39 @@ button { cursor: pointer; }
   .generator-check-wide { grid-column: auto; }
   .generator-hint { grid-column: auto; }
 }
+.kind-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: -4px 0 12px;
+  flex-shrink: 0;
+}
+.kind-chip {
+  height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 0 8px 0 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.kind-chip:hover { background: #f4f5fb; }
+.kind-chip.active { font-weight: 600; }
+.kind-chip.website.active { background: #e8f8ee; border-color: #b7e4c7; color: var(--green); }
+.kind-chip.api_token.active { background: #eef0ff; border-color: #c7c9f5; color: var(--brand); }
+.kind-chip.ssh.active { background: #fff4e5; border-color: #f5c89a; color: #c2410c; }
+.kind-chip.mailbox.active { background: #e0f2fe; border-color: #9fd4f5; color: #0369a1; }
+.kind-chip.mail_auth.active { background: #fce7f3; border-color: #f3b4d0; color: #be185d; }
+.kind-chip.server.active { background: #ecfccb; border-color: #c4e38a; color: #3f6212; }
+.kind-chip.database.active { background: #f3e8ff; border-color: #d4b8f8; color: #7c3aed; }
+.kind-chip .count {
+  background: #f3f4f7;
+  color: var(--muted);
+}
+.kind-chip.active .count { background: rgba(255,255,255,.72); color: inherit; }
 .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-shrink: 0; }
 .search {
   flex: 1; height: 36px; border: 1px solid var(--line); border-radius: 8px; padding: 0 12px; background: var(--surface);

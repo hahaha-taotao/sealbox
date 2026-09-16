@@ -133,6 +133,7 @@ pub fn match_websites(session: &Mutex<Session>, page_url: &str) -> Result<Vec<Fi
         .list_entries(&ListFilter {
             query: None,
             kind: Some(EntryKind::Website),
+            kinds: vec![EntryKind::Website],
             folder_id: None,
             uncategorized: false,
             tag: None,
@@ -181,6 +182,7 @@ pub fn reveal_for_fill(
         .list_entries(&ListFilter {
             query: None,
             kind: Some(EntryKind::Website),
+            kinds: vec![EntryKind::Website],
             folder_id: None,
             uncategorized: false,
             tag: None,
@@ -242,6 +244,7 @@ pub fn save_from_browser_with_notes(
         .list_entries(&ListFilter {
             query: None,
             kind: Some(EntryKind::Website),
+            kinds: vec![EntryKind::Website],
             folder_id: None,
             uncategorized: false,
             tag: None,
@@ -761,6 +764,7 @@ mod tests {
                 .list_entries(&ListFilter {
                     query: None,
                     kind: Some(EntryKind::Website),
+                    kinds: vec![EntryKind::Website],
                     folder_id: None,
                     uncategorized: false,
                     tag: None,

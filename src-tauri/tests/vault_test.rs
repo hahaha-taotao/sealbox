@@ -106,6 +106,7 @@ fn list_dto_has_no_password_and_search_skips_notes() {
         .list_entries(&ListFilter {
             query: Some("jira".into()),
             kind: None,
+            kinds: Vec::new(),
             folder_id: None,
             uncategorized: false,
             tag: None,
@@ -392,6 +393,89 @@ fn list_filter_accepts_partial_json_from_quick_search() {
     let listed = vault.list_entries(&filter).unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].title, "跳板机");
+    assert!(filter.kinds.is_empty());
+}
+
+#[test]
+fn list_filter_kinds_and_folder_combine() {
+    let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+    let personal = vault.create_folder("个人").unwrap();
+    vault
+        .upsert_entry(
+            &dek,
+            UpsertEntry {
+                folder_id: Some(personal.id.clone()),
+                ..sample_website("个人网站", None)
+            },
+        )
+        .unwrap();
+    vault
+        .upsert_entry(
+            &dek,
+            UpsertEntry {
+                id: None,
+                kind: EntryKind::ApiToken,
+                title: "个人 Token".into(),
+                account: Some("bot".into()),
+                url: None,
+                folder_id: Some(personal.id.clone()),
+                tags: vec![],
+                pinned: false,
+                expires_at: None,
+                notes: None,
+                secret: SecretPayload::ApiToken {
+                    service: "github".into(),
+                    account: Some("bot".into()),
+                    token: "ghp_personal".into(),
+                },
+            },
+        )
+        .unwrap();
+    vault
+        .upsert_entry(
+            &dek,
+            UpsertEntry {
+                id: None,
+                kind: EntryKind::Ssh,
+                title: "未归类 SSH".into(),
+                account: Some("deploy".into()),
+                url: None,
+                folder_id: None,
+                tags: vec![],
+                pinned: false,
+                expires_at: None,
+                notes: None,
+                secret: SecretPayload::Ssh {
+                    key_type: "ed25519".into(),
+                    private_key: "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----"
+                        .into(),
+                    passphrase: None,
+                    public_fingerprint: Some("SHA256:abcd".into()),
+                },
+            },
+        )
+        .unwrap();
+
+    let mixed = vault
+        .list_entries(&ListFilter {
+            kinds: vec![EntryKind::Website, EntryKind::ApiToken],
+            folder_id: Some(personal.id.clone()),
+            ..ListFilter::default()
+        })
+        .unwrap();
+    let titles: Vec<_> = mixed.iter().map(|e| e.title.as_str()).collect();
+    assert_eq!(titles.len(), 2);
+    assert!(titles.contains(&"个人网站"));
+    assert!(titles.contains(&"个人 Token"));
+
+    let by_legacy_kind = vault
+        .list_entries(&ListFilter {
+            kind: Some(EntryKind::Ssh),
+            ..ListFilter::default()
+        })
+        .unwrap();
+    assert_eq!(by_legacy_kind.len(), 1);
+    assert_eq!(by_legacy_kind[0].title, "未归类 SSH");
 }
 
 #[test]

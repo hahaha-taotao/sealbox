@@ -22,6 +22,7 @@ export interface EntryDto {
 export interface ListFilter {
   query?: string | null;
   kind?: EntryKind | null;
+  kinds?: EntryKind[];
   folder_id?: string | null;
   uncategorized?: boolean;
   tag?: string | null;

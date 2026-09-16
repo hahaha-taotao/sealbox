@@ -53,6 +53,7 @@ async function refresh() {
     entries.value = await api.list({
       query: null,
       kind: null,
+      kinds: [],
       folder_id: null,
       uncategorized: false,
       tag: null,

@@ -358,7 +358,8 @@ fn call_tool(
             let list = vault
                 .list_entries(&ListFilter {
                     query,
-                    kind,
+                    kind: kind.clone(),
+                    kinds: kind.into_iter().collect(),
                     folder_id: None,
                     uncategorized: false,
                     tag: None,

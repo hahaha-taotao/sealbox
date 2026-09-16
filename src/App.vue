@@ -32,6 +32,7 @@ const selected = ref<Set<string>>(new Set());
 const filter = reactive<ListFilter>({
   query: "",
   kind: null,
+  kinds: [],
   folder_id: null,
   uncategorized: false,
   tag: null,
@@ -93,6 +94,20 @@ const backupPath = ref("");
 const backupPassword = ref("");
 const backupOverwrite = ref(false);
 
+const KIND_ITEMS: { id: EntryKind; label: string }[] = [
+  { id: "website", label: "网站账号" },
+  { id: "api_token", label: "API Token" },
+  { id: "ssh", label: "SSH" },
+  { id: "mailbox", label: "邮箱" },
+  { id: "mail_auth", label: "邮箱授权码" },
+  { id: "server", label: "服务器" },
+  { id: "database", label: "数据库" },
+];
+const selectedKindIds = computed(() => {
+  const ids = [...(filter.kinds ?? [])];
+  if (filter.kind && !ids.includes(filter.kind)) ids.push(filter.kind);
+  return ids;
+});
 const crumb = computed(() => {
   if (page.value === "home") return "首页";
   if (page.value === "audit") return "审计";
@@ -100,13 +115,11 @@ const crumb = computed(() => {
   if (page.value === "mcp") return "MCP";
   if (page.value === "plugin") return "插件";
   if (filter.trash) return "回收站";
-  if (filter.kind === "website") return "网站账号";
-  if (filter.kind === "api_token") return "API Token";
-  if (filter.kind === "ssh") return "SSH";
-  if (filter.kind === "mailbox") return "邮箱";
-  if (filter.kind === "mail_auth") return "邮箱授权码";
-  if (filter.kind === "server") return "服务器";
-  if (filter.kind === "database") return "数据库";
+  const selectedKinds = selectedKindIds.value;
+  if (selectedKinds.length === 1) {
+    return KIND_ITEMS.find((item) => item.id === selectedKinds[0])?.label ?? "全部凭据";
+  }
+  if (selectedKinds.length > 1) return `已选 ${selectedKinds.length} 种类型`;
   return "全部凭据";
 });
 
@@ -125,20 +138,11 @@ function kindLabel(k: EntryKind) {
     case "database": return "数据库";
   }
 }
-const KIND_ITEMS: { id: EntryKind; label: string }[] = [
-  { id: "website", label: "网站账号" },
-  { id: "api_token", label: "API Token" },
-  { id: "ssh", label: "SSH" },
-  { id: "mailbox", label: "邮箱" },
-  { id: "mail_auth", label: "邮箱授权码" },
-  { id: "server", label: "服务器" },
-  { id: "database", label: "数据库" },
-];
 function kindCount(k: EntryKind) {
   return status.value?.counts?.[k] ?? 0;
 }
 const allFilterActive = computed(
-  () => !filter.kind && !filter.trash && !filter.folder_id && !filter.uncategorized && !filter.tag,
+  () => !filter.trash && !filter.folder_id && !filter.uncategorized && !filter.tag,
 );
 const DB_ENGINES: { id: string; label: string; port: number }[] = [
   { id: "mysql", label: "MySQL / MariaDB", port: 3306 },
@@ -231,7 +235,13 @@ async function refreshStatus() {
   status.value = await api.status();
 }
 async function refreshVault() {
-  entries.value = await api.list({ ...filter, query: filter.query || null });
+  const kinds = selectedKindIds.value;
+  entries.value = await api.list({
+    ...filter,
+    query: filter.query || null,
+    kinds,
+    kind: kinds.length === 1 ? kinds[0] : null,
+  });
   folders.value = await api.folders();
   tags.value = await api.tags();
   status.value = await api.status();
@@ -519,7 +529,6 @@ const passwordHint = computed(() => {
 
 function setFilter(partial: Partial<ListFilter>) {
   Object.assign(filter, {
-    kind: null,
     folder_id: null,
     uncategorized: false,
     tag: null,
@@ -527,6 +536,20 @@ function setFilter(partial: Partial<ListFilter>) {
     ...partial,
   });
   refreshVault();
+}
+
+function toggleKind(kind: EntryKind) {
+  const next = new Set(selectedKindIds.value);
+  if (next.has(kind)) next.delete(kind);
+  else next.add(kind);
+  const kinds = KIND_ITEMS.map((item) => item.id).filter((id) => next.has(id));
+  filter.kinds = kinds;
+  filter.kind = kinds.length === 1 ? kinds[0] : null;
+  refreshVault();
+}
+
+function isKindSelected(kind: EntryKind) {
+  return selectedKindIds.value.includes(kind);
 }
 
 function closeForm() {
@@ -1054,20 +1077,6 @@ onMounted(async () => {
             </button>
           </div>
           <div class="side-scroll">
-            <div class="side-section">
-              <div class="side-label">类型</div>
-              <button
-                class="side-item"
-                v-for="item in KIND_ITEMS"
-                :key="item.id"
-                type="button"
-                :class="{ active: filter.kind === item.id }"
-                :title="item.label"
-                @click="setFilter({ kind: item.id })"
-              >
-                <span>{{ item.label }}</span><span class="count">{{ kindCount(item.id) }}</span>
-              </button>
-            </div>
             <div class="side-section" v-if="tags.length">
               <div class="side-label">标签</div>
               <button
@@ -1121,6 +1130,20 @@ onMounted(async () => {
               <option value="title">键名</option>
             </select>
             <button class="btn primary" type="button" @click="openCreate">新建凭据</button>
+          </div>
+          <div class="kind-filters" role="group" aria-label="按类型筛选">
+            <button
+              class="kind-chip"
+              v-for="item in KIND_ITEMS"
+              :key="item.id"
+              type="button"
+              :class="[item.id, { active: isKindSelected(item.id) }]"
+              :aria-pressed="isKindSelected(item.id)"
+              @click="toggleKind(item.id)"
+            >
+              <span>{{ item.label }}</span>
+              <span class="count">{{ kindCount(item.id) }}</span>
+            </button>
           </div>
           <div class="toolbar" v-if="selected.size">
             <button class="btn danger" @click="remove([...selected])">移入回收站 ({{ selected.size }})</button>
