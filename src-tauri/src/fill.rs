@@ -25,11 +25,11 @@ pub struct FillSecret {
 }
 
 pub fn host_of(url: &str) -> Option<String> {
-    origin_of(url).map(|(host, _port)| host)
+    origin_of(url).map(|(_scheme, host, _port)| host)
 }
 
-/// Host without leading www, plus explicit or default port.
-fn origin_of(url: &str) -> Option<(String, u16)> {
+/// Scheme, host without leading www, and explicit or default port.
+fn origin_of(url: &str) -> Option<(String, String, u16)> {
     let u = url.trim();
     if u.is_empty() {
         return None;
@@ -67,7 +67,7 @@ fn origin_of(url: &str) -> Option<(String, u16)> {
     if host.is_empty() || host == "localhost" || !host.contains('.') {
         None
     } else {
-        Some((host.to_string(), port))
+        Some((scheme.to_string(), host.to_string(), port))
     }
 }
 
@@ -92,13 +92,6 @@ fn path_of(url: &str) -> String {
     p
 }
 
-fn path_matches(page_path: &str, stored_path: &str) -> bool {
-    if stored_path == "/" {
-        return true;
-    }
-    page_path == stored_path || page_path.starts_with(&format!("{stored_path}/"))
-}
-
 fn score_url(page_url: &str, stored_url: &str) -> i32 {
     let Some(page) = origin_of(page_url) else {
         return 0;
@@ -111,13 +104,15 @@ fn score_url(page_url: &str, stored_url: &str) -> i32 {
     }
     let page_path = path_of(page_url);
     let stored_path = path_of(stored_url);
-    if !path_matches(&page_path, &stored_path) {
-        return 0;
-    }
-    if stored_path == "/" {
-        70
-    } else {
+    if page_path == stored_path {
         100
+    } else if stored_path != "/"
+        && (page_path.starts_with(&format!("{stored_path}/"))
+            || stored_path.starts_with(&format!("{page_path}/")))
+    {
+        90
+    } else {
+        70
     }
 }
 
@@ -626,12 +621,11 @@ mod tests {
             0
         );
         assert_eq!(score_url("https://example.com", "https://other.net"), 0);
-        assert_eq!(
+        assert!(
             score_url(
                 "https://heat.example.com/billing/login",
                 "https://heat.example.com/iam"
-            ),
-            0
+            ) > 0
         );
         assert!(
             score_url(
@@ -639,6 +633,28 @@ mod tests {
                 "https://heat.example.com/iam"
             ) >= 90
         );
+        assert!(
+            score_url(
+                "https://csm.hhughg.com:8280/#",
+                "https://csm.hhughg.com:8280/sof_login.jsp"
+            ) > 0
+        );
+        assert_eq!(
+            score_url(
+                "https://csm.hhughg.com:8280/",
+                "http://csm.hhughg.com:8280/"
+            ),
+            0
+        );
+        let login_score = score_url(
+            "https://csm.hhughg.com:8280/sof_login.jsp",
+            "https://csm.hhughg.com:8280/sof_login.jsp",
+        );
+        let root_score = score_url(
+            "https://csm.hhughg.com:8280/#",
+            "https://csm.hhughg.com:8280/sof_login.jsp",
+        );
+        assert!(login_score > root_score);
         assert_eq!(host_of("iam"), None);
         assert_eq!(score_url("https://foo.iam.com/x", "iam"), 0);
     }
@@ -693,38 +709,41 @@ mod tests {
             .as_bytes(),
         );
         assert_eq!(mismatch.unwrap_err().0, 403);
-        let other_id = save_from_browser(
+        let login_id = save_from_browser(
+            &mutex,
+            "客服",
+            "https://csm.hhughg.com:8280/sof_login.jsp",
+            "18698459937",
+            "login-pass",
+        )
+        .unwrap();
+        let hash_hits = match_websites(&mutex, "https://csm.hhughg.com:8280/#").unwrap();
+        assert!(hash_hits.iter().any(|m| m.id == login_id));
+        let updated = save_from_browser(
+            &mutex,
+            "客服",
+            "https://csm.hhughg.com:8280/#",
+            "18698459937",
+            "new-login-pass",
+        )
+        .unwrap();
+        assert_eq!(updated, login_id);
+        assert_eq!(
+            reveal_for_fill(&mutex, &login_id, "https://csm.hhughg.com:8280/#")
+                .unwrap()
+                .password,
+            "new-login-pass"
+        );
+        let other_host = save_from_browser(
             &mutex,
             "IAM",
-            "https://heat.example.com/iam",
-            "same-user",
+            "https://iam.hhughg.com:8381/login",
+            "18698459937",
             "iam-pass",
         )
         .unwrap();
-        let billing_id = save_from_browser(
-            &mutex,
-            "Billing",
-            "https://heat.example.com/billing/login",
-            "same-user",
-            "billing-pass",
-        )
-        .unwrap();
-        assert_ne!(other_id, billing_id);
-        let poisoned = save_from_browser(
-            &mutex,
-            "Billing",
-            "https://heat.example.com/billing/login",
-            "same-user",
-            "new-billing",
-        )
-        .unwrap();
-        assert_eq!(poisoned, billing_id);
-        assert!(
-            reveal_for_fill(&mutex, &other_id, "https://heat.example.com/iam")
-                .unwrap()
-                .password
-                == "iam-pass"
-        );
+        assert_ne!(other_host, login_id);
+        assert!(reveal_for_fill(&mutex, &other_host, "https://csm.hhughg.com:8280/#").is_err());
         assert!(save_from_browser(&mutex, "x", "not-a-url", "a", "b").is_err());
         let id = save_from_browser(&mutex, "New", "https://new.example", "a", "b").unwrap();
         assert!(!id.is_empty());

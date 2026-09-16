@@ -106,11 +106,13 @@ test("choiceLabel puts the username first and abbreviates a long auto title", ()
   );
 });
 
-test("sameSite matches host and port, ignoring www and path", () => {
+test("sameSite matches scheme, host and port, ignoring www and path", () => {
   assert.equal(fill.sameSite("https://www.github.com/login", "https://github.com/dashboard"), true);
   assert.equal(fill.sameSite("https://github.com:443/login", "https://github.com/"), true);
+  assert.equal(fill.sameSite("https://csm.hhughg.com:8280/#", "https://csm.hhughg.com:8280/sof_login.jsp"), true);
   assert.equal(fill.sameSite("https://login.github.com/", "https://github.com/"), false);
   assert.equal(fill.sameSite("https://csm.example.com:8280/", "https://csm.example.com:8281/"), false);
+  assert.equal(fill.sameSite("https://csm.example.com:8280/", "http://csm.example.com:8280/"), false);
 });
 
 test("isExcluded honors exact hosts and wildcard suffixes", () => {
@@ -312,6 +314,44 @@ test("pickReadFields prefers the frame that actually has login values", () => {
   ]);
   assert.equal(merged.username, "18698459937");
   assert.equal(merged.password, "secret");
+});
+
+test("fillTokenFromStores prefers session and drops any local leftover", () => {
+  assert.deepEqual(fill.fillTokenFromStores({ sessionToken: "s", localToken: "l" }), {
+    token: "s",
+    writeSession: false,
+    removeLocal: true,
+  });
+  assert.deepEqual(fill.fillTokenFromStores({ sessionToken: "", localToken: "l" }), {
+    token: "l",
+    writeSession: true,
+    removeLocal: true,
+  });
+  assert.deepEqual(fill.fillTokenFromStores({ sessionToken: "s", localToken: "" }), {
+    token: "s",
+    writeSession: false,
+    removeLocal: false,
+  });
+  assert.deepEqual(fill.fillTokenFromStores({}), {
+    token: "",
+    writeSession: false,
+    removeLocal: false,
+  });
+});
+
+test("fillTokenWritePlan never persists the token to local storage", () => {
+  assert.deepEqual(fill.fillTokenWritePlan("fill_abc"), {
+    token: "fill_abc",
+    writeSession: true,
+    removeLocal: true,
+  });
+});
+
+test("background.js never writes fillToken to chrome.storage.local", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(new URL("./background.js", import.meta.url), "utf8");
+  assert.equal(/storage\.local\.set\(\s*\{[^}]*fillToken/.test(src), false);
+  assert.match(src, /storage\.local\.remove\(\s*(?:\[\s*"fillToken"|"fillToken")/);
 });
 
 test("pickSaveUrl keeps the login-page url when the tab stayed on the same site", () => {

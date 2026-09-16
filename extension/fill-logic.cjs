@@ -20,7 +20,7 @@
       if (!host || host === "localhost" || !host.includes(".")) return null;
       const port = u.port ? Number(u.port) : u.protocol === "http:" ? 80 : 443;
       if (!Number.isFinite(port)) return null;
-      return { host, port };
+      return { scheme: u.protocol.replace(":", ""), host, port };
     } catch (_) {
       return null;
     }
@@ -29,7 +29,7 @@
   function sameSite(a, b) {
     const oa = originOf(a);
     const ob = originOf(b);
-    return Boolean(oa && ob && oa.host === ob.host && oa.port === ob.port);
+    return Boolean(oa && ob && oa.scheme === ob.scheme && oa.host === ob.host && oa.port === ob.port);
   }
 
   function parseExcludeHosts(text) {
@@ -295,6 +295,24 @@
     };
   }
 
+  function fillTokenFromStores({ sessionToken, localToken } = {}) {
+    const session = String(sessionToken || "");
+    const local = String(localToken || "");
+    return {
+      token: session || local,
+      writeSession: Boolean(!session && local),
+      removeLocal: Boolean(local),
+    };
+  }
+
+  function fillTokenWritePlan(fillToken) {
+    return {
+      token: String(fillToken || ""),
+      writeSession: true,
+      removeLocal: true,
+    };
+  }
+
   function pickReadFields(replies) {
     const list = (replies || []).filter(Boolean);
     if (!list.length) return { ok: false };
@@ -350,6 +368,8 @@
     nativeValue,
     pickLoginValues,
     pickReadFields,
+    fillTokenFromStores,
+    fillTokenWritePlan,
   };
 
   root.SealboxFill = api;

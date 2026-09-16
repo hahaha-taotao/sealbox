@@ -45,6 +45,20 @@ const Fill = globalThis.SealboxFill || {
       note: String(m.notes || "").replace(/\s+/g, " ").trim(),
     })),
   addHostLine: (text) => text || "",
+  fillTokenFromStores: ({ sessionToken, localToken } = {}) => {
+    const session = String(sessionToken || "");
+    const local = String(localToken || "");
+    return {
+      token: session || local,
+      writeSession: Boolean(!session && local),
+      removeLocal: Boolean(local),
+    };
+  },
+  fillTokenWritePlan: (fillToken) => ({
+    token: String(fillToken || ""),
+    writeSession: true,
+    removeLocal: true,
+  }),
 };
 const DEFAULT_PORT = 17891;
 
@@ -53,24 +67,55 @@ async function getPort() {
   return s.port || DEFAULT_PORT;
 }
 
-async function getFillToken() {
+async function readStoredFillToken(area) {
   try {
-    const session = await chrome.storage.session.get(["fillToken"]);
-    if (session.fillToken) return session.fillToken;
+    const stored = await chrome.storage[area].get(["fillToken"]);
+    return stored.fillToken || "";
   } catch (_) {
-    /* session storage unavailable */
+    return "";
   }
-  const local = await chrome.storage.local.get(["fillToken"]);
-  return local.fillToken || "";
+}
+
+async function applyFillTokenPlan(plan) {
+  if (plan.writeSession) {
+    try {
+      if (plan.token) await chrome.storage.session.set({ fillToken: plan.token });
+      else await chrome.storage.session.remove(["fillToken"]);
+    } catch (e) {
+      if (plan.removeLocal) {
+        try {
+          await chrome.storage.local.remove(["fillToken"]);
+        } catch (_) {
+          /* ignore */
+        }
+      }
+      throw e;
+    }
+  }
+  if (plan.removeLocal) {
+    try {
+      await chrome.storage.local.remove(["fillToken"]);
+    } catch (_) {
+      /* ignore */
+    }
+  }
+}
+
+async function getFillToken() {
+  const plan = Fill.fillTokenFromStores({
+    sessionToken: await readStoredFillToken("session"),
+    localToken: await readStoredFillToken("local"),
+  });
+  try {
+    await applyFillTokenPlan(plan);
+  } catch (_) {
+    /* session write failed; still return in-memory token for this worker */
+  }
+  return plan.token;
 }
 
 async function setFillToken(fillToken) {
-  await chrome.storage.local.set({ fillToken });
-  try {
-    await chrome.storage.session.set({ fillToken });
-  } catch (_) {
-    /* session storage unavailable */
-  }
+  await applyFillTokenPlan(Fill.fillTokenWritePlan(fillToken));
 }
 
 async function stored() {

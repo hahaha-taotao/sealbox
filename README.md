@@ -30,7 +30,7 @@ A local credential vault for Windows. Unlock with a master password (optional Wi
 | 锁定 Lock | 空闲超时、标题栏或托盘锁定都会丢掉 DEK、清已复制秘密、关掉编辑框和明文显示 |
 | 备份 Backup | `.svbak` 用导出密码加密；Windows Hello 解不开备份文件 |
 | 网络 Network | MCP / 填表只监听 `127.0.0.1`，默认端口 `17891`。`http_request` 只向凭据绑定 origin 注入 Authorization，并拒绝回环 / 内网 / 云元数据 |
-| 插件 Extension | 登录页右下角弹出填充条；一站点多账号可点选。`Alt+Shift+F` 也可打开选择器。填充条在 closed Shadow DOM 中，只响应真实用户点击，账号做掩码。提交后询问保存/更新，明文只暂存在 `chrome.storage.session`。扩展仅申请 `127.0.0.1` 主机权限；填表 Token 优先放 session |
+| 插件 Extension | 登录页右下角弹出填充条；一站点多账号可点选。`Alt+Shift+F` 也可打开选择器。填充条在 closed Shadow DOM 中，只响应真实用户点击，账号做掩码。提交后询问保存/更新，明文只暂存在 `chrome.storage.session`。扩展仅申请 `127.0.0.1` 主机权限；填表 Token 只放 session，启动时清掉 local 残留 |
 
 ## 环境 Requirements
 
@@ -77,11 +77,11 @@ The unpacked extension lives in `extension/`. After the app starts, fill APIs li
 3. 在 Sealbox 的 **插件** 页点 **配对**，60 秒内把一次性配对码填进扩展 / On the Plugin page click **Pair**, then enter the one-time code in the extension within 60 seconds.
 4. 打开登录页：检测到密码框后右下角会出现匹配账号，点选填充；也可按 `Alt+Shift+F`。卡片优先显示账号，过长标题会缩略；有备注时在账号后显示前几个字。打开插件弹窗时，「登记当前站点」会读当前页已填的账号密码，并可填写备注。登录提交后，若该站点还没有这个账号会询问保存；已有同一账号且密码变了会询问更新；密码没变则不弹。 / Open a login page: after a password field is detected, a bottom-right overlay lists matching accounts. `Alt+Shift+F` also opens the chooser. Buttons show the username first, abbreviate long titles, and append a short note when present. Opening the popup copies the page’s current username and password into the save form, with an optional note. After submit, Sealbox asks to save a new login, or update when the same account’s password changed. Unchanged passwords are not prompted.
 
-金库锁定时无法填充或登记。配对码一次性有效；填表 Token 存在 `chrome.storage.session`（关浏览器即失效），与 MCP Token 分开，可单独轮换。读取明文和写入条目都会按当前页面网址复核。提交后采集的账号密码只暂存在会话存储，确认保存才写入金库，拒绝或超时会清掉。填充选择器在 closed Shadow DOM 里，只响应真实用户点击，账号做掩码。扩展只申请访问 `127.0.0.1`。可在弹窗里配置站点排除列表。  
-Fill and save require an unlocked vault. Pairing codes are one-shot. The fill token lives in session storage (cleared when the browser quits) and is separate from the MCP token. Secret reveal and save are bound to the current page URL. Captured logins stay in session storage until you confirm save, then they are cleared. The chooser uses a closed Shadow DOM, requires a real user gesture, and masks usernames. The extension only requests host access to `127.0.0.1`. Sites can be excluded in the popup.
+金库锁定时无法填充或登记。配对码一次性有效；填表 Token 只存在 `chrome.storage.session`（关浏览器即失效），不写入 `chrome.storage.local`；升级后会把旧的 local 残留清掉。与 MCP Token 分开，可单独轮换。读取明文和写入条目都会按当前页面网址复核。提交后采集的账号密码只暂存在会话存储，确认保存才写入金库，拒绝或超时会清掉。填充选择器在 closed Shadow DOM 里，只响应真实用户点击，账号做掩码。扩展只申请访问 `127.0.0.1`。可在弹窗里配置站点排除列表。  
+Fill and save require an unlocked vault. Pairing codes are one-shot. The fill token lives only in session storage (cleared when the browser quits) and is never written to `chrome.storage.local`; leftover local copies are deleted on upgrade. It is separate from the MCP token. Secret reveal and save are bound to the current page URL. Captured logins stay in session storage until you confirm save, then they are cleared. The chooser uses a closed Shadow DOM, requires a real user gesture, and masks usernames. The extension only requests host access to `127.0.0.1`. Sites can be excluded in the popup.
 
-匹配规则：按网址的主机和端口精确匹配，避免把凭据填到错误站点。  
-Matches require the exact host and port of the stored URL.
+匹配规则：按协议、主机和端口匹配（与 Chrome 网页登录相同），路径只用来排序，不挡同站账号。  
+Matches require the same scheme, host, and port as Chrome web logins. Path only ranks results.
 
 ## 开发 Development
 
