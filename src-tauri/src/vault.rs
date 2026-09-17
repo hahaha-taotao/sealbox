@@ -1,8 +1,10 @@
+use crate::certificate;
 use crate::crypto::{
     decrypt, derive_kek, encrypt, random_key, unwrap_key, wrap_key, ArgonParams, Encrypted,
 };
 use crate::db;
 use chrono::{DateTime, Duration, Utc};
+use rusqlite::types::Type;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -31,6 +33,10 @@ pub enum VaultError {
     NotFound,
     #[error("invalid kind")]
     InvalidKind,
+    #[error("entry kind and secret payload do not match")]
+    KindMismatch,
+    #[error("certificate: {0}")]
+    Certificate(#[from] certificate::CertificateError),
     #[error("master password too short")]
     PasswordTooShort,
     #[error("备份文件损坏或格式不正确")]
@@ -49,6 +55,7 @@ pub enum EntryKind {
     MailAuth,
     Server,
     Database,
+    ClientCert,
 }
 
 impl EntryKind {
@@ -61,6 +68,7 @@ impl EntryKind {
             Self::MailAuth => "mail_auth",
             Self::Server => "server",
             Self::Database => "database",
+            Self::ClientCert => "client_cert",
         }
     }
 
@@ -73,7 +81,23 @@ impl EntryKind {
             "mail_auth" => Ok(Self::MailAuth),
             "server" => Ok(Self::Server),
             "database" => Ok(Self::Database),
+            "client_cert" => Ok(Self::ClientCert),
             _ => Err(VaultError::InvalidKind),
+        }
+    }
+}
+
+impl SecretPayload {
+    pub fn kind(&self) -> EntryKind {
+        match self {
+            Self::Website { .. } => EntryKind::Website,
+            Self::ApiToken { .. } => EntryKind::ApiToken,
+            Self::Ssh { .. } => EntryKind::Ssh,
+            Self::Mailbox { .. } => EntryKind::Mailbox,
+            Self::MailAuth { .. } => EntryKind::MailAuth,
+            Self::Server { .. } => EntryKind::Server,
+            Self::Database { .. } => EntryKind::Database,
+            Self::ClientCert { .. } => EntryKind::ClientCert,
         }
     }
 }
@@ -208,6 +232,12 @@ pub enum SecretPayload {
         database: String,
         username: String,
         password: String,
+    },
+    /// 客户端证书（mTLS）。私钥随证书一起加密存放，不落磁盘明文。
+    ClientCert {
+        cert_pem: String,
+        key_pem: String,
+        passphrase: Option<String>,
     },
 }
 
@@ -385,7 +415,29 @@ impl Vault {
         Ok(())
     }
 
-    pub fn upsert_entry(&self, dek: &[u8; 32], input: UpsertEntry) -> Result<EntryDto, VaultError> {
+    pub fn upsert_entry(
+        &self,
+        dek: &[u8; 32],
+        mut input: UpsertEntry,
+    ) -> Result<EntryDto, VaultError> {
+        if input.kind != input.secret.kind() {
+            return Err(VaultError::KindMismatch);
+        }
+        let certificate_metadata = if let SecretPayload::ClientCert {
+            cert_pem,
+            key_pem,
+            passphrase,
+        } = &mut input.secret
+        {
+            let (normalized_cert, normalized_key, normalized_passphrase, metadata) =
+                certificate::prepare_client_cert(cert_pem, key_pem, passphrase.as_deref())?;
+            *cert_pem = normalized_cert;
+            *key_pem = normalized_key;
+            *passphrase = normalized_passphrase;
+            Some(metadata)
+        } else {
+            None
+        };
         let id = input
             .id
             .clone()
@@ -463,6 +515,14 @@ impl Vault {
                     Some(loc),
                 )
             }
+            SecretPayload::ClientCert { .. } => (
+                false,
+                certificate_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.fingerprint.clone()),
+                input.account.clone(),
+                input.url.clone(),
+            ),
         };
         let secret_json = serde_json::to_vec(&input.secret)?;
         let secret_blob = encrypt(dek, &secret_json)?.to_bytes();
@@ -542,25 +602,102 @@ impl Vault {
     }
 
     pub fn get_secret(&self, dek: &[u8; 32], id: &str) -> Result<SecretPayload, VaultError> {
-        let blob: Vec<u8> = self
+        self.get_secret_with_scope(dek, id, true)
+    }
+
+    pub fn get_active_secret(&self, dek: &[u8; 32], id: &str) -> Result<SecretPayload, VaultError> {
+        self.get_secret_with_scope(dek, id, true)
+    }
+
+    fn get_secret_with_scope(
+        &self,
+        dek: &[u8; 32],
+        id: &str,
+        active_only: bool,
+    ) -> Result<SecretPayload, VaultError> {
+        let sql = if active_only {
+            "SELECT kind, secret_blob FROM entries WHERE id=?1 AND deleted_at IS NULL"
+        } else {
+            "SELECT kind, secret_blob FROM entries WHERE id=?1"
+        };
+        let (kind_raw, blob): (String, Vec<u8>) = self
+            .conn
+            .query_row(sql, params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?
+            .ok_or(VaultError::NotFound)?;
+        let kind = EntryKind::parse(&kind_raw)?;
+        let enc = Encrypted::from_bytes(&blob)?;
+        let json = decrypt(dek, &enc)?;
+        let payload: SecretPayload = serde_json::from_slice(&json)?;
+        if payload.kind() != kind {
+            return Err(VaultError::KindMismatch);
+        }
+        Ok(payload)
+    }
+
+    pub fn update_entry_metadata(
+        &self,
+        dek: &[u8; 32],
+        id: &str,
+        title: &str,
+        account: Option<&str>,
+        url: Option<&str>,
+        folder_id: Option<&str>,
+        tags: &[String],
+        pinned: bool,
+        expires_at: Option<&str>,
+        notes: Option<&str>,
+    ) -> Result<EntryDto, VaultError> {
+        let kind: String = self
             .conn
             .query_row(
-                "SELECT secret_blob FROM entries WHERE id=?1",
+                "SELECT kind FROM entries WHERE id=?1 AND deleted_at IS NULL",
                 params![id],
-                |r| r.get(0),
+                |row| row.get(0),
             )
             .optional()?
             .ok_or(VaultError::NotFound)?;
-        let enc = Encrypted::from_bytes(&blob)?;
-        let json = decrypt(dek, &enc)?;
-        Ok(serde_json::from_slice(&json)?)
+        if EntryKind::parse(&kind)? != EntryKind::ClientCert {
+            return Err(VaultError::KindMismatch);
+        }
+        let notes_blob = match notes {
+            Some(value) if !value.is_empty() => Some(encrypt(dek, value.as_bytes())?.to_bytes()),
+            _ => None,
+        };
+        let now = now_rfc3339();
+        self.conn.execute(
+            "UPDATE entries SET title=?1, account=?2, url=?3, folder_id=?4, pinned=?5,
+             expires_at=?6, updated_at=?7, notes_blob=?8 WHERE id=?9 AND deleted_at IS NULL",
+            params![
+                title,
+                account,
+                url,
+                folder_id,
+                pinned as i64,
+                expires_at,
+                &now,
+                notes_blob,
+                id
+            ],
+        )?;
+        self.conn
+            .execute("DELETE FROM entry_tags WHERE entry_id=?1", params![id])?;
+        for tag in tags {
+            let tag_id = self.ensure_tag(tag)?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1,?2)",
+                params![id, tag_id],
+            )?;
+        }
+        self.audit("update", Some(id), &format!("client_cert {title}"))?;
+        self.get_dto(id)
     }
 
     pub fn get_notes(&self, dek: &[u8; 32], id: &str) -> Result<Option<String>, VaultError> {
         let blob: Option<Vec<u8>> = self
             .conn
             .query_row(
-                "SELECT notes_blob FROM entries WHERE id=?1",
+                "SELECT notes_blob FROM entries WHERE id=?1 AND deleted_at IS NULL",
                 params![id],
                 |r| r.get(0),
             )
@@ -671,9 +808,20 @@ impl Vault {
         let mut stmt = self.conn.prepare(&sql)?;
         let bind_refs: Vec<&dyn rusqlite::ToSql> = bind.iter().map(|b| b.as_ref()).collect();
         let rows = stmt.query_map(bind_refs.as_slice(), |r| {
+            let kind_raw: String = r.get(1)?;
+            let kind = EntryKind::parse(&kind_raw).map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid entry kind",
+                    )),
+                )
+            })?;
             Ok(EntryDto {
                 id: r.get(0)?,
-                kind: EntryKind::parse(&r.get::<_, String>(1)?).unwrap_or(EntryKind::Website),
+                kind,
                 title: r.get(2)?,
                 account: r.get(3)?,
                 url: r.get(4)?,
@@ -933,6 +1081,20 @@ impl Vault {
             return Ok(false);
         }
         let secret = decrypt(source_dek, &Encrypted::from_bytes(&entry.secret_blob)?)?;
+        let payload: SecretPayload = serde_json::from_slice(&secret).map_err(|_| VaultError::CorruptBackup)?;
+        let expected_kind = EntryKind::parse(&entry.kind).map_err(|_| VaultError::CorruptBackup)?;
+        if payload.kind() != expected_kind {
+            return Err(VaultError::CorruptBackup);
+        }
+        if let SecretPayload::ClientCert {
+            cert_pem,
+            key_pem,
+            passphrase,
+        } = &payload
+        {
+            certificate::validate_client_cert(cert_pem, key_pem, passphrase.as_deref())
+                .map_err(|_| VaultError::CorruptBackup)?;
+        }
         let new_secret = encrypt(dest_dek, &secret)?.to_bytes();
         let new_notes = match &entry.notes_blob {
             Some(b) => {
@@ -1092,9 +1254,20 @@ impl Vault {
              FROM entries WHERE id=?1",
             params![id],
             |r| {
+                let kind_raw: String = r.get(1)?;
+                let kind = EntryKind::parse(&kind_raw).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid entry kind",
+                        )),
+                    )
+                })?;
                 Ok(EntryDto {
                     id: r.get(0)?,
-                    kind: EntryKind::parse(&r.get::<_, String>(1)?).unwrap_or(EntryKind::Website),
+                    kind,
                     title: r.get(2)?,
                     account: r.get(3)?,
                     url: r.get(4)?,
@@ -1143,6 +1316,7 @@ impl Vault {
                 "mail_auth" => counts.mail_auth = n,
                 "server" => counts.server = n,
                 "database" => counts.database = n,
+                "client_cert" => counts.client_cert = n,
                 _ => {}
             }
             counts.total += n;
@@ -1275,6 +1449,7 @@ pub struct Counts {
     pub mail_auth: i64,
     pub server: i64,
     pub database: i64,
+    pub client_cert: i64,
     pub trash: i64,
 }
 

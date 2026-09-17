@@ -578,7 +578,8 @@ mod tests {
             s.idle_secs = 2;
             s.age_last_active(Duration::from_secs(1));
         }
-        let classified = classify_save(&mutex, "https://github.com/login", "octocat", "gh-pass").unwrap();
+        let classified =
+            classify_save(&mutex, "https://github.com/login", "octocat", "gh-pass").unwrap();
         assert_eq!(classified.action, "unchanged");
         let mut s = mutex.lock().unwrap();
         s.age_last_active(Duration::from_millis(1500));
@@ -801,7 +802,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fresh["action"], "save");
-        assert!(fresh.get("id").and_then(|v| v.as_str()).unwrap_or("").is_empty());
+        assert!(fresh
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .is_empty());
     }
 
     #[test]
@@ -854,11 +859,7 @@ mod tests {
         {
             let s = mutex.lock().unwrap();
             let dek = *s.dek().unwrap();
-            let notes = s
-                .vault()
-                .unwrap()
-                .get_notes(&dek, &hits[0].id)
-                .unwrap();
+            let notes = s.vault().unwrap().get_notes(&dek, &hits[0].id).unwrap();
             assert_eq!(notes.as_deref(), Some("工作号，别给外人用"));
         }
 

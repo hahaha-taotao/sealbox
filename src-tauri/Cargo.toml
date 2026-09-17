@@ -35,6 +35,9 @@ keyring = "3"
 totp-rs = { version = "5", default-features = false, features = ["otpauth"] }
 regex = "1"
 ureq = { version = "2", default-features = false, features = ["tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+md-5 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

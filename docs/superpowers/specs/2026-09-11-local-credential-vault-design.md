@@ -4,15 +4,15 @@
 状态：已批准  
 产品名：Sealbox（印盒）  
 应用 id：`com.sealbox.app`  
-对标参考：Sigil 掌玺（https://sigil.ruoyi.plus/），仅借鉴「本地金库」思路与界面视觉，不复制其 AI/MCP 功能集。
+对标参考：Sigil 掌玺（https://sigil.ruoyi.plus/），仅借鉴「本地金库」思路与界面视觉，不复制其云端 AI/MCP 形态；本项目只提供本机、受控的 GitHub 只读 MCP。
 
 ## 1. 产品定位
 
 做一个 Windows 桌面凭据金库：给人安全存放网站账号、API Token、SSH/证书；日常用主窗口或全局快捷键复制；可导出加密备份换机。按可发布产品的标准写加密、数据格式和审计，但第一版只给自己用。
 
-它不是 1Password 的云同步密码箱，也不是第一版就做 Sigil 那样的 MCP 代理。第二期再在同一个 Rust 核心上接 MCP，让 AI 调用能力而看不到明文。
+它不是 1Password 的云同步密码箱，也不是 Sigil 那样的云端 MCP 代理。本项目的本机 MCP 只提供受控的 GitHub 与 ZoomKey 查询能力，让 AI 使用能力而看不到凭据明文。
 
-一句话：本机金库先做对，印章房以后再接。
+一句话：本机金库先做对，再以受控方式连接查询工具。
 
 ## 2. 已确认决策
 
@@ -49,16 +49,17 @@
 - macOS / Linux
 - 云同步、多用户、账号系统
 - 浏览器自动填充、向其他窗口注入按键
-- MCP Server、AI 对话、能力白名单、Kill Switch 产品化
+- MCP 写入 GitHub、通用 HTTP 默认暴露、模型触发的秘密复制
+- GitHub MCP 只读能力已实现：默认停用，启用后开放固定的 api.github.com GET 工具；所有活动 GitHub Token 由模型按凭据 ID 选择
 - 文件加密盘、加密分享包、邮件、MQTT、对象存储、内置浏览器、Git 工作区
 - Bitwarden 导入、扫描导入、Have I Been Pwned、试用倒计时
 - Token 额度刷新、分页（本地全量列表 + 搜索即可）
 - 自动定时备份、备份上传网盘
 - 试错 N 次后自动销毁金库
 
-### 3.3 第二期预留（不实现，但接口要留得住）
+### 3.3 后续能力预留
 
-Rust 核心暴露内部 `VaultService`：按筛选列出元数据、按 id 解密一次、写审计。MCP 将来只调这个接口，不经过前端，也不把明文送进模型。第一版不监听任何本机 HTTP 端口。
+Rust 核心暴露内部 `VaultService`：按筛选列出元数据、按 id 解密一次、写审计。当前本机 MCP 只暴露一个总开关控制的 GitHub 只读能力：`GithubMcpPolicy` 只包含 `enabled`；启用后提供一个凭据元数据发现工具和六个固定 GitHub 工具，模型通过 `credential_id` 选择活动 GitHub Token。工具固定访问 `https://api.github.com`，只执行 GET，不接受任意 URL、请求头或请求体；模型只收到结构化字段，不收到 Token、响应头或任意原始响应。
 
 ## 4. 成功标准
 
@@ -74,27 +75,31 @@ Rust 核心暴露内部 `VaultService`：按筛选列出元数据、按 id 解�
 
 ## 5. 架构
 
-单个 Windows 进程，两层，中间只走 Tauri `invoke`，不走 HTTP。
+单个 Windows 进程，桌面界面通过 Tauri `invoke` 调用 Rust 核心；本机 MCP 另监听 loopback HTTP，仅提供受控查询工具。
 
 ```
 Vue 3 界面
-  主窗口：解锁 / 首页 / 保险库 / 审计 / 设置
+  主窗口：解锁 / 首页 / 保险库 / 审计 / 设置 / MCP / 助手
   快捷键小窗：解锁或搜索复制
   只接收元数据、脱敏预览、操作结果
         │ invoke
 Rust 核心
   会话（数据密钥在内存）
   VaultService（CRUD、搜索元数据、按需解密）
+  GitHub MCP：单一 enabled 开关、固定 GET、Token ID 选择
+  ZoomKey MCP：独立内网策略、mTLS、固定只读查询
   加密、Hello、热键、剪贴板定时清空、备份、审计
         │                    │
   SQLite（密文+元数据）   Windows Credential Manager
+        │
+  127.0.0.1 MCP HTTP（不向模型返回凭据明文）
 ```
 
 三条硬边界：
 
 1. 明文只在 Rust 里短暂出现。前端默认看不到完整秘密；「显示」或「复制」才请求一次。
 2. 磁盘无明文。SQLite 存元数据与 AES-256-GCM 密文；数据密钥用主密码派生钥包装，另有一份包装进 Credential Manager 供 Hello。
-3. 第二期 MCP 接 `VaultService`，不接前端。
+3. MCP 只在本机 loopback 提供固定的只读查询；凭据明文只在 Rust 请求构造期间短暂存在，不进入模型结果。
 
 关主窗口 ≠ 退出。托盘仍在，热键才可用。退出或锁定：丢掉内存中的数据密钥、清我们放入的剪贴板。
 
@@ -252,7 +257,7 @@ Windows Hello **不是**第二套 KDF。它是「已登录的 Windows 用户 + �
 3. 审计  
 4. 底部：设置 + 解锁状态点  
 
-禁止出现第一版做不完的入口（AI、MCP、存储、文件加密、工作区、浏览器、邮件、MQTT）。
+不新增云端 AI、存储、文件加密、工作区、邮件或 MQTT 入口；本机 MCP 与助手页面属于已实现的受控查询能力。
 
 ### 9.3 保险库
 
@@ -368,7 +373,7 @@ Windows Hello **不是**第二套 KDF。它是「已登录的 Windows 用户 + �
 
 首次设密码、Hello 开关（无生物设备则跳过）、列表搜索、行内复制、热键小窗回车复制、备份导出导入。
 
-不测：浏览器填充、MCP、多设备同步、非 Windows。
+不测：多设备同步、非 Windows；MCP 与浏览器填充分别由各自模块的自动化测试覆盖。
 
 ## 14. 安全属性（实现时不可破）
 
@@ -376,7 +381,7 @@ Windows Hello **不是**第二套 KDF。它是「已登录的 Windows 用户 + �
 2. 显示和复制是唯一把明文送到 UI/剪贴板的出口，且有超时。
 3. 同一把 DEK；Hello 只是 Credential Manager + 本人确认，不是第二套库。
 4. 备份只用主密码加密，与 Hello 无关；Hello 不能解开 `.svbak`。
-5. 第一版不监听端口，不发网络请求（界面无更新检查也可以；若以后加更新检查不得上传金库数据）。
+5. 本机 MCP/填表服务仅监听 `127.0.0.1`；GitHub 只读工具固定访问 `api.github.com`，ZoomKey 按独立内网策略和 mTLS 访问；不得上传金库数据或凭据明文。
 
 ## 15. 实现顺序
 

@@ -1,6 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type EntryKind = "website" | "api_token" | "ssh" | "mailbox" | "mail_auth" | "server" | "database";
+export type EntryKind =
+  | "website"
+  | "api_token"
+  | "ssh"
+  | "mailbox"
+  | "mail_auth"
+  | "server"
+  | "database"
+  | "client_cert";
 
 export interface EntryDto {
   id: string;
@@ -17,6 +25,29 @@ export interface EntryDto {
   updated_at: string;
   has_totp: boolean;
   fingerprint: string | null;
+}
+
+export interface ClientCertInfo {
+  id: string;
+  title: string;
+  fingerprint: string | null;
+  certificateCount: number | null;
+  hasPassphrase: boolean;
+}
+
+export interface ImportClientCertInput {
+  id?: string | null;
+  title: string;
+  certPath: string;
+  keyPath: string;
+  passphrase?: string | null;
+  account?: string | null;
+  url?: string | null;
+  folderId?: string | null;
+  tags: string[];
+  pinned: boolean;
+  expiresAt?: string | null;
+  notes?: string | null;
 }
 
 export interface ListFilter {
@@ -52,6 +83,7 @@ export interface Counts {
   mail_auth: number;
   server: number;
   database: number;
+  client_cert: number;
   trash: number;
 }
 
@@ -70,6 +102,95 @@ export interface McpStatus {
   fill_url: string;
   has_token: boolean;
   has_fill_token: boolean;
+}
+
+export interface GithubMcpPolicy {
+  enabled: boolean;
+}
+
+export interface ZoomkeyEndpointPolicy {
+  base_url: string;
+  credential_id: string;
+  client_cert_id: string;
+  ca_bundle_path: string;
+}
+
+export interface ZoomkeyMcpPolicy {
+  jira_enabled: boolean;
+  crm_enabled: boolean;
+  allow_private_network: boolean;
+  allowed_hosts: string[];
+  jira: ZoomkeyEndpointPolicy;
+  crm: ZoomkeyEndpointPolicy;
+}
+
+export interface ZoomkeyCredentialOption {
+  id: string;
+  title: string;
+  account: string | null;
+}
+
+export interface ZoomkeyCertOption {
+  id: string;
+  title: string;
+}
+
+export interface ZoomkeyCandidates {
+  jira_credentials: ZoomkeyCredentialOption[];
+  crm_credentials: ZoomkeyCredentialOption[];
+  client_certs: ZoomkeyCertOption[];
+}
+
+export interface McpToolInfo {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  readOnly: boolean;
+  risk: string;
+}
+
+export interface AssistantConfigView {
+  model: string;
+  baseUrl: string;
+  hasApiKey: boolean;
+}
+
+export interface AssistantConfigInput {
+  model: string;
+  baseUrl: string;
+  apiKey?: string;
+  clearApiKey?: boolean;
+}
+
+export interface AssistantToolSummary {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+  readOnly: boolean;
+  risk: string;
+}
+
+export interface AssistantMcpProbe {
+  connected: boolean;
+  url: string;
+  tools: AssistantToolSummary[];
+}
+
+export interface AssistantMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface AssistantToolTrace {
+  name: string;
+  arguments: string;
+  success: boolean;
+  resultPreview: string;
+}
+
+export interface AssistantChatResponse {
+  content: string;
+  traces: AssistantToolTrace[];
 }
 
 export type SecretPayload =
@@ -95,7 +216,8 @@ export type SecretPayload =
       database: string;
       username: string;
       password: string;
-    };
+    }
+  | { type: "client_cert"; cert_pem: string; key_pem: string; passphrase?: string | null };
 
 export interface UpsertEntry {
   id?: string | null;
@@ -129,7 +251,21 @@ export const api = {
   tags: () => invoke<string[]>("list_tags"),
   audit: () => invoke<AuditEvent[]>("list_audit"),
   copy: (id: string, field: string) => invoke("copy_secret", { id, field }),
+  copyClientCert: (id: string) => invoke("copy_client_cert", { id }),
   reveal: (id: string) => invoke<SecretPayload>("reveal_secret", { id }),
+  clientCertInfo: (id: string) => invoke<ClientCertInfo>("client_cert_info", { id }),
+  updateClientCertMetadata: (input: {
+    id: string;
+    title: string;
+    account?: string | null;
+    url?: string | null;
+    folderId?: string | null;
+    tags: string[];
+    pinned: boolean;
+    expiresAt?: string | null;
+    notes?: string | null;
+  }) => invoke<EntryDto>("update_client_cert_metadata", { input }),
+  importClientCert: (input: ImportClientCertInput) => invoke<EntryDto>("import_client_cert", { input }),
   notes: (id: string) => invoke<string | null>("get_notes", { id }),
   tick: () => invoke<boolean>("tick_idle"),
   genPassword: (opts: {
@@ -156,8 +292,6 @@ export const api = {
   home: () =>
     invoke<{ counts: Counts; recent: EntryDto[]; expiring: EntryDto[] }>("home_overview"),
   mcpStatus: () => invoke<McpStatus>("mcp_status"),
-  mcpStart: () => invoke<McpStatus>("mcp_start"),
-  mcpStop: () => invoke<McpStatus>("mcp_stop"),
   mcpRotate: () => invoke<McpStatus>("mcp_rotate_token"),
   fillRotate: () => invoke<McpStatus>("fill_rotate_token"),
   revealMcpToken: () => invoke<string>("reveal_mcp_token"),
@@ -169,19 +303,19 @@ export const api = {
     invoke<{ active: boolean; code: string | null; expires_in_secs: number; port: number }>("fill_open_pairing"),
   fillPairingStatus: () =>
     invoke<{ active: boolean; code: string | null; expires_in_secs: number; port: number }>("fill_pairing_status"),
-  mcpTools: () => invoke<{ name: string; description: string }[]>("mcp_tools"),
-  mcpHttpLogs: () =>
-    invoke<
-      {
-        id: string;
-        at: string;
-        credential_id: string;
-        method: string;
-        url: string;
-        status: number;
-        bytes: number;
-        sha256: string;
-        body: string;
-      }[]
-    >("mcp_http_logs"),
+  mcpTools: () => invoke<McpToolInfo[]>("mcp_tools"),
+  githubMcpPolicyGet: () => invoke<GithubMcpPolicy>("github_mcp_policy_get"),
+  githubMcpPolicySet: (policy: GithubMcpPolicy) => invoke<GithubMcpPolicy>("github_mcp_policy_set", { policy }),
+  zoomkeyPolicyGet: () => invoke<ZoomkeyMcpPolicy>("zoomkey_policy_get"),
+  zoomkeyPolicySet: (policy: ZoomkeyMcpPolicy) => invoke<ZoomkeyMcpPolicy>("zoomkey_policy_set", { policy }),
+  zoomkeyCandidates: () => invoke<ZoomkeyCandidates>("zoomkey_candidates"),
+  zoomkeyTest: (endpoint: "jira" | "crm") => invoke<string>("zoomkey_test_connection", { endpoint }),
+  assistantConfigGet: () => invoke<AssistantConfigView>("assistant_config_get"),
+  assistantConfigSet: (input: AssistantConfigInput) =>
+    invoke<AssistantConfigView>("assistant_config_set", { input }),
+  assistantMcpProbe: () => invoke<AssistantMcpProbe>("assistant_mcp_probe"),
+  assistantChat: (request: {
+    history: AssistantMessage[];
+    message: string;
+  }) => invoke<AssistantChatResponse>("assistant_chat", { request }),
 };

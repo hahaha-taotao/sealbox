@@ -23,7 +23,8 @@ pub fn register_active_mcp(mcp: &McpState) {
 
 fn sweep_mcp(mcp: &McpState) {
     mcp.close_pairing();
-    mcp.clear_http_logs();
+    crate::zoomkey::tls::clear_cache();
+    crate::zoomkey::crm::clear_cache();
 }
 
 /// Pairing window and HTTP response cache belong with the DEK: any session
@@ -152,14 +153,11 @@ mod tests {
         let m = Mutex::new(session);
         let mcp = crate::mcp::McpState::default();
         mcp.open_pairing();
-        mcp.seed_http_log();
         assert!(mcp.pairing_status().active);
-        assert!(!mcp.http_logs().is_empty());
         lock_everything(&m, &mcp);
         assert!(!lock_session(&m).is_unlocked());
         assert!(!lock_session(&m).clipboard_owned("alpha"));
         assert!(!mcp.pairing_status().active);
-        assert!(mcp.http_logs().is_empty());
     }
 
     #[test]

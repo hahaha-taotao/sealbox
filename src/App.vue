@@ -5,19 +5,29 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   api,
   type AuditEvent,
+  type AssistantChatResponse,
+  type AssistantConfigView,
+  type AssistantMessage,
+  type AssistantMcpProbe,
+  type AssistantToolTrace,
+  type ClientCertInfo,
   type Counts,
   type EntryDto,
   type EntryKind,
   type FolderDto,
+  type GithubMcpPolicy,
   type ListFilter,
   type McpStatus,
+  type McpToolInfo,
   type SecretPayload,
   type Status,
   type UpsertEntry,
+  type ZoomkeyCandidates,
+  type ZoomkeyMcpPolicy,
 } from "./lib/tauri";
 
 const status = ref<Status | null>(null);
-type Page = "home" | "vault" | "audit" | "settings" | "mcp" | "plugin";
+  type Page = "home" | "vault" | "audit" | "settings" | "mcp" | "plugin" | "assistant";
 const page = ref<Page>("vault");
 const history = ref<Page[]>(["vault"]);
 const historyIndex = ref(0);
@@ -71,7 +81,14 @@ const form = reactive({
   protocol: "ssh",
   engine: "mysql",
   db_name: "",
+  cert_pem: "",
+  key_pem: "",
+  cert_path: "",
+  key_path: "",
+  cert_passphrase: "",
 });
+const clientCertInfo = ref<ClientCertInfo | null>(null);
+const certImportBusy = ref(false);
 const generatorOpen = ref(false);
 const generatorBusy = ref(false);
 const generator = reactive({
@@ -90,6 +107,7 @@ const generatorNoClasses = computed(
 );
 const reveal = ref<SecretPayload | null>(null);
 const revealFor = ref<string | null>(null);
+const certInfoFor = ref<string | null>(null);
 const backupOpen = ref(false);
 const backupMode = ref<"export" | "import">("export");
 const backupPath = ref("");
@@ -104,6 +122,7 @@ const KIND_ITEMS: { id: EntryKind; label: string }[] = [
   { id: "mail_auth", label: "邮箱授权码" },
   { id: "server", label: "服务器" },
   { id: "database", label: "数据库" },
+  { id: "client_cert", label: "客户端证书" },
 ];
 const selectedKindIds = computed(() => {
   const ids = [...(filter.kinds ?? [])];
@@ -116,6 +135,7 @@ const crumb = computed(() => {
   if (page.value === "settings") return "设置";
   if (page.value === "mcp") return "MCP";
   if (page.value === "plugin") return "插件";
+  if (page.value === "assistant") return "助手";
   if (filter.trash) return "回收站";
   const selectedKinds = selectedKindIds.value;
   if (selectedKinds.length === 1) {
@@ -138,6 +158,7 @@ function kindLabel(k: EntryKind) {
     case "mail_auth": return "邮箱授权码";
     case "server": return "服务器";
     case "database": return "数据库";
+    case "client_cert": return "客户端证书";
   }
 }
 function kindCount(k: EntryKind) {
@@ -198,6 +219,8 @@ function resetGenerator() {
 }
 function resetFormFields() {
   resetGenerator();
+  clientCertInfo.value = null;
+  certInfoFor.value = null;
   Object.assign(form, {
     kind: "website" as EntryKind,
     title: "",
@@ -226,6 +249,11 @@ function resetFormFields() {
     protocol: "ssh",
     engine: "mysql",
     db_name: "",
+    cert_pem: "",
+    key_pem: "",
+    cert_path: "",
+    key_path: "",
+    cert_passphrase: "",
   });
 }
 function fmtTime(s: string | null) {
@@ -313,21 +341,31 @@ const pairingBusy = ref(false);
 const revealedFillToken = ref("");
 const revealedMcpToken = ref("");
 const revealedMcpSnippet = ref("");
-const httpLogs = ref<
-  {
-    id: string;
-    at: string;
-    credential_id: string;
-    method: string;
-    url: string;
-    status: number;
-    bytes: number;
-    sha256: string;
-    body: string;
-  }[]
->([]);
-const openHttpLog = ref<string | null>(null);
-const mcpTools = ref<{ name: string; description: string }[]>([]);
+const mcpTools = ref<McpToolInfo[]>([]);
+const githubPolicy = ref<GithubMcpPolicy>({ enabled: false });
+const githubPolicyBusy = ref(false);
+const zoomkeyPolicy = ref<ZoomkeyMcpPolicy | null>(null);
+const zoomkeyCandidates = ref<ZoomkeyCandidates>({
+  jira_credentials: [],
+  crm_credentials: [],
+  client_certs: [],
+});
+const zoomkeyBusy = ref(false);
+const zoomkeyTestBusy = ref("");
+const zoomkeyTestResult = ref<{ endpoint: string; ok: boolean; text: string } | null>(null);
+const assistantConfig = ref<AssistantConfigView | null>(null);
+const assistantModel = ref("gpt-4o-mini");
+const assistantBaseUrl = ref("https://api.openai.com/v1");
+const assistantApiKey = ref("");
+const assistantClearApiKey = ref(false);
+const assistantConfigBusy = ref(false);
+const assistantProbeBusy = ref(false);
+const assistantChatBusy = ref(false);
+const assistantError = ref("");
+const assistantInput = ref("");
+const assistantMcp = ref<AssistantMcpProbe | null>(null);
+const assistantMessages = ref<AssistantMessage[]>([]);
+const assistantTraces = ref<AssistantToolTrace[]>([]);
 let pairingTimer: ReturnType<typeof setInterval> | null = null;
 function hideBridgeTokens() {
   revealedFillToken.value = "";
@@ -338,26 +376,76 @@ async function refreshMcp() {
   hideBridgeTokens();
   mcp.value = await api.mcpStatus();
   try {
+    githubPolicy.value = await api.githubMcpPolicyGet();
+  } catch {
+    githubPolicy.value = { enabled: false };
+  }
+  try {
+    zoomkeyPolicy.value = await api.zoomkeyPolicyGet();
+    zoomkeyCandidates.value = await api.zoomkeyCandidates();
+  } catch {
+    zoomkeyPolicy.value = null;
+  }
+  try {
     mcpTools.value = await api.mcpTools();
   } catch {
     mcpTools.value = [];
   }
+}
+
+async function saveZoomkeyPolicy() {
+  if (!zoomkeyPolicy.value || zoomkeyBusy.value) return;
+  if (zoomkeyPolicy.value.allow_private_network) {
+    const ok = confirm(
+      "开启后，Sealbox 允许向白名单内的内网主机发起请求（携带金库里的客户端证书）。\n" +
+        "请确认白名单里只有你信任的公司内网域名。继续？",
+    );
+    if (!ok) return;
+  }
+  zoomkeyBusy.value = true;
   try {
-    httpLogs.value = await api.mcpHttpLogs();
-  } catch {
-    httpLogs.value = [];
+    zoomkeyPolicy.value = await api.zoomkeyPolicySet(zoomkeyPolicy.value);
+    mcpTools.value = await api.mcpTools();
+    showToast("ZoomKey 策略已保存");
+  } catch (e) {
+    showToast(String(e));
+  } finally {
+    zoomkeyBusy.value = false;
   }
 }
-async function startMcp() {
-  hideBridgeTokens();
-  mcp.value = await api.mcpStart();
-  showToast("MCP 已在本机启动");
+
+async function testZoomkey(endpoint: "jira" | "crm") {
+  if (zoomkeyTestBusy.value) return;
+  zoomkeyTestBusy.value = endpoint;
+  zoomkeyTestResult.value = null;
+  try {
+    const text = await api.zoomkeyTest(endpoint);
+    zoomkeyTestResult.value = { endpoint, ok: true, text };
+  } catch (e) {
+    zoomkeyTestResult.value = { endpoint, ok: false, text: String(e) };
+  } finally {
+    zoomkeyTestBusy.value = "";
+  }
 }
-async function stopMcp() {
-  hideBridgeTokens();
-  mcp.value = await api.mcpStop();
-  showToast("MCP 已停止");
+
+async function saveGithubPolicy() {
+  if (githubPolicyBusy.value) return;
+  const previous = githubPolicy.value.enabled;
+  githubPolicyBusy.value = true;
+  githubPolicy.value = { enabled: !previous };
+  try {
+    githubPolicy.value = await api.githubMcpPolicySet(githubPolicy.value);
+    mcp.value = await api.mcpStatus();
+    mcpTools.value = await api.mcpTools();
+    showToast(githubPolicy.value.enabled ? "GitHub MCP 已启用" : "GitHub MCP 已停用");
+  } catch (e) {
+    githubPolicy.value = { enabled: previous };
+    showToast(String(e));
+  } finally {
+    githubPolicyBusy.value = false;
+  }
 }
+
 async function rotateMcp() {
   if (!confirm("轮换 Token 后，Cursor / Claude Code 里的旧配置会失效，确定？")) return;
   hideBridgeTokens();
@@ -508,6 +596,97 @@ async function openPlugin() {
   await refreshPairing();
 }
 
+async function refreshAssistantConfig() {
+  assistantError.value = "";
+  try {
+    const config = await api.assistantConfigGet();
+    assistantConfig.value = config;
+    assistantModel.value = config.model;
+    assistantBaseUrl.value = config.baseUrl;
+    assistantApiKey.value = "";
+    assistantClearApiKey.value = false;
+  } catch (e) {
+    assistantError.value = String(e);
+  }
+}
+
+async function openAssistant() {
+  goPage("assistant");
+  await refreshAssistantConfig();
+  if (!assistantMcp.value) await probeAssistantMcp();
+}
+
+async function saveAssistantConfig() {
+  if (assistantConfigBusy.value) return;
+  assistantConfigBusy.value = true;
+  assistantError.value = "";
+  try {
+    const config = await api.assistantConfigSet({
+      model: assistantModel.value,
+      baseUrl: assistantBaseUrl.value,
+      apiKey: assistantApiKey.value || undefined,
+      clearApiKey: assistantClearApiKey.value,
+    });
+    assistantConfig.value = config;
+    assistantApiKey.value = "";
+    assistantClearApiKey.value = false;
+    showToast("助手配置已保存");
+  } catch (e) {
+    assistantError.value = String(e);
+    showToast(assistantError.value);
+  } finally {
+    assistantConfigBusy.value = false;
+  }
+}
+
+async function probeAssistantMcp() {
+  if (assistantProbeBusy.value) return;
+  assistantProbeBusy.value = true;
+  assistantError.value = "";
+  try {
+    assistantMcp.value = await api.assistantMcpProbe();
+    showToast(`MCP 已连接，发现 ${assistantMcp.value.tools.length} 个只读工具`);
+  } catch (e) {
+    assistantMcp.value = null;
+    assistantError.value = String(e);
+    showToast(assistantError.value);
+  } finally {
+    assistantProbeBusy.value = false;
+  }
+}
+
+function clearAssistantChat() {
+  assistantMessages.value = [];
+  assistantTraces.value = [];
+  assistantInput.value = "";
+  assistantError.value = "";
+}
+
+async function sendAssistantMessage() {
+  const message = assistantInput.value.trim();
+  if (!message || assistantChatBusy.value) return;
+  assistantChatBusy.value = true;
+  assistantError.value = "";
+  assistantInput.value = "";
+  const history = [...assistantMessages.value];
+  assistantMessages.value.push({ role: "user", content: message });
+  try {
+    const response: AssistantChatResponse = await api.assistantChat({
+      history,
+      message,
+    });
+    assistantMessages.value.push({ role: "assistant", content: response.content });
+    assistantTraces.value.push(...response.traces);
+  } catch (e) {
+    assistantError.value = String(e);
+    assistantMessages.value.pop();
+    assistantInput.value = message;
+    showToast(assistantError.value);
+  } finally {
+    assistantChatBusy.value = false;
+  }
+}
+
 function goPage(next: Page) {
   if (page.value === next) return;
   history.value = history.value.slice(0, historyIndex.value + 1);
@@ -573,8 +752,22 @@ function openCreate() {
 async function openEdit(row: EntryDto) {
   resetGenerator();
   editing.value = row;
-  const secret = await api.reveal(row.id);
   const notes = await api.notes(row.id);
+  if (row.kind === "client_cert") {
+    clientCertInfo.value = await api.clientCertInfo(row.id);
+    form.kind = row.kind;
+    form.title = row.title;
+    form.account = row.account || "";
+    form.url = row.url || "";
+    form.folder_id = row.folder_id || "";
+    form.tags = row.tags.join(", ");
+    form.notes = notes || "";
+    form.pinned = row.pinned;
+    form.expires_at = row.expires_at ? row.expires_at.slice(0, 10) : "";
+    showForm.value = true;
+    return;
+  }
+  const secret = await api.reveal(row.id);
   form.kind = row.kind;
   form.title = row.title;
   form.account = row.account || "";
@@ -619,7 +812,7 @@ async function openEdit(row: EntryDto) {
     form.db_name = secret.database;
     form.account = secret.username;
     form.password = secret.password;
-  } else {
+  } else if (secret.type === "ssh") {
     form.private_key = secret.private_key;
     form.key_type = secret.key_type;
   }
@@ -674,6 +867,9 @@ function buildSecret(): SecretPayload {
       password: form.password,
     };
   }
+  if (form.kind === "client_cert") {
+    throw new Error("客户端证书请使用文件导入");
+  }
   return {
     type: "ssh",
     key_type: form.key_type,
@@ -683,7 +879,65 @@ function buildSecret(): SecretPayload {
   };
 }
 
+async function pickClientCertFile(kind: "cert" | "key") {
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const picked = await open({
+    multiple: false,
+    filters: [{ name: "PEM / certificate", extensions: ["pem", "crt", "cer", "key"] }],
+  });
+  if (typeof picked !== "string") return;
+  if (kind === "cert") form.cert_path = picked;
+  else form.key_path = picked;
+}
+
 async function saveEntry() {
+  if (form.kind === "client_cert") {
+    const hasCertPath = Boolean(form.cert_path);
+    const hasKeyPath = Boolean(form.key_path);
+    if (hasCertPath !== hasKeyPath || (!editing.value && (!hasCertPath || !hasKeyPath))) {
+      showToast("请选择客户端证书和私钥文件，或都不选择");
+      return;
+    }
+    certImportBusy.value = true;
+    try {
+      if (hasCertPath && hasKeyPath) {
+        await api.importClientCert({
+          id: editing.value?.id ?? null,
+          title: form.title,
+          certPath: form.cert_path,
+          keyPath: form.key_path,
+          passphrase: form.cert_passphrase || null,
+          account: form.account || null,
+          url: form.url || null,
+          folderId: form.folder_id || null,
+          tags: form.tags.split(",").map((s) => s.trim()).filter(Boolean),
+          pinned: form.pinned,
+          expiresAt: form.expires_at || null,
+          notes: form.notes || null,
+        });
+      } else if (editing.value) {
+        await api.updateClientCertMetadata({
+          id: editing.value.id,
+          title: form.title,
+          account: form.account || null,
+          url: form.url || null,
+          folderId: form.folder_id || null,
+          tags: form.tags.split(",").map((s) => s.trim()).filter(Boolean),
+          pinned: form.pinned,
+          expiresAt: form.expires_at || null,
+          notes: form.notes || null,
+        });
+      }
+      closeForm();
+      showToast("客户端证书已保存");
+      await refreshVault();
+    } catch (e) {
+      showToast(String(e));
+    } finally {
+      certImportBusy.value = false;
+    }
+    return;
+  }
   const input: UpsertEntry = {
     id: editing.value?.id ?? null,
     kind: form.kind,
@@ -710,6 +964,20 @@ async function copy(id: string, field = "secret") {
   await api.copy(id, field);
   showToast(field === "account" ? "已复制账号" : field === "totp" ? "已复制验证码" : "已复制，20 秒后清空剪贴板");
   await refreshVault();
+}
+async function copyClientCertificate(id: string) {
+  await api.copyClientCert(id);
+  showToast("已复制公开证书，20 秒后清空剪贴板");
+  await refreshVault();
+}
+async function showClientCertificateInfo(row: EntryDto) {
+  if (certInfoFor.value === row.id) {
+    certInfoFor.value = null;
+    clientCertInfo.value = null;
+    return;
+  }
+  clientCertInfo.value = await api.clientCertInfo(row.id);
+  certInfoFor.value = row.id;
 }
 async function revealRow(row: EntryDto) {
   if (revealFor.value === row.id) {
@@ -800,13 +1068,19 @@ function hideVisibleSecrets() {
 
 function clearSecrets() {
   hideVisibleSecrets();
+  clientCertInfo.value = null;
+  certInfoFor.value = null;
   closeForm();
   backupPassword.value = "";
+  assistantApiKey.value = "";
+  assistantInput.value = "";
+  assistantMessages.value = [];
+  assistantTraces.value = [];
+  assistantMcp.value = null;
+  assistantError.value = "";
   pairing.value = null;
   pairingError.value = "";
   stopPairingTimer();
-  httpLogs.value = [];
-  openHttpLog.value = null;
   oldMaster.value = "";
   newMaster.value = "";
   newMaster2.value = "";
@@ -1033,6 +1307,15 @@ onMounted(async () => {
           </span>
           <span>插件</span>
         </button>
+        <button class="rail-btn" :class="{ active: page === 'assistant' }" @click="openAssistant">
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3h11A2.5 2.5 0 0 1 20 5.5v8a2.5 2.5 0 0 1-2.5 2.5H12l-4.5 4v-4h-1A2.5 2.5 0 0 1 4 13.5z" />
+              <path d="M8 8h8M8 11h5" />
+            </svg>
+          </span>
+          <span>助手</span>
+        </button>
         <div class="spacer" />
         <button class="rail-btn" :class="{ active: page === 'settings' }" @click="goPage('settings')">
           <span class="icon" aria-hidden="true">
@@ -1048,7 +1331,7 @@ onMounted(async () => {
       <section class="main" v-if="page === 'home'">
         <div class="content">
           <h2>概览</h2>
-          <p>全部 {{ status.counts?.total ?? 0 }} · 网站 {{ status.counts?.website ?? 0 }} · Token {{ status.counts?.api_token ?? 0 }} · SSH {{ status.counts?.ssh ?? 0 }} · 邮箱 {{ status.counts?.mailbox ?? 0 }} · 授权码 {{ status.counts?.mail_auth ?? 0 }} · 服务器 {{ status.counts?.server ?? 0 }} · 数据库 {{ status.counts?.database ?? 0 }} · 回收站 {{ status.counts?.trash ?? 0 }}</p>
+          <p>全部 {{ status.counts?.total ?? 0 }} · 网站 {{ status.counts?.website ?? 0 }} · Token {{ status.counts?.api_token ?? 0 }} · SSH {{ status.counts?.ssh ?? 0 }} · 邮箱 {{ status.counts?.mailbox ?? 0 }} · 授权码 {{ status.counts?.mail_auth ?? 0 }} · 服务器 {{ status.counts?.server ?? 0 }} · 数据库 {{ status.counts?.database ?? 0 }} · 证书 {{ status.counts?.client_cert ?? 0 }} · 回收站 {{ status.counts?.trash ?? 0 }}</p>
           <h3>最近使用</h3>
           <div class="table" v-if="recent.length">
             <table>
@@ -1192,7 +1475,12 @@ onMounted(async () => {
                   </td>
                   <td>
                     {{ row.account || row.fingerprint || "—" }}
-                    <div v-if="revealFor === row.id && reveal" style="font-size:12px;color:var(--muted);margin-top:4px;word-break:break-all">
+                    <div v-if="certInfoFor === row.id && clientCertInfo" class="cert-row-info">
+                      <span>指纹：{{ clientCertInfo.fingerprint || '—' }}</span>
+                      <span>证书链：{{ clientCertInfo.certificateCount ?? '—' }} 张</span>
+                      <span v-if="clientCertInfo.hasPassphrase">含私钥口令</span>
+                    </div>
+                    <div v-else-if="revealFor === row.id && reveal" style="font-size:12px;color:var(--muted);margin-top:4px;word-break:break-all">
                       <template v-if="reveal.type === 'website' || reveal.type === 'mailbox' || reveal.type === 'server' || reveal.type === 'database'">{{ reveal.password }}</template>
                       <template v-else-if="reveal.type === 'api_token'">{{ reveal.token }}</template>
                       <template v-else-if="reveal.type === 'mail_auth'">{{ reveal.auth_code }}</template>
@@ -1204,19 +1492,30 @@ onMounted(async () => {
                   <td>{{ row.use_count }}</td>
                   <td>{{ row.expires_at ? fmtTime(row.expires_at) : "永不" }}</td>
                   <td class="row-actions">
-                    <button class="icon-btn" type="button" title="复制密码" aria-label="复制密码" @click="copy(row.id)">
+                    <button v-if="!filter.trash && row.kind !== 'client_cert'" class="icon-btn" type="button" title="复制密码" aria-label="复制密码" @click="copy(row.id)">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <rect x="9" y="9" width="13" height="13" rx="2" />
                         <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
                       </svg>
                     </button>
-                    <button class="icon-btn" type="button" title="复制账号" aria-label="复制账号" @click="copy(row.id, 'account')">
+                    <button v-if="!filter.trash" class="icon-btn" type="button" title="复制账号" aria-label="复制账号" @click="copy(row.id, 'account')">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
                         <circle cx="12" cy="7" r="4" />
                       </svg>
                     </button>
-                    <button v-if="row.has_totp" class="icon-btn" type="button" title="复制 TOTP" aria-label="复制 TOTP" @click="copy(row.id, 'totp')">
+                    <button v-if="!filter.trash && row.kind === 'client_cert'" class="icon-btn" type="button" :class="{ on: certInfoFor === row.id }" title="查看证书信息" aria-label="查看证书信息" @click="showClientCertificateInfo(row)">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <circle cx="12" cy="12" r="9" /><path d="M12 10v6M12 7h.01" />
+                      </svg>
+                    </button>
+                    <button v-if="!filter.trash && row.kind === 'client_cert'" class="icon-btn" type="button" title="复制公开证书" aria-label="复制公开证书" @click="copyClientCertificate(row.id)">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M8 3h8a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Z" />
+                        <path d="M9 8h6M9 12h6M9 16h4" />
+                      </svg>
+                    </button>
+                    <button v-if="!filter.trash && row.has_totp" class="icon-btn" type="button" title="复制 TOTP" aria-label="复制 TOTP" @click="copy(row.id, 'totp')">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <circle cx="12" cy="12" r="10" />
                         <polyline points="12 6 12 12 16 14" />
@@ -1229,7 +1528,7 @@ onMounted(async () => {
                       </svg>
                     </button>
                     <button
-                      v-else
+                      v-else-if="row.kind !== 'client_cert'"
                       class="icon-btn"
                       type="button"
                       :class="{ on: revealFor === row.id }"
@@ -1282,8 +1581,6 @@ onMounted(async () => {
             <div class="mcp-status">
               <span class="mcp-dot" :class="{ on: mcp?.running }" />
               <span>{{ mcp?.running ? "运行中" : "已停止" }} · {{ mcp?.port || "—" }}</span>
-              <button class="btn primary" v-if="!mcp?.running" type="button" @click="startMcp">启动</button>
-              <button class="btn" v-else type="button" @click="stopMcp">停止</button>
               <button class="btn" type="button" @click="rotateMcp">轮换 MCP Token</button>
             </div>
           </div>
@@ -1305,39 +1602,135 @@ onMounted(async () => {
             <button class="btn" type="button" :disabled="!mcp?.has_token" @click="copyMcpSnippet">复制配置</button>
           </div>
           <div class="mcp-card">
+            <h3>GitHub 只读能力</h3>
+            <p class="crumb">只访问固定的 api.github.com，只执行 GET。启用后六个 GitHub 业务工具和一个 Token 发现工具全部可用，模型可通过 github_list_credentials 选择活动 Token。</p>
+            <div class="mcp-actions">
+              <button class="btn primary" type="button" :disabled="githubPolicyBusy" @click="saveGithubPolicy">
+                {{ githubPolicyBusy ? "保存中…" : (githubPolicy.enabled ? "停用 GitHub MCP" : "启用 GitHub MCP") }}
+              </button>
+            </div>
+            <p class="crumb">GitHub Token 在 GitHub 侧的实际权限仍由 GitHub 返回结果决定；Sealbox 不把 Token、请求头或任意请求体返回给模型。</p>
+          </div>
+          <div class="mcp-card">
+            <h3>ZoomKey JIRA / CRM</h3>
+            <p class="crumb">
+              把众齐内网的 JIRA 与 CRM 查询能力开放给本机 MCP 客户端。两个站点都在 172.16.x.x 内网且强制双向 TLS；
+              账号密码与客户端私钥都从金库取，不落磁盘明文，模型永远看不到明文。
+            </p>
+            <template v-if="zoomkeyPolicy">
+              <div class="zoomkey-notice">
+                内网例外：开启后 Sealbox 只对下方白名单里的主机名放行，解析结果会被钉住再使用；
+                回环、链路本地与云元数据地址（169.254.169.254 / 100.100.100.200）永远拒绝。
+              </div>
+              <div class="field">
+                <label class="check">
+                  <input v-model="zoomkeyPolicy.allow_private_network" type="checkbox" />
+                  允许访问内网地址（不开这一项，下面两个能力都不会生效）
+                </label>
+              </div>
+              <div class="field">
+                <label>允许的主机名（每行一个，精确匹配）</label>
+                <textarea
+                  rows="2"
+                  :value="zoomkeyPolicy.allowed_hosts.join('\n')"
+                  @change="zoomkeyPolicy.allowed_hosts = ($event.target as HTMLTextAreaElement).value.split('\n').map((s) => s.trim()).filter(Boolean)"
+                />
+              </div>
+
+              <div class="zoomkey-endpoint">
+                <div class="zoomkey-endpoint-head">
+                  <label class="check">
+                    <input v-model="zoomkeyPolicy.jira_enabled" type="checkbox" />
+                    <strong>JIRA</strong>
+                  </label>
+                  <button class="btn" type="button" :disabled="!!zoomkeyTestBusy" @click="testZoomkey('jira')">
+                    {{ zoomkeyTestBusy === 'jira' ? '测试中…' : '测试连接' }}
+                  </button>
+                </div>
+                <div class="field"><label>站点地址</label><input v-model="zoomkeyPolicy.jira.base_url" /></div>
+                <div class="field">
+                  <label>金库凭据（服务需填 zoomkey-jira，账号=用户名，密钥=密码）</label>
+                  <select v-model="zoomkeyPolicy.jira.credential_id">
+                    <option value="">未选择</option>
+                    <option v-for="c in zoomkeyCandidates.jira_credentials" :key="c.id" :value="c.id">
+                      {{ c.title }}{{ c.account ? ` · ${c.account}` : '' }}
+                    </option>
+                  </select>
+                  <p class="crumb" v-if="!zoomkeyCandidates.jira_credentials.length">
+                    还没有可用的 JIRA 凭据。请先在保险库新建一条 API Token，服务填 zoomkey-jira。
+                  </p>
+                </div>
+                <div class="field">
+                  <label>客户端证书（金库里的「客户端证书」条目）</label>
+                  <select v-model="zoomkeyPolicy.jira.client_cert_id">
+                    <option value="">未选择</option>
+                    <option v-for="c in zoomkeyCandidates.client_certs" :key="c.id" :value="c.id">{{ c.title }}</option>
+                  </select>
+                  <p class="crumb" v-if="!zoomkeyCandidates.client_certs.length">
+                    还没有客户端证书条目。请新建一条「客户端证书」，把 client-cert.pem 与 client-key.pem 贴进去。
+                  </p>
+                </div>
+                <div class="field"><label>CA bundle 路径（含 Root + SubCA 的 PEM）</label><input v-model="zoomkeyPolicy.jira.ca_bundle_path" placeholder="D:\...\zoomkey-ca-bundle.pem" /></div>
+              </div>
+
+              <div class="zoomkey-endpoint">
+                <div class="zoomkey-endpoint-head">
+                  <label class="check">
+                    <input v-model="zoomkeyPolicy.crm_enabled" type="checkbox" />
+                    <strong>CRM</strong>
+                  </label>
+                  <button class="btn" type="button" :disabled="!!zoomkeyTestBusy" @click="testZoomkey('crm')">
+                    {{ zoomkeyTestBusy === 'crm' ? '测试中…' : '测试连接' }}
+                  </button>
+                </div>
+                <div class="field"><label>Webservice 地址</label><input v-model="zoomkeyPolicy.crm.base_url" /></div>
+                <div class="field">
+                  <label>金库凭据（服务需填 zoomkey-crm，账号=用户名，密钥=AccessKey）</label>
+                  <select v-model="zoomkeyPolicy.crm.credential_id">
+                    <option value="">未选择</option>
+                    <option v-for="c in zoomkeyCandidates.crm_credentials" :key="c.id" :value="c.id">
+                      {{ c.title }}{{ c.account ? ` · ${c.account}` : '' }}
+                    </option>
+                  </select>
+                  <p class="crumb" v-if="!zoomkeyCandidates.crm_credentials.length">
+                    还没有可用的 CRM 凭据。请先在保险库新建一条 API Token，服务填 zoomkey-crm，密钥填 AccessKey。
+                  </p>
+                </div>
+                <div class="field">
+                  <label>客户端证书</label>
+                  <select v-model="zoomkeyPolicy.crm.client_cert_id">
+                    <option value="">未选择</option>
+                    <option v-for="c in zoomkeyCandidates.client_certs" :key="c.id" :value="c.id">{{ c.title }}</option>
+                  </select>
+                </div>
+                <div class="field"><label>CA bundle 路径</label><input v-model="zoomkeyPolicy.crm.ca_bundle_path" placeholder="D:\...\zoomkey-ca-bundle.pem" /></div>
+              </div>
+
+              <div class="mcp-actions">
+                <button class="btn primary" type="button" :disabled="zoomkeyBusy" @click="saveZoomkeyPolicy">
+                  {{ zoomkeyBusy ? "保存中…" : "保存 ZoomKey 策略" }}
+                </button>
+              </div>
+              <div class="zoomkey-test" v-if="zoomkeyTestResult" :class="{ ok: zoomkeyTestResult.ok }">
+                <strong>{{ zoomkeyTestResult.endpoint.toUpperCase() }} {{ zoomkeyTestResult.ok ? "连通正常" : "连接失败" }}</strong>
+                <pre>{{ zoomkeyTestResult.text }}</pre>
+              </div>
+            </template>
+            <p class="crumb" v-else>解锁金库后才能读取 ZoomKey 策略。</p>
+          </div>
+          <div class="mcp-card">
             <h3>工具列表</h3>
             <p class="crumb">当前 MCP 对模型暴露的工具，与 tools/list 一致。</p>
             <div class="tool-list" v-if="mcpTools.length">
               <div class="tool-item" v-for="tool in mcpTools" :key="tool.name">
-                <code class="tool-name">{{ tool.name }}</code>
+                <div class="tool-heading">
+                  <code class="tool-name">{{ tool.name }}</code>
+                  <span class="tool-risk" :class="{ safe: tool.readOnly, danger: !tool.readOnly }">{{ tool.readOnly ? "只读" : tool.risk }}</span>
+                </div>
                 <p class="crumb">{{ tool.description }}</p>
               </div>
             </div>
             <p class="crumb" v-else>还没有读到工具定义。</p>
-          </div>
-          <div class="mcp-card mcp-logs">
-            <h3>http_request 响应</h3>
-            <p class="crumb">完整正文只在这里查看，锁定金库后清空。模型侧只有状态码、长度和 SHA256。</p>
-            <button class="btn" style="margin:8px 0 12px" type="button" @click="refreshMcp">刷新日志</button>
-            <div class="table" v-if="httpLogs.length">
-              <table>
-                <thead><tr><th>时间</th><th>方法</th><th>状态</th><th>网址</th><th></th></tr></thead>
-                <tbody>
-                  <tr v-for="log in httpLogs" :key="log.id">
-                    <td>{{ fmtTime(log.at) }}</td>
-                    <td>{{ log.method }}</td>
-                    <td>{{ log.status }} / {{ log.bytes }} B</td>
-                    <td>{{ log.url }}</td>
-                    <td><button class="btn" type="button" @click="openHttpLog = openHttpLog === log.id ? null : log.id">{{ openHttpLog === log.id ? "收起" : "查看" }}</button></td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-            <p class="crumb" v-else>还没有代发记录。</p>
-            <div class="field" v-if="httpLogs.find((l) => l.id === openHttpLog)">
-              <label>sha256 {{ httpLogs.find((l) => l.id === openHttpLog)?.sha256 }}</label>
-              <textarea rows="10" readonly :value="httpLogs.find((l) => l.id === openHttpLog)?.body || ''"></textarea>
-            </div>
           </div>
         </div>
       </section>
@@ -1384,6 +1777,127 @@ onMounted(async () => {
               </div>
             </div>
             <p class="crumb">{{ mcp?.fill_url || "http://127.0.0.1:17891/fill" }} · 只接受 Host 为 127.0.0.1 的本机请求</p>
+          </div>
+        </div>
+      </section>
+
+      <section class="main" v-else-if="page === 'assistant'">
+        <div class="content content-page assistant-page">
+          <div class="mcp-head assistant-head">
+            <div>
+              <h2>助手</h2>
+              <p class="crumb">用 OpenAI 兼容接口聊天，并通过本机 MCP 只读工具验证连通性。API Key 只保存在加密金库中。</p>
+            </div>
+            <div class="mcp-status">
+              <span class="mcp-dot" :class="{ on: assistantConfig?.hasApiKey }" />
+              <span>{{ assistantConfig?.hasApiKey ? "模型已配置" : "待配置模型" }}</span>
+              <span class="assistant-connection" :class="{ connected: assistantMcp?.connected }">
+                {{ assistantMcp?.connected ? `MCP · ${assistantMcp.tools.length} 工具` : "MCP 未测试" }}
+              </span>
+            </div>
+          </div>
+          <p class="error" v-if="assistantError">{{ assistantError }}</p>
+          <div class="assistant-layout">
+            <div class="assistant-side">
+              <div class="mcp-card assistant-card">
+                <div class="assistant-card-heading">
+                  <div>
+                    <h3>模型配置</h3>
+                    <p class="crumb">兼容 Chat Completions 的服务均可使用。</p>
+                  </div>
+                  <span class="tool-risk" :class="{ safe: assistantConfig?.hasApiKey }">{{ assistantConfig?.hasApiKey ? "已配置" : "未配置" }}</span>
+                </div>
+                <div class="field">
+                  <label>Base URL</label>
+                  <input v-model="assistantBaseUrl" placeholder="https://api.openai.com/v1" />
+                </div>
+                <div class="field">
+                  <label>模型</label>
+                  <input v-model="assistantModel" placeholder="gpt-4o-mini" />
+                </div>
+                <div class="field">
+                  <label>API Key <span class="crumb">（留空保持原值）</span></label>
+                  <input v-model="assistantApiKey" type="password" autocomplete="off" placeholder="不会回显或返回前端" />
+                </div>
+                <label class="checkbox-row assistant-check">
+                  <input v-model="assistantClearApiKey" type="checkbox" />
+                  <span>清除已保存的 API Key</span>
+                </label>
+                <button class="btn primary" type="button" :disabled="assistantConfigBusy" @click="saveAssistantConfig">
+                  {{ assistantConfigBusy ? "保存中…" : "保存配置" }}
+                </button>
+              </div>
+
+              <div class="mcp-card assistant-card">
+                <div class="assistant-card-heading">
+                  <div>
+                    <h3>MCP 连通性</h3>
+                    <p class="crumb">助手会连接当前 Sealbox 的本机 MCP，不把 Token 交给网页。</p>
+                  </div>
+                  <span class="tool-risk" :class="{ safe: assistantMcp?.connected }">{{ assistantMcp?.connected ? "在线" : "待测试" }}</span>
+                </div>
+                <div class="assistant-endpoint" v-if="assistantMcp?.url || mcp?.url">{{ assistantMcp?.url || mcp?.url }}</div>
+                <button class="btn" type="button" :disabled="assistantProbeBusy" @click="probeAssistantMcp">
+                  {{ assistantProbeBusy ? "测试中…" : "测试 MCP" }}
+                </button>
+                <div class="tool-list assistant-tool-list" v-if="assistantMcp?.tools.length">
+                  <div class="tool-item" v-for="tool in assistantMcp.tools" :key="tool.name">
+                    <div class="tool-heading">
+                      <code class="tool-name">{{ tool.name }}</code>
+                      <span class="tool-risk safe">只读</span>
+                    </div>
+                    <p class="crumb">{{ tool.description }}</p>
+                  </div>
+                </div>
+                <p class="crumb" v-else>点击“测试 MCP”发现当前可用工具。</p>
+              </div>
+            </div>
+
+            <div class="mcp-card assistant-card assistant-chat-card">
+              <div class="assistant-card-heading">
+                <div>
+                  <h3>对话</h3>
+                  <p class="crumb">工具结果会标记为外部资料，不会改变助手权限。</p>
+                </div>
+                <div class="mcp-actions assistant-chat-actions">
+                  <span class="crumb">GitHub MCP 开关决定是否可调用只读工具</span>
+                  <button class="btn" type="button" :disabled="assistantChatBusy || !assistantMessages.length" @click="clearAssistantChat">清空</button>
+                </div>
+              </div>
+              <div class="assistant-messages" aria-live="polite">
+                <div class="assistant-empty" v-if="!assistantMessages.length">
+                  <div class="assistant-empty-mark">✦</div>
+                  <strong>开始一次 MCP 连通性测试</strong>
+                  <p class="crumb">例如：“列出当前可用的 GitHub 工具”，或直接问一个普通问题。</p>
+                </div>
+                <div class="assistant-message" :class="message.role" v-for="(message, index) in assistantMessages" :key="`${index}-${message.role}`">
+                  <span class="assistant-message-role">{{ message.role === 'user' ? '你' : '助手' }}</span>
+                  <div class="assistant-message-content">{{ message.content }}</div>
+                </div>
+                <div class="assistant-thinking" v-if="assistantChatBusy"><span></span><span></span><span></span> 正在思考…</div>
+              </div>
+              <div class="assistant-traces" v-if="assistantTraces.length">
+                <div class="assistant-trace-title">工具调用记录</div>
+                <details class="assistant-tool-trace" v-for="(trace, index) in assistantTraces" :key="`${trace.name}-${index}`">
+                  <summary>
+                    <span class="assistant-trace-dot" :class="{ ok: trace.success }" />
+                    <code>{{ trace.name }}</code>
+                    <span>{{ trace.success ? "完成" : "失败" }}</span>
+                  </summary>
+                  <div class="assistant-trace-body">
+                    <div><strong>参数</strong><pre>{{ trace.arguments }}</pre></div>
+                    <div><strong>结果预览</strong><pre>{{ trace.resultPreview }}</pre></div>
+                  </div>
+                </details>
+              </div>
+              <form class="assistant-composer" @submit.prevent="sendAssistantMessage">
+                <textarea v-model="assistantInput" rows="3" :disabled="assistantChatBusy" placeholder="输入消息，Enter 发送，Shift+Enter 换行" @keydown.enter.exact.prevent="sendAssistantMessage" />
+                <div class="assistant-composer-foot">
+                  <span class="crumb">工具由 GitHub MCP 总开关控制</span>
+                  <button class="btn primary" type="submit" :disabled="assistantChatBusy || !assistantInput.trim()">{{ assistantChatBusy ? "发送中…" : "发送" }}</button>
+                </div>
+              </form>
+            </div>
           </div>
         </div>
       </section>
@@ -1483,10 +1997,11 @@ onMounted(async () => {
             <option value="mail_auth">邮箱授权码</option>
             <option value="server">服务器账号</option>
             <option value="database">数据库</option>
+            <option value="client_cert">客户端证书</option>
           </select>
         </div>
         <div class="field"><label>键名</label><input v-model="form.title" /></div>
-        <div class="field" v-if="form.kind !== 'ssh' && form.kind !== 'mailbox' && form.kind !== 'mail_auth'"><label>{{ form.kind === 'server' || form.kind === 'database' ? '用户名' : '账号' }}</label><input v-model="form.account" /></div>
+        <div class="field" v-if="form.kind !== 'ssh' && form.kind !== 'mailbox' && form.kind !== 'mail_auth' && form.kind !== 'client_cert'"><label>{{ form.kind === 'server' || form.kind === 'database' ? '用户名' : '账号' }}</label><input v-model="form.account" /></div>
         <div class="field" v-if="form.kind === 'website'"><label>网址</label><input v-model="form.url" /></div>
         <div class="field" v-if="form.kind === 'website' || form.kind === 'mailbox' || form.kind === 'server' || form.kind === 'database'">
           <label>密码</label>
@@ -1582,6 +2097,25 @@ onMounted(async () => {
         <div class="field" v-if="form.kind === 'database' && form.engine !== 'sqlite'"><label>主机</label><input v-model="form.host" placeholder="127.0.0.1 或 db.example.com" /></div>
         <div class="field" v-if="form.kind === 'database' && form.engine !== 'sqlite'"><label>端口</label><input v-model.number="form.port" type="number" /></div>
         <div class="field" v-if="form.kind === 'database'"><label>{{ form.engine === 'sqlite' ? '文件路径' : form.engine === 'oracle' ? '服务名 / SID' : form.engine === 'redis' ? '库编号（可空）' : '库名' }}</label><input v-model="form.db_name" :placeholder="form.engine === 'sqlite' ? 'D:\\data\\app.db' : 'appdb'" /></div>
+        <div class="field cert-import-panel" v-if="form.kind === 'client_cert'">
+          <label>客户端证书与私钥</label>
+          <p class="crumb">文件只在 Rust 侧读取并加密保存；不会把私钥内容回显到界面，也不会保存原始路径。</p>
+          <div class="cert-file-row">
+            <input :value="form.cert_path || '未选择证书 PEM 文件'" readonly />
+            <button class="btn" type="button" @click="pickClientCertFile('cert')">选择证书</button>
+          </div>
+          <div class="cert-file-row">
+            <input :value="form.key_path || '未选择私钥 PEM 文件'" readonly />
+            <button class="btn" type="button" @click="pickClientCertFile('key')">选择私钥</button>
+          </div>
+          <div class="cert-meta" v-if="clientCertInfo">
+            <span>指纹：{{ clientCertInfo.fingerprint || '—' }}</span>
+            <span>证书链：{{ clientCertInfo.certificateCount ?? '—' }} 张</span>
+            <span v-if="clientCertInfo.hasPassphrase">含私钥口令</span>
+          </div>
+          <p class="crumb" v-if="editing && !form.cert_path && !form.key_path">不选择新文件将保留当前加密证书，仅更新下方元数据。</p>
+          <div class="field cert-passphrase"><label>私钥口令（可空）</label><input v-model="form.cert_passphrase" type="password" autocomplete="off" /></div>
+        </div>
         <div class="field"><label>文件夹</label>
           <select v-model="form.folder_id">
             <option value="">未归类</option>

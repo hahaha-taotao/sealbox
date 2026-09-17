@@ -20,7 +20,7 @@ const hits = computed(() => {
       e.title.toLowerCase().includes(q) ||
       (e.account || "").toLowerCase().includes(q) ||
       (e.url || "").toLowerCase().includes(q),
-  );
+  ).filter((e) => e.kind !== "client_cert");
 });
 
 function kindLabel(k: EntryKind) {
@@ -32,6 +32,7 @@ function kindLabel(k: EntryKind) {
     case "mail_auth": return "授权码";
     case "server": return "服务器";
     case "database": return "数据库";
+    case "client_cert": return "客户端证书";
   }
 }
 
@@ -81,6 +82,11 @@ async function unlock() {
 }
 
 async function copyHit(row: EntryDto) {
+  if (row.kind === "client_cert") {
+    toast.value = "客户端证书不能通过速查复制";
+    setTimeout(() => (toast.value = ""), 800);
+    return;
+  }
   await api.copy(row.id, "secret");
   toast.value = `已复制 ${row.title}`;
   setTimeout(() => (toast.value = ""), 800);

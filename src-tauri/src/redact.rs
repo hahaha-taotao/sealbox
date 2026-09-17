@@ -2,10 +2,18 @@ use crate::vault::SecretPayload;
 use regex::Regex;
 use std::sync::OnceLock;
 
+fn pem_block() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?is)-----BEGIN (?:[A-Z ]*PRIVATE KEY|CERTIFICATE)-----.*?-----END (?:[A-Z ]*PRIVATE KEY|CERTIFICATE)-----")
+            .unwrap()
+    })
+}
+
 fn token_like() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"(?i)(ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|gho_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|fill_[A-Fa-f0-9]{32}|sbx_[A-Fa-f0-9]{32}|-----BEGIN [A-Z ]*PRIVATE KEY-----)").unwrap()
+        Regex::new(r"(?i)(ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|gho_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|fill_[A-Fa-f0-9]{32}|sbx_[A-Fa-f0-9]{32}|-----BEGIN (?:[A-Z ]*PRIVATE KEY|CERTIFICATE)-----)").unwrap()
     })
 }
 
@@ -24,6 +32,7 @@ pub fn redact_text(input: &str, secrets: &[&str]) -> String {
             out = out.replace(&s, "[REDACTED]");
         }
     }
+    let out = pem_block().replace_all(&out, "[REDACTED]");
     token_like().replace_all(&out, "[REDACTED]").into_owned()
 }
 
@@ -62,6 +71,17 @@ pub fn secrets_from_payload(payload: &SecretPayload) -> Vec<String> {
         SecretPayload::MailAuth { auth_code, .. } => vec![auth_code.clone()],
         SecretPayload::Server { password, .. } => vec![password.clone()],
         SecretPayload::Database { password, .. } => vec![password.clone()],
+        SecretPayload::ClientCert {
+            key_pem,
+            passphrase,
+            ..
+        } => {
+            let mut v = vec![key_pem.clone()];
+            if let Some(p) = passphrase {
+                v.push(p.clone());
+            }
+            v
+        }
     }
 }
 
@@ -86,5 +106,14 @@ mod tests {
         assert!(!out.contains(fill));
         assert!(!out.contains(mcp));
         assert!(out.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redacts_complete_certificate_and_private_key_blocks() {
+        let input = "-----BEGIN CERTIFICATE-----\npublic-body\n-----END CERTIFICATE-----\n-----BEGIN PRIVATE KEY-----\nprivate-body\n-----END PRIVATE KEY-----";
+        let out = redact_text(input, &[]);
+        assert!(!out.contains("public-body"));
+        assert!(!out.contains("private-body"));
+        assert_eq!(out.matches("[REDACTED]").count(), 2);
     }
 }

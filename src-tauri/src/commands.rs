@@ -1,5 +1,7 @@
+use crate::assistant;
 use crate::backup::{export_envelope, import_envelope};
 use crate::clipboard;
+use crate::github_mcp::{self, GithubMcpPolicy};
 use crate::hello;
 use crate::lock::{idle_lock_if_needed, lock_everything, lock_session, recover_lock};
 use crate::mcp::{self, McpState};
@@ -8,7 +10,9 @@ use crate::totp::{generate_passphrase, generate_password_with_options, ssh_finge
 use crate::vault::{
     AuditEvent, Counts, EntryDto, FolderDto, ListFilter, SecretPayload, UpsertEntry, Vault,
 };
+use crate::zoomkey::{self, ZoomkeyCandidates, ZoomkeyMcpPolicy};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -443,15 +447,16 @@ pub fn list_audit(state: State<AppState>) -> Result<Vec<AuditEvent>, String> {
         .map_err(map_err)
 }
 
-fn primary_secret(payload: &SecretPayload) -> String {
+fn primary_secret(payload: &SecretPayload) -> Result<String, String> {
     match payload {
-        SecretPayload::Website { password, .. } => password.clone(),
-        SecretPayload::ApiToken { token, .. } => token.clone(),
-        SecretPayload::Ssh { private_key, .. } => private_key.clone(),
-        SecretPayload::Mailbox { password, .. } => password.clone(),
-        SecretPayload::MailAuth { auth_code, .. } => auth_code.clone(),
-        SecretPayload::Server { password, .. } => password.clone(),
-        SecretPayload::Database { password, .. } => password.clone(),
+        SecretPayload::Website { password, .. } => Ok(password.clone()),
+        SecretPayload::ApiToken { token, .. } => Ok(token.clone()),
+        SecretPayload::Ssh { private_key, .. } => Ok(private_key.clone()),
+        SecretPayload::Mailbox { password, .. } => Ok(password.clone()),
+        SecretPayload::MailAuth { auth_code, .. } => Ok(auth_code.clone()),
+        SecretPayload::Server { password, .. } => Ok(password.clone()),
+        SecretPayload::Database { password, .. } => Ok(password.clone()),
+        SecretPayload::ClientCert { .. } => Err("客户端证书私钥不能通过通用复制功能导出".into()),
     }
 }
 
@@ -464,6 +469,7 @@ fn account_of(payload: &SecretPayload) -> Option<String> {
         SecretPayload::MailAuth { email, .. } => Some(email.clone()),
         SecretPayload::Server { username, .. } => Some(username.clone()),
         SecretPayload::Database { username, .. } => Some(username.clone()),
+        SecretPayload::ClientCert { .. } => None,
     }
 }
 
@@ -474,7 +480,7 @@ pub fn copy_secret(state: State<AppState>, id: String, field: String) -> Result<
     let dek = *session.dek().map_err(map_err)?;
     let payload = {
         let vault = session.vault().map_err(map_err)?;
-        vault.get_secret(&dek, &id).map_err(map_err)?
+        vault.get_active_secret(&dek, &id).map_err(map_err)?
     };
     let text = match field.as_str() {
         "account" => account_of(&payload).unwrap_or_default(),
@@ -485,7 +491,7 @@ pub fn copy_secret(state: State<AppState>, id: String, field: String) -> Result<
             let secret = totp_secret.as_ref().ok_or("没有 TOTP")?;
             totp_now(secret)?
         }
-        _ => primary_secret(&payload),
+        _ => primary_secret(&payload)?,
     };
     if text.is_empty() {
         return Err("没有可复制的内容".into());
@@ -507,11 +513,183 @@ pub fn reveal_secret(state: State<AppState>, id: String) -> Result<SecretPayload
     let dek = *session.dek().map_err(map_err)?;
     let payload = {
         let vault = session.vault().map_err(map_err)?;
-        let payload = vault.get_secret(&dek, &id).map_err(map_err)?;
+        let payload = vault.get_active_secret(&dek, &id).map_err(map_err)?;
+        if matches!(payload, SecretPayload::ClientCert { .. }) {
+            return Err("客户端证书私钥不能通过通用显示功能返回到界面".into());
+        }
         let _ = vault.audit("reveal", Some(&id), "ok");
         payload
     };
     Ok(payload)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientCertInfo {
+    pub id: String,
+    pub title: String,
+    pub fingerprint: Option<String>,
+    pub certificate_count: Option<usize>,
+    pub has_passphrase: bool,
+}
+
+#[tauri::command]
+pub fn client_cert_info(state: State<AppState>, id: String) -> Result<ClientCertInfo, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let dek = *session.dek().map_err(map_err)?;
+    let vault = session.vault().map_err(map_err)?;
+    let entry = vault
+        .list_entries(&crate::vault::ListFilter {
+            kind: Some(crate::vault::EntryKind::ClientCert),
+            ..Default::default()
+        })
+        .map_err(map_err)?
+        .into_iter()
+        .find(|entry| entry.id == id)
+        .ok_or_else(|| "客户端证书不存在或已在回收站".to_string())?;
+    let payload = vault.get_active_secret(&dek, &id).map_err(map_err)?;
+    let SecretPayload::ClientCert {
+        cert_pem,
+        key_pem,
+        passphrase,
+    } = payload
+    else {
+        return Err("条目不是客户端证书".into());
+    };
+    let metadata = crate::certificate::validate_client_cert(&cert_pem, &key_pem, passphrase.as_deref()).ok();
+    Ok(ClientCertInfo {
+        id: entry.id,
+        title: entry.title,
+        fingerprint: entry.fingerprint.or_else(|| metadata.as_ref().map(|value| value.fingerprint.clone())),
+        certificate_count: metadata.as_ref().map(|value| value.certificate_count),
+        has_passphrase: passphrase.is_some(),
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateClientCertMetadataInput {
+    pub id: String,
+    pub title: String,
+    pub account: Option<String>,
+    pub url: Option<String>,
+    pub folder_id: Option<String>,
+    pub tags: Vec<String>,
+    pub pinned: bool,
+    pub expires_at: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[tauri::command]
+pub fn update_client_cert_metadata(
+    state: State<AppState>,
+    input: UpdateClientCertMetadataInput,
+) -> Result<EntryDto, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let dek = *session.dek().map_err(map_err)?;
+    session
+        .vault()
+        .map_err(map_err)?
+        .update_entry_metadata(
+            &dek,
+            &input.id,
+            &input.title,
+            input.account.as_deref(),
+            input.url.as_deref(),
+            input.folder_id.as_deref(),
+            &input.tags,
+            input.pinned,
+            input.expires_at.as_deref(),
+            input.notes.as_deref(),
+        )
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn copy_client_cert(state: State<AppState>, id: String) -> Result<(), String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let dek = *session.dek().map_err(map_err)?;
+    let cert_pem = {
+        let vault = session.vault().map_err(map_err)?;
+        let payload = vault.get_active_secret(&dek, &id).map_err(map_err)?;
+        let SecretPayload::ClientCert { cert_pem, .. } = payload else {
+            return Err("条目不是客户端证书".into());
+        };
+        cert_pem
+    };
+    clipboard::write_text(&cert_pem)?;
+    session.remember_clipboard(&cert_pem);
+    if let Ok(vault) = session.vault() {
+        let _ = vault.bump_use(&id);
+        let _ = vault.audit("copy_certificate", Some(&id), "public_pem");
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportClientCertInput {
+    pub id: Option<String>,
+    pub title: String,
+    pub cert_path: String,
+    pub key_path: String,
+    pub passphrase: Option<String>,
+    pub account: Option<String>,
+    pub url: Option<String>,
+    pub folder_id: Option<String>,
+    pub tags: Vec<String>,
+    pub pinned: bool,
+    pub expires_at: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[tauri::command]
+pub fn import_client_cert(
+    state: State<AppState>,
+    input: ImportClientCertInput,
+) -> Result<EntryDto, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let cert_pem = crate::certificate::read_text_file(
+        &input.cert_path,
+        "客户端证书文件",
+        crate::certificate::MAX_CERT_PEM_BYTES,
+    )
+    .map_err(map_err)?;
+    let key_pem = crate::certificate::read_text_file(
+        &input.key_path,
+        "客户端私钥文件",
+        crate::certificate::MAX_KEY_PEM_BYTES,
+    )
+    .map_err(map_err)?;
+    let dek = *session.dek().map_err(map_err)?;
+    session
+        .vault()
+        .map_err(map_err)?
+        .upsert_entry(
+            &dek,
+            UpsertEntry {
+                id: input.id,
+                kind: crate::vault::EntryKind::ClientCert,
+                title: input.title,
+                account: input.account,
+                url: input.url,
+                folder_id: input.folder_id,
+                tags: input.tags,
+                pinned: input.pinned,
+                expires_at: input.expires_at,
+                notes: input.notes,
+                secret: SecretPayload::ClientCert {
+                    cert_pem,
+                    key_pem,
+                    passphrase: input.passphrase,
+                },
+            },
+        )
+        .map_err(map_err)
 }
 
 #[tauri::command]
@@ -939,15 +1117,149 @@ pub fn fill_pairing_status(state: State<AppState>) -> mcp::PairingStatus {
 }
 
 #[tauri::command]
-pub fn mcp_tools() -> Vec<mcp::ToolInfo> {
-    mcp::tool_catalog()
+pub fn mcp_tools(state: State<AppState>) -> Vec<mcp::ToolInfo> {
+    mcp::tool_catalog(&state.session)
 }
 
 #[tauri::command]
-pub fn mcp_http_logs(state: State<AppState>) -> Result<Vec<mcp::HttpLogEntry>, String> {
+pub fn github_mcp_policy_get(state: State<AppState>) -> Result<GithubMcpPolicy, String> {
     let mut session = lock_session(&state.session);
     session.require_unlocked().map_err(map_err)?;
-    Ok(state.mcp.http_logs())
+    let vault = session.vault().map_err(map_err)?;
+    let dek = session.dek().map_err(map_err)?;
+    Ok(github_mcp::load_policy(vault, dek))
+}
+
+#[tauri::command]
+pub fn github_mcp_policy_set(
+    state: State<AppState>,
+    policy: GithubMcpPolicy,
+) -> Result<GithubMcpPolicy, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let normalized = github_mcp::normalize_policy(policy)?;
+    let dek = *session.dek().map_err(map_err)?;
+    let vault = session.vault().map_err(map_err)?;
+    github_mcp::save_policy(vault, &dek, &normalized)?;
+    let _ = vault.audit(
+        "mcp_github_policy",
+        None,
+        if normalized.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+    );
+    Ok(normalized)
+}
+
+#[tauri::command]
+pub fn zoomkey_policy_get(state: State<AppState>) -> Result<ZoomkeyMcpPolicy, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let vault = session.vault().map_err(map_err)?;
+    let dek = session.dek().map_err(map_err)?;
+    Ok(zoomkey::load_policy(vault, dek))
+}
+
+#[tauri::command]
+pub fn zoomkey_policy_set(
+    state: State<AppState>,
+    policy: ZoomkeyMcpPolicy,
+) -> Result<ZoomkeyMcpPolicy, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let normalized = zoomkey::normalize_policy(policy);
+    let dek = *session.dek().map_err(map_err)?;
+    let vault = session.vault().map_err(map_err)?;
+    zoomkey::save_policy(vault, &dek, &normalized)?;
+    let _ = vault.audit(
+        "mcp_zoomkey_policy",
+        None,
+        &format!(
+            "jira={} crm={} private_network={}",
+            on_off(normalized.jira_enabled),
+            on_off(normalized.crm_enabled),
+            on_off(normalized.allow_private_network),
+        ),
+    );
+    Ok(normalized)
+}
+
+#[tauri::command]
+pub fn zoomkey_candidates(state: State<AppState>) -> Result<ZoomkeyCandidates, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    zoomkey::list_candidates(&session)
+}
+
+/// 用户主动触发的连通性自检，不经过 MCP 路由，但仍然写审计。
+#[tauri::command]
+pub fn zoomkey_test_connection(state: State<AppState>, endpoint: String) -> Result<String, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let label: &'static str = match endpoint.trim().to_ascii_lowercase().as_str() {
+        "jira" => "jira",
+        "crm" => "crm",
+        _ => return Err("endpoint 必须是 jira 或 crm".into()),
+    };
+    let name = format!("zoomkey_{label}_connection_status");
+    let outcome = zoomkey::call_tool_detailed(&mut session, &name, json!({ "ping": true }));
+    if let Ok(vault) = session.vault() {
+        let detail = match &outcome {
+            Ok(_) => format!("endpoint={label} decision=allow"),
+            Err(error) => format!(
+                "endpoint={label} decision=deny reason={} status={}",
+                error.reason,
+                error
+                    .status
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".into())
+            ),
+        };
+        let _ = vault.audit("mcp_zoomkey_test", None, &detail);
+    }
+    outcome
+        .map(|result| result.text)
+        .map_err(|error| error.message)
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+#[tauri::command]
+pub fn assistant_config_get(
+    state: State<AppState>,
+) -> Result<assistant::AssistantConfigView, String> {
+    let mut session = lock_session(&state.session);
+    assistant::config_get(&mut session)
+}
+
+#[tauri::command]
+pub fn assistant_config_set(
+    state: State<AppState>,
+    input: assistant::AssistantConfigInput,
+) -> Result<assistant::AssistantConfigView, String> {
+    let mut session = lock_session(&state.session);
+    assistant::config_set(&mut session, input)
+}
+
+#[tauri::command]
+pub fn assistant_mcp_probe(state: State<AppState>) -> Result<assistant::AssistantMcpProbe, String> {
+    assistant::mcp_probe(&state.session, &state.mcp)
+}
+
+#[tauri::command]
+pub fn assistant_chat(
+    state: State<AppState>,
+    request: assistant::AssistantChatRequest,
+) -> Result<assistant::AssistantChatResponse, String> {
+    assistant::chat(&state.session, &state.mcp, request)
 }
 
 #[tauri::command]
@@ -1146,7 +1458,10 @@ mod tests {
         *recover_lock(&state.mcp.fill_token) = "fill_ephemeral_boot".into();
         *recover_lock(&state.mcp.token) = "sbx_ephemeral_boot".into();
         hydrate_bridge_tokens(&state);
-        assert_eq!(recover_lock(&state.mcp.fill_token).as_str(), "fill_from_disk");
+        assert_eq!(
+            recover_lock(&state.mcp.fill_token).as_str(),
+            "fill_from_disk"
+        );
         assert_eq!(recover_lock(&state.mcp.token).as_str(), "sbx_from_disk");
     }
 

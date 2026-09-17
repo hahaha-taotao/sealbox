@@ -1,9 +1,12 @@
+pub mod assistant;
 pub mod backup;
+pub mod certificate;
 pub mod clipboard;
 pub mod commands;
 pub mod crypto;
 pub mod db;
 pub mod fill;
+pub mod github_mcp;
 pub mod hello;
 pub mod http_guard;
 pub mod lock;
@@ -13,6 +16,7 @@ pub mod redact;
 pub mod session;
 pub mod totp;
 pub mod vault;
+pub mod zoomkey;
 
 use commands::AppState;
 use tauri::menu::{Menu, MenuItem};
@@ -52,6 +56,10 @@ pub fn run() {
             commands::list_audit,
             commands::copy_secret,
             commands::reveal_secret,
+            commands::client_cert_info,
+            commands::copy_client_cert,
+            commands::update_client_cert_metadata,
+            commands::import_client_cert,
             commands::get_notes,
             commands::tick_idle,
             commands::gen_password,
@@ -73,8 +81,17 @@ pub fn run() {
             commands::copy_mcp_snippet,
             commands::fill_open_pairing,
             commands::fill_pairing_status,
-            commands::mcp_http_logs,
+            commands::assistant_config_get,
+            commands::assistant_config_set,
+            commands::assistant_mcp_probe,
+            commands::assistant_chat,
             commands::mcp_tools,
+            commands::github_mcp_policy_get,
+            commands::github_mcp_policy_set,
+            commands::zoomkey_policy_get,
+            commands::zoomkey_policy_set,
+            commands::zoomkey_candidates,
+            commands::zoomkey_test_connection,
             commands::window_control,
         ])
         .setup(|app| {

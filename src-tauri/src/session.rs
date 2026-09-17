@@ -77,6 +77,9 @@ impl Session {
     }
 
     pub fn set_unlocked(&mut self, vault: Vault, dek: [u8; 32]) {
+        if self.dek.is_some() || self.vault.is_some() {
+            self.lock();
+        }
         self.vault = Some(vault);
         self.dek = Some(dek);
         self.failed_unlocks = 0;

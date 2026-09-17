@@ -166,6 +166,66 @@ mod tests {
         assert!(dst.unlock("local password long").is_ok());
     }
 
+    fn client_cert(id: &str, title: &str) -> UpsertEntry {
+        UpsertEntry {
+            id: Some(id.into()),
+            kind: EntryKind::ClientCert,
+            title: title.into(),
+            account: None,
+            url: None,
+            folder_id: None,
+            tags: vec![],
+            pinned: false,
+            expires_at: None,
+            notes: None,
+            secret: SecretPayload::ClientCert {
+                cert_pem: include_str!("../tests/data/client-chain.pem").into(),
+                key_pem: include_str!("../tests/data/client-key.pem").into(),
+                passphrase: None,
+            },
+        }
+    }
+
+    #[test]
+    fn client_cert_is_stored_encrypted_and_survives_backup() {
+        let (src, dek) = Vault::create_in_memory("export password long").unwrap();
+        let entry = src
+            .upsert_entry(&dek, client_cert("cert-id-1", "ZoomKey 客户端证书"))
+            .unwrap();
+        assert_eq!(entry.kind, EntryKind::ClientCert);
+        assert_eq!(
+            src.counts_for(&crate::vault::ListFilter::default())
+                .unwrap()
+                .client_cert,
+            1
+        );
+        match src.get_secret(&dek, "cert-id-1").unwrap() {
+            SecretPayload::ClientCert { key_pem, .. } => {
+                assert!(key_pem.contains("BEGIN PRIVATE KEY"))
+            }
+            _ => panic!("kind"),
+        }
+
+        let bytes = export_envelope(&src, &dek, "export password long").unwrap();
+        let (dst, ddek) = Vault::create_in_memory("local password long").unwrap();
+        let (n, skip) =
+            import_envelope(&dst, &ddek, &bytes, "export password long", false).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(skip, 0);
+        match dst.get_secret(&ddek, "cert-id-1").unwrap() {
+            SecretPayload::ClientCert {
+                cert_pem,
+                key_pem,
+                passphrase,
+            } => {
+                assert!(cert_pem.contains("BEGIN CERTIFICATE"));
+                assert!(key_pem.contains("BEGIN PRIVATE KEY"));
+                assert!(passphrase.is_none());
+            }
+            _ => panic!("kind"),
+        }
+    }
+
     #[test]
     fn import_rejects_weak_and_huge_kdf_params() {
         let (src, dek) = Vault::create_in_memory("export password long").unwrap();

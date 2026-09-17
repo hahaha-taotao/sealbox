@@ -25,9 +25,7 @@ pub fn parse_http_url(url: &str, require_scheme: bool) -> Result<Target, String>
         ("https", r)
     } else if let Some(r) = u.strip_prefix("http://") {
         ("http", r)
-    } else if u.contains("://") {
-        return Err("url 必须以 http:// 或 https:// 开头".into());
-    } else if require_scheme {
+    } else if u.contains("://") || require_scheme {
         return Err("url 必须以 http:// 或 https:// 开头".into());
     } else {
         ("https", u)
@@ -237,7 +235,8 @@ pub fn bind_origins(
         }
         SecretPayload::Mailbox { .. }
         | SecretPayload::Server { .. }
-        | SecretPayload::Database { .. } => {
+        | SecretPayload::Database { .. }
+        | SecretPayload::ClientCert { .. } => {
             Err("该类型凭据不能用于 http_request，请选 API Token 或网站账号".into())
         }
     }
