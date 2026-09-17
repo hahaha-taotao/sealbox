@@ -6,6 +6,7 @@ pub mod commands;
 pub mod crypto;
 pub mod db;
 pub mod fill;
+pub mod extension_install;
 pub mod github_mcp;
 pub mod hello;
 pub mod http_guard;
