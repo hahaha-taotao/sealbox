@@ -93,6 +93,10 @@ pub fn run() {
             commands::zoomkey_policy_set,
             commands::zoomkey_candidates,
             commands::zoomkey_test_connection,
+            commands::extension_install_status,
+            commands::extension_install,
+            commands::extension_open_folder,
+            commands::extension_open_browser,
             commands::window_control,
         ])
         .setup(|app| {

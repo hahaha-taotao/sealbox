@@ -1263,6 +1263,30 @@ pub fn assistant_chat(
 }
 
 #[tauri::command]
+pub fn extension_install_status(
+    app: AppHandle,
+) -> Result<crate::extension_install::ExtensionInstallStatus, String> {
+    crate::extension_install::status_for_app(&app)
+}
+
+#[tauri::command]
+pub fn extension_install(
+    app: AppHandle,
+) -> Result<crate::extension_install::ExtensionInstallStatus, String> {
+    crate::extension_install::install_for_app(&app)
+}
+
+#[tauri::command]
+pub fn extension_open_folder(app: AppHandle) -> Result<(), String> {
+    crate::extension_install::open_folder_for_app(&app)
+}
+
+#[tauri::command]
+pub fn extension_open_browser(app: AppHandle, browser: String) -> Result<(), String> {
+    crate::extension_install::open_browser_for_app(&app, &browser)
+}
+
+#[tauri::command]
 pub fn window_control(app: AppHandle, action: String) -> Result<(), String> {
     let win = app.get_webview_window("main").ok_or("no window")?;
     match action.as_str() {

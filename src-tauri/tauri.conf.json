@@ -43,6 +43,19 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": {
+      "../extension/manifest.json": "extension/manifest.json",
+      "../extension/background.js": "extension/background.js",
+      "../extension/content.js": "extension/content.js",
+      "../extension/fill-logic.cjs": "extension/fill-logic.cjs",
+      "../extension/overlay-inject.js": "extension/overlay-inject.js",
+      "../extension/overlay.html": "extension/overlay.html",
+      "../extension/overlay.js": "extension/overlay.js",
+      "../extension/page-fill.js": "extension/page-fill.js",
+      "../extension/popup.css": "extension/popup.css",
+      "../extension/popup.html": "extension/popup.html",
+      "../extension/popup.js": "extension/popup.js"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

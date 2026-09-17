@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tauri::{AppHandle, Manager};
 
 pub const FILES: &[&str] = &[
     "manifest.json",
@@ -224,6 +225,75 @@ pub fn browser_open_command(exe: &Path, kind: BrowserKind) -> Command {
 
 pub fn spawn_logged(mut cmd: Command, fail: &str) -> Result<(), String> {
     cmd.spawn().map(|_| ()).map_err(|_| fail.to_string())
+}
+
+fn bundled_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Ok(dir) = app.path().resource_dir() {
+        let bundled = dir.join("extension");
+        if bundled.join("manifest.json").is_file() {
+            return Ok(bundled);
+        }
+    }
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../extension");
+    if dev.join("manifest.json").is_file() {
+        return Ok(dev);
+    }
+    Err(MISSING_BUNDLE.into())
+}
+
+fn local_dest(app: &AppHandle) -> Result<PathBuf, String> {
+    let root = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|_| WRITE_FAILED.to_string())?;
+    Ok(dest_dir(&root))
+}
+
+pub fn status_for_app(app: &AppHandle) -> Result<ExtensionInstallStatus, String> {
+    status_at(
+        &bundled_dir(app)?,
+        &local_dest(app)?,
+        detect_chrome().is_some(),
+        detect_edge().is_some(),
+    )
+}
+
+pub fn install_for_app(app: &AppHandle) -> Result<ExtensionInstallStatus, String> {
+    let src = bundled_dir(app)?;
+    let dest = local_dest(app)?;
+    copy_extension(&src, &dest)?;
+    let _ = spawn_logged(
+        explorer_open_command(&dest),
+        "无法打开扩展目录，请手动打开上面的路径。",
+    );
+    status_at(&src, &dest, detect_chrome().is_some(), detect_edge().is_some())
+}
+
+pub fn open_folder_for_app(app: &AppHandle) -> Result<(), String> {
+    let dest = local_dest(app)?;
+    if !dest.join("manifest.json").is_file() {
+        return Err("请先安装到本机。".into());
+    }
+    spawn_logged(explorer_open_command(&dest), "无法打开扩展目录，请手动打开上面的路径。")
+}
+
+pub fn open_browser_for_app(app: &AppHandle, browser: &str) -> Result<(), String> {
+    let _ = app;
+    let kind = parse_browser(browser)?;
+    let (exe, missing, fail) = match kind {
+        BrowserKind::Chrome => (
+            detect_chrome(),
+            "未检测到 Google Chrome",
+            "无法打开扩展页，请手动访问 chrome://extensions 或 edge://extensions。",
+        ),
+        BrowserKind::Edge => (
+            detect_edge(),
+            "未检测到 Microsoft Edge",
+            "无法打开扩展页，请手动访问 chrome://extensions 或 edge://extensions。",
+        ),
+    };
+    let exe = exe.ok_or_else(|| missing.to_string())?;
+    spawn_logged(browser_open_command(&exe, kind), fail)
 }
 
 #[cfg(test)]
