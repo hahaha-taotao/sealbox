@@ -1876,7 +1876,6 @@ onMounted(async () => {
           <div class="mcp-head">
             <div>
               <h2>插件</h2>
-              <p class="crumb">Chrome / Edge 扩展随客户端分发。先安装到本机再加载，然后配对。配对码一次性有效；填表 Token 与 MCP Token 分开。</p>
             </div>
           </div>
           <div class="mcp-card" style="max-width:640px">
@@ -1905,7 +1904,6 @@ onMounted(async () => {
               <li>加载已解压的扩展</li>
               <li>选择上面这个文件夹</li>
             </ol>
-            <p class="crumb">升级 Sealbox 后若提示更新，先点安装覆盖文件，再回扩展页点刷新。路径不要改。</p>
 
             <h3>配对</h3>
             <p class="crumb">扩展加载成功后，点配对，60 秒内把一次性配对码填进扩展。</p>
@@ -1939,7 +1937,6 @@ onMounted(async () => {
                 <button class="btn" type="button" :disabled="!mcp?.has_fill_token" @click="copyFillToken">复制</button>
               </div>
             </div>
-            <p class="crumb">{{ mcp?.fill_url || "http://127.0.0.1:17891/fill" }} · 只接受 Host 为 127.0.0.1 的本机请求</p>
           </div>
         </div>
       </section>
