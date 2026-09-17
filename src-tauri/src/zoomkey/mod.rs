@@ -76,10 +76,7 @@ pub fn normalize_policy(mut policy: ZoomkeyMcpPolicy) -> ZoomkeyMcpPolicy {
     if policy.jira.base_url.is_empty() {
         policy.jira.base_url = DEFAULT_JIRA_BASE.into();
     }
-    policy.crm.base_url = policy.crm.base_url.trim().trim_end_matches('/').to_string();
-    if policy.crm.base_url.is_empty() {
-        policy.crm.base_url = DEFAULT_CRM_BASE.into();
-    }
+    policy.crm.base_url = normalize_crm_base_url(&policy.crm.base_url);
     policy.jira.credential_id = policy.jira.credential_id.trim().to_string();
     policy.jira.client_cert_id = policy.jira.client_cert_id.trim().to_string();
     policy.jira.ca_bundle_path = policy.jira.ca_bundle_path.trim().to_string();
@@ -100,6 +97,55 @@ pub fn normalize_policy(mut policy: ZoomkeyMcpPolicy) -> ZoomkeyMcpPolicy {
     }
     policy.allowed_hosts = hosts;
     policy
+}
+
+/// CRM 必须打到 Vtiger 的 `webservice.php`。站点首页（`/` 或 `/index.php`）
+/// 会返回 HTTP 200 的登录页 HTML，客户端就会报「非 JSON 响应」。
+fn normalize_crm_base_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_CRM_BASE.into();
+    }
+    let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
+    let without_query = without_fragment.split('?').next().unwrap_or(without_fragment);
+    let url = without_query.trim_end_matches('/');
+    if url.is_empty() {
+        return DEFAULT_CRM_BASE.into();
+    }
+    let path = crm_url_path(url);
+    if path.is_empty() || path.eq_ignore_ascii_case("/index.php") {
+        return match crm_url_origin(url) {
+            Some(origin) => format!("{origin}/webservice.php"),
+            None => DEFAULT_CRM_BASE.into(),
+        };
+    }
+    url.to_string()
+}
+
+fn crm_url_path(url: &str) -> &str {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    match rest.find('/') {
+        Some(index) => &rest[index..],
+        None => "",
+    }
+}
+
+fn crm_url_origin(url: &str) -> Option<String> {
+    let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        ("https", rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        ("http", rest)
+    } else {
+        return None;
+    };
+    let hostport = rest.split('/').next().unwrap_or("").trim();
+    if hostport.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{hostport}"))
 }
 
 pub fn load_policy(vault: &Vault, dek: &[u8; 32]) -> ZoomkeyMcpPolicy {
@@ -512,13 +558,9 @@ pub(crate) fn build_runtime(
 
     let tls_config = tls::cached_client_config(&ca_pem, &cert_pem, &key_pem)
         .map_err(|e| ToolFailure::validation(tls::describe_key_error(&e)))?;
-    let agent = ureq::builder()
+    let agent = tuned_agent_builder()
         .tls_config(tls_config)
         .resolver(pinned.resolver())
-        .redirects(0)
-        .timeout(Duration::from_secs(30))
-        .timeout_connect(Duration::from_secs(10))
-        .user_agent("Sealbox/0.1")
         .build();
 
     Ok(EndpointRuntime {
@@ -528,6 +570,27 @@ pub(crate) fn build_runtime(
         username,
         secret: Zeroizing::new(token),
     })
+}
+
+/// ZoomKey 的 agent 调参。抽成函数是为了让单测能用同一份配置复现连接复用问题
+/// （见本模块 `agent_does_not_reuse_a_connection_the_server_closed`）。
+///
+/// **不要打开连接池。** `crm.zoomkey.com.cn` 的响应头是 `Connection: Upgrade, close`，
+/// 而 ureq 只把「整串等于 `close`」判定为不可复用（`ureq::response::connection_option`
+/// 里的 `c.eq_ignore_ascii_case("close")`），于是把一条服务端已经关闭的连接放回池里。
+/// 一次 CRM 工具调用要连发多个请求（`getchallenge` → `login` → 业务接口），
+/// 第二个请求复用到那条死连接就会报 `Network Error: Unexpected EOF`。
+/// 两个站点都是内网低频调用，重建连接的代价远小于这条隐蔽的失败路径。
+///
+/// 手工回归：`cargo run --example zoomkey_probe -- <ca.pem> <cert.pem> <key.pem> <url>`，
+/// 加 `PROBE_FLOW=1` 复现「getchallenge → login」两连请求，`PROBE_POOL=1` 做对照。
+fn tuned_agent_builder() -> ureq::AgentBuilder {
+    ureq::builder()
+        .redirects(0)
+        .timeout(Duration::from_secs(30))
+        .timeout_connect(Duration::from_secs(10))
+        .user_agent("Sealbox/0.1")
+        .max_idle_connections(0)
 }
 
 pub(crate) struct RawResponse {
@@ -688,6 +751,39 @@ mod tests {
     }
 
     #[test]
+    fn crm_origin_is_rewritten_to_webservice() {
+        assert_eq!(
+            normalize_crm_base_url("https://crm.zoomkey.com.cn"),
+            DEFAULT_CRM_BASE
+        );
+        assert_eq!(
+            normalize_crm_base_url("https://crm.zoomkey.com.cn/"),
+            DEFAULT_CRM_BASE
+        );
+        assert_eq!(
+            normalize_crm_base_url("https://crm.zoomkey.com.cn/index.php"),
+            DEFAULT_CRM_BASE
+        );
+        assert_eq!(
+            normalize_crm_base_url("https://crm.zoomkey.com.cn/webservice.php"),
+            DEFAULT_CRM_BASE
+        );
+        assert_eq!(
+            normalize_crm_base_url("https://crm.zoomkey.com.cn/webservice.php/"),
+            DEFAULT_CRM_BASE
+        );
+        assert_eq!(normalize_crm_base_url("  "), DEFAULT_CRM_BASE);
+        assert_eq!(
+            normalize_crm_base_url("https://crm.zoomkey.com.cn:8443"),
+            "https://crm.zoomkey.com.cn:8443/webservice.php"
+        );
+        assert_eq!(
+            normalize_crm_base_url("https://crm.zoomkey.com.cn/custom.php"),
+            "https://crm.zoomkey.com.cn/custom.php"
+        );
+    }
+
+    #[test]
     fn policy_round_trips_through_vault_settings() {
         let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
         assert!(!load_policy(&vault, &dek).jira_enabled);
@@ -741,5 +837,81 @@ mod tests {
         trim_json(&mut value, 10);
         assert_eq!(value["a"].as_str().unwrap().chars().count(), 11);
         assert_eq!(value["b"][0].as_str().unwrap().chars().count(), 11);
+    }
+
+    /// 回归：服务端用多 token 的 `Connection` 头声明关闭时，agent 不能复用这条连接。
+    ///
+    /// `crm.zoomkey.com.cn` 发的是 `Connection: Upgrade, close`（配套还有 `Upgrade: h2`）。
+    /// ureq 只把「整串等于 `close`」判为不可复用（`c.eq_ignore_ascii_case("close")`），
+    /// 于是把它当 keep-alive 放回连接池。真实服务端在响应之后还会补发一条 19 字节的
+    /// TLS application_data 记录（HTTP/2 GOAWAY）再断开，而 ureq 取用池中连接前只做一次
+    /// 非阻塞 `peek`——那条记录往往还没到，peek 返回 `WouldBlock`，于是判定连接可用。
+    /// 结果就是一次工具调用里的第二个请求（`getchallenge` → `login`）写进一条正在被
+    /// 服务端拆除的连接，拿不到任何响应字节，报 `Network Error: Unexpected EOF`。
+    ///
+    /// 注意请求必须是 **POST**：ureq 只会自动重试「幂等方法 + 复用了池中连接」
+    /// （`Unit::is_retryable`），GET 会被悄悄重试掉，掩盖这个 bug。CRM 挂掉的正是
+    /// `login` 那个 POST。
+    ///
+    /// 这里用一个本地服务端复现这个窗口：响应里带 `Connection: Upgrade, close`，
+    /// 但**先不断开 TCP**；一旦客户端复用这条连接再发请求，就直接关掉、不给响应。
+    #[test]
+    fn agent_does_not_reuse_a_connection_the_server_closed() {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpStream};
+
+        /// 读到请求头结束（`\r\n\r\n`）就算一条请求，不解析内容。
+        fn read_request(socket: &mut TcpStream) -> bool {
+            let mut seen = Vec::new();
+            let mut buffer = [0u8; 512];
+            loop {
+                match socket.read(&mut buffer) {
+                    Ok(0) | Err(_) => return false,
+                    Ok(n) => {
+                        seen.extend_from_slice(&buffer[..n]);
+                        if seen.windows(4).any(|w| w == b"\r\n\r\n") || seen.len() > 8192 {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
+        let port = listener.local_addr().unwrap().port();
+        // 服务端线程故意不 join：测试进程退出时它随之结束。
+        std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let Ok(mut socket) = incoming else { return };
+                std::thread::spawn(move || {
+                    let mut requests = 0usize;
+                    loop {
+                        if !read_request(&mut socket) {
+                            return;
+                        }
+                        requests += 1;
+                        if requests > 1 {
+                            // 复用到了声明 close 的连接：不给响应，直接拆掉。
+                            let _ = socket.shutdown(Shutdown::Both);
+                            return;
+                        }
+                        let _ = socket.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: Upgrade, close\r\n\r\nok",
+                        );
+                    }
+                });
+            }
+        });
+
+        let agent = tuned_agent_builder().build();
+        let url = format!("http://127.0.0.1:{port}/webservice.php");
+        for round in 1..=2 {
+            let response = agent
+                .post(&url)
+                .set("Content-Type", "application/x-www-form-urlencoded")
+                .send_string("operation=login&username=probe&accessKey=0")
+                .unwrap_or_else(|error| panic!("第 {round} 次请求失败: {error}"));
+            assert_eq!(response.into_string().unwrap(), "ok", "第 {round} 次响应体不符");
+        }
     }
 }

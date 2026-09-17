@@ -980,10 +980,7 @@ fn call_operation(
                 Some(status),
             )
         } else {
-            ToolFailure::request(
-                format!("CRM 返回了非 JSON 响应（HTTP {status}）"),
-                Some(status),
-            )
+            ToolFailure::request(non_json_message(status, &bytes, &runtime.base_url), Some(status))
         }
     })?;
     if value.get("success").and_then(Value::as_bool) == Some(false) {
@@ -1168,6 +1165,49 @@ fn valid_record_id(id: &str) -> bool {
         && id.contains('x')
 }
 
+fn non_json_message(status: u16, body: &[u8], base_url: &str) -> String {
+    let looks_like_html = body_looks_like_html(body);
+    let preview = body_preview(body);
+    if looks_like_html {
+        format!(
+            "CRM 返回了登录页 HTML 而不是 Webservice JSON（HTTP {status}）。请把地址改成以 /webservice.php 结尾（当前: {base_url}）"
+        )
+    } else if preview.is_empty() {
+        format!("CRM 返回了非 JSON 响应（HTTP {status}）")
+    } else {
+        format!("CRM 返回了非 JSON 响应（HTTP {status}）: {preview}")
+    }
+}
+
+fn body_looks_like_html(body: &[u8]) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.windows(b"<!doctype html".len()).any(|w| w == b"<!doctype html")
+        || lower.windows(b"<html".len()).any(|w| w == b"<html")
+}
+
+fn body_preview(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let collapsed: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.is_empty() {
+        return String::new();
+    }
+    let mut end = collapsed.len().min(120);
+    while end > 0 && !collapsed.is_char_boundary(end) {
+        end -= 1;
+    }
+    if collapsed.len() > end {
+        format!("{}…", &collapsed[..end])
+    } else {
+        collapsed
+    }
+}
+
 fn encode_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
@@ -1312,5 +1352,21 @@ mod tests {
             "select%20%2A%20from%20Project"
         );
         assert_eq!(encode_component("30x489839"), "30x489839");
+    }
+
+    #[test]
+    fn html_login_page_is_explained_instead_of_generic_non_json() {
+        let html = b"<!DOCTYPE html><html><head><title>ZoomKey CRM</title></head></html>";
+        let message = non_json_message(200, html, "https://crm.zoomkey.com.cn");
+        assert!(message.contains("登录页 HTML"), "{message}");
+        assert!(message.contains("/webservice.php"), "{message}");
+        assert!(message.contains("https://crm.zoomkey.com.cn"), "{message}");
+    }
+
+    #[test]
+    fn non_json_plain_text_keeps_a_short_preview() {
+        let message = non_json_message(200, b"Invalid request", "https://crm.zoomkey.com.cn/webservice.php");
+        assert!(message.contains("Invalid request"), "{message}");
+        assert!(!message.contains("登录页 HTML"), "{message}");
     }
 }

@@ -1810,7 +1810,11 @@ onMounted(async () => {
                     {{ zoomkeyTestBusy === 'crm' ? '测试中…' : '测试连接' }}
                   </button>
                 </div>
-                <div class="field"><label>Webservice 地址</label><input v-model="zoomkeyPolicy.crm.base_url" /></div>
+                <div class="field">
+                  <label>Webservice 地址</label>
+                  <input v-model="zoomkeyPolicy.crm.base_url" placeholder="https://crm.zoomkey.com.cn/webservice.php" />
+                  <p class="crumb">必须指向 Vtiger 的 webservice.php。填站点首页会拿到登录页 HTML，测试连接会失败。</p>
+                </div>
                 <div class="field">
                   <label>金库凭据（API Token 条目，服务选「ZoomKey CRM」，账号=用户名，密钥=AccessKey）</label>
                   <select v-model="zoomkeyPolicy.crm.credential_id">

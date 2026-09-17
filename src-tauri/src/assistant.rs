@@ -568,6 +568,12 @@ fn call_model(
     serde_json::from_slice(&bytes).map_err(|_| "模型返回了无效 JSON".into())
 }
 
+fn assistant_tool_allowed(name: &str) -> bool {
+    name.starts_with("github_")
+        || name.starts_with("zoomkey_jira_")
+        || name.starts_with("zoomkey_crm_")
+}
+
 fn safe_tool_definitions(value: &Value) -> Vec<McpToolDefinition> {
     value
         .get("tools")
@@ -584,7 +590,7 @@ fn safe_tool_definitions(value: &Value) -> Vec<McpToolDefinition> {
                 .get("risk")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            if !read_only || risk != "low" || !name.starts_with("github_") {
+            if !read_only || risk != "low" || !assistant_tool_allowed(name) {
                 return None;
             }
             let description = tool
@@ -728,13 +734,18 @@ mod tests {
         let value = json!({
             "tools": [
                 {"name":"github_get_file","description":"file","inputSchema":{},"readOnly":true,"risk":"low"},
+                {"name":"zoomkey_jira_nav","description":"jira","inputSchema":{},"readOnly":true,"risk":"low"},
+                {"name":"zoomkey_crm_query","description":"crm","inputSchema":{},"readOnly":true,"risk":"low"},
                 {"name":"list_credentials","description":"legacy","inputSchema":{},"readOnly":true,"risk":"medium"},
                 {"name":"http_request","description":"legacy","inputSchema":{},"readOnly":false,"risk":"high"}
             ]
         });
         let tools = safe_tool_definitions(&value);
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].summary.name, "github_get_file");
+        let names: Vec<&str> = tools.iter().map(|tool| tool.summary.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["github_get_file", "zoomkey_jira_nav", "zoomkey_crm_query"]
+        );
     }
 
     #[test]
