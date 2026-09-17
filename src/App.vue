@@ -428,6 +428,24 @@ async function testZoomkey(endpoint: "jira" | "crm") {
   }
 }
 
+// CA bundle 是「验证服务端证书」的那份签发链，与凭据条目里的客户端证书/私钥是两个文件。
+async function pickCaBundlePath(endpoint: "jira" | "crm") {
+  try {
+    const picked = await withNativeDialog(async () => {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      return open({
+        multiple: false,
+        title: "选择 CA bundle（含 Root + SubCA 的 PEM）",
+        filters: [{ name: "PEM / certificate", extensions: ["pem", "crt", "cer"] }],
+      });
+    });
+    if (typeof picked !== "string" || !zoomkeyPolicy.value) return;
+    zoomkeyPolicy.value[endpoint].ca_bundle_path = picked;
+  } catch (e) {
+    showToast(`打开文件选择框失败：${String(e)}`);
+  }
+}
+
 async function saveGithubPolicy() {
   if (githubPolicyBusy.value) return;
   const previous = githubPolicy.value.enabled;
@@ -880,14 +898,21 @@ function buildSecret(): SecretPayload {
 }
 
 async function pickClientCertFile(kind: "cert" | "key") {
-  const { open } = await import("@tauri-apps/plugin-dialog");
-  const picked = await open({
-    multiple: false,
-    filters: [{ name: "PEM / certificate", extensions: ["pem", "crt", "cer", "key"] }],
-  });
-  if (typeof picked !== "string") return;
-  if (kind === "cert") form.cert_path = picked;
-  else form.key_path = picked;
+  try {
+    const picked = await withNativeDialog(async () => {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      return open({
+        multiple: false,
+        title: kind === "cert" ? "选择证书 PEM 文件" : "选择私钥 PEM 文件",
+        filters: [{ name: "PEM / certificate", extensions: ["pem", "crt", "cer", "key"] }],
+      });
+    });
+    if (typeof picked !== "string") return;
+    if (kind === "cert") form.cert_path = picked;
+    else form.key_path = picked;
+  } catch (e) {
+    showToast(`打开文件选择框失败：${String(e)}`);
+  }
 }
 
 async function saveEntry() {
@@ -1060,9 +1085,30 @@ const newMaster2 = ref("");
 const recent = ref<EntryDto[]>([]);
 const expiring = ref<EntryDto[]>([]);
 
+// 系统文件选择框是应用窗口的子窗口，弹出时会让窗口失焦。那种失焦不是「用户离开了」，
+// 所以开着文件框的时候不能把表单关掉，否则选完路径表单已经没了（新建凭据 -> 选择证书）。
+let nativeDialogDepth = 0;
+let nativeDialogClosedAt = 0;
+const NATIVE_DIALOG_GRACE_MS = 400;
+
+async function withNativeDialog<T>(run: () => Promise<T>): Promise<T> {
+  nativeDialogDepth += 1;
+  try {
+    return await run();
+  } finally {
+    nativeDialogDepth -= 1;
+    nativeDialogClosedAt = Date.now();
+  }
+}
+
+function nativeDialogInFlight() {
+  return nativeDialogDepth > 0 || Date.now() - nativeDialogClosedAt < NATIVE_DIALOG_GRACE_MS;
+}
+
 function hideVisibleSecrets() {
   hideSecret();
-  closeForm();
+  // 文件选择框（以及它的收尾事件）导致的失焦不算数，其余失焦照旧关表单。
+  if (!nativeDialogInFlight()) closeForm();
   hideBridgeTokens();
 }
 
@@ -1153,19 +1199,28 @@ async function loadHome() {
   status.value = { ...(status.value as Status), counts: h.counts };
 }
 async function pickBackupFile(mode: "export" | "import") {
-  const { save, open } = await import("@tauri-apps/plugin-dialog");
-  if (mode === "export") {
-    const p = await save({
-      defaultPath: "sealbox.svbak",
-      filters: [{ name: "Sealbox backup", extensions: ["svbak"] }],
+  try {
+    if (mode === "export") {
+      const picked = await withNativeDialog(async () => {
+        const { save } = await import("@tauri-apps/plugin-dialog");
+        return save({
+          defaultPath: "sealbox.svbak",
+          filters: [{ name: "Sealbox backup", extensions: ["svbak"] }],
+        });
+      });
+      if (picked) backupPath.value = picked;
+      return;
+    }
+    const picked = await withNativeDialog(async () => {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      return open({
+        multiple: false,
+        filters: [{ name: "Sealbox backup", extensions: ["svbak"] }],
+      });
     });
-    if (p) backupPath.value = p;
-  } else {
-    const p = await open({
-      multiple: false,
-      filters: [{ name: "Sealbox backup", extensions: ["svbak"] }],
-    });
-    if (typeof p === "string") backupPath.value = p;
+    if (typeof picked === "string") backupPath.value = picked;
+  } catch (e) {
+    showToast(`打开文件选择框失败：${String(e)}`);
   }
 }
 
@@ -1649,7 +1704,7 @@ onMounted(async () => {
                 </div>
                 <div class="field"><label>站点地址</label><input v-model="zoomkeyPolicy.jira.base_url" /></div>
                 <div class="field">
-                  <label>金库凭据（服务需填 zoomkey-jira，账号=用户名，密钥=密码）</label>
+                  <label>金库凭据（API Token 条目，服务选「ZoomKey JIRA」，账号=用户名，密钥=密码）</label>
                   <select v-model="zoomkeyPolicy.jira.credential_id">
                     <option value="">未选择</option>
                     <option v-for="c in zoomkeyCandidates.jira_credentials" :key="c.id" :value="c.id">
@@ -1657,7 +1712,7 @@ onMounted(async () => {
                     </option>
                   </select>
                   <p class="crumb" v-if="!zoomkeyCandidates.jira_credentials.length">
-                    还没有可用的 JIRA 凭据。请先在保险库新建一条 API Token，服务填 zoomkey-jira。
+                    还没有可用的 JIRA 凭据。请在保险库新建一条 API Token：服务选「ZoomKey JIRA」、账号填 JIRA 用户名、密钥填 JIRA 密码，保存后回到本页重新进入即可选中。
                   </p>
                 </div>
                 <div class="field">
@@ -1670,7 +1725,13 @@ onMounted(async () => {
                     还没有客户端证书条目。请新建一条「客户端证书」，把 client-cert.pem 与 client-key.pem 贴进去。
                   </p>
                 </div>
-                <div class="field"><label>CA bundle 路径（含 Root + SubCA 的 PEM）</label><input v-model="zoomkeyPolicy.jira.ca_bundle_path" placeholder="D:\...\zoomkey-ca-bundle.pem" /></div>
+                <div class="field"><label>CA bundle 路径（含 Root + SubCA 的 PEM，用于验证服务端证书）</label>
+                  <div class="path-row">
+                    <input v-model="zoomkeyPolicy.jira.ca_bundle_path" placeholder="D:\...\zoomkey-ca-bundle.pem" />
+                    <button class="btn" type="button" @click="pickCaBundlePath('jira')">浏览</button>
+                  </div>
+                  <p class="crumb">这不是凭据条目里选的客户端证书/私钥，而是签发服务端证书的那条链（公司自建 Root CA + SubCA）。</p>
+                </div>
               </div>
 
               <div class="zoomkey-endpoint">
@@ -1685,7 +1746,7 @@ onMounted(async () => {
                 </div>
                 <div class="field"><label>Webservice 地址</label><input v-model="zoomkeyPolicy.crm.base_url" /></div>
                 <div class="field">
-                  <label>金库凭据（服务需填 zoomkey-crm，账号=用户名，密钥=AccessKey）</label>
+                  <label>金库凭据（API Token 条目，服务选「ZoomKey CRM」，账号=用户名，密钥=AccessKey）</label>
                   <select v-model="zoomkeyPolicy.crm.credential_id">
                     <option value="">未选择</option>
                     <option v-for="c in zoomkeyCandidates.crm_credentials" :key="c.id" :value="c.id">
@@ -1693,7 +1754,7 @@ onMounted(async () => {
                     </option>
                   </select>
                   <p class="crumb" v-if="!zoomkeyCandidates.crm_credentials.length">
-                    还没有可用的 CRM 凭据。请先在保险库新建一条 API Token，服务填 zoomkey-crm，密钥填 AccessKey。
+                    还没有可用的 CRM 凭据。请在保险库新建一条 API Token：服务选「ZoomKey CRM」、账号填 CRM 用户名、密钥填 AccessKey，保存后回到本页重新进入即可选中。
                   </p>
                 </div>
                 <div class="field">
@@ -1703,7 +1764,12 @@ onMounted(async () => {
                     <option v-for="c in zoomkeyCandidates.client_certs" :key="c.id" :value="c.id">{{ c.title }}</option>
                   </select>
                 </div>
-                <div class="field"><label>CA bundle 路径</label><input v-model="zoomkeyPolicy.crm.ca_bundle_path" placeholder="D:\...\zoomkey-ca-bundle.pem" /></div>
+                <div class="field"><label>CA bundle 路径（含 Root + SubCA 的 PEM，用于验证服务端证书）</label>
+                  <div class="path-row">
+                    <input v-model="zoomkeyPolicy.crm.ca_bundle_path" placeholder="D:\...\zoomkey-ca-bundle.pem" />
+                    <button class="btn" type="button" @click="pickCaBundlePath('crm')">浏览</button>
+                  </div>
+                </div>
               </div>
 
               <div class="mcp-actions">
@@ -2054,6 +2120,8 @@ onMounted(async () => {
             <option value="github">GitHub</option>
             <option value="gitee">Gitee</option>
             <option value="gitlab">GitLab</option>
+            <option value="zoomkey-jira">ZoomKey JIRA（MCP 用）</option>
+            <option value="zoomkey-crm">ZoomKey CRM（MCP 用）</option>
             <option value="custom">自定义</option>
           </select>
         </div>
