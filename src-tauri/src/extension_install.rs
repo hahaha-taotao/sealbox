@@ -2,6 +2,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 pub const FILES: &[&str] = &[
     "manifest.json",
@@ -129,6 +130,102 @@ pub fn status_at(
     })
 }
 
+pub fn parse_browser(name: &str) -> Result<BrowserKind, String> {
+    match name {
+        "chrome" => Ok(BrowserKind::Chrome),
+        "edge" => Ok(BrowserKind::Edge),
+        _ => Err("未检测到该浏览器。".into()),
+    }
+}
+
+pub fn resolve_browser(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates.iter().find(|p| p.is_file()).cloned()
+}
+
+pub fn chrome_install_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        out.push(PathBuf::from(pf).join(r"Google\Chrome\Application\chrome.exe"));
+    }
+    if let Ok(pf86) = std::env::var("ProgramFiles(x86)") {
+        out.push(PathBuf::from(pf86).join(r"Google\Chrome\Application\chrome.exe"));
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        out.push(PathBuf::from(local).join(r"Google\Chrome\Application\chrome.exe"));
+    }
+    out
+}
+
+pub fn edge_install_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(pf86) = std::env::var("ProgramFiles(x86)") {
+        out.push(PathBuf::from(pf86).join(r"Microsoft\Edge\Application\msedge.exe"));
+    }
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        out.push(PathBuf::from(pf).join(r"Microsoft\Edge\Application\msedge.exe"));
+    }
+    out
+}
+
+#[cfg(windows)]
+fn app_path_from_registry(exe_name: &str) -> Option<PathBuf> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::RegKey;
+    let sub = format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}");
+    for hive in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
+        let hk = RegKey::predef(hive);
+        let Ok(key) = hk.open_subkey(&sub) else { continue };
+        let Ok(val) = key.get_value::<String, _>("") else { continue };
+        let path = PathBuf::from(val);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn app_path_from_registry(_exe_name: &str) -> Option<PathBuf> {
+    None
+}
+
+pub fn detect_chrome() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(p) = app_path_from_registry("chrome.exe") {
+        candidates.push(p);
+    }
+    candidates.extend(chrome_install_candidates());
+    resolve_browser(&candidates)
+}
+
+pub fn detect_edge() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(p) = app_path_from_registry("msedge.exe") {
+        candidates.push(p);
+    }
+    candidates.extend(edge_install_candidates());
+    resolve_browser(&candidates)
+}
+
+pub fn explorer_open_command(dir: &Path) -> Command {
+    let mut cmd = Command::new("explorer.exe");
+    cmd.arg(dir);
+    cmd
+}
+
+pub fn browser_open_command(exe: &Path, kind: BrowserKind) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.arg(match kind {
+        BrowserKind::Chrome => "chrome://extensions",
+        BrowserKind::Edge => "edge://extensions",
+    });
+    cmd
+}
+
+pub fn spawn_logged(mut cmd: Command, fail: &str) -> Result<(), String> {
+    cmd.spawn().map(|_| ()).map_err(|_| fail.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +318,53 @@ mod tests {
         assert!(!st.installed);
         assert!(st.installed_version.is_none());
         assert!(!st.outdated);
+    }
+
+    #[test]
+    fn resolve_browser_picks_first_existing_file() {
+        let dir = temp_dir();
+        let missing = dir.join("missing.exe");
+        let present = dir.join("present.exe");
+        fs::write(&present, b"x").unwrap();
+        assert_eq!(
+            resolve_browser(&[missing.clone(), present.clone()]),
+            Some(present)
+        );
+        assert_eq!(resolve_browser(&[missing]), None);
+    }
+
+    #[test]
+    fn open_commands_use_fixed_targets() {
+        let folder = temp_dir();
+        let explorer = explorer_open_command(&folder);
+        assert_eq!(explorer.get_program(), "explorer.exe");
+        let args: Vec<_> = explorer
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, [folder.to_string_lossy().into_owned()]);
+
+        let chrome = browser_open_command(Path::new(r"C:\Chrome\chrome.exe"), BrowserKind::Chrome);
+        assert_eq!(chrome.get_program(), Path::new(r"C:\Chrome\chrome.exe"));
+        let args: Vec<_> = chrome
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["chrome://extensions"]);
+
+        let edge = browser_open_command(Path::new(r"C:\Edge\msedge.exe"), BrowserKind::Edge);
+        let args: Vec<_> = edge
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["edge://extensions"]);
+    }
+
+    #[test]
+    fn parse_browser_only_allows_chrome_and_edge() {
+        assert_eq!(parse_browser("chrome").unwrap(), BrowserKind::Chrome);
+        assert_eq!(parse_browser("edge").unwrap(), BrowserKind::Edge);
+        assert!(parse_browser("firefox").is_err());
+        assert!(parse_browser("chrome.exe").is_err());
     }
 }

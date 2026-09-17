@@ -40,6 +40,7 @@ rustls-pemfile = "2"
 md-5 = "0.10"
 
 [target.'cfg(windows)'.dependencies]
+winreg = "0.52"
 windows = { version = "0.58", features = [
   "Security_Credentials_UI",
   "Foundation",
