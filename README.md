@@ -20,7 +20,7 @@ A local credential vault for Windows. Unlock with a master password (optional Wi
 - **ZoomKey JIRA / CRM** — 可选的内网只读工具，挂在同一个 MCP 上。走强制双向 TLS，账号密码 / AccessKey 从金库的 API Token 条目取，客户端私钥从金库的「客户端证书」条目取；默认关闭，需显式打开「允许访问内网地址」并确认主机白名单
 - **客户端证书 Client cert** — 保险库里可以导入 mTLS 用的客户端证书与私钥（PEM），由 Rust 侧限长、解析并校验证书/私钥匹配后加密保存，随金库一起备份；列表和速查不会显示或复制私钥，锁定时会清理 TLS 运行时缓存
 - **助手 Assistant** — 位于「插件」下方的 OpenAI 兼容对话页；可测试本机 MCP 连通性，并让模型调用当前暴露的 GitHub 只读工具
-- **插件 Plugin** — Chrome / Edge 按当前网址填充或一键登记；在侧栏「插件」页配对
+- **插件 Plugin** — Chrome / Edge 从客户端安装后按当前网址填充或一键登记；在侧栏「插件」页配对
 
 ## 安全模型 Security
 
@@ -119,13 +119,13 @@ GitHub MCP is disabled by default. When enabled, the assistant discovers one cre
 
 ## 插件 Plugin（Chrome / Edge）
 
-扩展在仓库 `extension/` 目录。应用启动后会在 `127.0.0.1:17891` 提供填表接口。配对在侧栏 **插件** 页，不和 MCP 混在一起。
+应用启动后会在 `127.0.0.1:17891` 提供填表接口。配对和扩展安装都在侧栏 **插件** 页，不和 MCP 混在一起。开发调试仍可直接加载仓库里的 `extension/`。
 
-The unpacked extension lives in `extension/`. After the app starts, fill APIs listen on `127.0.0.1:17891`. Pairing is on the **Plugin** page, not MCP.
+After the app starts, fill APIs listen on `127.0.0.1:17891`. Install and pairing are on the **Plugin** page, not MCP. Developers can still load the repo `extension/` folder unpacked.
 
-1. 运行并解锁 Sealbox / Run and unlock Sealbox.
-2. 打开 `chrome://extensions`（Edge：`edge://extensions`），打开「开发者模式」，加载已解压的扩展，选择 `extension` 文件夹 / Enable Developer mode and load the unpacked `extension` folder.
-3. 在 Sealbox 的 **插件** 页点 **配对**，60 秒内把一次性配对码填进扩展 / On the Plugin page click **Pair**, then enter the one-time code in the extension within 60 seconds.
+1. 运行 Sealbox（安装扩展不要求解锁）/ Run Sealbox. Installing the extension does not require an unlocked vault.
+2. 打开侧栏 **插件**，点 **安装到本机并打开目录**。扩展写到 `%LOCALAPPDATA%\com.sealbox.app\extension\`。再打开 `chrome://extensions` 或 `edge://extensions`，打开开发者模式，加载已解压的扩展，选刚打开的文件夹 / On **Plugin**, click install. The files go to `%LOCALAPPDATA%\com.sealbox.app\extension\`. Load that unpacked folder in Chrome or Edge.
+3. 解锁后点 **配对**，60 秒内把一次性配对码填进扩展 / Unlock, click **Pair**, then enter the one-time code in the extension within 60 seconds.
 4. 打开登录页：检测到密码框后右下角会出现匹配账号，点选填充；也可按 `Alt+Shift+F`。卡片优先显示账号，过长标题会缩略；有备注时在账号后显示前几个字。打开插件弹窗时，「登记当前站点」会读当前页已填的账号密码，并可填写备注。登录提交后，若该站点还没有这个账号会询问保存；已有同一账号且密码变了会询问更新；密码没变则不弹。 / Open a login page: after a password field is detected, a bottom-right overlay lists matching accounts. `Alt+Shift+F` also opens the chooser. Buttons show the username first, abbreviate long titles, and append a short note when present. Opening the popup copies the page’s current username and password into the save form, with an optional note. After submit, Sealbox asks to save a new login, or update when the same account’s password changed. Unchanged passwords are not prompted.
 
 金库锁定时无法填充或登记。配对码一次性有效；填表 Token 只存在 `chrome.storage.session`（关浏览器即失效），不写入 `chrome.storage.local`；升级后会把旧的 local 残留清掉。与 MCP Token 分开，可单独轮换。读取明文和写入条目都会按当前页面网址复核。提交后采集的账号密码只暂存在会话存储，确认保存才写入金库，拒绝或超时会清掉。填充选择器在 closed Shadow DOM 里，只响应真实用户点击，账号做掩码。扩展只申请访问 `127.0.0.1`。可在弹窗里配置站点排除列表。  
