@@ -217,6 +217,18 @@ button { cursor: pointer; }
 .mcp-card h3 { margin: 0 0 8px; font-size: 15px; }
 .mcp-card .crumb { margin: 0 0 12px; }
 .mcp-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 12px; }
+.plugin-path {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+}
+.plugin-steps {
+  margin: 0 0 12px;
+  padding-left: 1.2em;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.7;
+}
+.plugin-steps li { margin: 0; }
 .zoomkey-notice {
   background: #fff8e6;
   border: 1px solid #f0d18a;

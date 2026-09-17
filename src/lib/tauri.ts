@@ -104,6 +104,16 @@ export interface McpStatus {
   has_fill_token: boolean;
 }
 
+export interface ExtensionInstallStatus {
+  dest_path: string;
+  bundled_version: string;
+  installed: boolean;
+  installed_version: string | null;
+  outdated: boolean;
+  chrome: { available: boolean };
+  edge: { available: boolean };
+}
+
 export interface GithubMcpPolicy {
   enabled: boolean;
 }
@@ -303,6 +313,11 @@ export const api = {
     invoke<{ active: boolean; code: string | null; expires_in_secs: number; port: number }>("fill_open_pairing"),
   fillPairingStatus: () =>
     invoke<{ active: boolean; code: string | null; expires_in_secs: number; port: number }>("fill_pairing_status"),
+  extensionInstallStatus: () => invoke<ExtensionInstallStatus>("extension_install_status"),
+  extensionInstall: () => invoke<ExtensionInstallStatus>("extension_install"),
+  extensionOpenFolder: () => invoke("extension_open_folder"),
+  extensionOpenBrowser: (browser: "chrome" | "edge") =>
+    invoke("extension_open_browser", { browser }),
   mcpTools: () => invoke<McpToolInfo[]>("mcp_tools"),
   githubMcpPolicyGet: () => invoke<GithubMcpPolicy>("github_mcp_policy_get"),
   githubMcpPolicySet: (policy: GithubMcpPolicy) => invoke<GithubMcpPolicy>("github_mcp_policy_set", { policy }),

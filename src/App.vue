@@ -14,6 +14,7 @@ import {
   type Counts,
   type EntryDto,
   type EntryKind,
+  type ExtensionInstallStatus,
   type FolderDto,
   type GithubMcpPolicy,
   type ListFilter,
@@ -338,6 +339,9 @@ const mcp = ref<McpStatus | null>(null);
 const pairing = ref<{ active: boolean; code: string | null; expires_in_secs: number; port: number } | null>(null);
 const pairingError = ref("");
 const pairingBusy = ref(false);
+const extStatus = ref<ExtensionInstallStatus | null>(null);
+const extError = ref("");
+const extBusy = ref(false);
 const revealedFillToken = ref("");
 const revealedMcpToken = ref("");
 const revealedMcpSnippet = ref("");
@@ -608,10 +612,72 @@ async function openMcp() {
   goPage("mcp");
   await refreshMcp();
 }
+function extStatusText(s: ExtensionInstallStatus | null) {
+  if (!s) return "尚未检查本机扩展。";
+  if (!s.installed) return "尚未安装到本机";
+  if (!s.outdated) return `已安装 · v${s.installed_version || s.bundled_version}`;
+  if (s.installed_version && s.installed_version !== s.bundled_version) {
+    return `已安装 · v${s.installed_version}，内置 v${s.bundled_version}，请更新后再到浏览器点刷新`;
+  }
+  return `已安装 · v${s.installed_version || s.bundled_version}，内置文件已更新，请重新安装后再到浏览器点刷新`;
+}
+
+async function refreshExtensionInstall() {
+  try {
+    extStatus.value = await api.extensionInstallStatus();
+    extError.value = "";
+  } catch (e) {
+    extStatus.value = null;
+    extError.value = String(e);
+  }
+}
+
+async function installExtension() {
+  if (extBusy.value) return;
+  extBusy.value = true;
+  extError.value = "";
+  try {
+    extStatus.value = await api.extensionInstall();
+    showToast("已安装到本机并打开目录");
+  } catch (e) {
+    extError.value = String(e);
+    showToast(extError.value);
+  } finally {
+    extBusy.value = false;
+  }
+}
+
+async function openExtensionFolder() {
+  extError.value = "";
+  try {
+    await api.extensionOpenFolder();
+  } catch (e) {
+    extError.value = String(e);
+    showToast(extError.value);
+  }
+}
+
+async function openExtensionBrowser(browser: "chrome" | "edge") {
+  extError.value = "";
+  try {
+    await api.extensionOpenBrowser(browser);
+  } catch (e) {
+    extError.value = String(e);
+    showToast(extError.value);
+  }
+}
+
+async function copyExtensionPath() {
+  if (!extStatus.value?.dest_path) return;
+  await navigator.clipboard.writeText(extStatus.value.dest_path);
+  showToast("扩展目录已复制");
+}
+
 async function openPlugin() {
   goPage("plugin");
   await refreshMcp();
   await refreshPairing();
+  await refreshExtensionInstall();
 }
 
 async function refreshAssistantConfig() {
@@ -1806,12 +1872,39 @@ onMounted(async () => {
           <div class="mcp-head">
             <div>
               <h2>插件</h2>
-              <p class="crumb">Chrome / Edge 浏览器扩展。配对码一次性有效，填表 Token 与 MCP Token 分开。读取明文和写入条目都会按当前页面网址复核。</p>
+              <p class="crumb">Chrome / Edge 扩展随客户端分发。先安装到本机再加载，然后配对。配对码一次性有效；填表 Token 与 MCP Token 分开。</p>
             </div>
           </div>
           <div class="mcp-card" style="max-width:640px">
-            <h3>浏览器扩展</h3>
-            <p class="crumb">打开 <code>chrome://extensions</code>（Edge：<code>edge://extensions</code>），打开开发者模式，加载已解压的扩展，选择仓库里的 <code>extension</code> 目录。点配对后，60 秒内把一次性配对码填进扩展。</p>
+            <h3>安装扩展</h3>
+            <p class="crumb">{{ extStatusText(extStatus) }}</p>
+            <div class="field" v-if="extStatus?.dest_path">
+              <label>本机目录</label>
+              <div class="secret-row">
+                <input class="plugin-path" :value="extStatus.dest_path" readonly />
+                <button class="btn" type="button" @click="copyExtensionPath">复制</button>
+              </div>
+            </div>
+            <p class="error" v-if="extError">{{ extError }}</p>
+            <div class="mcp-actions">
+              <button class="btn primary" type="button" :disabled="extBusy" @click="installExtension">
+                {{ extBusy ? "正在安装…" : (extStatus && extStatus.installed && !extStatus.outdated ? "重新安装并打开目录" : "安装到本机并打开目录") }}
+              </button>
+              <button class="btn" type="button" :disabled="!extStatus?.installed" @click="openExtensionFolder">打开目录</button>
+              <button class="btn" type="button" :disabled="!extStatus?.chrome.available" @click="openExtensionBrowser('chrome')">打开 Chrome 扩展页</button>
+              <button class="btn" type="button" :disabled="!extStatus?.edge.available" @click="openExtensionBrowser('edge')">打开 Edge 扩展页</button>
+            </div>
+            <p class="crumb" v-if="extStatus && !extStatus.chrome.available">未检测到 Google Chrome</p>
+            <p class="crumb" v-if="extStatus && !extStatus.edge.available">未检测到 Microsoft Edge</p>
+            <ol class="plugin-steps">
+              <li>打开开发者模式</li>
+              <li>加载已解压的扩展</li>
+              <li>选择上面这个文件夹</li>
+            </ol>
+            <p class="crumb">升级 Sealbox 后若提示更新，先点安装覆盖文件，再回扩展页点刷新。路径不要改。</p>
+
+            <h3>配对</h3>
+            <p class="crumb">扩展加载成功后，点配对，60 秒内把一次性配对码填进扩展。</p>
             <div class="mcp-actions">
               <button class="btn primary" type="button" :disabled="pairingBusy" @click="openFillPairing">{{ pairingBusy ? "正在打开…" : "配对" }}</button>
               <button class="btn" type="button" @click="rotateFill">轮换填表 Token</button>
