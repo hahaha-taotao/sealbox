@@ -1593,10 +1593,20 @@ onMounted(async () => {
             <button class="btn danger" @click="doEmptyTrash">清空回收站</button>
           </div>
           <div class="table">
-            <table v-if="entries.length">
+            <table v-if="entries.length" class="vault-table">
+              <colgroup>
+                <col class="vault-select-col" />
+                <col class="vault-title-col" />
+                <col class="vault-account-col" />
+                <col class="vault-kind-col" />
+                <col class="vault-updated-col" />
+                <col class="vault-count-col" />
+                <col class="vault-expires-col" />
+                <col class="vault-actions-col" />
+              </colgroup>
               <thead>
                 <tr>
-                  <th></th><th>键名</th><th>关联账号</th><th>类型</th><th>修改时间</th><th>次数</th><th>过期</th><th>操作</th>
+                  <th></th><th>键名</th><th class="vault-account-col">关联账号</th><th>类型</th><th>修改时间</th><th>次数</th><th>过期</th><th class="vault-actions-col">操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -1622,8 +1632,8 @@ onMounted(async () => {
                       </button>
                     </div>
                   </td>
-                  <td>
-                    {{ row.account || row.fingerprint || "—" }}
+                  <td class="vault-account-cell">
+                    <span class="account-text" :title="row.account || row.fingerprint || '—'">{{ row.account || row.fingerprint || "—" }}</span>
                     <div v-if="certInfoFor === row.id && clientCertInfo" class="cert-row-info">
                       <span>指纹：{{ clientCertInfo.fingerprint || '—' }}</span>
                       <span>证书链：{{ clientCertInfo.certificateCount ?? '—' }} 张</span>
@@ -1641,6 +1651,7 @@ onMounted(async () => {
                   <td>{{ row.use_count }}</td>
                   <td>{{ row.expires_at ? fmtTime(row.expires_at) : "永不" }}</td>
                   <td class="row-actions">
+                    <div class="row-actions-inner">
                     <button v-if="!filter.trash && row.kind !== 'client_cert'" class="icon-btn" type="button" title="复制密码" aria-label="复制密码" @click="copy(row.id)">
                       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                         <rect x="9" y="9" width="13" height="13" rx="2" />
@@ -1709,6 +1720,7 @@ onMounted(async () => {
                         <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
                       </svg>
                     </button>
+                    </div>
                   </td>
                 </tr>
               </tbody>

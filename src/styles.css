@@ -532,19 +532,37 @@ button { cursor: pointer; }
 
 .table { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; overflow: auto; flex: 1; }
 table { width: 100%; border-collapse: collapse; }
+.vault-table {
+  width: max-content;
+  min-width: max(100%, 1120px);
+  table-layout: fixed;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+.vault-table .vault-select-col { width: 44px; }
+.vault-table .vault-title-col { width: 260px; }
+.vault-table .vault-account-col { width: 220px; }
+.vault-table .vault-kind-col { width: 110px; }
+.vault-table .vault-updated-col { width: 160px; }
+.vault-table .vault-count-col { width: 70px; }
+.vault-table .vault-expires-col { width: 140px; }
+.vault-table .vault-actions-col { width: 260px; }
 th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; padding: 10px 12px; border-bottom: 1px solid var(--line); background: var(--surface); position: sticky; top: 0; z-index: 1; }
 td { padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: middle; }
 tr:hover td { background: #fafbff; }
 .title-cell { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .title-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-th:last-child, td.row-actions {
+.vault-account-cell { overflow: hidden; }
+.account-text { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vault-table th.vault-actions-col,
+.vault-table td.row-actions {
   position: sticky;
   right: 0;
   background: var(--surface);
   box-shadow: -8px 0 8px -8px rgba(31, 35, 41, 0.12);
   z-index: 2;
 }
-tr:hover td.row-actions { background: #fafbff; }
+.vault-table tr:hover td.row-actions { background: #fafbff; }
 .letter {
   width: 28px; height: 28px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center;
   color: #fff; font-weight: 700; margin-right: 8px; font-size: 13px;
@@ -558,11 +576,14 @@ tr:hover td.row-actions { background: #fafbff; }
 .pill.server { background: #ecfccb; color: #3f6212; }
 .pill.database { background: #f3e8ff; color: #7c3aed; }
 .pill.client_cert { background: #fef3c7; color: #92400e; }
-.row-actions {
+.vault-table .row-actions {
+  white-space: nowrap;
+}
+.vault-table .row-actions-inner {
   display: flex;
+  align-items: center;
   gap: 4px;
   white-space: nowrap;
-  width: 1%;
 }
 .icon-btn {
   width: 28px;

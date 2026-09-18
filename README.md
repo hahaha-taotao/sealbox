@@ -4,7 +4,7 @@
 
 A local credential vault for Windows. Unlock with a master password (optional Windows Hello). Website logins, API tokens, SSH keys, mailboxes, servers, and databases stay encrypted on disk. Copied secrets are cleared from the clipboard on a timer. Encrypted `.svbak` backups can be exported and imported. An optional localhost MCP lets Cursor / Claude Code use credentials without seeing plaintext. A Chrome / Edge extension can fill or save website logins.
 
-当前版本 Current version: **v0.1** (`0.1.0`)
+当前版本 Current version: **v0.1.1** (`0.1.1`)
 
 > 数据只存本机，不做云同步。  
 > Secrets stay on this machine. There is no cloud sync.
@@ -13,7 +13,7 @@ A local credential vault for Windows. Unlock with a master password (optional Wi
 
 ## 安装 Install
 
-Windows x64 使用 NSIS 安装包 `Sealbox_0.1.0_x64-setup.exe`。向导会让你选择：
+Windows x64 使用 NSIS 安装包 `Sealbox_0.1.1_x64-setup.exe`。向导会让你选择：
 
 1. 安装范围：当前用户，或所有用户（后者需要管理员权限）
 2. **安装盘符与目录**，例如 `D:\Sealbox`；默认在当前用户下是 `%LOCALAPPDATA%\Sealbox`，在所有用户下是 `C:\Program Files\Sealbox`

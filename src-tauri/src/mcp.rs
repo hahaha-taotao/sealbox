@@ -294,7 +294,7 @@ fn handle_rpc(session: &Mutex<Session>, mcp: &McpState, req: JsonRpcReq) -> Opti
             json!({
                 "protocolVersion": "2024-11-05",
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": "sealbox", "version": "0.1.0" }
+                "serverInfo": { "name": "sealbox", "version": "0.1.1" }
             }),
         ),
         "notifications/initialized" | "initialized" => return None,
