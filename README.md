@@ -17,7 +17,7 @@ A local credential vault for Windows. Unlock with a master password (optional Wi
 - **安全习惯 Hygiene** — 空闲自动锁定、审计日志（不记明文）、回收站、置顶、标签、文件夹
 - **备份 Backup** — 加密 `.svbak` 导出 / 导入（默认合并，覆盖需确认）
 - **MCP** — 本机 `127.0.0.1` 服务；只有一个 GitHub MCP 启用/停用开关，启用后提供 GitHub 只读工具，固定访问 `api.github.com`；模型按 Token ID 选择活动 GitHub Token
-- **ZoomKey JIRA / CRM** — 可选的内网只读工具，挂在同一个 MCP 上。走强制双向 TLS，账号密码 / AccessKey 从金库的 API Token 条目取，客户端私钥从金库的「客户端证书」条目取；默认关闭，需显式打开「允许访问内网地址」并确认主机白名单
+- **ZoomKey JIRA / CRM** — 可选的内网只读工具，挂在同一个 MCP 上。走强制双向 TLS，账号密码 / AccessKey 从金库的 API Token 条目取，客户端私钥从金库的「客户端证书」条目取；默认关闭，需显式启用 ZoomKey MCP 并确认主机白名单。配齐的端点会自动出现，不必再单独勾选 JIRA / CRM
 - **客户端证书 Client cert** — 保险库里可以导入 mTLS 用的客户端证书与私钥（PEM），由 Rust 侧限长、解析并校验证书/私钥匹配后加密保存，随金库一起备份；列表和速查不会显示或复制私钥，锁定时会清理 TLS 运行时缓存
 - **助手 Assistant** — 位于「插件」下方的 OpenAI 兼容对话页；可测试本机 MCP 连通性，并让模型调用当前暴露的 GitHub 只读工具
 - **插件 Plugin** — Chrome / Edge 从客户端安装后按当前网址填充或一键登记；在侧栏「插件」页配对
@@ -76,7 +76,7 @@ GitHub MCP 默认停用。启用后七个只读工具全部可用；模型先调
 
 ## ZoomKey JIRA / CRM
 
-把众齐内网的 JIRA 与 CRM 查询能力开放给本机 MCP 客户端，工具挂在同一个 MCP 服务上，各自独立开关。
+把众齐内网的 JIRA 与 CRM 查询能力开放给本机 MCP 客户端，工具挂在同一个 MCP 服务上，共用一个启用开关。
 
 **前置：两个站点都在 `172.16.x.x` 内网，且强制要求客户端证书（mTLS）。**
 
@@ -85,7 +85,7 @@ GitHub MCP 默认停用。启用后七个只读工具全部可用；模型先调
 1. 保险库 → 新建一条 **API Token**：服务填 `zoomkey-jira`，账号填 JIRA 用户名，密钥填 JIRA 密码。
 2. 保险库 → 新建一条 **API Token**：服务填 `zoomkey-crm`，账号填 CRM 用户名，密钥填 Vtiger AccessKey（不是登录密码）。
 3. 保险库 → 新建一条 **客户端证书**：分别选择 `client-cert.pem` 与 `client-key.pem` 文件。文件只在 Rust 侧读取、校验并加密保存；不会保存原始路径，也不会把私钥回显到界面。两个站点可以共用同一份证书。
-4. 侧栏 **MCP** → **ZoomKey JIRA / CRM**：打开「允许访问内网地址」，勾选要启用的端，选好凭据与证书条目，填 CA bundle 路径（含 Root + SubCA 的 PEM），保存。只有配置完整的端点才会出现在 MCP `tools/list`。
+4. 侧栏 **MCP** → **ZoomKey JIRA / CRM**：点「启用 ZoomKey MCP」（等于同意访问白名单内网），选好凭据与证书条目，填 CA bundle 路径（含 Root + SubCA 的 PEM），保存。只有配置完整的端点才会出现在 MCP `tools/list`。
 5. 点 **测试连接** 验证 CA、客户端证书、账号三段链路。
 
 工具 Tools：
@@ -95,7 +95,7 @@ GitHub MCP 默认停用。启用后七个只读工具全部可用；模型先调
 
 两个 `field_map` 默认只返回**内置结构地图**（JIRA 的状态清单/字段/预设/查询剧本，CRM 的 ID 前缀/关联主线/模块核心字段），不联网即可用；传 `live=true` 才去在线拉元数据。参数与源插件对齐：JIRA 用 `section`（`overview`/`status`/`issuetype`/`fields`/`presets`/`playbooks`/`crm-bridge`），CRM 用 `module`。
 
-内网例外是刻意开的口子，收得很紧：只对策略里列出的**精确主机名**放行；解析出的地址会被钉住再使用，避免 DNS 重绑定；回环、链路本地、云元数据地址（`169.254.169.254` / `100.100.100.200`）永远拒绝；不开「允许访问内网地址」时全部拒绝。GitHub 那条路径完全不受影响，仍然只走公网守卫。
+内网例外是刻意开的口子，收得很紧：只对策略里列出的**精确主机名**放行；解析出的地址会被钉住再使用，避免 DNS 重绑定；回环、链路本地、云元数据地址（`169.254.169.254` / `100.100.100.200`）永远拒绝；ZoomKey MCP 未启用时全部拒绝。GitHub 那条路径完全不受影响，仍然只走公网守卫。
 
 模型可控面同样收窄：不接受模型传入 URL、Host、Header 或 HTTP 方法，路径由代码按固定模板拼装。少数确实需要模型输入的字符串都先过校验才使用——`search_issues` / `get_issue` 的 `fields` 只接受逗号分隔的字段名（字母、数字、下划线、点、连字符，最多 64 个），`list_projects` 的 `query` 仅用于本地过滤，`field_map` 的 `section` 走固定枚举、`module` 只匹配内置表。非法值直接拒绝，不回显原值。JIRA 只发 GET；CRM 只发 GET 与表单 POST，且只指向配置的 webservice 地址。`zoomkey_crm_query` 只放行单条 `select`，写操作与多语句会被拒绝。返回体统一脱敏，密码、AccessKey 与 Vtiger `sessionName` 不会出现在输出或审计里。
 

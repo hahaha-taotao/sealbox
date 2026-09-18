@@ -39,9 +39,7 @@ pub struct ZoomkeyEndpointPolicy {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ZoomkeyMcpPolicy {
-    pub jira_enabled: bool,
-    pub crm_enabled: bool,
-    pub allow_private_network: bool,
+    pub enabled: bool,
     pub allowed_hosts: Vec<String>,
     pub jira: ZoomkeyEndpointPolicy,
     pub crm: ZoomkeyEndpointPolicy,
@@ -50,9 +48,7 @@ pub struct ZoomkeyMcpPolicy {
 impl Default for ZoomkeyMcpPolicy {
     fn default() -> Self {
         Self {
-            jira_enabled: false,
-            crm_enabled: false,
-            allow_private_network: false,
+            enabled: false,
             allowed_hosts: DEFAULT_HOSTS.iter().map(|h| h.to_string()).collect(),
             jira: ZoomkeyEndpointPolicy {
                 base_url: DEFAULT_JIRA_BASE.into(),
@@ -155,9 +151,36 @@ pub fn load_policy(vault: &Vault, dek: &[u8; 32]) -> ZoomkeyMcpPolicy {
     let Ok(value) = serde_json::from_str::<Value>(&raw) else {
         return ZoomkeyMcpPolicy::default();
     };
-    serde_json::from_value(value)
+    serde_json::from_value(migrate_policy_value(value))
         .map(normalize_policy)
         .unwrap_or_default()
+}
+
+/// 旧策略有三道开关（内网例外 / JIRA / CRM）。任一打开都迁成总开关打开。
+fn migrate_policy_value(mut value: Value) -> Value {
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    if object.contains_key("enabled") {
+        return value;
+    }
+    let enabled = object
+        .get("allow_private_network")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || object
+            .get("jira_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        || object
+            .get("crm_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    object.insert("enabled".into(), Value::Bool(enabled));
+    object.remove("allow_private_network");
+    object.remove("jira_enabled");
+    object.remove("crm_enabled");
+    value
 }
 
 pub fn save_policy(vault: &Vault, dek: &[u8; 32], policy: &ZoomkeyMcpPolicy) -> Result<(), String> {
@@ -241,13 +264,11 @@ pub fn list_candidates(session: &Session) -> Result<ZoomkeyCandidates, String> {
 }
 
 pub fn tool_definitions(policy: &ZoomkeyMcpPolicy) -> Vec<Value> {
-    let mut out = Vec::new();
-    if policy.jira_enabled {
-        out.extend(jira::tool_definitions());
+    if !policy.enabled {
+        return Vec::new();
     }
-    if policy.crm_enabled {
-        out.extend(crm::tool_definitions());
-    }
+    let mut out = jira::tool_definitions();
+    out.extend(crm::tool_definitions());
     out
 }
 
@@ -256,14 +277,14 @@ pub fn tool_definitions_for_vault(
     dek: &[u8; 32],
     policy: &ZoomkeyMcpPolicy,
 ) -> Vec<Value> {
-    if !policy.allow_private_network {
+    if !policy.enabled {
         return Vec::new();
     }
     let mut out = Vec::new();
-    if policy.jira_enabled && endpoint_ready(vault, dek, &policy.jira, JIRA_SERVICE) {
+    if endpoint_ready(vault, dek, &policy.jira, JIRA_SERVICE) {
         out.extend(jira::tool_definitions());
     }
-    if policy.crm_enabled && endpoint_ready(vault, dek, &policy.crm, CRM_SERVICE) {
+    if endpoint_ready(vault, dek, &policy.crm, CRM_SERVICE) {
         out.extend(crm::tool_definitions());
     }
     out
@@ -442,6 +463,55 @@ pub fn call_tool(session: &mut Session, name: &str, args: Value) -> Result<Strin
         .map_err(|error| error.message)
 }
 
+/// 用户在 MCP 页点「测试连接」：绕过总开关，但仍走白名单、证书与凭据校验。
+pub fn test_connection(
+    session: &mut Session,
+    label: &'static str,
+) -> Result<ZoomkeyCallResult, ZoomkeyCallError> {
+    let fingerprint = credential_fingerprint(session, label);
+    let runtime = build_runtime_for_test(session, label).map_err(|failure| ZoomkeyCallError {
+        message: failure.message,
+        status: failure.status,
+        reason: failure.reason,
+        credential_fingerprint: fingerprint.clone(),
+        context: ZoomkeyAuditContext {
+            endpoint: label.to_string(),
+            detail: failure.detail,
+        },
+    })?;
+    let args = serde_json::json!({ "ping": true });
+    let outcome = if label == "jira" {
+        jira::connection_status(&runtime, &args)
+    } else {
+        crm::connection_status(&runtime, &args)
+    };
+    match outcome {
+        Ok(outcome) => {
+            session.touch();
+            Ok(ZoomkeyCallResult {
+                text: outcome.text,
+                status: 200,
+                result_count: outcome.count,
+                credential_fingerprint: fingerprint.unwrap_or_default(),
+                context: ZoomkeyAuditContext {
+                    endpoint: label.to_string(),
+                    detail: outcome.detail,
+                },
+            })
+        }
+        Err(failure) => Err(ZoomkeyCallError {
+            message: failure.message,
+            status: failure.status,
+            reason: failure.reason,
+            credential_fingerprint: fingerprint,
+            context: ZoomkeyAuditContext {
+                endpoint: label.to_string(),
+                detail: failure.detail,
+            },
+        }),
+    }
+}
+
 fn credential_fingerprint(session: &Session, endpoint: &str) -> Option<String> {
     let vault = session.vault().ok()?;
     let dek = session.dek().ok()?;
@@ -470,6 +540,22 @@ pub(crate) fn build_runtime(
     session: &Session,
     label: &'static str,
 ) -> Result<EndpointRuntime, ToolFailure> {
+    build_runtime_inner(session, label, true)
+}
+
+/// 页面上的「测试连接」可以在总开关关闭时先验证证书与凭据；MCP 工具调用仍必须启用。
+pub(crate) fn build_runtime_for_test(
+    session: &Session,
+    label: &'static str,
+) -> Result<EndpointRuntime, ToolFailure> {
+    build_runtime_inner(session, label, false)
+}
+
+fn build_runtime_inner(
+    session: &Session,
+    label: &'static str,
+    require_enabled: bool,
+) -> Result<EndpointRuntime, ToolFailure> {
     let vault = session
         .vault()
         .map_err(|e| ToolFailure::validation(e.to_string()))?;
@@ -477,22 +563,18 @@ pub(crate) fn build_runtime(
         .dek()
         .map_err(|e| ToolFailure::validation(e.to_string()))?;
     let policy = load_policy(vault, dek);
-    let (endpoint, enabled, service) = match label {
-        "jira" => (&policy.jira, policy.jira_enabled, JIRA_SERVICE),
-        "crm" => (&policy.crm, policy.crm_enabled, CRM_SERVICE),
+    let (endpoint, service) = match label {
+        "jira" => (&policy.jira, JIRA_SERVICE),
+        "crm" => (&policy.crm, CRM_SERVICE),
         _ => return Err(ToolFailure::validation("未知 ZoomKey 端点")),
     };
-    if !enabled {
-        return Err(ToolFailure::validation(format!(
-            "ZoomKey {label} 能力未启用，请先在 Sealbox 的 MCP 页面打开"
-        )));
+    if require_enabled && !policy.enabled {
+        return Err(ToolFailure::validation(
+            "ZoomKey MCP 未启用，请先在 Sealbox 的 MCP 页面打开",
+        ));
     }
-    let pinned = target::pin(
-        &endpoint.base_url,
-        &policy.allowed_hosts,
-        policy.allow_private_network,
-    )
-    .map_err(ToolFailure::validation)?;
+    let pinned = target::pin(&endpoint.base_url, &policy.allowed_hosts)
+        .map_err(ToolFailure::validation)?;
 
     if endpoint.credential_id.trim().is_empty() {
         return Err(ToolFailure::validation(format!(
@@ -693,40 +775,38 @@ mod tests {
     #[test]
     fn default_policy_is_fully_disabled() {
         let policy = ZoomkeyMcpPolicy::default();
-        assert!(!policy.jira_enabled);
-        assert!(!policy.crm_enabled);
-        assert!(!policy.allow_private_network);
+        assert!(!policy.enabled);
         assert!(policy.jira.base_url.contains("jira.zoomkey.com.cn"));
         assert!(policy.crm.base_url.ends_with("/webservice.php"));
         assert!(tool_definitions(&policy).is_empty());
     }
 
     #[test]
-    fn enabled_endpoint_exposes_its_tools() {
+    fn enabled_policy_exposes_both_endpoint_tools() {
         let policy = ZoomkeyMcpPolicy {
-            jira_enabled: true,
-            ..Default::default()
-        };
-        let tools = tool_definitions(&policy);
-        assert_eq!(tools.len(), 10);
-        assert!(tools
-            .iter()
-            .all(|t| t["name"].as_str().unwrap().starts_with("zoomkey_jira_")));
-        assert!(tools.iter().all(|t| t["readOnly"] == true));
-        assert!(tools
-            .iter()
-            .all(|t| t["inputSchema"]["additionalProperties"] == false));
-    }
-
-    #[test]
-    fn both_endpoints_expose_twenty_tools() {
-        let policy = ZoomkeyMcpPolicy {
-            jira_enabled: true,
-            crm_enabled: true,
+            enabled: true,
             ..Default::default()
         };
         let tools = tool_definitions(&policy);
         assert_eq!(tools.len(), 20);
+        assert!(tools.iter().all(|t| t["readOnly"] == true));
+        assert!(tools
+            .iter()
+            .all(|t| t["inputSchema"]["additionalProperties"] == false));
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|t| t["name"].as_str().unwrap().starts_with("zoomkey_jira_"))
+                .count(),
+            10
+        );
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|t| t["name"].as_str().unwrap().starts_with("zoomkey_crm_"))
+                .count(),
+            10
+        );
     }
 
     #[test]
@@ -786,17 +866,44 @@ mod tests {
     #[test]
     fn policy_round_trips_through_vault_settings() {
         let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
-        assert!(!load_policy(&vault, &dek).jira_enabled);
+        assert!(!load_policy(&vault, &dek).enabled);
         let policy = ZoomkeyMcpPolicy {
-            jira_enabled: true,
-            allow_private_network: true,
+            enabled: true,
             ..Default::default()
         };
         save_policy(&vault, &dek, &policy).unwrap();
         let loaded = load_policy(&vault, &dek);
-        assert!(loaded.jira_enabled);
-        assert!(loaded.allow_private_network);
-        assert!(!loaded.crm_enabled);
+        assert!(loaded.enabled);
+    }
+
+    #[test]
+    fn legacy_triple_switch_migrates_to_master_enabled() {
+        let migrated = serde_json::from_value::<ZoomkeyMcpPolicy>(migrate_policy_value(json!({
+            "jira_enabled": false,
+            "crm_enabled": true,
+            "allow_private_network": false,
+            "allowed_hosts": ["jira.zoomkey.com.cn"],
+            "jira": { "base_url": DEFAULT_JIRA_BASE },
+            "crm": { "base_url": DEFAULT_CRM_BASE }
+        })))
+        .unwrap();
+        assert!(migrated.enabled);
+        assert_eq!(migrated.allowed_hosts, vec!["jira.zoomkey.com.cn"]);
+
+        let still_off = serde_json::from_value::<ZoomkeyMcpPolicy>(migrate_policy_value(json!({
+            "jira_enabled": false,
+            "crm_enabled": false,
+            "allow_private_network": false
+        })))
+        .unwrap();
+        assert!(!still_off.enabled);
+
+        let already_new = serde_json::from_value::<ZoomkeyMcpPolicy>(migrate_policy_value(json!({
+            "enabled": false,
+            "jira_enabled": true
+        })))
+        .unwrap();
+        assert!(!already_new.enabled);
     }
 
     #[test]
@@ -818,7 +925,7 @@ mod tests {
             Ok(_) => panic!("锁定的端点不应构建出运行时"),
             Err(error) => error,
         };
-        assert!(error.message.contains("未启用"), "{}", error.message);
+        assert!(error.message.contains("ZoomKey MCP 未启用"), "{}", error.message);
     }
 
     #[test]

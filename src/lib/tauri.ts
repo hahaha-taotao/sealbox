@@ -126,9 +126,7 @@ export interface ZoomkeyEndpointPolicy {
 }
 
 export interface ZoomkeyMcpPolicy {
-  jira_enabled: boolean;
-  crm_enabled: boolean;
-  allow_private_network: boolean;
+  enabled: boolean;
   allowed_hosts: string[];
   jira: ZoomkeyEndpointPolicy;
   crm: ZoomkeyEndpointPolicy;

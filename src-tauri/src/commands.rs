@@ -12,7 +12,6 @@ use crate::vault::{
 };
 use crate::zoomkey::{self, ZoomkeyCandidates, ZoomkeyMcpPolicy};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -1176,12 +1175,7 @@ pub fn zoomkey_policy_set(
     let _ = vault.audit(
         "mcp_zoomkey_policy",
         None,
-        &format!(
-            "jira={} crm={} private_network={}",
-            on_off(normalized.jira_enabled),
-            on_off(normalized.crm_enabled),
-            on_off(normalized.allow_private_network),
-        ),
+        on_off(normalized.enabled),
     );
     Ok(normalized)
 }
@@ -1203,8 +1197,7 @@ pub fn zoomkey_test_connection(state: State<AppState>, endpoint: String) -> Resu
         "crm" => "crm",
         _ => return Err("endpoint 必须是 jira 或 crm".into()),
     };
-    let name = format!("zoomkey_{label}_connection_status");
-    let outcome = zoomkey::call_tool_detailed(&mut session, &name, json!({ "ping": true }));
+    let outcome = zoomkey::test_connection(&mut session, label);
     if let Ok(vault) = session.vault() {
         let detail = match &outcome {
             Ok(_) => format!("endpoint={label} decision=allow"),

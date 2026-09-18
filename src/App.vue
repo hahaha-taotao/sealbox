@@ -397,25 +397,41 @@ async function refreshMcp() {
   }
 }
 
-async function saveZoomkeyPolicy() {
+async function saveZoomkeyPolicy(opts: { toggling?: boolean } = {}) {
   if (!zoomkeyPolicy.value || zoomkeyBusy.value) return;
-  if (zoomkeyPolicy.value.allow_private_network) {
+  const previousEnabled = zoomkeyPolicy.value.enabled;
+  if (opts.toggling) {
+    zoomkeyPolicy.value.enabled = !previousEnabled;
+  }
+  if (zoomkeyPolicy.value.enabled && (opts.toggling || !previousEnabled)) {
     const ok = confirm(
       "开启后，Sealbox 允许向白名单内的内网主机发起请求（携带金库里的客户端证书）。\n" +
-        "请确认白名单里只有你信任的公司内网域名。继续？",
+        "请确认白名单里只有你信任的公司内网域名。配齐凭据的端点会自动出现在工具列表。继续？",
     );
-    if (!ok) return;
+    if (!ok) {
+      if (opts.toggling) zoomkeyPolicy.value.enabled = previousEnabled;
+      return;
+    }
   }
   zoomkeyBusy.value = true;
   try {
     zoomkeyPolicy.value = await api.zoomkeyPolicySet(zoomkeyPolicy.value);
     mcpTools.value = await api.mcpTools();
-    showToast("ZoomKey 策略已保存");
+    if (opts.toggling) {
+      showToast(zoomkeyPolicy.value.enabled ? "ZoomKey MCP 已启用" : "ZoomKey MCP 已停用");
+    } else {
+      showToast("ZoomKey 策略已保存");
+    }
   } catch (e) {
+    if (opts.toggling) zoomkeyPolicy.value.enabled = previousEnabled;
     showToast(String(e));
   } finally {
     zoomkeyBusy.value = false;
   }
+}
+
+function toggleZoomkeyEnabled() {
+  return saveZoomkeyPolicy({ toggling: true });
 }
 
 async function testZoomkey(endpoint: "jira" | "crm") {
@@ -1741,14 +1757,14 @@ onMounted(async () => {
             </p>
             <template v-if="zoomkeyPolicy">
               <div class="zoomkey-notice">
-                内网例外：开启后 Sealbox 只对下方白名单里的主机名放行，解析结果会被钉住再使用；
+                启用后 Sealbox 只对下方白名单里的主机名放行，解析结果会被钉住再使用；
                 回环、链路本地与云元数据地址（169.254.169.254 / 100.100.100.200）永远拒绝。
+                配齐凭据、客户端证书和 CA bundle 的端点会自动出现在工具列表。
               </div>
-              <div class="field">
-                <label class="check">
-                  <input v-model="zoomkeyPolicy.allow_private_network" type="checkbox" />
-                  允许访问内网地址（不开这一项，下面两个能力都不会生效）
-                </label>
+              <div class="mcp-actions">
+                <button class="btn primary" type="button" :disabled="zoomkeyBusy" @click="toggleZoomkeyEnabled">
+                  {{ zoomkeyBusy ? "保存中…" : (zoomkeyPolicy.enabled ? "停用 ZoomKey MCP" : "启用 ZoomKey MCP") }}
+                </button>
               </div>
               <div class="field">
                 <label>允许的主机名（每行一个，精确匹配）</label>
@@ -1761,10 +1777,7 @@ onMounted(async () => {
 
               <div class="zoomkey-endpoint">
                 <div class="zoomkey-endpoint-head">
-                  <label class="check">
-                    <input v-model="zoomkeyPolicy.jira_enabled" type="checkbox" />
-                    <strong>JIRA</strong>
-                  </label>
+                  <strong>JIRA</strong>
                   <button class="btn" type="button" :disabled="!!zoomkeyTestBusy" @click="testZoomkey('jira')">
                     {{ zoomkeyTestBusy === 'jira' ? '测试中…' : '测试连接' }}
                   </button>
@@ -1803,10 +1816,7 @@ onMounted(async () => {
 
               <div class="zoomkey-endpoint">
                 <div class="zoomkey-endpoint-head">
-                  <label class="check">
-                    <input v-model="zoomkeyPolicy.crm_enabled" type="checkbox" />
-                    <strong>CRM</strong>
-                  </label>
+                  <strong>CRM</strong>
                   <button class="btn" type="button" :disabled="!!zoomkeyTestBusy" @click="testZoomkey('crm')">
                     {{ zoomkeyTestBusy === 'crm' ? '测试中…' : '测试连接' }}
                   </button>
@@ -2022,7 +2032,7 @@ onMounted(async () => {
                   <p class="crumb">工具结果会标记为外部资料，不会改变助手权限。</p>
                 </div>
                 <div class="mcp-actions assistant-chat-actions">
-                  <span class="crumb">GitHub MCP 开关决定是否可调用只读工具</span>
+                  <span class="crumb">工具列表由 MCP 页当前开关决定</span>
                   <button class="btn" type="button" :disabled="assistantChatBusy || !assistantMessages.length" @click="clearAssistantChat">清空</button>
                 </div>
               </div>
@@ -2055,7 +2065,7 @@ onMounted(async () => {
               <form class="assistant-composer" @submit.prevent="sendAssistantMessage">
                 <textarea v-model="assistantInput" rows="3" :disabled="assistantChatBusy" placeholder="输入消息，Enter 发送，Shift+Enter 换行" @keydown.enter.exact.prevent="sendAssistantMessage" />
                 <div class="assistant-composer-foot">
-                  <span class="crumb">工具由 GitHub MCP 总开关控制</span>
+                  <span class="crumb">工具由 MCP 页当前开关控制</span>
                   <button class="btn primary" type="submit" :disabled="assistantChatBusy || !assistantInput.trim()">{{ assistantChatBusy ? "发送中…" : "发送" }}</button>
                 </div>
               </form>

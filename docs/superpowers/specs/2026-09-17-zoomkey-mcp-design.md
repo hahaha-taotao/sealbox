@@ -10,7 +10,7 @@
 | 1 | 架构形态 | **Rust 原生实现，并入 Sealbox 现有本机 MCP**（方案 A） |
 | 2 | 用户名 / 密码 / AccessKey | **复用金库 `ApiToken` 条目**（service = `zoomkey-jira` / `zoomkey-crm`） |
 | 3 | mTLS 客户端证书 | **私钥存进金库**（新增 `EntryKind::ClientCert`） |
-| 4 | 工具范围 | **全部 20 个只读工具**（JIRA 10 + CRM 10），两边独立开关 |
+| 4 | 工具范围 | **全部 20 个只读工具**（JIRA 10 + CRM 10），共用一个 ZoomKey MCP 总开关；配齐的端点自动出现 |
 
 ## 1. 目标
 
@@ -109,9 +109,7 @@ SecretPayload::ClientCert {
 
 ```json
 {
-  "jira_enabled": false,
-  "crm_enabled": false,
-  "allow_private_network": false,
+  "enabled": false,
   "allowed_hosts": ["jira.zoomkey.com.cn", "crm.zoomkey.com.cn"],
   "jira": {
     "base_url": "https://jira.zoomkey.com.cn",
@@ -129,8 +127,10 @@ SecretPayload::ClientCert {
 }
 ```
 
-默认全关。开启 JIRA 工具需要同时满足：`jira_enabled` + `allow_private_network` +
-`credential_id` 指向一个 service 为 `zoomkey-jira` 的活动条目 + `client_cert_id` 指向有效证书条目。
+默认关闭。启用 ZoomKey 工具需要同时满足：`enabled` +
+`credential_id` 指向对应 service 的活动条目 + `client_cert_id` 指向有效证书条目 + CA bundle 路径有效。
+JIRA 与 CRM 不再各挂启用勾选；配齐的端点自动出现在 `tools/list`。
+旧策略里的 `jira_enabled` / `crm_enabled` / `allow_private_network` 任一为真，加载时迁成 `enabled=true`。
 
 ## 5. 工具清单
 
@@ -162,7 +162,7 @@ Vtiger 操作：`getchallenge / login / describe / listtypes / query / retrieve`
 |---|---|
 | 监听 | 不变，仍只 `127.0.0.1`，Bearer `mcp_token` |
 | 金库锁定 | 锁定即所有 zoomkey 工具失败并提示先解锁（与 github 一致） |
-| 默认状态 | 全部关闭。三个开关（JIRA / CRM / 允许内网）都要显式打开 |
+| 默认状态 | 全部关闭。启用 ZoomKey MCP 等于同意访问白名单内网；配齐的端点自动出现 |
 | 内网例外 | 只对 `allowed_hosts` 中的**精确主机名**放开；其余仍走 `assert_public_target`。github 路径完全不受影响 |
 | DNS 重绑定 | 解析一次并**钉住** IP（自定义 `ureq::Resolver` 只返回已校验地址），校验与使用之间不重解析 |
 | 模型可控面 | 不接受模型传入 URL / Host / Header / HTTP 方法。路径由代码按固定模板拼装，参数做白名单与转义 |
@@ -219,8 +219,8 @@ Vtiger 操作：`getchallenge / login / describe / listtypes / query / retrieve`
 ## 9. 测试
 
 **Rust 单元测试**（`cargo test`，不碰网络）
-- 默认策略全关；三开关任一缺失时工具拒绝执行
-- 主机白名单：非白名单主机拒绝；`allow_private_network=false` 时内网地址拒绝
+- 默认策略全关；总开关关闭时工具拒绝执行
+- 主机白名单：非白名单主机拒绝；总开关关闭时内网地址拒绝
 - IP 钉住：解析结果被改写时不放行
 - JQL 拼装与转义；CRM SQL 转义与 `limit` 夹取
 - 响应 DTO 映射与字段截断

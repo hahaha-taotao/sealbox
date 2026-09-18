@@ -4,7 +4,7 @@
 //! （实测 `jira.zoomkey.com.cn` → 172.16.1.40，`crm.zoomkey.com.cn` → 172.16.1.147），
 //! 现有的公网守卫会把它们全部拦掉。这里刻意开一个口子，但收得很紧：
 //!
-//! 1. 策略里必须显式打开 `allow_private_network`；
+//! 1. 只有 ZoomKey MCP 总开关打开后才会走到这里；
 //! 2. 主机名必须精确命中 `allowed_hosts` 白名单（不做后缀匹配，不做通配）；
 //! 3. 解析出来的**每一个**地址都要通过 `ip_allowed`——回环、链路本地、
 //!    云元数据（169.254.169.254 / 100.100.100.200）永远拒绝，私网地址才放行；
@@ -36,11 +36,7 @@ impl PinnedTarget {
 }
 
 /// 解析并校验 base url，返回钉住地址的目标。
-pub fn pin(
-    base_url: &str,
-    allowed_hosts: &[String],
-    allow_private: bool,
-) -> Result<PinnedTarget, String> {
+pub fn pin(base_url: &str, allowed_hosts: &[String]) -> Result<PinnedTarget, String> {
     let target = parse_http_url(base_url, true)?;
     if target.scheme != "https" {
         return Err("ZoomKey 只允许 https".into());
@@ -54,9 +50,6 @@ pub fn pin(
         .any(|allowed| allowed.trim().eq_ignore_ascii_case(&host))
     {
         return Err(format!("主机 {host} 不在允许列表内，已拒绝"));
-    }
-    if !allow_private {
-        return Err("尚未打开「允许访问内网地址」，已拒绝".into());
     }
     let netloc = format!("{}:{}", target.host, target.port);
     let resolved = netloc
@@ -147,20 +140,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_when_private_network_disabled() {
-        let err = pin("https://jira.zoomkey.com.cn", &hosts(), false).unwrap_err();
-        assert!(err.contains("内网"), "{err}");
-    }
-
-    #[test]
     fn rejects_host_outside_allowlist() {
-        let err = pin("https://evil.example.com", &hosts(), true).unwrap_err();
+        let err = pin("https://evil.example.com", &hosts()).unwrap_err();
         assert!(err.contains("不在允许列表"), "{err}");
     }
 
     #[test]
     fn rejects_plain_http() {
-        let err = pin("http://jira.zoomkey.com.cn", &hosts(), true).unwrap_err();
+        let err = pin("http://jira.zoomkey.com.cn", &hosts()).unwrap_err();
         assert!(err.contains("https"), "{err}");
     }
 

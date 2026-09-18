@@ -241,7 +241,7 @@ fn nav(runtime: &EndpointRuntime, args: &Value) -> Result<ToolOutcome, ToolFailu
     })
 }
 
-fn connection_status(runtime: &EndpointRuntime, args: &Value) -> Result<ToolOutcome, ToolFailure> {
+pub(crate) fn connection_status(runtime: &EndpointRuntime, args: &Value) -> Result<ToolOutcome, ToolFailure> {
     let challenge = call_operation(
         runtime,
         "GET",
