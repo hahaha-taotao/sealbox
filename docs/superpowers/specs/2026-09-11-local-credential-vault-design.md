@@ -4,15 +4,15 @@
 状态：已批准  
 产品名：Sealbox（印盒）  
 应用 id：`com.sealbox.app`  
-对标参考：Sigil 掌玺（https://sigil.ruoyi.plus/），仅借鉴「本地金库」思路与界面视觉，不复制其云端 AI/MCP 形态；本项目只提供本机、受控的 GitHub 只读 MCP。
+对标参考：Sigil 掌玺（https://sigil.ruoyi.plus/），仅借鉴「本地金库」思路与界面视觉，不复制其云端 AI/MCP 形态；本项目只提供本机、受控的 GitHub MCP（只读 API + 已登记本地仓库的 git）。
 
 ## 1. 产品定位
 
 做一个 Windows 桌面凭据金库：给人安全存放网站账号、API Token、SSH/证书；日常用主窗口或全局快捷键复制；可导出加密备份换机。按可发布产品的标准写加密、数据格式和审计，但第一版只给自己用。
 
-它不是 1Password 的云同步密码箱，也不是 Sigil 那样的云端 MCP 代理。本项目的本机 MCP 只提供受控的 GitHub 与 ZoomKey 查询能力，让 AI 使用能力而看不到凭据明文。
+它不是 1Password 的云同步密码箱，也不是 Sigil 那样的云端 MCP 代理。本项目的本机 MCP 只提供受控的 GitHub 与 ZoomKey 能力，让 AI 使用能力而看不到凭据明文。
 
-一句话：本机金库先做对，再以受控方式连接查询工具。
+一句话：本机金库先做对，再以受控方式连接查询与已登记仓库的 git 工具。
 
 ## 2. 已确认决策
 
@@ -49,9 +49,9 @@
 - macOS / Linux
 - 云同步、多用户、账号系统
 - 浏览器自动填充、向其他窗口注入按键
-- MCP 写入 GitHub、通用 HTTP 默认暴露、模型触发的秘密复制
-- GitHub MCP 只读能力已实现：默认停用，启用后开放固定的 api.github.com GET 工具；所有活动 GitHub Token 由模型按凭据 ID 选择
-- 文件加密盘、加密分享包、邮件、MQTT、对象存储、内置浏览器、Git 工作区
+- GitHub Contents / Git Data 写 API、通用 HTTP 默认暴露、模型触发的秘密复制
+- GitHub MCP：默认停用；启用后开放固定的 api.github.com GET 工具，以及 Agent 传入绝对路径的 `github_git_*`（见 `2026-09-18-git-workspace-mcp-design.md`）。不做 force / SSH / 相对路径逃逸
+- 文件加密盘、加密分享包、邮件、MQTT、对象存储、内置浏览器
 - Bitwarden 导入、扫描导入、Have I Been Pwned、试用倒计时
 - Token 额度刷新、分页（本地全量列表 + 搜索即可）
 - 自动定时备份、备份上传网盘
@@ -59,7 +59,7 @@
 
 ### 3.3 后续能力预留
 
-Rust 核心暴露内部 `VaultService`：按筛选列出元数据、按 id 解密一次、写审计。当前本机 MCP 只暴露一个总开关控制的 GitHub 只读能力：`GithubMcpPolicy` 只包含 `enabled`；启用后提供一个凭据元数据发现工具和六个固定 GitHub 工具，模型通过 `credential_id` 选择活动 GitHub Token。工具固定访问 `https://api.github.com`，只执行 GET，不接受任意 URL、请求头或请求体；模型只收到结构化字段，不收到 Token、响应头或任意原始响应。
+Rust 核心暴露内部 `VaultService`：按筛选列出元数据、按 id 解密一次、写审计。当前本机 MCP 用同一个 `GithubMcpPolicy.enabled` 控制 GitHub API 只读工具和本地 `github_git_*`。API 工具固定 GET `https://api.github.com`；git 工具在 Agent 给出的绝对路径上跑本机 `git`，Token 经 askpass 注入且不回给模型。详见 `2026-09-18-git-workspace-mcp-design.md`。
 
 ## 4. 成功标准
 

@@ -734,6 +734,8 @@ mod tests {
         let value = json!({
             "tools": [
                 {"name":"github_get_file","description":"file","inputSchema":{},"readOnly":true,"risk":"low"},
+                {"name":"github_git_status","description":"git status","inputSchema":{},"readOnly":true,"risk":"low"},
+                {"name":"github_git_push","description":"git push","inputSchema":{},"readOnly":false,"risk":"high"},
                 {"name":"zoomkey_jira_nav","description":"jira","inputSchema":{},"readOnly":true,"risk":"low"},
                 {"name":"zoomkey_crm_query","description":"crm","inputSchema":{},"readOnly":true,"risk":"low"},
                 {"name":"list_credentials","description":"legacy","inputSchema":{},"readOnly":true,"risk":"medium"},
@@ -744,7 +746,7 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|tool| tool.summary.name.as_str()).collect();
         assert_eq!(
             names,
-            vec!["github_get_file", "zoomkey_jira_nav", "zoomkey_crm_query"]
+            vec!["github_get_file", "github_git_status", "zoomkey_jira_nav", "zoomkey_crm_query"]
         );
     }
 

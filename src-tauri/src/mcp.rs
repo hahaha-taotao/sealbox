@@ -721,9 +721,12 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .filter(|name| name.starts_with("github_"))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 16);
         assert!(names.contains(&"github_list_credentials"));
         assert!(names.contains(&"github_get_file"));
+        assert!(names.contains(&"github_git_status"));
+        assert!(names.contains(&"github_git_clone"));
+        assert!(!names.contains(&"github_git_list"));
     }
 
     #[test]
@@ -765,8 +768,9 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .filter(|name| name.starts_with("github_"))
             .collect::<Vec<_>>();
-        assert_eq!(github_names.len(), 7);
+        assert_eq!(github_names.len(), 16);
         assert!(github_names.contains(&"github_list_credentials"));
+        assert!(github_names.contains(&"github_git_push"));
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod db;
 pub mod fill;
 pub mod extension_install;
 pub mod github_mcp;
+pub mod git_workspace;
 pub mod hello;
 pub mod http_guard;
 pub mod lock;

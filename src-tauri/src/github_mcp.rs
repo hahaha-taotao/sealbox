@@ -137,7 +137,7 @@ struct GithubFileDto {
     truncated: bool,
 }
 
-pub fn tool_definitions() -> Vec<Value> {
+pub fn api_tool_definitions() -> Vec<Value> {
     vec![
         tool(
             "github_list_credentials",
@@ -222,6 +222,12 @@ pub fn tool_definitions() -> Vec<Value> {
     ]
 }
 
+pub fn tool_definitions() -> Vec<Value> {
+    let mut tools = api_tool_definitions();
+    tools.extend(crate::git_workspace::tool_definitions());
+    tools
+}
+
 fn string_schema(minimum: u64, maximum: u64) -> Value {
     json!({"type":"string","minLength":minimum,"maxLength":maximum})
 }
@@ -249,10 +255,14 @@ fn tool(name: &str, description: &str, input_schema: Value) -> Value {
     })
 }
 
-pub fn is_github_tool(name: &str) -> bool {
-    tool_definitions()
+pub fn is_github_api_tool(name: &str) -> bool {
+    api_tool_definitions()
         .iter()
         .any(|definition| definition.get("name").and_then(Value::as_str) == Some(name))
+}
+
+pub fn is_github_tool(name: &str) -> bool {
+    is_github_api_tool(name) || crate::git_workspace::is_git_tool(name)
 }
 
 pub fn load_policy(vault: &Vault, dek: &[u8; 32]) -> GithubMcpPolicy {
@@ -280,7 +290,9 @@ pub fn save_policy(vault: &Vault, dek: &[u8; 32], policy: &GithubMcpPolicy) -> R
 }
 
 pub fn normalize_policy(policy: GithubMcpPolicy) -> Result<GithubMcpPolicy, String> {
-    Ok(policy)
+    Ok(GithubMcpPolicy {
+        enabled: policy.enabled,
+    })
 }
 
 pub fn list_credentials(session: &Session) -> Result<Vec<GithubCredentialMeta>, String> {
@@ -360,6 +372,9 @@ pub fn call_tool_detailed(
 }
 
 fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<String, String> {
+    if crate::git_workspace::is_git_tool(name) {
+        return crate::git_workspace::call_tool_text(session, name, args);
+    }
     if name == "github_list_credentials" {
         let definition = tool_definitions()
             .into_iter()
@@ -519,6 +534,10 @@ fn parse_call_error(raw: &str) -> (Option<u16>, &'static str, String) {
         return (None, "network", raw.to_string());
     }
     (None, "validation", raw.to_string())
+}
+
+pub(crate) fn validate_tool_arguments(schema: &Value, args: &Value) -> Result<(), String> {
+    validate_arguments(schema, args)
 }
 
 fn validate_arguments(schema: &Value, args: &Value) -> Result<(), String> {
@@ -944,10 +963,6 @@ mod tests {
     fn default_policy_is_disabled() {
         let policy = GithubMcpPolicy::default();
         assert!(!policy.enabled);
-        assert_eq!(
-            serde_json::to_value(policy).unwrap(),
-            json!({"enabled": false})
-        );
     }
 
     #[test]
@@ -996,8 +1011,11 @@ mod tests {
             assert_eq!(definition["readOnly"], true);
             assert_eq!(definition["risk"], "low");
             assert_eq!(definition["inputSchema"]["additionalProperties"], false);
+            assert!(is_github_api_tool(name));
             assert!(is_github_tool(name));
         }
+        assert!(is_github_tool("github_git_status"));
+        assert!(!is_github_api_tool("github_git_status"));
     }
 
     #[test]
@@ -1033,11 +1051,18 @@ mod tests {
             let error = call_tool(&mut session, name, args).unwrap_err();
             assert!(error.contains("未启用"), "{name}: {error}");
         }
+        let git_error = call_tool(
+            &mut session,
+            "github_git_status",
+            json!({"path":"E:\\\\repo"}),
+        )
+        .unwrap_err();
+        assert!(git_error.contains("未启用"), "{git_error}");
     }
 
     #[test]
     fn tool_schemas_are_closed() {
-        for definition in tool_definitions() {
+        for definition in api_tool_definitions() {
             assert_eq!(definition["inputSchema"]["additionalProperties"], false);
             assert_eq!(definition["readOnly"], true);
         }

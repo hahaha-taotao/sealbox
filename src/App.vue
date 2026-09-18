@@ -469,6 +469,12 @@ async function pickCaBundlePath(endpoint: "jira" | "crm") {
 async function saveGithubPolicy() {
   if (githubPolicyBusy.value) return;
   const previous = githubPolicy.value.enabled;
+  if (!previous) {
+    const ok = confirm(
+      "开启后，Cursor / Claude Code 可以使用 GitHub 只读 API，并在模型给出的本地路径上执行 git（含 commit / push / pull / clone）。Token 不会返回给模型。继续？",
+    );
+    if (!ok) return;
+  }
   githubPolicyBusy.value = true;
   githubPolicy.value = { enabled: !previous };
   try {
@@ -1740,8 +1746,11 @@ onMounted(async () => {
             <button class="btn" type="button" :disabled="!mcp?.has_token" @click="copyMcpSnippet">复制配置</button>
           </div>
           <div class="mcp-card">
-            <h3>GitHub 只读能力</h3>
-            <p class="crumb">只访问固定的 api.github.com，只执行 GET。启用后六个 GitHub 业务工具和一个 Token 发现工具全部可用，模型可通过 github_list_credentials 选择活动 Token。</p>
+            <h3>GitHub MCP</h3>
+            <p class="crumb">
+              启用后开放 api.github.com 只读 GET 工具，以及本地 git 工具 github_git_*（status / diff / commit / push / pull / clone）。
+              Agent 传入本机绝对路径；Token 只在 Rust 里注入，不会返回给模型。
+            </p>
             <div class="mcp-actions">
               <button class="btn primary" type="button" :disabled="githubPolicyBusy" @click="saveGithubPolicy">
                 {{ githubPolicyBusy ? "保存中…" : (githubPolicy.enabled ? "停用 GitHub MCP" : "启用 GitHub MCP") }}
@@ -2032,7 +2041,7 @@ onMounted(async () => {
                   <p class="crumb">工具结果会标记为外部资料，不会改变助手权限。</p>
                 </div>
                 <div class="mcp-actions assistant-chat-actions">
-                  <span class="crumb">工具列表由 MCP 页当前开关决定</span>
+                  <span class="crumb">助手只调用只读工具；git 写入需在 Cursor 里使用</span>
                   <button class="btn" type="button" :disabled="assistantChatBusy || !assistantMessages.length" @click="clearAssistantChat">清空</button>
                 </div>
               </div>
@@ -2065,7 +2074,7 @@ onMounted(async () => {
               <form class="assistant-composer" @submit.prevent="sendAssistantMessage">
                 <textarea v-model="assistantInput" rows="3" :disabled="assistantChatBusy" placeholder="输入消息，Enter 发送，Shift+Enter 换行" @keydown.enter.exact.prevent="sendAssistantMessage" />
                 <div class="assistant-composer-foot">
-                  <span class="crumb">工具由 MCP 页当前开关控制</span>
+                  <span class="crumb">助手不会调用 github_git_commit / push / pull / clone</span>
                   <button class="btn primary" type="submit" :disabled="assistantChatBusy || !assistantInput.trim()">{{ assistantChatBusy ? "发送中…" : "发送" }}</button>
                 </div>
               </form>

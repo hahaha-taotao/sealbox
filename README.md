@@ -16,7 +16,7 @@ A local credential vault for Windows. Unlock with a master password (optional Wi
 - **速查 Quick search** — 默认全局热键 `Ctrl+Shift+Space`，回车复制主秘密
 - **安全习惯 Hygiene** — 空闲自动锁定、审计日志（不记明文）、回收站、置顶、标签、文件夹
 - **备份 Backup** — 加密 `.svbak` 导出 / 导入（默认合并，覆盖需确认）
-- **MCP** — 本机 `127.0.0.1` 服务；只有一个 GitHub MCP 启用/停用开关，启用后提供 GitHub 只读工具，固定访问 `api.github.com`；模型按 Token ID 选择活动 GitHub Token
+- **MCP** — 本机 `127.0.0.1` 服务；GitHub MCP 一个开关同时提供 api.github.com 只读工具和本地 `github_git_*`；模型按 Token ID 选择活动 GitHub Token，git 写入不会把 Token 回给模型
 - **ZoomKey JIRA / CRM** — 可选的内网只读工具，挂在同一个 MCP 上。走强制双向 TLS，账号密码 / AccessKey 从金库的 API Token 条目取，客户端私钥从金库的「客户端证书」条目取；默认关闭，需显式启用 ZoomKey MCP 并确认主机白名单。配齐的端点会自动出现，不必再单独勾选 JIRA / CRM
 - **客户端证书 Client cert** — 保险库里可以导入 mTLS 用的客户端证书与私钥（PEM），由 Rust 侧限长、解析并校验证书/私钥匹配后加密保存，随金库一起备份；列表和速查不会显示或复制私钥，锁定时会清理 TLS 运行时缓存
 - **助手 Assistant** — 位于「插件」下方的 OpenAI 兼容对话页；可测试本机 MCP 连通性，并让模型调用当前暴露的 GitHub 只读工具
@@ -57,7 +57,7 @@ On first launch, set a master password (at least 10 characters). Closing the win
 ## MCP
 
 1. 解锁金库 / Unlock the vault.
-2. 打开侧栏 **MCP**，在 GitHub 只读能力卡片中点击“启用 GitHub MCP”。服务只监听 `127.0.0.1`，默认端口 17891。
+2. 打开侧栏 **MCP**，在 GitHub MCP 卡片中点击“启用 GitHub MCP”。服务只监听 `127.0.0.1`，默认端口 17891。
 3. 复制页面上的配置到 Cursor / Claude Code / Paste the snippet into Cursor or Claude Code.
 
 默认工具 Tools:
@@ -69,10 +69,12 @@ On first launch, set a master password (at least 10 characters). Closing the win
 - `github_get_file` — 读取仓库中的文本文件，带大小和二进制限制
 - `github_list_issues` — 列出仓库的 Issue
 - `github_list_pull_requests` — 列出仓库的 Pull Request 元数据
+- `github_git_status` / `github_git_diff` / `github_git_log` / `github_git_branches` — 本地仓库只读 git，`path` 为仓库绝对路径
+- `github_git_stage` / `github_git_commit` / `github_git_push` / `github_git_pull` / `github_git_clone` — 日常写入；push / pull / clone 用 `credential_id` 从金库取 Token，经 askpass 注入，不写进 `.git/config`
 
-GitHub MCP 默认停用。启用后七个只读工具全部可用；模型先调用 `github_list_credentials`，再通过 `credential_id` 选择要使用的活动 GitHub Token。工具只访问 `https://api.github.com:443`，固定使用 GET，不接受模型传入 URL、Header、Body 或任意 HTTP 方法。GitHub Token 在 GitHub 侧的权限仍可能导致 API 返回 403。
+GitHub MCP 默认停用。启用后 API 只读工具和 `github_git_*` 全部出现在 `tools/list`。模型先调用 `github_list_credentials`，再通过 `credential_id` 选择活动 GitHub Token。API 工具只访问 `https://api.github.com:443`，固定使用 GET。git 工具由 Agent 传入本机绝对路径，远程必须是 `https://github.com`。侧栏助手只调用只读工具。
 
-停用时七个工具都不会出现在 `tools/list`，直接调用也会被拒绝。模型收到的是每个工具定义好的结构化字段，不包含 Token、Authorization、响应头或任意原始响应。金库锁定时工具会失败。MCP Token 可在页面轮换。
+停用时这些工具都不会出现在 `tools/list`，直接调用也会被拒绝。模型收到的是结构化字段或截断后的 git 输出，不包含 Token。金库锁定时工具会失败。MCP Token 可在页面轮换。
 
 ## ZoomKey JIRA / CRM
 
