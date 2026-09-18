@@ -259,7 +259,12 @@ function resetFormFields() {
 }
 function fmtTime(s: string | null) {
   if (!s) return "—";
-  return s.replace("T", " ").slice(0, 16);
+  const raw = s.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return raw.replace("T", " ").slice(0, 16);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
 async function refreshStatus() {
