@@ -1868,7 +1868,7 @@ onMounted(async () => {
               </div>
 
               <div class="mcp-actions">
-                <button class="btn primary" type="button" :disabled="zoomkeyBusy" @click="saveZoomkeyPolicy">
+                <button class="btn primary" type="button" :disabled="zoomkeyBusy" @click="() => saveZoomkeyPolicy()">
                   {{ zoomkeyBusy ? "保存中…" : "保存 ZoomKey 策略" }}
                 </button>
               </div>

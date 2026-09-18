@@ -42,7 +42,11 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis"],
+    "publisher": "Sealbox",
+    "shortDescription": "Sealbox 印盒 — 本地凭据金库",
+    "longDescription": "A local credential vault for Windows. Unlock with a master password (optional Windows Hello). Website logins, API tokens, SSH keys, mailboxes, servers, and databases stay encrypted on disk.",
+    "category": "Utility",
     "resources": {
       "../extension/manifest.json": "extension/manifest.json",
       "../extension/background.js": "extension/background.js",
@@ -62,6 +66,17 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "both",
+        "languages": ["SimpChinese", "English"],
+        "displayLanguageSelector": true
+      }
+    }
   }
 }

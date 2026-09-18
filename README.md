@@ -4,10 +4,32 @@
 
 A local credential vault for Windows. Unlock with a master password (optional Windows Hello). Website logins, API tokens, SSH keys, mailboxes, servers, and databases stay encrypted on disk. Copied secrets are cleared from the clipboard on a timer. Encrypted `.svbak` backups can be exported and imported. An optional localhost MCP lets Cursor / Claude Code use credentials without seeing plaintext. A Chrome / Edge extension can fill or save website logins.
 
+当前版本 Current version: **v0.1** (`0.1.0`)
+
 > 数据只存本机，不做云同步。  
 > Secrets stay on this machine. There is no cloud sync.
 
 设计见 [`docs/superpowers/specs/2026-09-11-local-credential-vault-design.md`](docs/superpowers/specs/2026-09-11-local-credential-vault-design.md).
+
+## 安装 Install
+
+Windows x64 使用 NSIS 安装包 `Sealbox_0.1.0_x64-setup.exe`。向导会让你选择：
+
+1. 安装范围：当前用户，或所有用户（后者需要管理员权限）
+2. **安装盘符与目录**，例如 `D:\Sealbox`；默认在当前用户下是 `%LOCALAPPDATA%\Sealbox`，在所有用户下是 `C:\Program Files\Sealbox`
+
+金库文件仍写在 `%APPDATA%\com.sealbox.app\vault.db`，不会跟着安装盘一起搬家。
+
+The Windows x64 setup wizard lets you pick per-user or per-machine install, then choose the drive and folder. Vault data stays in `%APPDATA%\com.sealbox.app\`, not next to the exe.
+
+从源码打包 Build the installer:
+
+```bash
+npm install
+npm run tauri build
+```
+
+产物在 `src-tauri/target/release/bundle/nsis/`。
 
 ## 功能 Features
 
@@ -17,7 +39,6 @@ A local credential vault for Windows. Unlock with a master password (optional Wi
 - **安全习惯 Hygiene** — 空闲自动锁定、审计日志（不记明文）、回收站、置顶、标签、文件夹
 - **备份 Backup** — 加密 `.svbak` 导出 / 导入（默认合并，覆盖需确认）
 - **MCP** — 本机 `127.0.0.1` 服务；GitHub MCP 一个开关同时提供 api.github.com 只读工具和本地 `github_git_*`；模型按 Token ID 选择活动 GitHub Token，git 写入不会把 Token 回给模型
-- **ZoomKey JIRA / CRM** — 可选的内网只读工具，挂在同一个 MCP 上。走强制双向 TLS，账号密码 / AccessKey 从金库的 API Token 条目取，客户端私钥从金库的「客户端证书」条目取；默认关闭，需显式启用 ZoomKey MCP 并确认主机白名单。配齐的端点会自动出现，不必再单独勾选 JIRA / CRM
 - **客户端证书 Client cert** — 保险库里可以导入 mTLS 用的客户端证书与私钥（PEM），由 Rust 侧限长、解析并校验证书/私钥匹配后加密保存，随金库一起备份；列表和速查不会显示或复制私钥，锁定时会清理 TLS 运行时缓存
 - **助手 Assistant** — 位于「插件」下方的 OpenAI 兼容对话页；可测试本机 MCP 连通性，并让模型调用当前暴露的 GitHub 只读工具
 - **插件 Plugin** — Chrome / Edge 从客户端安装后按当前网址填充或一键登记；在侧栏「插件」页配对
@@ -40,6 +61,8 @@ A local credential vault for Windows. Unlock with a master password (optional Wi
 - Windows
 - [Rust](https://rustup.rs/)
 - [Node.js](https://nodejs.org/)（含 npm）
+
+已安装的 Windows 用户直接运行安装包即可，不需要 Rust / Node。
 
 ## 开始使用 Getting started
 
@@ -75,39 +98,6 @@ On first launch, set a master password (at least 10 characters). Closing the win
 GitHub MCP 默认停用。启用后 API 只读工具和 `github_git_*` 全部出现在 `tools/list`。模型先调用 `github_list_credentials`，再通过 `credential_id` 选择活动 GitHub Token。API 工具只访问 `https://api.github.com:443`，固定使用 GET。git 工具由 Agent 传入本机绝对路径，远程必须是 `https://github.com`。侧栏助手只调用只读工具。
 
 停用时这些工具都不会出现在 `tools/list`，直接调用也会被拒绝。模型收到的是结构化字段或截断后的 git 输出，不包含 Token。金库锁定时工具会失败。MCP Token 可在页面轮换。
-
-## ZoomKey JIRA / CRM
-
-把众齐内网的 JIRA 与 CRM 查询能力开放给本机 MCP 客户端，工具挂在同一个 MCP 服务上，共用一个启用开关。
-
-**前置：两个站点都在 `172.16.x.x` 内网，且强制要求客户端证书（mTLS）。**
-
-启用步骤：
-
-1. 保险库 → 新建一条 **API Token**：服务填 `zoomkey-jira`，账号填 JIRA 用户名，密钥填 JIRA 密码。
-2. 保险库 → 新建一条 **API Token**：服务填 `zoomkey-crm`，账号填 CRM 用户名，密钥填 Vtiger AccessKey（不是登录密码）。
-3. 保险库 → 新建一条 **客户端证书**：分别选择 `client-cert.pem` 与 `client-key.pem` 文件。文件只在 Rust 侧读取、校验并加密保存；不会保存原始路径，也不会把私钥回显到界面。两个站点可以共用同一份证书。
-4. 侧栏 **MCP** → **ZoomKey JIRA / CRM**：点「启用 ZoomKey MCP」（等于同意访问白名单内网），选好凭据与证书条目，填 CA bundle 路径（含 Root + SubCA 的 PEM），保存。只有配置完整的端点才会出现在 MCP `tools/list`。
-5. 点 **测试连接** 验证 CA、客户端证书、账号三段链路。
-
-工具 Tools：
-
-- JIRA：`zoomkey_jira_nav`、`zoomkey_jira_connection_status`、`zoomkey_jira_list_projects`、`zoomkey_jira_project_statuses`、`zoomkey_jira_field_map`、`zoomkey_jira_search_issues`、`zoomkey_jira_get_issue`、`zoomkey_jira_my_open_issues`、`zoomkey_jira_project_unfinished`、`zoomkey_jira_preset_unfinished`
-- CRM：`zoomkey_crm_nav`、`zoomkey_crm_connection_status`、`zoomkey_crm_describe_module`、`zoomkey_crm_field_map`、`zoomkey_crm_find_account`、`zoomkey_crm_find_project`、`zoomkey_crm_list_service_contracts`、`zoomkey_crm_project_members`、`zoomkey_crm_query`、`zoomkey_crm_retrieve`
-
-两个 `field_map` 默认只返回**内置结构地图**（JIRA 的状态清单/字段/预设/查询剧本，CRM 的 ID 前缀/关联主线/模块核心字段），不联网即可用；传 `live=true` 才去在线拉元数据。参数与源插件对齐：JIRA 用 `section`（`overview`/`status`/`issuetype`/`fields`/`presets`/`playbooks`/`crm-bridge`），CRM 用 `module`。
-
-内网例外是刻意开的口子，收得很紧：只对策略里列出的**精确主机名**放行；解析出的地址会被钉住再使用，避免 DNS 重绑定；回环、链路本地、云元数据地址（`169.254.169.254` / `100.100.100.200`）永远拒绝；ZoomKey MCP 未启用时全部拒绝。GitHub 那条路径完全不受影响，仍然只走公网守卫。
-
-模型可控面同样收窄：不接受模型传入 URL、Host、Header 或 HTTP 方法，路径由代码按固定模板拼装。少数确实需要模型输入的字符串都先过校验才使用——`search_issues` / `get_issue` 的 `fields` 只接受逗号分隔的字段名（字母、数字、下划线、点、连字符，最多 64 个），`list_projects` 的 `query` 仅用于本地过滤，`field_map` 的 `section` 走固定枚举、`module` 只匹配内置表。非法值直接拒绝，不回显原值。JIRA 只发 GET；CRM 只发 GET 与表单 POST，且只指向配置的 webservice 地址。`zoomkey_crm_query` 只放行单条 `select`，写操作与多语句会被拒绝。返回体统一脱敏，密码、AccessKey 与 Vtiger `sessionName` 不会出现在输出或审计里。
-
-源插件里的 `configure`（写凭证）与 `insecureSkipTlsVerify`（跳过 TLS 校验）**不移植**。客户端私钥必须是**无口令**的 PEM；带口令的私钥请先解密：
-
-```bash
-openssl pkcs8 -topk8 -nocrypt -in client-key.pem -out client-key-plain.pem
-```
-
-设计见 [`docs/superpowers/specs/2026-09-17-zoomkey-mcp-design.md`](docs/superpowers/specs/2026-09-17-zoomkey-mcp-design.md)。
 
 ## 助手 Assistant
 
