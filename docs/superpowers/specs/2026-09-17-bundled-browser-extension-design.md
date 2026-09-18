@@ -24,7 +24,7 @@
 
 1. Chrome / Edge **不允许**桌面程序替用户安装 unpacked 扩展。开发者模式和「加载已解压的扩展」必须人手点。
 2. unpacked 扩展的身份跟**目录路径**绑定。导出路径必须稳定，不能每次换临时目录。
-3. `chrome://extensions` / `edge://extensions` 不能当普通 URL 用 ShellExecute 打开，必须启动对应浏览器可执行文件并传入该地址。
+3. `chrome://extensions` / `edge://extensions` 不能当普通 URL 用 ShellExecute 打开；已运行的 Chrome / Edge 也会丢掉命令行里的内部地址。必须启动对应浏览器可执行文件，再用地址栏（UI Automation）导航到扩展页。
 4. 扩展只支持 Chrome / Edge（Manifest V3 + `chrome.*` API）。不为此期做 Firefox / Safari。
 5. 金库锁定不影响「把文件复制到本机」；配对、显示 Token 仍要求已解锁。
 
@@ -113,8 +113,8 @@ popup.js
 | 动作 | 做法 |
 |---|---|
 | 打开扩展目录 | `explorer.exe` + 目标目录。目录不存在则先提示去安装 |
-| 打开 Chrome 扩展页 | `chrome.exe` + 参数 `chrome://extensions` |
-| 打开 Edge 扩展页 | `msedge.exe` + 参数 `edge://extensions` |
+| 打开 Chrome 扩展页 | 若已有 Chrome 窗口则不再启动进程，直接把地址栏导航到 `chrome://extensions`；没有窗口才启动 `chrome.exe` |
+| 打开 Edge 扩展页 | 若已有 Edge 窗口则不再启动进程，直接把地址栏导航到 `edge://extensions`；没有窗口才启动 `msedge.exe` |
 
 找不到对应浏览器：按钮禁用，旁注「未检测到 Google Chrome」或「未检测到 Microsoft Edge」。目录路径仍可复制，用户可手动加载。
 
@@ -152,7 +152,7 @@ popup.js
 
 ### 7.4 `extension_open_browser`
 
-参数：`browser: "chrome" | "edge"`。启动对应浏览器并打开扩展管理页。未检测到则失败，文案与按钮旁注一致。
+参数：`browser: "chrome" | "edge"`。启动对应浏览器，并把地址栏导航到扩展页；成功时返回该地址。未检测到则失败，文案与按钮旁注一致。
 
 前端封装在现有 `src/lib/tauri.ts`。
 
@@ -186,7 +186,7 @@ popup.js
 | 写入范围 | 只写 `app_local_data_dir()/extension` |
 | 读取范围 | 只读内置资源目录或开发回退的仓库 `extension/` |
 | 启动进程 | 只启动探测到的 `chrome.exe` / `msedge.exe` / `explorer.exe` |
-| 参数 | 扩展页地址写死为 `chrome://extensions` / `edge://extensions` |
+| 参数 | 启动浏览器时不传 `chrome://` / `edge://`；扩展页地址只通过地址栏写入，不作为命令行参数 |
 | 不做什么 | 不写 `ExtensionInstallForcelist` 等策略；不下载远程扩展；不执行扩展目录里的脚本；不把扩展文件注入页面 |
 
 复制过程不读、不记录、不上传扩展内容。审计：此期不写 `vault.audit`（无秘密、不依赖解锁）。若以后要记，只记「安装扩展」动作，不记文件哈希以外的内容。
@@ -199,7 +199,7 @@ popup.js
 | 目标目录无法创建或写入 | 无法写入扩展目录，请检查磁盘权限。 |
 | 尚未安装就打开目录 | 请先安装到本机。 |
 | 未检测到 Chrome / Edge | 未检测到 Google Chrome / 未检测到 Microsoft Edge。 |
-| 启动浏览器失败 | 无法打开扩展页，请手动访问 chrome://extensions 或 edge://extensions。 |
+| 启动浏览器失败 | 无法打开扩展页，请手动访问 chrome://extensions（Chrome）或 edge://extensions（Edge）。 |
 
 目录路径始终展示，安装失败后仍可复制，方便手工加载。
 

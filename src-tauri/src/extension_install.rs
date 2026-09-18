@@ -139,6 +139,20 @@ pub fn parse_browser(name: &str) -> Result<BrowserKind, String> {
     }
 }
 
+pub fn extensions_page_url(kind: BrowserKind) -> &'static str {
+    match kind {
+        BrowserKind::Chrome => "chrome://extensions",
+        BrowserKind::Edge => "edge://extensions",
+    }
+}
+
+pub fn exe_stem(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
 pub fn resolve_browser(candidates: &[PathBuf]) -> Option<PathBuf> {
     candidates.iter().find(|p| p.is_file()).cloned()
 }
@@ -214,13 +228,8 @@ pub fn explorer_open_command(dir: &Path) -> Command {
     cmd
 }
 
-pub fn browser_open_command(exe: &Path, kind: BrowserKind) -> Command {
-    let mut cmd = Command::new(exe);
-    cmd.arg(match kind {
-        BrowserKind::Chrome => "chrome://extensions",
-        BrowserKind::Edge => "edge://extensions",
-    });
-    cmd
+pub fn browser_open_command(exe: &Path) -> Command {
+    Command::new(exe)
 }
 
 pub fn spawn_logged(mut cmd: Command, fail: &str) -> Result<(), String> {
@@ -277,23 +286,310 @@ pub fn open_folder_for_app(app: &AppHandle) -> Result<(), String> {
     spawn_logged(explorer_open_command(&dest), "无法打开扩展目录，请手动打开上面的路径。")
 }
 
-pub fn open_browser_for_app(app: &AppHandle, browser: &str) -> Result<(), String> {
+pub fn open_browser_for_app(app: &AppHandle, browser: &str) -> Result<String, String> {
     let _ = app;
     let kind = parse_browser(browser)?;
     let (exe, missing, fail) = match kind {
         BrowserKind::Chrome => (
             detect_chrome(),
             "未检测到 Google Chrome",
-            "无法打开扩展页，请手动访问 chrome://extensions 或 edge://extensions。",
+            "无法打开扩展页，请手动访问 chrome://extensions。",
         ),
         BrowserKind::Edge => (
             detect_edge(),
             "未检测到 Microsoft Edge",
-            "无法打开扩展页，请手动访问 chrome://extensions 或 edge://extensions。",
+            "无法打开扩展页，请手动访问 edge://extensions。",
         ),
     };
     let exe = exe.ok_or_else(|| missing.to_string())?;
-    spawn_logged(browser_open_command(&exe, kind), fail)
+    let url = extensions_page_url(kind);
+    let already_open = browser_window_open(&exe);
+    if !already_open {
+        spawn_logged(browser_open_command(&exe), fail)?;
+    }
+    if let Err(detail) = navigate_omnibox(&exe, url) {
+        return Err(format!("{fail}（{detail}）"));
+    }
+    Ok(url.to_string())
+}
+
+fn browser_window_open(exe: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        windows_omnibox::has_window(exe)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = exe;
+        false
+    }
+}
+
+fn navigate_omnibox(exe: &Path, url: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        windows_omnibox::navigate(exe, url)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (exe, url);
+        Err("仅支持 Windows".into())
+    }
+}
+
+#[cfg(windows)]
+mod windows_omnibox {
+    use super::exe_stem;
+    use std::mem::size_of;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+    use windows::core::{BSTR, VARIANT};
+    use windows::Win32::Foundation::{CloseHandle, BOOL, HWND, LPARAM, MAX_PATH, WPARAM};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::System::Threading::{
+        AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
+        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationValuePattern,
+        TreeScope_Descendants, UIA_ClassNamePropertyId, UIA_ValuePatternId,
+    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VIRTUAL_KEY,
+        VK_RETURN,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AllowSetForegroundWindow, EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowTextW,
+        GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow,
+        ShowWindow, SW_RESTORE, WM_KEYDOWN, WM_KEYUP,
+    };
+
+    const OMNIBOX_CLASS: &str = "OmniboxViewViews";
+    const BROWSER_WINDOW_CLASS: &str = "Chrome_WidgetWin_1";
+
+    struct FoundWindows {
+        hwnds: Vec<HWND>,
+        wanted: String,
+    }
+
+    pub fn has_window(exe: &Path) -> bool {
+        find_windows(exe).map(|hwnds| !hwnds.is_empty()).unwrap_or(false)
+    }
+
+    pub fn navigate(exe: &Path, url: &str) -> Result<(), String> {
+        let exe = exe.to_path_buf();
+        let url = url.to_string();
+        std::thread::spawn(move || navigate_sta(&exe, &url))
+            .join()
+            .unwrap_or_else(|_| Err("无法打开扩展页".into()))
+    }
+
+    fn navigate_sta(exe: &Path, url: &str) -> Result<(), String> {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        }
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut last = "未找到浏览器窗口".to_string();
+        while Instant::now() < deadline {
+            match find_windows(exe) {
+                Ok(hwnds) => {
+                    for hwnd in hwnds {
+                        if navigate_window(hwnd, url).is_ok() {
+                            return Ok(());
+                        }
+                    }
+                    last = "无法写入浏览器地址栏".into();
+                }
+                Err(e) => last = e,
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        Err(last)
+    }
+
+    fn navigate_window(hwnd: HWND, url: &str) -> Result<(), String> {
+        let _ = focus_window(hwnd);
+        let native = set_omnibox(hwnd, url)?;
+        std::thread::sleep(Duration::from_millis(80));
+        send_enter(native.unwrap_or(hwnd));
+        Ok(())
+    }
+
+    fn find_windows(exe: &Path) -> Result<Vec<HWND>, String> {
+        let mut found = FoundWindows {
+            hwnds: Vec::new(),
+            wanted: exe_stem(exe),
+        };
+        unsafe {
+            let _ = EnumWindows(
+                Some(enum_windows_proc),
+                LPARAM(&mut found as *mut FoundWindows as isize),
+            );
+        }
+        if found.hwnds.is_empty() {
+            return Err(format!("未找到 {} 窗口", found.wanted));
+        }
+        Ok(found.hwnds)
+    }
+
+    unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let found = &mut *(lparam.0 as *mut FoundWindows);
+        if !IsWindowVisible(hwnd).as_bool() {
+            return BOOL(1);
+        }
+        let mut class_buf = [0u16; 256];
+        let class_len = GetClassNameW(hwnd, &mut class_buf);
+        if class_len <= 0 {
+            return BOOL(1);
+        }
+        let class_name = String::from_utf16_lossy(&class_buf[..class_len as usize]);
+        if class_name != BROWSER_WINDOW_CLASS {
+            return BOOL(1);
+        }
+        let mut title_buf = [0u16; 512];
+        if GetWindowTextW(hwnd, &mut title_buf) <= 0 {
+            return BOOL(1);
+        }
+        if window_matches_exe(hwnd, &found.wanted) {
+            found.hwnds.push(hwnd);
+        }
+        BOOL(1)
+    }
+
+    fn window_matches_exe(hwnd: HWND, wanted_stem: &str) -> bool {
+        let mut pid = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        }
+        if pid == 0 {
+            return false;
+        }
+        process_stem(pid).map(|stem| stem == wanted_stem).unwrap_or(false)
+    }
+
+    fn process_stem(pid: u32) -> Option<String> {
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+            let mut buf = [0u16; MAX_PATH as usize];
+            let mut size = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(
+                handle,
+                PROCESS_NAME_WIN32,
+                windows::core::PWSTR(buf.as_mut_ptr()),
+                &mut size,
+            )
+            .is_ok();
+            let _ = CloseHandle(handle);
+            if !ok {
+                return None;
+            }
+            let path = String::from_utf16_lossy(&buf[..size as usize]);
+            Some(exe_stem(Path::new(&path)))
+        }
+    }
+
+    fn focus_window(hwnd: HWND) -> Result<(), String> {
+        unsafe {
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
+            let mut pid = 0u32;
+            let target_thread = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            let _ = AllowSetForegroundWindow(pid);
+            let current = GetCurrentThreadId();
+            let attached = if target_thread != 0 && target_thread != current {
+                AttachThreadInput(current, target_thread, true).as_bool()
+            } else {
+                false
+            };
+            let ok = SetForegroundWindow(hwnd).as_bool() || GetForegroundWindow() == hwnd;
+            if attached {
+                let _ = AttachThreadInput(current, target_thread, false);
+            }
+            if ok {
+                return Ok(());
+            }
+        }
+        Err("无法激活浏览器窗口".into())
+    }
+
+    fn set_omnibox(hwnd: HWND, url: &str) -> Result<Option<HWND>, String> {
+        unsafe {
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
+                    .map_err(|_| "无法访问浏览器地址栏".to_string())?;
+            let root = automation
+                .ElementFromHandle(hwnd)
+                .map_err(|_| "无法访问浏览器地址栏".to_string())?;
+            let condition = automation
+                .CreatePropertyCondition(UIA_ClassNamePropertyId, &VARIANT::from(OMNIBOX_CLASS))
+                .map_err(|_| "无法访问浏览器地址栏".to_string())?;
+            let omnibox: IUIAutomationElement = root
+                .FindFirst(TreeScope_Descendants, &condition)
+                .map_err(|_| "无法访问浏览器地址栏".to_string())?;
+            let _ = omnibox.SetFocus();
+            let pattern: IUIAutomationValuePattern = omnibox
+                .GetCurrentPatternAs(UIA_ValuePatternId)
+                .map_err(|_| "无法写入浏览器地址栏".to_string())?;
+            pattern
+                .SetValue(&BSTR::from(url))
+                .map_err(|_| "无法写入浏览器地址栏".to_string())?;
+            let native = omnibox.CurrentNativeWindowHandle().ok().filter(|h| !h.is_invalid());
+            Ok(native)
+        }
+    }
+
+    fn send_enter(hwnd: HWND) {
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_KEYDOWN, WPARAM(VK_RETURN.0 as usize), LPARAM(0));
+            let _ = PostMessageW(
+                hwnd,
+                WM_KEYUP,
+                WPARAM(VK_RETURN.0 as usize),
+                LPARAM(1 << 30 | 1 << 31),
+            );
+            let down = key(VK_RETURN, false);
+            let up = key(VK_RETURN, true);
+            SendInput(&[down, up], size_of::<INPUT>() as i32);
+        }
+    }
+
+    fn key(vk: VIRTUAL_KEY, up: bool) -> INPUT {
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: 0,
+                    dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn missing_exe_has_no_window() {
+            let err = find_windows(Path::new(r"C:\missing\chrome.exe")).unwrap_err();
+            assert!(err.contains("未找到"), "{err}");
+        }
+
+        #[test]
+        #[ignore]
+        fn navigates_running_edge_if_present() {
+            let Some(exe) = super::super::detect_edge() else {
+                return;
+            };
+            navigate(&exe, "edge://extensions").unwrap();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -404,6 +700,25 @@ mod tests {
     }
 
     #[test]
+    fn exe_stem_matches_chrome_and_edge_paths() {
+        assert_eq!(
+            exe_stem(Path::new(r"C:\Program Files\Google\Chrome\Application\chrome.exe")),
+            "chrome"
+        );
+        assert_eq!(
+            exe_stem(Path::new(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")),
+            "msedge"
+        );
+        assert_ne!(exe_stem(Path::new(r"C:\Windows\explorer.exe")), "chrome");
+    }
+
+    #[test]
+    fn extensions_page_url_is_browser_specific() {
+        assert_eq!(extensions_page_url(BrowserKind::Chrome), "chrome://extensions");
+        assert_eq!(extensions_page_url(BrowserKind::Edge), "edge://extensions");
+    }
+
+    #[test]
     fn open_commands_use_fixed_targets() {
         let folder = temp_dir();
         let explorer = explorer_open_command(&folder);
@@ -414,20 +729,21 @@ mod tests {
             .collect();
         assert_eq!(args, [folder.to_string_lossy().into_owned()]);
 
-        let chrome = browser_open_command(Path::new(r"C:\Chrome\chrome.exe"), BrowserKind::Chrome);
+        let chrome = browser_open_command(Path::new(r"C:\Chrome\chrome.exe"));
         assert_eq!(chrome.get_program(), Path::new(r"C:\Chrome\chrome.exe"));
         let args: Vec<_> = chrome
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args, ["chrome://extensions"]);
+        assert!(args.is_empty(), "{args:?}");
 
-        let edge = browser_open_command(Path::new(r"C:\Edge\msedge.exe"), BrowserKind::Edge);
+        let edge = browser_open_command(Path::new(r"C:\Edge\msedge.exe"));
         let args: Vec<_> = edge
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(args, ["edge://extensions"]);
+        assert!(args.is_empty(), "{args:?}");
+        assert!(!args.iter().any(|a| a.contains("chrome://") || a.contains("edge://")));
     }
 
     #[test]

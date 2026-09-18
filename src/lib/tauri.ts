@@ -317,7 +317,7 @@ export const api = {
   extensionInstall: () => invoke<ExtensionInstallStatus>("extension_install"),
   extensionOpenFolder: () => invoke("extension_open_folder"),
   extensionOpenBrowser: (browser: "chrome" | "edge") =>
-    invoke("extension_open_browser", { browser }),
+    invoke<string>("extension_open_browser", { browser }),
   mcpTools: () => invoke<McpToolInfo[]>("mcp_tools"),
   githubMcpPolicyGet: () => invoke<GithubMcpPolicy>("github_mcp_policy_get"),
   githubMcpPolicySet: (policy: GithubMcpPolicy) => invoke<GithubMcpPolicy>("github_mcp_policy_set", { policy }),

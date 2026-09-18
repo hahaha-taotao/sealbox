@@ -124,7 +124,7 @@ GitHub MCP is disabled by default. When enabled, the assistant discovers one cre
 After the app starts, fill APIs listen on `127.0.0.1:17891`. Install and pairing are on the **Plugin** page, not MCP. Developers can still load the repo `extension/` folder unpacked.
 
 1. 运行 Sealbox（安装扩展不要求解锁）/ Run Sealbox. Installing the extension does not require an unlocked vault.
-2. 打开侧栏 **插件**，点 **安装到本机并打开目录**。扩展写到 `%LOCALAPPDATA%\com.sealbox.app\extension\`。再打开 `chrome://extensions` 或 `edge://extensions`，打开开发者模式，加载已解压的扩展，选刚打开的文件夹 / On **Plugin**, click install. The files go to `%LOCALAPPDATA%\com.sealbox.app\extension\`. Load that unpacked folder in Chrome or Edge.
+2. 打开侧栏 **插件**，点 **安装到本机并打开目录**。扩展写到 `%LOCALAPPDATA%\com.sealbox.app\extension\`。再点 **打开 Chrome 扩展页** 或 **打开 Edge 扩展页**，打开开发者模式，加载刚打开的文件夹 / On **Plugin**, click install. The files go to `%LOCALAPPDATA%\com.sealbox.app\extension\`. Then open the Chrome or Edge extensions page and load that unpacked folder.
 3. 解锁后点 **配对**，60 秒内把一次性配对码填进扩展 / Unlock, click **Pair**, then enter the one-time code in the extension within 60 seconds.
 4. 打开登录页：检测到密码框后右下角会出现匹配账号，点选填充；也可按 `Alt+Shift+F`。卡片优先显示账号，过长标题会缩略；有备注时在账号后显示前几个字。打开插件弹窗时，「登记当前站点」会读当前页已填的账号密码，并可填写备注。登录提交后，若该站点还没有这个账号会询问保存；已有同一账号且密码变了会询问更新；密码没变则不弹。 / Open a login page: after a password field is detected, a bottom-right overlay lists matching accounts. `Alt+Shift+F` also opens the chooser. Buttons show the username first, abbreviate long titles, and append a short note when present. Opening the popup copies the page’s current username and password into the save form, with an optional note. After submit, Sealbox asks to save a new login, or update when the same account’s password changed. Unchanged passwords are not prompted.
 

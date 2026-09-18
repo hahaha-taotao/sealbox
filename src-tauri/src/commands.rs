@@ -1282,7 +1282,7 @@ pub fn extension_open_folder(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn extension_open_browser(app: AppHandle, browser: String) -> Result<(), String> {
+pub fn extension_open_browser(app: AppHandle, browser: String) -> Result<String, String> {
     crate::extension_install::open_browser_for_app(&app, &browser)
 }
 
