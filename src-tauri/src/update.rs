@@ -21,10 +21,19 @@ pub struct InstallerAsset {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionStatus {
+    UpdateAvailable,
+    UpToDate,
+    Ahead,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct UpdateCheck {
     pub current_version: String,
     pub latest_version: String,
     pub update_available: bool,
+    pub version_status: VersionStatus,
     pub release_url: String,
     pub published_at: Option<String>,
     pub notes: Option<String>,
@@ -40,7 +49,10 @@ struct ReleaseAsset {
 
 fn normalize_version(raw: &str) -> Result<Vec<u64>, String> {
     let value = raw.trim().trim_start_matches(['v', 'V']);
-    let core = value.split(['-', '+']).next().unwrap_or_default();
+    if value.is_empty() || value.contains(['-', '+']) {
+        return Err(format!("版本号不合法：{raw}"));
+    }
+    let core = value;
     if core.is_empty() {
         return Err("版本号为空".into());
     }
@@ -116,18 +128,15 @@ fn choose_installer(assets: &[ReleaseAsset]) -> Result<Option<InstallerAsset>, S
         else {
             continue;
         };
-        if !name.to_ascii_lowercase().ends_with("setup.exe") {
+        let lower_name = name.to_ascii_lowercase();
+        if !lower_name.ends_with("setup.exe")
+            || !(lower_name.contains("x64") || lower_name.contains("amd64"))
+        {
             continue;
         }
-        candidates.push((
-            name.to_string(),
-            url.to_string(),
-            asset.size,
-            name.to_ascii_lowercase().contains("x64"),
-        ));
+        candidates.push((name.to_string(), url.to_string(), asset.size));
     }
-    candidates.sort_by_key(|(_, _, _, x64)| !*x64);
-    let Some((name, url, size, _)) = candidates.into_iter().next() else {
+    let Some((name, url, size)) = candidates.into_iter().next() else {
         return Ok(None);
     };
     Ok(Some(InstallerAsset {
@@ -155,7 +164,13 @@ fn parse_release(value: &Value, current_version: &str) -> Result<UpdateCheck, St
         .and_then(Value::as_str)
         .ok_or_else(|| "GitHub Release 缺少版本号".to_string())?;
     let latest_version = tag_name.trim().trim_start_matches(['v', 'V']).to_string();
-    let update_available = compare_versions(current_version, &latest_version)? == Ordering::Greater;
+    let comparison = compare_versions(current_version, &latest_version)?;
+    let version_status = match comparison {
+        Ordering::Greater => VersionStatus::UpdateAvailable,
+        Ordering::Equal => VersionStatus::UpToDate,
+        Ordering::Less => VersionStatus::Ahead,
+    };
+    let update_available = matches!(version_status, VersionStatus::UpdateAvailable);
     let release_url = match value.get("html_url").and_then(Value::as_str) {
         Some(url) => validate_release_url(url)?,
         None => RELEASE_PAGE_URL.to_string(),
@@ -175,11 +190,16 @@ fn parse_release(value: &Value, current_version: &str) -> Result<UpdateCheck, St
                 .map_err(|_| "GitHub Release 安装包信息无效".to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let installer = choose_installer(&assets)?;
+    let installer = if update_available {
+        choose_installer(&assets)?
+    } else {
+        None
+    };
     Ok(UpdateCheck {
         current_version: current_version.to_string(),
         latest_version,
         update_available,
+        version_status,
         release_url,
         published_at,
         notes,
@@ -246,8 +266,10 @@ fn fetch_latest(current_version: &str) -> Result<UpdateCheck, String> {
 }
 
 #[command]
-pub fn check_for_updates() -> Result<UpdateCheck, String> {
-    fetch_latest(env!("CARGO_PKG_VERSION"))
+pub async fn check_for_updates() -> Result<UpdateCheck, String> {
+    tauri::async_runtime::spawn_blocking(|| fetch_latest(env!("CARGO_PKG_VERSION")))
+        .await
+        .map_err(|_| "更新检查任务异常终止".to_string())?
 }
 
 #[cfg(test)]
@@ -314,6 +336,29 @@ mod tests {
     }
 
     #[test]
+    fn does_not_choose_arm64_or_unknown_architecture_assets() {
+        let assets = vec![
+            ReleaseAsset {
+                name: Some("Sealbox_0.1.2_arm64-setup.exe".into()),
+                browser_download_url: Some(
+                    "https://github.com/hahaha-taotao/sealbox/releases/download/v0.1.2/arm64.exe"
+                        .into(),
+                ),
+                size: Some(1),
+            },
+            ReleaseAsset {
+                name: Some("Sealbox_0.1.2-setup.exe".into()),
+                browser_download_url: Some(
+                    "https://github.com/hahaha-taotao/sealbox/releases/download/v0.1.2/setup.exe"
+                        .into(),
+                ),
+                size: Some(2),
+            },
+        ];
+        assert!(choose_installer(&assets).unwrap().is_none());
+    }
+
+    #[test]
     fn parses_release_metadata_and_limits_notes() {
         let value = json!({
             "tag_name": "v0.1.2",
@@ -326,12 +371,43 @@ mod tests {
         });
         let result = parse_release(&value, "0.1.1").unwrap();
         assert!(result.update_available);
+        assert_eq!(result.version_status, VersionStatus::UpdateAvailable);
         assert_eq!(result.latest_version, "0.1.2");
         assert_eq!(
             result.release_url,
             "https://github.com/hahaha-taotao/sealbox/releases/tag/v0.1.2"
         );
         assert_eq!(result.notes.as_deref(), Some("修复与改进"));
+    }
+
+    #[test]
+    fn reports_up_to_date_without_an_installer() {
+        let value = json!({
+            "tag_name": "v0.1.2",
+            "html_url": "https://github.com/hahaha-taotao/sealbox/releases/tag/v0.1.2",
+            "assets": [{
+                "name": "Sealbox_0.1.2_x64-setup.exe",
+                "browser_download_url": "https://github.com/hahaha-taotao/sealbox/releases/download/v0.1.2/x64.exe",
+                "size": 2
+            }]
+        });
+        let result = parse_release(&value, "0.1.2").unwrap();
+        assert_eq!(result.version_status, VersionStatus::UpToDate);
+        assert!(!result.update_available);
+        assert!(result.installer.is_none());
+    }
+
+    #[test]
+    fn reports_ahead_without_an_installer() {
+        let value = json!({
+            "tag_name": "v0.1.2",
+            "html_url": "https://github.com/hahaha-taotao/sealbox/releases/tag/v0.1.2",
+            "assets": []
+        });
+        let result = parse_release(&value, "0.1.3").unwrap();
+        assert_eq!(result.version_status, VersionStatus::Ahead);
+        assert!(!result.update_available);
+        assert!(result.installer.is_none());
     }
 
     #[test]
