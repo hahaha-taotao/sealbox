@@ -105,6 +105,7 @@ export interface UpdateCheck {
   current_version: string;
   latest_version: string;
   update_available: boolean;
+  version_status: "update_available" | "up_to_date" | "ahead";
   release_url: string;
   published_at: string | null;
   notes: string | null;

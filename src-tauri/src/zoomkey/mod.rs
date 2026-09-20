@@ -671,7 +671,7 @@ fn tuned_agent_builder() -> ureq::AgentBuilder {
         .redirects(0)
         .timeout(Duration::from_secs(30))
         .timeout_connect(Duration::from_secs(10))
-        .user_agent("Sealbox/0.1")
+        .user_agent(concat!("Sealbox/", env!("CARGO_PKG_VERSION")))
         .max_idle_connections(0)
 }
 

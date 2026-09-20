@@ -502,7 +502,7 @@ impl McpClient {
             .redirects(0)
             .timeout(Duration::from_secs(15))
             .timeout_connect(Duration::from_secs(5))
-            .user_agent("Sealbox-Assistant/0.1")
+            .user_agent(concat!("Sealbox-Assistant/", env!("CARGO_PKG_VERSION")))
             .build();
         let request = agent
             .request("POST", &self.url)
@@ -547,7 +547,7 @@ fn call_model(
         .redirects(0)
         .timeout(Duration::from_secs(60))
         .timeout_connect(Duration::from_secs(10))
-        .user_agent("Sealbox-Assistant/0.1")
+        .user_agent(concat!("Sealbox-Assistant/", env!("CARGO_PKG_VERSION")))
         .build();
     let mut request = agent
         .request("POST", &endpoint)

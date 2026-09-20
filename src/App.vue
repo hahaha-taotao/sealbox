@@ -1179,7 +1179,7 @@ const settingsHotkey = ref("Ctrl+Shift+Space");
 const oldMaster = ref("");
 const newMaster = ref("");
 const newMaster2 = ref("");
-const appVersion = String(packageJson.version);
+const appVersion = ref(String(packageJson.version));
 const updateCheck = ref<UpdateCheck | null>(null);
 const updateBusy = ref(false);
 const updateError = ref("");
@@ -1280,6 +1280,7 @@ async function checkForUpdates() {
   updateError.value = "";
   try {
     updateCheck.value = await api.checkForUpdates();
+    appVersion.value = updateCheck.value.current_version;
     updateCheckedAt.value = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   } catch (e) {
     updateCheck.value = null;
@@ -2233,7 +2234,8 @@ onMounted(async () => {
               </template>
             </div>
             <p v-if="updateError" class="error about-error">{{ updateError }}</p>
-            <p v-else-if="updateCheck && !updateCheck.update_available" class="about-status ok">已是最新版本<span v-if="updateCheckedAt"> · {{ updateCheckedAt }} 检查</span></p>
+            <p v-else-if="updateCheck?.version_status === 'up_to_date'" class="about-status ok">已是最新版本<span v-if="updateCheckedAt"> · {{ updateCheckedAt }} 检查</span></p>
+            <p v-else-if="updateCheck?.version_status === 'ahead'" class="about-status">当前版本高于最新稳定版 v{{ updateCheck.latest_version }}<span v-if="updateCheckedAt"> · {{ updateCheckedAt }} 检查</span></p>
             <p v-else-if="updateCheck" class="about-status">发现新版本 v{{ updateCheck.latest_version }}<span v-if="updateCheckedAt"> · {{ updateCheckedAt }} 检查</span></p>
             <p v-else class="crumb">点击“检查更新”获取 GitHub Releases 中的最新稳定版本。</p>
             <div v-if="updateCheck?.notes" class="about-notes">
@@ -2242,11 +2244,11 @@ onMounted(async () => {
             </div>
             <div class="mcp-actions">
               <button class="btn primary" type="button" :disabled="updateBusy" @click="checkForUpdates">{{ updateBusy ? "检查中…" : "检查更新" }}</button>
-              <button v-if="updateCheck?.installer" class="btn" type="button" @click="openUpdateUrl(updateCheck.installer.url)">下载最新程序包 · {{ formatAssetSize(updateCheck.installer.size) }}</button>
-              <button v-if="updateCheck && !updateCheck.installer" class="btn" type="button" @click="openUpdateUrl(updateCheck.release_url)">打开发布页</button>
+              <button v-if="updateCheck?.update_available && updateCheck.installer" class="btn" type="button" @click="openUpdateUrl(updateCheck.installer.url)">下载最新程序包 · {{ formatAssetSize(updateCheck.installer.size) }}</button>
+              <button v-if="updateCheck && (!updateCheck.update_available || !updateCheck.installer)" class="btn" type="button" @click="openUpdateUrl(updateCheck.release_url)">打开发布页</button>
             </div>
-            <p v-if="updateCheck?.installer" class="crumb about-download">{{ updateCheck.installer.name }} · 下载将由系统浏览器处理，不会自动安装。</p>
-            <p v-else-if="updateCheck" class="crumb about-download">当前 Release 暂无 Windows 安装包，请稍后再试或打开发布页。</p>
+            <p v-if="updateCheck?.update_available && updateCheck.installer" class="crumb about-download">{{ updateCheck.installer.name }} · 下载将由系统浏览器处理，不会自动安装。</p>
+            <p v-else-if="updateCheck?.update_available" class="crumb about-download">当前 Release 暂无 Windows x64 安装包，请打开发布页查看详情。</p>
           </div>
         </div>
       </section>

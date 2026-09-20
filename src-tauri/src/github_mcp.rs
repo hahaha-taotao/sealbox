@@ -740,7 +740,7 @@ fn request_json<T>(
         .timeout(Duration::from_secs(15))
         .timeout_connect(Duration::from_secs(8))
         .resolver(PublicResolver)
-        .user_agent("Sealbox/0.1")
+        .user_agent(concat!("Sealbox/", env!("CARGO_PKG_VERSION")))
         .build();
     let response = agent
         .get(&format!("{API_BASE}{path}"))
