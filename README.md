@@ -4,7 +4,7 @@
 
 A local credential vault for Windows. Unlock with a master password (optional Windows Hello). Website logins, API tokens, SSH keys, mailboxes, servers, and databases stay encrypted on disk. Copied secrets are cleared from the clipboard on a timer. Encrypted `.svbak` backups can be exported and imported. An optional localhost MCP lets Cursor / Claude Code use credentials without seeing plaintext. A Chrome / Edge extension can fill or save website logins.
 
-当前版本 Current version: **v0.1.3** (`0.1.3`)
+当前版本 Current version: **v0.1.4** (`0.1.4`)
 
 在「设置」底部的「关于 Sealbox」中可以检查 GitHub Releases 的最新稳定版本。发现更新后，应用会在系统浏览器中打开经过校验的 GitHub 安装包下载地址；如果 Release 尚未上传 Windows 安装包，则提供发布页入口，不会静默下载或自动执行安装程序。
 
@@ -15,7 +15,7 @@ A local credential vault for Windows. Unlock with a master password (optional Wi
 
 ## 安装 Install
 
-Windows x64 使用 NSIS 安装包 `Sealbox_0.1.3_x64-setup.exe`。向导会让你选择：
+Windows x64 使用 NSIS 安装包 `Sealbox_0.1.4_x64-setup.exe`。向导会让你选择：
 
 1. 安装范围：当前用户，或所有用户（后者需要管理员权限）
 2. **安装盘符与目录**，例如 `D:\Sealbox`；默认在当前用户下是 `%LOCALAPPDATA%\Sealbox`，在所有用户下是 `C:\Program Files\Sealbox`
@@ -40,7 +40,7 @@ npm run tauri build
 - **速查 Quick search** — 默认全局热键 `Ctrl+Shift+Space`，回车复制主秘密
 - **安全习惯 Hygiene** — 空闲自动锁定、审计日志（不记明文）、回收站、置顶、标签、文件夹
 - **备份 Backup** — 加密 `.svbak` 导出 / 导入（默认合并，覆盖需确认）
-- **MCP** — 本机 `127.0.0.1` 服务；GitHub MCP 一个开关同时提供 api.github.com 只读工具和本地 `github_git_*`；模型按 Token ID 选择活动 GitHub Token，git 写入不会把 Token 回给模型
+- **MCP** — 本机 `127.0.0.1` 服务；GitHub MCP 总开关提供 api.github.com 只读工具和本地 `github_git_*`，API 写入另有独立开关；模型按 Token ID 选择活动 GitHub Token，git 写入不会把 Token 回给模型
 - **客户端证书 Client cert** — 保险库里可以导入 mTLS 用的客户端证书与私钥（PEM），由 Rust 侧限长、解析并校验证书/私钥匹配后加密保存，随金库一起备份；列表和速查不会显示或复制私钥，锁定时会清理 TLS 运行时缓存
 - **助手 Assistant** — 位于「插件」下方的 OpenAI 兼容对话页；可测试本机 MCP 连通性，并让模型调用当前暴露的 GitHub 只读工具
 - **插件 Plugin** — Chrome / Edge 从客户端安装后按当前网址填充或一键登记；在侧栏「插件」页配对
@@ -55,7 +55,7 @@ npm run tauri build
 | 剪贴板 Clipboard | 复制条目秘密、MCP / 填表 Token 和 MCP 配置后约 20 秒，若仍是那条内容则清空；锁定会立刻清掉本应用写入的秘密 |
 | 锁定 Lock | 空闲超时、标题栏或托盘锁定都会丢掉 DEK、清已复制秘密、关掉编辑框和明文显示 |
 | 备份 Backup | `.svbak` 用导出密码加密；Windows Hello 解不开备份文件 |
-| 网络 Network | MCP / 填表只监听 `127.0.0.1`，默认端口 `17891`。GitHub 工具只访问 `https://api.github.com:443`，固定 GET、拒绝重定向和内网目标 |
+| 网络 Network | MCP / 填表只监听 `127.0.0.1`，默认端口 `17891`。GitHub 读取工具只访问 `https://api.github.com:443`，固定 GET；Release 写入使用独立、受控的 POST，统一拒绝重定向和内网目标 |
 | 插件 Extension | 登录页右下角弹出填充条；一站点多账号可点选。`Alt+Shift+F` 也可打开选择器。填充条在 closed Shadow DOM 中，只响应真实用户点击，账号做掩码。提交后询问保存/更新，明文只暂存在 `chrome.storage.session`。扩展仅申请 `127.0.0.1` 主机权限；填表 Token 只放 session，启动时清掉 local 残留 |
 
 ## 环境 Requirements
@@ -96,10 +96,11 @@ On first launch, set a master password (at least 10 characters). Closing the win
 - `github_list_pull_requests` — 列出仓库的 Pull Request 元数据
 - `github_git_status` / `github_git_diff` / `github_git_log` / `github_git_branches` — 本地仓库只读 git，`path` 为仓库绝对路径
 - `github_git_stage` / `github_git_commit` / `github_git_push` / `github_git_pull` / `github_git_clone` — 日常写入；push / pull / clone 用 `credential_id` 从金库取 Token，经 askpass 注入，不写进 `.git/config`
+- `github_create_release` — 高风险 GitHub API 写入，需在 MCP 页面另外启用；默认创建草稿，仍会在远程仓库创建 Release 对象
 
-GitHub MCP 默认停用。启用后 API 只读工具和 `github_git_*` 全部出现在 `tools/list`。模型先调用 `github_list_credentials`，再通过 `credential_id` 选择活动 GitHub Token。API 工具只访问 `https://api.github.com:443`，固定使用 GET。git 工具由 Agent 传入本机绝对路径，远程必须是 `https://github.com`。侧栏助手只调用只读工具。
+GitHub MCP 默认停用。启用后会开放 API 只读工具和 `github_git_*`；GitHub API 写入由单独的 `api_write_enabled` 开关控制，只有同时打开两个开关时才会出现 `github_create_release`。模型先调用 `github_list_credentials`，再通过 `credential_id` 选择活动 GitHub Token。GitHub API 只访问 `https://api.github.com:443`；只读 API 固定使用 GET，Release 创建使用固定 POST 和白名单请求字段。git 工具由 Agent 传入本机绝对路径，远程必须是 `https://github.com`。侧栏助手只调用只读低风险工具，不会自动调用 Release 创建。
 
-停用时这些工具都不会出现在 `tools/list`，直接调用也会被拒绝。模型收到的是结构化字段或截断后的 git 输出，不包含 Token。金库锁定时工具会失败。MCP Token 可在页面轮换。
+停用时这些工具都不会出现在 `tools/list`，直接调用也会被拒绝。模型收到的是结构化字段或截断后的 git 输出，不包含 Token、请求头、Release body 或完整远端响应。金库锁定时工具会失败。后续接口规划见 [`docs/superpowers/specs/2026-09-20-github-mcp-roadmap.md`](docs/superpowers/specs/2026-09-20-github-mcp-roadmap.md)。MCP Token 可在页面轮换。
 
 ## 助手 Assistant
 
@@ -109,7 +110,7 @@ GitHub MCP 默认停用。启用后 API 只读工具和 `github_git_*` 全部出
 
 The Assistant page is below Plugin in the sidebar. It uses an OpenAI Chat Completions-compatible endpoint, stores the API key encrypted in the vault, probes the real local MCP HTTP endpoint, and automatically follows the single GitHub MCP enable/disable switch. The first version is non-streaming and does not support external MCP servers or stdio/SSE transports.
 
-GitHub MCP is disabled by default. When enabled, the assistant discovers one credential metadata tool and six read-only GitHub tools. The model selects an active GitHub token by ID; requests remain fixed GET calls to `https://api.github.com:443` and never accept arbitrary URLs, headers, bodies, or methods.
+GitHub MCP is disabled by default. When enabled, the assistant discovers the low-risk read-only GitHub and local-git tools; high-risk tools such as `github_create_release` are not offered to the assistant. GitHub API reads remain fixed GET calls to `https://api.github.com:443`; the separate API-write switch exposes only the allowlisted Release POST and never accepts arbitrary URLs, headers, bodies, or methods.
 
 ## 插件 Plugin（Chrome / Edge）
 

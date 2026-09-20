@@ -185,7 +185,12 @@ fn tools_list(session: &Mutex<Session>) -> Value {
         .unwrap_or((false, Vec::new()));
     let mut tools: Vec<Value> = Vec::new();
     if github_enabled {
-        tools.extend(github_mcp::tool_definitions());
+        let policy = locked
+            .vault()
+            .ok()
+            .and_then(|vault| locked.dek().ok().map(|dek| github_mcp::load_policy(vault, dek)))
+            .unwrap_or_default();
+        tools.extend(github_mcp::tool_definitions_for_policy(&policy));
     }
     tools.extend(zoomkey_tools);
     json!({ "tools": tools })
@@ -709,7 +714,7 @@ mod tests {
         let (vault, dek) =
             crate::vault::Vault::create_in_memory("correct horse battery staple extra").unwrap();
         vault
-            .set_secret_setting(&dek, "github_mcp_policy", r#"{"enabled":true}"#)
+            .set_secret_setting(&dek, "github_mcp_policy", r#"{"enabled":true,"api_write_enabled":true}"#)
             .unwrap();
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
@@ -721,11 +726,12 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .filter(|name| name.starts_with("github_"))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 16);
+        assert_eq!(names.len(), 17);
         assert!(names.contains(&"github_list_credentials"));
         assert!(names.contains(&"github_get_file"));
         assert!(names.contains(&"github_git_status"));
         assert!(names.contains(&"github_git_clone"));
+        assert!(names.contains(&"github_create_release"));
         assert!(!names.contains(&"github_git_list"));
     }
 
@@ -756,7 +762,7 @@ mod tests {
         let (vault, dek) =
             crate::vault::Vault::create_in_memory("correct horse battery staple extra").unwrap();
         vault
-            .set_secret_setting(&dek, "github_mcp_policy", r#"{"enabled":true}"#)
+            .set_secret_setting(&dek, "github_mcp_policy", r#"{"enabled":true,"api_write_enabled":true}"#)
             .unwrap();
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
@@ -768,9 +774,10 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .filter(|name| name.starts_with("github_"))
             .collect::<Vec<_>>();
-        assert_eq!(github_names.len(), 16);
+        assert_eq!(github_names.len(), 17);
         assert!(github_names.contains(&"github_list_credentials"));
         assert!(github_names.contains(&"github_git_push"));
+        assert!(github_names.contains(&"github_create_release"));
     }
 
     #[test]

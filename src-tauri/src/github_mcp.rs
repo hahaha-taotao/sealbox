@@ -12,8 +12,11 @@ const POLICY_KEY: &str = "github_mcp_policy";
 const API_BASE: &str = "https://api.github.com";
 const API_VERSION: &str = "2022-11-28";
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
+const MAX_REQUEST_BYTES: usize = 128 * 1024;
 const MAX_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_DESCRIPTION_BYTES: usize = 2 * 1024;
+const MAX_RELEASE_BODY_BYTES: usize = 64 * 1024;
+const MAX_RELEASE_TAG_CHARS: usize = 200;
 const MAX_PAGE_SIZE: u64 = 50;
 const ELLIPSIS: &str = "…";
 
@@ -70,11 +73,15 @@ impl From<&str> for GithubCallError {
 #[serde(default)]
 pub struct GithubMcpPolicy {
     pub enabled: bool,
+    pub api_write_enabled: bool,
 }
 
 impl Default for GithubMcpPolicy {
     fn default() -> Self {
-        Self { enabled: false }
+        Self {
+            enabled: false,
+            api_write_enabled: false,
+        }
     }
 }
 
@@ -135,6 +142,19 @@ struct GithubFileDto {
     content: Option<String>,
     is_binary: bool,
     truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GithubReleaseDto {
+    id: Option<i64>,
+    tag_name: Option<String>,
+    name: Option<String>,
+    target_commitish: Option<String>,
+    draft: Option<bool>,
+    prerelease: Option<bool>,
+    html_url: Option<String>,
+    created_at: Option<String>,
+    published_at: Option<String>,
 }
 
 pub fn api_tool_definitions() -> Vec<Value> {
@@ -219,12 +239,44 @@ pub fn api_tool_definitions() -> Vec<Value> {
                 &["credential_id", "owner", "repo"],
             ),
         ),
+        write_tool(
+            "github_create_release",
+            "在指定 GitHub 仓库创建 Release。默认创建草稿；这是高风险远端写操作，需要单独打开 GitHub API 写入权限。",
+            schema(
+                &[
+                    ("credential_id", string_schema(1, 100)),
+                    ("owner", string_schema(1, 100)),
+                    ("repo", string_schema(1, 100)),
+                    ("tag_name", string_schema(1, MAX_RELEASE_TAG_CHARS as u64)),
+                    ("target_commitish", string_schema(1, 200)),
+                    ("name", string_schema(1, 200)),
+                    ("body", string_schema(0, MAX_RELEASE_BODY_BYTES as u64)),
+                    ("draft", json!({"type":"boolean","default":true})),
+                    ("prerelease", json!({"type":"boolean","default":false})),
+                    ("generate_release_notes", json!({"type":"boolean","default":false})),
+                    ("make_latest", json!({"type":"string","enum":["true","false","legacy"],"default":"legacy"})),
+                ],
+                &["credential_id", "owner", "repo", "tag_name"],
+            ),
+        ),
     ]
 }
 
 pub fn tool_definitions() -> Vec<Value> {
     let mut tools = api_tool_definitions();
     tools.extend(crate::git_workspace::tool_definitions());
+    tools
+}
+
+pub fn tool_definitions_for_policy(policy: &GithubMcpPolicy) -> Vec<Value> {
+    let mut tools = crate::git_workspace::tool_definitions();
+    tools.extend(
+        api_tool_definitions()
+            .into_iter()
+            .filter(|definition| {
+                definition["readOnly"].as_bool().unwrap_or(false) || policy.api_write_enabled
+            }),
+    );
     tools
 }
 
@@ -255,6 +307,16 @@ fn tool(name: &str, description: &str, input_schema: Value) -> Value {
     })
 }
 
+fn write_tool(name: &str, description: &str, input_schema: Value) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": input_schema,
+        "readOnly": false,
+        "risk": "high"
+    })
+}
+
 pub fn is_github_api_tool(name: &str) -> bool {
     api_tool_definitions()
         .iter()
@@ -278,7 +340,7 @@ pub fn load_policy(vault: &Vault, dek: &[u8; 32]) -> GithubMcpPolicy {
     {
         return GithubMcpPolicy::default();
     }
-    serde_json::from_value(value).unwrap_or_default()
+    normalize_policy(serde_json::from_value(value).unwrap_or_default()).unwrap_or_default()
 }
 
 pub fn save_policy(vault: &Vault, dek: &[u8; 32], policy: &GithubMcpPolicy) -> Result<(), String> {
@@ -292,6 +354,7 @@ pub fn save_policy(vault: &Vault, dek: &[u8; 32], policy: &GithubMcpPolicy) -> R
 pub fn normalize_policy(policy: GithubMcpPolicy) -> Result<GithubMcpPolicy, String> {
     Ok(GithubMcpPolicy {
         enabled: policy.enabled,
+        api_write_enabled: policy.enabled && policy.api_write_enabled,
     })
 }
 
@@ -337,7 +400,7 @@ pub fn call_tool_detailed(
     let context = audit_context(&args);
     let fingerprint = github_credential_fingerprint(&args);
     match call_tool_text(session, name, args) {
-        Ok(text) => {
+        Ok((status, text)) => {
             let result_count = serde_json::from_str::<Value>(&text).ok().and_then(|value| {
                 value
                     .get("items")
@@ -347,7 +410,7 @@ pub fn call_tool_detailed(
             });
             Ok(GithubCallResult {
                 text,
-                status: 200,
+                status,
                 result_count,
                 credential_fingerprint: fingerprint.unwrap_or_default(),
                 context,
@@ -371,9 +434,10 @@ pub fn call_tool_detailed(
     }
 }
 
-fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<String, String> {
+fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16, String), String> {
     if crate::git_workspace::is_git_tool(name) {
-        return crate::git_workspace::call_tool_text(session, name, args);
+        return crate::git_workspace::call_tool_text(session, name, args)
+            .map(|text| (200, text));
     }
     if name == "github_list_credentials" {
         let definition = tool_definitions()
@@ -388,10 +452,45 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<Stri
         }
         let credentials = list_credentials(session)?;
         session.touch();
-        return serde_json::to_string_pretty(&credentials).map_err(|e| e.to_string());
+        return serde_json::to_string_pretty(&credentials)
+            .map(|text| (200, text))
+            .map_err(|e| e.to_string());
     }
     let token = prepare(session, name, &args)?;
-    let result = match name {
+    let (status, result) = match name {
+        "github_create_release" => {
+            let repository = repository_args(&args)?;
+            let tag_name = release_tag_arg(&args)?;
+            let target_commitish = optional_release_string(&args, "target_commitish", 200)?;
+            let name = optional_release_string(&args, "name", 200)?;
+            let body = optional_release_body(&args)?;
+            let draft = bool_arg(&args, "draft", true)?;
+            let prerelease = bool_arg(&args, "prerelease", false)?;
+            let generate_release_notes = bool_arg(&args, "generate_release_notes", false)?;
+            let make_latest = enum_arg(&args, "make_latest", &["true", "false", "legacy"], "legacy")?;
+            let mut request = Map::new();
+            request.insert("tag_name".into(), Value::String(tag_name));
+            if let Some(value) = target_commitish {
+                request.insert("target_commitish".into(), Value::String(value));
+            }
+            if let Some(value) = name {
+                request.insert("name".into(), Value::String(value));
+            }
+            if let Some(value) = body {
+                request.insert("body".into(), Value::String(value));
+            }
+            request.insert("draft".into(), Value::Bool(draft));
+            request.insert("prerelease".into(), Value::Bool(prerelease));
+            request.insert(
+                "generate_release_notes".into(),
+                Value::Bool(generate_release_notes),
+            );
+            request.insert("make_latest".into(), Value::String(make_latest));
+            let request = Value::Object(request);
+            post_json(&token, &format!("/repos/{repository}/releases"), &request, |value| {
+                release_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into())
+            })
+        }
         "github_get_authenticated_user" => request_json(&token, "/user", |value| {
             serde_json::to_value(GithubUserDto {
                 id: value.get("id").and_then(Value::as_i64),
@@ -471,7 +570,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<Stri
     }?;
     session.touch();
     let serialized = serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?;
-    Ok(redact_text(&serialized, &[token.as_str()]))
+    Ok((status, redact_text(&serialized, &[token.as_str()])))
 }
 
 fn prepare(session: &Session, name: &str, args: &Value) -> Result<String, String> {
@@ -484,6 +583,9 @@ fn prepare(session: &Session, name: &str, args: &Value) -> Result<String, String
     let policy = load_policy(vault, dek);
     if !policy.enabled {
         return Err("GitHub MCP 能力未启用".into());
+    }
+    if !definition["readOnly"].as_bool().unwrap_or(false) && !policy.api_write_enabled {
+        return Err("GitHub API 写入能力未启用".into());
     }
     validate_arguments(&definition["inputSchema"], args)?;
     let credential_id = args
@@ -499,6 +601,9 @@ fn prepare(session: &Session, name: &str, args: &Value) -> Result<String, String
     if !service.trim().eq_ignore_ascii_case("github") {
         return Err("凭据不是 GitHub API Token".into());
     }
+    if token.trim().is_empty() {
+        return Err("GitHub Token 不能为空".into());
+    }
     Ok(token)
 }
 
@@ -513,7 +618,11 @@ fn audit_context(args: &Value) -> GithubAuditContext {
     GithubAuditContext {
         repository,
         path: args.get("path").and_then(Value::as_str).map(str::to_string),
-        reference: args.get("ref").and_then(Value::as_str).map(str::to_string),
+        reference: args
+            .get("ref")
+            .or_else(|| args.get("tag_name"))
+            .and_then(Value::as_str)
+            .map(|value| truncate(value, MAX_RELEASE_TAG_CHARS).replace(['\r', '\n'], " ")),
     }
 }
 
@@ -603,6 +712,10 @@ fn validate_value(name: &str, value: &Value, definition: &Value) -> Result<(), S
         if value < min || value > max {
             return Err(format!("参数 {name} 超出范围"));
         }
+    } else if definition.get("type") == Some(&Value::String("boolean".into()))
+        && !value.is_boolean()
+    {
+        return Err(format!("参数 {name} 必须是布尔值"));
     }
     Ok(())
 }
@@ -725,11 +838,67 @@ fn page_args(args: &Value) -> Result<(u64, u64), String> {
     Ok((page, per_page))
 }
 
+fn bool_arg(args: &Value, name: &str, default: bool) -> Result<bool, String> {
+    let Some(value) = args.get(name) else {
+        return Ok(default);
+    };
+    value
+        .as_bool()
+        .ok_or_else(|| format!("参数 {name} 必须是布尔值"))
+}
+
+fn release_tag_arg(args: &Value) -> Result<String, String> {
+    let tag = args
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .ok_or("缺少参数 tag_name")?;
+    if tag.is_empty()
+        || tag.chars().count() > MAX_RELEASE_TAG_CHARS
+        || tag.chars().any(char::is_control)
+        || tag.contains('%')
+        || tag.contains('\\')
+        || tag.split('/').any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err("tag_name 格式不合法".into());
+    }
+    Ok(tag.to_string())
+}
+
+fn optional_release_string(args: &Value, name: &str, max: usize) -> Result<Option<String>, String> {
+    let Some(value) = args.get(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .ok_or_else(|| format!("参数 {name} 必须是字符串"))?;
+    if value.is_empty() || value.chars().count() > max || value.chars().any(char::is_control) {
+        return Err(format!("参数 {name} 长度或格式不合法"));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn optional_release_body(args: &Value) -> Result<Option<String>, String> {
+    let Some(value) = args.get("body") else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .ok_or_else(|| "参数 body 必须是字符串".to_string())?;
+    if value.chars().count() > MAX_RELEASE_BODY_BYTES
+        || value
+            .chars()
+            .any(|character| matches!(character, '\0' | '\u{000b}' | '\u{000c}'))
+    {
+        return Err("参数 body 长度或格式不合法".into());
+    }
+    Ok(Some(value.to_string()))
+}
+
 fn request_json<T>(
     token: &str,
     path: &str,
     map: impl FnOnce(&Value) -> Result<T, String>,
-) -> Result<T, String> {
+) -> Result<(u16, T), String> {
     let target = parse_http_url(&format!("{API_BASE}{path}"), true)?;
     if target.scheme != "https" || target.host != "api.github.com" || target.port != 443 {
         return Err("GitHub API 目标不合法".into());
@@ -748,10 +917,10 @@ fn request_json<T>(
         .set("Accept", "application/vnd.github+json")
         .set("X-GitHub-Api-Version", API_VERSION)
         .call();
-    let (body, truncated) = match response {
+    let (status, body, truncated) = match response {
         Ok(response) => {
-            let (_, body, truncated) = read_response(response);
-            (body, truncated)
+            let (status, body, truncated) = read_response(response);
+            (status, body, truncated)
         }
         Err(ureq::Error::Status(status, response)) => {
             let (_, body, truncated) = read_response(response);
@@ -767,7 +936,59 @@ fn request_json<T>(
     }
     let value: Value =
         serde_json::from_slice(&body).map_err(|_| "GitHub 响应不是有效 JSON".to_string())?;
-    map(&value).map_err(|error| format!("GitHub 响应处理失败: {error}"))
+    map(&value)
+        .map(|value| (status, value))
+        .map_err(|error| format!("GitHub 响应处理失败: {error}"))
+}
+
+fn post_json<T>(
+    token: &str,
+    path: &str,
+    request: &Value,
+    map: impl FnOnce(&Value) -> Result<T, String>,
+) -> Result<(u16, T), String> {
+    let target = parse_http_url(&format!("{API_BASE}{path}"), true)?;
+    if target.scheme != "https" || target.host != "api.github.com" || target.port != 443 {
+        return Err("GitHub API 目标不合法".into());
+    }
+    assert_public_target(&target)?;
+    let body = serde_json::to_vec(request).map_err(|_| "GitHub 请求体无效".to_string())?;
+    if body.len() > MAX_REQUEST_BYTES {
+        return Err("GitHub 请求体超过安全大小限制".into());
+    }
+    let agent = ureq::builder()
+        .redirects(0)
+        .timeout(Duration::from_secs(15))
+        .timeout_connect(Duration::from_secs(8))
+        .resolver(PublicResolver)
+        .user_agent(concat!("Sealbox/", env!("CARGO_PKG_VERSION")))
+        .build();
+    let response = agent
+        .post(&format!("{API_BASE}{path}"))
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Accept", "application/vnd.github+json")
+        .set("Content-Type", "application/json")
+        .set("X-GitHub-Api-Version", API_VERSION)
+        .send_bytes(&body);
+    let (status, body, truncated) = match response {
+        Ok(response) => read_response(response),
+        Err(ureq::Error::Status(status, response)) => {
+            let (_, body, truncated) = read_response(response);
+            return Err(redact_text(&github_error(status, &body, truncated), &[token]));
+        }
+        Err(_) => return Err("GitHub 网络请求失败".into()),
+    };
+    if status != 201 {
+        return Err(format!("GitHub 创建 Release 返回异常状态 {status}"));
+    }
+    if truncated {
+        return Err("GitHub 响应超过安全大小限制".into());
+    }
+    let value: Value = serde_json::from_slice(&body)
+        .map_err(|_| "GitHub 响应不是有效 JSON".to_string())?;
+    map(&value)
+        .map(|value| (status, value))
+        .map_err(|error| format!("GitHub 响应处理失败: {error}"))
 }
 
 fn read_response(response: ureq::Response) -> (u16, Vec<u8>, bool) {
@@ -812,6 +1033,21 @@ fn github_error(status: u16, body: &[u8], truncated: bool) -> String {
         .map(|value| truncate(&value, 240))
         .unwrap_or_else(|| "GitHub 请求失败".into());
     format!("GitHub HTTP {status}: {message}")
+}
+
+fn release_dto(value: &Value) -> Option<Value> {
+    serde_json::to_value(GithubReleaseDto {
+        id: value.get("id").and_then(Value::as_i64),
+        tag_name: limited_string_with_cap(value.get("tag_name"), MAX_RELEASE_TAG_CHARS),
+        name: limited_string_with_cap(value.get("name"), 200),
+        target_commitish: limited_string_with_cap(value.get("target_commitish"), 200),
+        draft: value.get("draft").and_then(Value::as_bool),
+        prerelease: value.get("prerelease").and_then(Value::as_bool),
+        html_url: limited_string(value.get("html_url")),
+        created_at: limited_string(value.get("created_at")),
+        published_at: limited_string(value.get("published_at")),
+    })
+    .ok()
 }
 
 fn repository_dto(value: &Value) -> Option<Value> {
@@ -963,6 +1199,7 @@ mod tests {
     fn default_policy_is_disabled() {
         let policy = GithubMcpPolicy::default();
         assert!(!policy.enabled);
+        assert!(!policy.api_write_enabled);
     }
 
     #[test]
@@ -989,6 +1226,40 @@ mod tests {
             "docs/my%20file%402.txt"
         );
         assert!(optional_ref(&json!({"ref":"refs/../main"})).is_err());
+    }
+
+    #[test]
+    fn release_tool_is_high_risk_and_closed() {
+        let definition = api_tool_definitions()
+            .into_iter()
+            .find(|definition| definition["name"] == "github_create_release")
+            .expect("release tool must be registered");
+        assert_eq!(definition["readOnly"], false);
+        assert_eq!(definition["risk"], "high");
+        assert_eq!(definition["inputSchema"]["additionalProperties"], false);
+        assert!(definition["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "tag_name"));
+    }
+
+    #[test]
+    fn write_tools_require_the_separate_policy_switch() {
+        let read_only = tool_definitions_for_policy(&GithubMcpPolicy {
+            enabled: true,
+            api_write_enabled: false,
+        });
+        assert!(!read_only
+            .iter()
+            .any(|definition| definition["name"] == "github_create_release"));
+        let with_write = tool_definitions_for_policy(&GithubMcpPolicy {
+            enabled: true,
+            api_write_enabled: true,
+        });
+        assert!(with_write
+            .iter()
+            .any(|definition| definition["name"] == "github_create_release"));
     }
 
     #[test]
@@ -1051,6 +1322,18 @@ mod tests {
             let error = call_tool(&mut session, name, args).unwrap_err();
             assert!(error.contains("未启用"), "{name}: {error}");
         }
+        let release_error = call_tool(
+            &mut session,
+            "github_create_release",
+            json!({
+                "credential_id":"id",
+                "owner":"octocat",
+                "repo":"hello-world",
+                "tag_name":"v1.0.0"
+            }),
+        )
+        .unwrap_err();
+        assert!(release_error.contains("未启用"), "{release_error}");
         let git_error = call_tool(
             &mut session,
             "github_git_status",
@@ -1064,8 +1347,33 @@ mod tests {
     fn tool_schemas_are_closed() {
         for definition in api_tool_definitions() {
             assert_eq!(definition["inputSchema"]["additionalProperties"], false);
-            assert_eq!(definition["readOnly"], true);
         }
+        let read_only = api_tool_definitions()
+            .into_iter()
+            .filter(|definition| definition["readOnly"] == true)
+            .count();
+        assert_eq!(read_only, 7);
+    }
+
+    #[test]
+    fn release_arguments_reject_unsafe_values_and_wrong_boolean_types() {
+        assert!(release_tag_arg(&json!({"tag_name":"refs/../main"})).is_err());
+        assert!(release_tag_arg(&json!({"tag_name":"release%2F1"})).is_err());
+        assert!(optional_release_string(&json!({"name": 1}), "name", 200).is_err());
+        assert!(optional_release_body(&json!({"body": "bad\u{000b}"})).is_err());
+        assert!(bool_arg(&json!({"draft":"true"}), "draft", true).is_err());
+        assert_eq!(bool_arg(&json!({}), "draft", true).unwrap(), true);
+    }
+
+    #[test]
+    fn policy_disables_api_writes_without_disabling_git() {
+        let policy = normalize_policy(GithubMcpPolicy {
+            enabled: false,
+            api_write_enabled: true,
+        })
+        .unwrap();
+        assert!(!policy.enabled);
+        assert!(!policy.api_write_enabled);
     }
 
     #[test]
@@ -1119,14 +1427,16 @@ mod tests {
     #[test]
     fn enabled_policy_requires_no_preselected_token() {
         let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
-        save_policy(&vault, &dek, &GithubMcpPolicy { enabled: true }).unwrap();
-        assert!(load_policy(&vault, &dek).enabled);
+        save_policy(&vault, &dek, &GithubMcpPolicy { enabled: true, api_write_enabled: false }).unwrap();
+        let policy = load_policy(&vault, &dek);
+        assert!(policy.enabled);
+        assert!(!policy.api_write_enabled);
     }
 
     #[test]
     fn active_token_is_selected_by_tool_argument() {
         let (vault, dek, id) = token_entry("github");
-        save_policy(&vault, &dek, &GithubMcpPolicy { enabled: true }).unwrap();
+        save_policy(&vault, &dek, &GithubMcpPolicy { enabled: true, api_write_enabled: false }).unwrap();
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
         let token = prepare(
@@ -1141,7 +1451,7 @@ mod tests {
     #[test]
     fn credential_discovery_returns_metadata_without_token() {
         let (vault, dek, _) = token_entry("github");
-        save_policy(&vault, &dek, &GithubMcpPolicy { enabled: true }).unwrap();
+        save_policy(&vault, &dek, &GithubMcpPolicy { enabled: true, api_write_enabled: false }).unwrap();
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
         let text = call_tool(&mut session, "github_list_credentials", json!({})).unwrap();

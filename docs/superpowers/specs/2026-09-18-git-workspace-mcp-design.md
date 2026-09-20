@@ -7,7 +7,7 @@
 
 | # | 决策点 | 结论 |
 |---|---|---|
-| 1 | 分组 / 开关 | 并进现有 GitHub MCP，共用 `GithubMcpPolicy.enabled` |
+| 1 | 分组 / 开关 | 本地 git 继续共用 `GithubMcpPolicy.enabled`；GitHub API 写入另有 `api_write_enabled` |
 | 2 | 提交路径 | 本地 `git` CLI，不是 GitHub Contents PUT |
 | 3 | 人闸 | 仅启用时确认一次；stage / commit / push / pull / clone 不再逐次审批 |
 | 4 | 工具命名 | 本地 git 用 `github_git_*`；现有 `github_*` API 工具名不变 |
@@ -19,7 +19,7 @@
 
 让 Cursor / Claude Code 能通过 Sealbox 在 Agent 给出的本地 git 仓库里看状态、暂存、提交，并用金库里的 GitHub Token **push / pull / clone**。Token 只在 Rust 进程内注入，永不返回给模型，也不写入 `.git/config`。
 
-这是对 2026-09-11 设计里「不做 Git 工作区 / MCP 写入 GitHub」的有意开口：只开本机 git CLI + HTTPS `github.com`，不开任意 HTTP、不开 GitHub 写 API。
+这是对 2026-09-11 设计里本地 Git 工作区边界的有意开口：只开本机 git CLI + HTTPS `github.com`，不开任意 HTTP；GitHub API 写入由独立的 `api_write_enabled` 和单独的 Release 工具路线控制。
 
 ## 2. 架构
 
@@ -48,7 +48,7 @@ Sealbox 本机 MCP (127.0.0.1:17891)
 
 - 旧 JSON 里多出来的 `clone_parent` / `workspaces` 会被忽略。
 - 仍含 `credential_id` / `scopes` / `allowed_repositories` 的更旧格式继续视为损坏，整份策略按关闭处理。
-- 启用时 MCP 页 confirm：将开放 GitHub 只读 API，并允许在模型给出的本地路径上执行 git（含 commit / push / pull / clone）。
+- 启用时 MCP 页 confirm：将开放 GitHub 只读 API，并允许在模型给出的本地路径上执行 git（含 commit / push / pull / clone）；GitHub API 写入另需单独确认和 `api_write_enabled` 开关。
 - git 工具的 `path` 必须是本机绝对路径；`credential_id` 必须指向活动的 `ApiToken { service: "github" }`。
 
 ## 4. 工具

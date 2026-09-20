@@ -50,7 +50,7 @@
 - 云同步、多用户、账号系统
 - 浏览器自动填充、向其他窗口注入按键
 - GitHub Contents / Git Data 写 API、通用 HTTP 默认暴露、模型触发的秘密复制
-- GitHub MCP：默认停用；启用后开放固定的 api.github.com GET 工具，以及 Agent 传入绝对路径的 `github_git_*`（见 `2026-09-18-git-workspace-mcp-design.md`）。不做 force / SSH / 相对路径逃逸
+- GitHub MCP：默认停用；启用后开放固定的 api.github.com GET 工具，以及 Agent 传入绝对路径的 `github_git_*`（见 `2026-09-18-git-workspace-mcp-design.md`）。GitHub API 写入仅在独立开关打开后提供受控的 `github_create_release`，不做任意写 API、force / SSH / 相对路径逃逸
 - 文件加密盘、加密分享包、邮件、MQTT、对象存储、内置浏览器
 - Bitwarden 导入、扫描导入、Have I Been Pwned、试用倒计时
 - Token 额度刷新、分页（本地全量列表 + 搜索即可）
@@ -59,7 +59,7 @@
 
 ### 3.3 后续能力预留
 
-Rust 核心暴露内部 `VaultService`：按筛选列出元数据、按 id 解密一次、写审计。当前本机 MCP 用同一个 `GithubMcpPolicy.enabled` 控制 GitHub API 只读工具和本地 `github_git_*`。API 工具固定 GET `https://api.github.com`；git 工具在 Agent 给出的绝对路径上跑本机 `git`，Token 经 askpass 注入且不回给模型。详见 `2026-09-18-git-workspace-mcp-design.md`。
+Rust 核心暴露内部 `VaultService`：按筛选列出元数据、按 id 解密一次、写审计。当前本机 MCP 用 `GithubMcpPolicy.enabled` 控制 GitHub API/本地 `github_git_*` 总能力，并用独立的 `api_write_enabled` 控制受控 GitHub Release 写入。API 读取固定 GET `https://api.github.com`；Release 创建只接受白名单 POST 字段；git 工具在 Agent 给出的绝对路径上跑本机 `git`，Token 经 askpass 注入且不回给模型。详见 `2026-09-18-git-workspace-mcp-design.md` 和 `2026-09-20-github-mcp-roadmap.md`。
 
 ## 4. 成功标准
 
@@ -86,7 +86,7 @@ Vue 3 界面
 Rust 核心
   会话（数据密钥在内存）
   VaultService（CRUD、搜索元数据、按需解密）
-  GitHub MCP：单一 enabled 开关、固定 GET、Token ID 选择
+  GitHub MCP：enabled 总开关 + 独立 API 写入开关、固定 GET 与受控 Release POST、Token ID 选择
   ZoomKey MCP：独立内网策略、mTLS、固定只读查询
   加密、Hello、热键、剪贴板定时清空、备份、审计
         │                    │
@@ -99,7 +99,7 @@ Rust 核心
 
 1. 明文只在 Rust 里短暂出现。前端默认看不到完整秘密；「显示」或「复制」才请求一次。
 2. 磁盘无明文。SQLite 存元数据与 AES-256-GCM 密文；数据密钥用主密码派生钥包装，另有一份包装进 Credential Manager 供 Hello。
-3. MCP 只在本机 loopback 提供固定的只读查询；凭据明文只在 Rust 请求构造期间短暂存在，不进入模型结果。
+3. MCP 只在本机 loopback 提供固定的只读查询和明确受控的 Release 写入；凭据明文只在 Rust 请求构造期间短暂存在，不进入模型结果。
 
 关主窗口 ≠ 退出。托盘仍在，热键才可用。退出或锁定：丢掉内存中的数据密钥、清我们放入的剪贴板。
 
@@ -381,7 +381,7 @@ Windows Hello **不是**第二套 KDF。它是「已登录的 Windows 用户 + �
 2. 显示和复制是唯一把明文送到 UI/剪贴板的出口，且有超时。
 3. 同一把 DEK；Hello 只是 Credential Manager + 本人确认，不是第二套库。
 4. 备份只用主密码加密，与 Hello 无关；Hello 不能解开 `.svbak`。
-5. 本机 MCP/填表服务仅监听 `127.0.0.1`；GitHub 只读工具固定访问 `api.github.com`，ZoomKey 按独立内网策略和 mTLS 访问；不得上传金库数据或凭据明文。
+5. 本机 MCP/填表服务仅监听 `127.0.0.1`；GitHub 读取工具固定访问 `api.github.com`，Release 写入只允许白名单 POST，ZoomKey 按独立内网策略和 mTLS 访问；不得上传金库数据或凭据明文。
 
 ## 15. 实现顺序
 

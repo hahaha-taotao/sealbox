@@ -1140,15 +1140,11 @@ pub fn github_mcp_policy_set(
     let dek = *session.dek().map_err(map_err)?;
     let vault = session.vault().map_err(map_err)?;
     github_mcp::save_policy(vault, &dek, &normalized)?;
-    let _ = vault.audit(
-        "mcp_github_policy",
-        None,
-        if normalized.enabled {
-            "enabled"
-        } else {
-            "disabled"
-        },
+    let detail = format!(
+        "enabled={} api_write_enabled={}",
+        normalized.enabled, normalized.api_write_enabled
     );
+    let _ = vault.audit("mcp_github_policy", None, &detail);
     Ok(normalized)
 }
 

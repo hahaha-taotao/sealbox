@@ -645,7 +645,7 @@ mod tests {
                 },
             )
             .unwrap();
-        crate::github_mcp::save_policy(&vault, &dek, &GithubMcpPolicy { enabled: true }).unwrap();
+        crate::github_mcp::save_policy(&vault, &dek, &GithubMcpPolicy { enabled: true, api_write_enabled: false }).unwrap();
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
         session

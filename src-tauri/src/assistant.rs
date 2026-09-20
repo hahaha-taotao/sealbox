@@ -736,6 +736,7 @@ mod tests {
                 {"name":"github_get_file","description":"file","inputSchema":{},"readOnly":true,"risk":"low"},
                 {"name":"github_git_status","description":"git status","inputSchema":{},"readOnly":true,"risk":"low"},
                 {"name":"github_git_push","description":"git push","inputSchema":{},"readOnly":false,"risk":"high"},
+                {"name":"github_create_release","description":"create release","inputSchema":{},"readOnly":false,"risk":"high"},
                 {"name":"zoomkey_jira_nav","description":"jira","inputSchema":{},"readOnly":true,"risk":"low"},
                 {"name":"zoomkey_crm_query","description":"crm","inputSchema":{},"readOnly":true,"risk":"low"},
                 {"name":"list_credentials","description":"legacy","inputSchema":{},"readOnly":true,"risk":"medium"},

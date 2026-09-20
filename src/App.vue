@@ -354,7 +354,7 @@ const revealedFillToken = ref("");
 const revealedMcpToken = ref("");
 const revealedMcpSnippet = ref("");
 const mcpTools = ref<McpToolInfo[]>([]);
-const githubPolicy = ref<GithubMcpPolicy>({ enabled: false });
+const githubPolicy = ref<GithubMcpPolicy>({ enabled: false, api_write_enabled: false });
 const githubPolicyBusy = ref(false);
 const zoomkeyPolicy = ref<ZoomkeyMcpPolicy | null>(null);
 const zoomkeyCandidates = ref<ZoomkeyCandidates>({
@@ -390,7 +390,7 @@ async function refreshMcp() {
   try {
     githubPolicy.value = await api.githubMcpPolicyGet();
   } catch {
-    githubPolicy.value = { enabled: false };
+    githubPolicy.value = { enabled: false, api_write_enabled: false };
   }
   try {
     zoomkeyPolicy.value = await api.zoomkeyPolicyGet();
@@ -476,22 +476,47 @@ async function pickCaBundlePath(endpoint: "jira" | "crm") {
 
 async function saveGithubPolicy() {
   if (githubPolicyBusy.value) return;
-  const previous = githubPolicy.value.enabled;
-  if (!previous) {
+  const previous = { ...githubPolicy.value };
+  const next = { ...githubPolicy.value, enabled: !previous.enabled, api_write_enabled: previous.enabled ? previous.api_write_enabled : false };
+  if (!previous.enabled) {
     const ok = confirm(
       "开启后，Cursor / Claude Code 可以使用 GitHub 只读 API，并在模型给出的本地路径上执行 git（含 commit / push / pull / clone）。Token 不会返回给模型。继续？",
     );
     if (!ok) return;
   }
   githubPolicyBusy.value = true;
-  githubPolicy.value = { enabled: !previous };
+  githubPolicy.value = next;
   try {
-    githubPolicy.value = await api.githubMcpPolicySet(githubPolicy.value);
+    githubPolicy.value = await api.githubMcpPolicySet(next);
     mcp.value = await api.mcpStatus();
     mcpTools.value = await api.mcpTools();
     showToast(githubPolicy.value.enabled ? "GitHub MCP 已启用" : "GitHub MCP 已停用");
   } catch (e) {
-    githubPolicy.value = { enabled: previous };
+    githubPolicy.value = previous;
+    showToast(String(e));
+  } finally {
+    githubPolicyBusy.value = false;
+  }
+}
+
+async function toggleGithubApiWrite() {
+  if (githubPolicyBusy.value || !githubPolicy.value.enabled) return;
+  const nextEnabled = !githubPolicy.value.api_write_enabled;
+  if (nextEnabled) {
+    const ok = confirm(
+      "这会允许外部 MCP 客户端使用 GitHub API 创建 Release（默认草稿，但仍会在远程仓库创建对象）。请确认 Token 具备目标仓库的写权限。继续？",
+    );
+    if (!ok) return;
+  }
+  const previous = { ...githubPolicy.value };
+  githubPolicyBusy.value = true;
+  githubPolicy.value = { ...previous, api_write_enabled: nextEnabled };
+  try {
+    githubPolicy.value = await api.githubMcpPolicySet(githubPolicy.value);
+    mcpTools.value = await api.mcpTools();
+    showToast(nextEnabled ? "GitHub API 写入已启用" : "GitHub API 写入已停用");
+  } catch (e) {
+    githubPolicy.value = previous;
     showToast(String(e));
   } finally {
     githubPolicyBusy.value = false;
@@ -1807,8 +1832,19 @@ onMounted(async () => {
               <button class="btn primary" type="button" :disabled="githubPolicyBusy" @click="saveGithubPolicy">
                 {{ githubPolicyBusy ? "保存中…" : (githubPolicy.enabled ? "停用 GitHub MCP" : "启用 GitHub MCP") }}
               </button>
+              <button
+                class="btn"
+                type="button"
+                :disabled="githubPolicyBusy || !githubPolicy.enabled"
+                @click="toggleGithubApiWrite"
+              >
+                {{ githubPolicy.api_write_enabled ? "停用 GitHub API 写入" : "启用 GitHub API 写入" }}
+              </button>
             </div>
-            <p class="crumb">GitHub Token 在 GitHub 侧的实际权限仍由 GitHub 返回结果决定；Sealbox 不把 Token、请求头或任意请求体返回给模型。</p>
+            <p class="crumb">
+              GitHub API 写入目前仅包含创建 Release，默认创建草稿；它仍会在远程仓库创建对象，需要单独启用。
+              GitHub Token 在 GitHub 侧的实际权限仍由 GitHub 返回结果决定；Sealbox 不把 Token、请求头或任意请求体返回给模型。
+            </p>
           </div>
           <div class="mcp-card">
             <h3>ZoomKey JIRA / CRM</h3>

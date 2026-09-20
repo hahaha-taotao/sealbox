@@ -133,6 +133,7 @@ export interface ExtensionInstallStatus {
 
 export interface GithubMcpPolicy {
   enabled: boolean;
+  api_write_enabled: boolean;
 }
 
 export interface ZoomkeyEndpointPolicy {
