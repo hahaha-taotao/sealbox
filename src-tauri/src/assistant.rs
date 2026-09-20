@@ -176,7 +176,7 @@ pub fn mcp_probe(
         json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-            "clientInfo": { "name": "sealbox-assistant", "version": "0.1.1" }
+            "clientInfo": { "name": "sealbox-assistant", "version": env!("CARGO_PKG_VERSION") }
         }),
     )?;
     let tools_value = client
@@ -210,7 +210,7 @@ pub fn chat(
         json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {},
-            "clientInfo": { "name": "sealbox-assistant", "version": "0.1.1" }
+            "clientInfo": { "name": "sealbox-assistant", "version": env!("CARGO_PKG_VERSION") }
         }),
     )?;
     let tools_value = client

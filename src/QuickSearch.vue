@@ -2,12 +2,13 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
-import { api, type EntryDto, type EntryKind, type Status } from "./lib/tauri";
+import { api, type EntryDto, type EntryKind, type FolderDto, type Status } from "./lib/tauri";
 
 const status = ref<Status | null>(null);
 const query = ref("");
 const index = ref(0);
 const entries = ref<EntryDto[]>([]);
+const folders = ref<FolderDto[]>([]);
 const password = ref("");
 const error = ref("");
 const toast = ref("");
@@ -19,7 +20,8 @@ const hits = computed(() => {
     (e) =>
       e.title.toLowerCase().includes(q) ||
       (e.account || "").toLowerCase().includes(q) ||
-      (e.url || "").toLowerCase().includes(q),
+      (e.url || "").toLowerCase().includes(q) ||
+      folderName(e.folder_id).toLowerCase().includes(q),
   ).filter((e) => e.kind !== "client_cert");
 });
 
@@ -36,6 +38,10 @@ function kindLabel(k: EntryKind) {
   }
 }
 
+function folderName(folderId: string | null) {
+  return folders.value.find((folder) => folder.id === folderId)?.name || "未归类";
+}
+
 async function hide() {
   query.value = "";
   index.value = 0;
@@ -48,10 +54,12 @@ async function refresh() {
   status.value = await api.status();
   if (!status.value.unlocked) {
     entries.value = [];
+    folders.value = [];
     return;
   }
   try {
-    entries.value = await api.list({
+    [entries.value, folders.value] = await Promise.all([
+      api.list({
       query: null,
       kind: null,
       kinds: [],
@@ -60,7 +68,9 @@ async function refresh() {
       tag: null,
       trash: false,
       sort: "use_count",
-    });
+      }),
+      api.folders(),
+    ]);
     error.value = "";
   } catch (e) {
     entries.value = [];
@@ -179,7 +189,10 @@ onMounted(async () => {
           @mouseenter="index = i"
           @click="copyHit(row)"
         >
-          <span>{{ row.title }}<small v-if="row.account"> · {{ row.account }}</small></span>
+          <span class="quick-item-main">
+            <span class="quick-item-title">{{ row.title }}<small v-if="row.account"> · {{ row.account }}</small></span>
+            <small class="quick-item-folder">文件夹：{{ folderName(row.folder_id) }}</small>
+          </span>
           <span class="count">{{ kindLabel(row.kind) }}</span>
         </button>
         <p class="crumb" v-if="!hits.length">没有匹配</p>

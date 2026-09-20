@@ -174,6 +174,20 @@ button { cursor: pointer; }
 }
 .settings-span { grid-column: 1 / -1; }
 .settings-master { margin-top: 16px; }
+.about-card { margin-top: 16px; }
+.about-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.about-heading h3 { margin-bottom: 6px; }
+.version-badge { border: 1px solid #c7c9f5; background: #eef0ff; color: var(--brand); border-radius: 999px; padding: 4px 9px; font-size: 12px; white-space: nowrap; }
+.about-meta { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; margin: 14px 0; font-size: 13px; }
+.about-meta span { color: var(--muted); }
+.about-meta strong { font-weight: 600; }
+.about-status { margin: 0 0 12px; color: var(--brand); font-size: 13px; }
+.about-status.ok { color: var(--green); }
+.about-error { margin: 0 0 12px; }
+.about-notes { margin: 0 0 14px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: #fafbff; }
+.about-notes strong { display: block; margin-bottom: 5px; font-size: 12px; }
+.about-notes p { margin: 0; white-space: pre-wrap; word-break: break-word; color: var(--text); font-size: 13px; line-height: 1.55; max-height: 180px; overflow: auto; }
+.about-download { overflow-wrap: anywhere; }
 .hello-status {
   display: flex;
   align-items: center;
@@ -697,4 +711,7 @@ html:has(.quick-win), body:has(.quick-win) {
 .quick-list { overflow: auto; margin-top: 8px; flex: 1; }
 .quick-list .side-item { margin-bottom: 2px; }
 .quick-list small { color: var(--muted); font-weight: 400; }
+.quick-item-main { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.quick-item-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.quick-item-folder { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 .icon { width: 18px; height: 18px; display: block; }

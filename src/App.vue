@@ -2,6 +2,8 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import packageJson from "../package.json";
 import {
   api,
   type AuditEvent,
@@ -22,6 +24,7 @@ import {
   type McpToolInfo,
   type SecretPayload,
   type Status,
+  type UpdateCheck,
   type UpsertEntry,
   type ZoomkeyCandidates,
   type ZoomkeyMcpPolicy,
@@ -1176,6 +1179,11 @@ const settingsHotkey = ref("Ctrl+Shift+Space");
 const oldMaster = ref("");
 const newMaster = ref("");
 const newMaster2 = ref("");
+const appVersion = String(packageJson.version);
+const updateCheck = ref<UpdateCheck | null>(null);
+const updateBusy = ref(false);
+const updateError = ref("");
+const updateCheckedAt = ref("");
 const recent = ref<EntryDto[]>([]);
 const expiring = ref<EntryDto[]>([]);
 
@@ -1265,6 +1273,32 @@ async function saveSettings() {
   } catch (e) {
     showToast("热键可能被占用：" + String(e));
   }
+}
+async function checkForUpdates() {
+  if (updateBusy.value) return;
+  updateBusy.value = true;
+  updateError.value = "";
+  try {
+    updateCheck.value = await api.checkForUpdates();
+    updateCheckedAt.value = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  } catch (e) {
+    updateCheck.value = null;
+    updateError.value = String(e);
+  } finally {
+    updateBusy.value = false;
+  }
+}
+async function openUpdateUrl(url: string) {
+  try {
+    await openUrl(url);
+  } catch (e) {
+    showToast(`无法打开下载页面：${String(e)}`);
+  }
+}
+function formatAssetSize(size: number | null) {
+  if (!size || size <= 0) return "大小未知";
+  if (size >= 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+  return `${Math.ceil(size / 1024)} KB`;
 }
 async function doChangeMaster() {
   if (newMaster.value.length < 10) {
@@ -2179,6 +2213,40 @@ onMounted(async () => {
               </div>
             </div>
             <button class="btn primary" type="button" @click="doChangeMaster">更新主密码</button>
+          </div>
+          <div class="mcp-card about-card">
+            <div class="about-heading">
+              <div>
+                <h3>关于 Sealbox</h3>
+                <p class="crumb">本地凭据金库，数据保存在本机。</p>
+              </div>
+              <span class="version-badge">v{{ appVersion }}</span>
+            </div>
+            <div class="about-meta">
+              <span>当前版本</span>
+              <strong>v{{ appVersion }}</strong>
+              <template v-if="updateCheck">
+                <span>最新稳定版</span>
+                <strong>v{{ updateCheck.latest_version }}</strong>
+                <span v-if="updateCheck.published_at">发布时间</span>
+                <strong v-if="updateCheck.published_at">{{ fmtTime(updateCheck.published_at) }}</strong>
+              </template>
+            </div>
+            <p v-if="updateError" class="error about-error">{{ updateError }}</p>
+            <p v-else-if="updateCheck && !updateCheck.update_available" class="about-status ok">已是最新版本<span v-if="updateCheckedAt"> · {{ updateCheckedAt }} 检查</span></p>
+            <p v-else-if="updateCheck" class="about-status">发现新版本 v{{ updateCheck.latest_version }}<span v-if="updateCheckedAt"> · {{ updateCheckedAt }} 检查</span></p>
+            <p v-else class="crumb">点击“检查更新”获取 GitHub Releases 中的最新稳定版本。</p>
+            <div v-if="updateCheck?.notes" class="about-notes">
+              <strong>更新说明</strong>
+              <p>{{ updateCheck.notes }}</p>
+            </div>
+            <div class="mcp-actions">
+              <button class="btn primary" type="button" :disabled="updateBusy" @click="checkForUpdates">{{ updateBusy ? "检查中…" : "检查更新" }}</button>
+              <button v-if="updateCheck?.installer" class="btn" type="button" @click="openUpdateUrl(updateCheck.installer.url)">下载最新程序包 · {{ formatAssetSize(updateCheck.installer.size) }}</button>
+              <button v-if="updateCheck && !updateCheck.installer" class="btn" type="button" @click="openUpdateUrl(updateCheck.release_url)">打开发布页</button>
+            </div>
+            <p v-if="updateCheck?.installer" class="crumb about-download">{{ updateCheck.installer.name }} · 下载将由系统浏览器处理，不会自动安装。</p>
+            <p v-else-if="updateCheck" class="crumb about-download">当前 Release 暂无 Windows 安装包，请稍后再试或打开发布页。</p>
           </div>
         </div>
       </section>
