@@ -1,9 +1,18 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, shallowRef } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import packageJson from "../package.json";
+import {
+  checkForUpdate,
+  download,
+  install,
+  RELEASE_PAGE_URL,
+  type AvailableUpdate,
+  type NormalizedDownloadEvent,
+  type UpdaterMetadata,
+} from "./lib/updater";
 import {
   api,
   type AuditEvent,
@@ -24,7 +33,6 @@ import {
   type McpToolInfo,
   type SecretPayload,
   type Status,
-  type UpdateCheck,
   type UpsertEntry,
   type ZoomkeyCandidates,
   type ZoomkeyMcpPolicy,
@@ -1205,10 +1213,30 @@ const oldMaster = ref("");
 const newMaster = ref("");
 const newMaster2 = ref("");
 const appVersion = ref(String(packageJson.version));
-const updateCheck = ref<UpdateCheck | null>(null);
+const update = shallowRef<AvailableUpdate | null>(null);
+const updateMetadata = ref<UpdaterMetadata | null>(null);
 const updateBusy = ref(false);
 const updateError = ref("");
 const updateCheckedAt = ref("");
+const updateStage = ref<"idle" | "checking" | "available" | "downloading" | "ready" | "installing" | "error">("idle");
+const updateDownloadedBytes = ref(0);
+const updateContentLength = ref<number | null>(null);
+const updateDownloadFinished = ref(false);
+const updateProgress = computed(() => {
+  if (!updateContentLength.value || updateContentLength.value <= 0) return null;
+  return Math.min(100, Math.round((updateDownloadedBytes.value / updateContentLength.value) * 100));
+});
+const updateStatusText = computed(() => {
+  switch (updateStage.value) {
+    case "checking": return "正在检查更新…";
+    case "available": return `发现新版本 v${updateMetadata.value?.latestVersion ?? ""}`;
+    case "downloading": return updateProgress.value === null ? "正在下载更新…" : `正在下载更新… ${updateProgress.value}%`;
+    case "ready": return "更新已下载，可以安装";
+    case "installing": return "正在安装更新…";
+    case "error": return "更新失败，可重试或打开发布页";
+    default: return "";
+  }
+});
 const recent = ref<EntryDto[]>([]);
 const expiring = ref<EntryDto[]>([]);
 
@@ -1271,14 +1299,23 @@ function applyLockedUi() {
   mcp.value = null;
 }
 
-async function doLock() {
+async function lockVault(strict: boolean) {
   applyLockedUi();
   try {
     await api.lock();
-  } catch {
-    /* already locked from tray / idle */
+  } catch (e) {
+    await refreshStatus().catch(() => undefined);
+    if (strict) throw e;
   }
   await refreshStatus();
+}
+
+async function doLock() {
+  await lockVault(false);
+}
+
+async function lockForUpdate() {
+  await lockVault(true);
 }
 
 async function loadSettings() {
@@ -1299,32 +1336,89 @@ async function saveSettings() {
     showToast("热键可能被占用：" + String(e));
   }
 }
+function formatBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.ceil(bytes / 1024)} KB`;
+  return `${Math.ceil(bytes)} B`;
+}
+
+function applyDownloadEvent(event: NormalizedDownloadEvent) {
+  updateDownloadedBytes.value = event.downloadedBytes;
+  updateContentLength.value = event.contentLength;
+  updateDownloadFinished.value = event.phase === "finished";
+}
+
 async function checkForUpdates() {
   if (updateBusy.value) return;
   updateBusy.value = true;
   updateError.value = "";
+  updateStage.value = "checking";
   try {
-    updateCheck.value = await api.checkForUpdates();
-    appVersion.value = updateCheck.value.current_version;
+    const result = await checkForUpdate();
     updateCheckedAt.value = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    if (!result) {
+      update.value = null;
+      updateMetadata.value = null;
+      updateStage.value = "idle";
+      showToast("已是最新版本");
+      return;
+    }
+    update.value = result;
+    updateMetadata.value = result.metadata;
+    appVersion.value = result.metadata.currentVersion;
+    updateStage.value = "available";
   } catch (e) {
-    updateCheck.value = null;
+    updateStage.value = "error";
     updateError.value = String(e);
   } finally {
     updateBusy.value = false;
   }
 }
+
+async function downloadUpdate() {
+  if (!update.value || updateBusy.value) return;
+  updateBusy.value = true;
+  updateError.value = "";
+  updateStage.value = "downloading";
+  updateDownloadedBytes.value = 0;
+  updateContentLength.value = null;
+  updateDownloadFinished.value = false;
+  try {
+    await download(update.value, applyDownloadEvent);
+    updateDownloadFinished.value = true;
+    updateStage.value = "ready";
+  } catch (e) {
+    updateStage.value = "error";
+    updateError.value = String(e);
+  } finally {
+    updateBusy.value = false;
+  }
+}
+
+async function installUpdate() {
+  if (!update.value || updateBusy.value || !updateDownloadFinished.value) return;
+  if (!confirm(`将安装 Sealbox v${updateMetadata.value?.latestVersion ?? "新版本"}。应用会退出并由签名安装器完成替换，确定继续？`)) return;
+  updateBusy.value = true;
+  updateError.value = "";
+  updateStage.value = "installing";
+  try {
+    await lockForUpdate();
+    await install(update.value);
+  } catch (e) {
+    updateStage.value = "error";
+    updateError.value = String(e);
+  } finally {
+    updateBusy.value = false;
+  }
+}
+
 async function openUpdateUrl(url: string) {
   try {
     await openUrl(url);
   } catch (e) {
-    showToast(`无法打开下载页面：${String(e)}`);
+    showToast(`无法打开发布页面：${String(e)}`);
   }
-}
-function formatAssetSize(size: number | null) {
-  if (!size || size <= 0) return "大小未知";
-  if (size >= 1024 * 1024) return `${(size / (1024 * 1024)).toFixed(1)} MB`;
-  return `${Math.ceil(size / 1024)} KB`;
 }
 async function doChangeMaster() {
   if (newMaster.value.length < 10) {
@@ -2262,29 +2356,42 @@ onMounted(async () => {
             <div class="about-meta">
               <span>当前版本</span>
               <strong>v{{ appVersion }}</strong>
-              <template v-if="updateCheck">
+              <template v-if="updateMetadata">
                 <span>最新稳定版</span>
-                <strong>v{{ updateCheck.latest_version }}</strong>
-                <span v-if="updateCheck.published_at">发布时间</span>
-                <strong v-if="updateCheck.published_at">{{ fmtTime(updateCheck.published_at) }}</strong>
+                <strong>v{{ updateMetadata.latestVersion }}</strong>
+                <span v-if="updateMetadata.publishedAt">发布时间</span>
+                <strong v-if="updateMetadata.publishedAt">{{ fmtTime(updateMetadata.publishedAt) }}</strong>
               </template>
             </div>
             <p v-if="updateError" class="error about-error">{{ updateError }}</p>
-            <p v-else-if="updateCheck?.version_status === 'up_to_date'" class="about-status ok">已是最新版本<span v-if="updateCheckedAt"> · {{ updateCheckedAt }} 检查</span></p>
-            <p v-else-if="updateCheck?.version_status === 'ahead'" class="about-status">当前版本高于最新稳定版 v{{ updateCheck.latest_version }}<span v-if="updateCheckedAt"> · {{ updateCheckedAt }} 检查</span></p>
-            <p v-else-if="updateCheck" class="about-status">发现新版本 v{{ updateCheck.latest_version }}<span v-if="updateCheckedAt"> · {{ updateCheckedAt }} 检查</span></p>
-            <p v-else class="crumb">点击“检查更新”获取 GitHub Releases 中的最新稳定版本。</p>
-            <div v-if="updateCheck?.notes" class="about-notes">
+            <p v-else-if="updateStage === 'idle' && updateCheckedAt" class="about-status ok">已是最新版本<span> · {{ updateCheckedAt }} 检查</span></p>
+            <p v-else-if="updateStage === 'checking'" class="about-status">正在检查 GitHub Releases…</p>
+            <p v-else-if="updateStage !== 'idle'" class="about-status">{{ updateStatusText }}<span v-if="updateCheckedAt"> · {{ updateCheckedAt }} 检查</span></p>
+            <p v-else class="crumb">点击“检查更新”获取签名更新信息。</p>
+            <div v-if="updateMetadata?.notes" class="about-notes">
               <strong>更新说明</strong>
-              <p>{{ updateCheck.notes }}</p>
+              <p>{{ updateMetadata.notes }}</p>
+            </div>
+            <div v-if="updateStage === 'downloading' || updateStage === 'ready'" class="update-progress">
+              <div class="update-progress-head">
+                <span>{{ updateStage === 'ready' ? '下载完成' : '下载进度' }}</span>
+                <strong v-if="updateProgress !== null">{{ updateProgress }}%</strong>
+                <strong v-else>下载中</strong>
+              </div>
+              <div class="update-progress-track" role="progressbar" :aria-valuenow="updateProgress ?? undefined" aria-valuemin="0" aria-valuemax="100">
+                <span :style="{ width: `${updateProgress ?? 0}%` }" />
+              </div>
+              <p class="crumb about-download">{{ formatBytes(updateDownloadedBytes) }}<span v-if="updateContentLength"> / {{ formatBytes(updateContentLength) }}</span></p>
             </div>
             <div class="mcp-actions">
-              <button class="btn primary" type="button" :disabled="updateBusy" @click="checkForUpdates">{{ updateBusy ? "检查中…" : "检查更新" }}</button>
-              <button v-if="updateCheck?.update_available && updateCheck.installer" class="btn" type="button" @click="openUpdateUrl(updateCheck.installer.url)">下载最新程序包 · {{ formatAssetSize(updateCheck.installer.size) }}</button>
-              <button v-if="updateCheck && (!updateCheck.update_available || !updateCheck.installer)" class="btn" type="button" @click="openUpdateUrl(updateCheck.release_url)">打开发布页</button>
+              <button class="btn primary" type="button" :disabled="updateBusy" @click="checkForUpdates">{{ updateBusy ? "处理中…" : "检查更新" }}</button>
+              <button v-if="updateStage === 'available' || updateStage === 'error' && update" class="btn" type="button" :disabled="updateBusy" @click="downloadUpdate">下载更新</button>
+              <button v-if="updateStage === 'ready'" class="btn primary" type="button" :disabled="updateBusy" @click="installUpdate">安装并重启</button>
+              <button v-if="updateMetadata || updateError" class="btn" type="button" :disabled="updateBusy" @click="openUpdateUrl(RELEASE_PAGE_URL)">打开发布页</button>
             </div>
-            <p v-if="updateCheck?.update_available && updateCheck.installer" class="crumb about-download">{{ updateCheck.installer.name }} · 下载将由系统浏览器处理，不会自动安装。</p>
-            <p v-else-if="updateCheck?.update_available" class="crumb about-download">当前 Release 暂无 Windows x64 安装包，请打开发布页查看详情。</p>
+            <p v-if="updateStage === 'available'" class="crumb about-download">更新包会在应用内下载并自动校验签名，不会交给浏览器执行。</p>
+            <p v-else-if="updateStage === 'ready'" class="crumb about-download">安装器会替换程序文件，不会修改 %APPDATA%\\com.sealbox.app\\vault.db。</p>
+            <p v-else-if="updateStage === 'installing'" class="crumb about-download">安装器正在接管更新，应用可能会退出；请不要重复启动安装。</p>
           </div>
         </div>
       </section>

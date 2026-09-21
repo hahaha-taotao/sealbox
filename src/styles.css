@@ -188,6 +188,11 @@ button { cursor: pointer; }
 .about-notes strong { display: block; margin-bottom: 5px; font-size: 12px; }
 .about-notes p { margin: 0; white-space: pre-wrap; word-break: break-word; color: var(--text); font-size: 13px; line-height: 1.55; max-height: 180px; overflow: auto; }
 .about-download { overflow-wrap: anywhere; }
+.update-progress { margin: 0 0 14px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: #fafbff; }
+.update-progress-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; color: var(--text); font-size: 12px; }
+.update-progress-head strong { color: var(--brand); font-weight: 600; }
+.update-progress-track { height: 8px; overflow: hidden; border-radius: 999px; background: #e7e9f5; }
+.update-progress-track span { display: block; height: 100%; border-radius: inherit; background: var(--brand); transition: width .2s ease; }
 .hello-status {
   display: flex;
   align-items: center;

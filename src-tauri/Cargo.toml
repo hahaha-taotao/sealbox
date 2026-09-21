@@ -1,6 +1,6 @@
 [package]
 name = "sealbox"
-version = "0.1.4"
+version = "0.1.5"
 description = "Sealbox 印盒 — local credential vault"
 authors = ["you"]
 edition = "2021"
@@ -38,6 +38,7 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
 md-5 = "0.10"
+tauri-plugin-updater = "2"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
