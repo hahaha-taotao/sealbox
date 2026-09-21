@@ -17,7 +17,6 @@ pub mod passphrase_words;
 pub mod redact;
 pub mod session;
 pub mod totp;
-pub mod update;
 pub mod vault;
 pub mod zoomkey;
 
@@ -37,6 +36,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
@@ -72,7 +72,6 @@ pub fn run() {
             commands::settings_set,
             commands::set_hello_enabled,
             commands::change_master,
-            update::check_for_updates,
             commands::mcp_status,
             commands::mcp_start,
             commands::mcp_stop,

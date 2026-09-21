@@ -95,23 +95,6 @@ export interface Status {
   counts: Counts | null;
 }
 
-export interface InstallerAsset {
-  name: string;
-  url: string;
-  size: number | null;
-}
-
-export interface UpdateCheck {
-  current_version: string;
-  latest_version: string;
-  update_available: boolean;
-  version_status: "update_available" | "up_to_date" | "ahead";
-  release_url: string;
-  published_at: string | null;
-  notes: string | null;
-  installer: InstallerAsset | null;
-}
-
 export interface McpStatus {
   running: boolean;
   port: number;
@@ -311,7 +294,6 @@ export const api = {
   settingsGet: () => invoke<{ idle_secs: number; clipboard_secs: number; hotkey: string }>("settings_get"),
   settingsSet: (settings: { idle_secs: number; clipboard_secs: number; hotkey: string }) =>
     invoke("settings_set", { settings }),
-  checkForUpdates: () => invoke<UpdateCheck>("check_for_updates"),
   setHello: (enabled: boolean) => invoke("set_hello_enabled", { enabled }),
   changeMaster: (oldPassword: string, newPassword: string) =>
     invoke("change_master", { oldPassword, newPassword }),
