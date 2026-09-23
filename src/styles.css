@@ -692,7 +692,8 @@ tr:hover td { background: #fafbff; }
   background: #1f2329; color: #fff; padding: 8px 14px; border-radius: 8px; z-index: 30;
 }
 
-html:has(.quick-win), body:has(.quick-win) {
+html:has(.quick-win), body:has(.quick-win),
+html:has(.confirm-win), body:has(.confirm-win) {
   background: transparent;
   overflow: hidden;
 }
@@ -720,3 +721,81 @@ html:has(.quick-win), body:has(.quick-win) {
 .quick-item-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .quick-item-folder { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 .icon { width: 18px; height: 18px; display: block; }
+
+.confirm-win {
+  height: 100vh;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 18px 48px rgba(31, 35, 41, 0.16);
+}
+.confirm-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 10px 0 16px;
+  height: 44px;
+  border-bottom: 1px solid var(--line);
+  user-select: none;
+}
+.confirm-head strong { font-size: 13px; }
+.confirm-body {
+  padding: 20px 20px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+}
+.confirm-title {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+.confirm-title h3 { margin: 0 0 6px; font-size: 16px; }
+.confirm-title .crumb { margin: 0; line-height: 1.55; }
+.confirm-mark {
+  width: 36px;
+  height: 36px;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  background: #fff4e5;
+  color: #c2410c;
+  font-weight: 700;
+}
+.confirm-fields {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #fafbff;
+  overflow: auto;
+  min-height: 0;
+  flex: 1;
+}
+.confirm-field {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+.confirm-field span { color: var(--muted); font-size: 12px; padding-top: 1px; }
+.confirm-field strong {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-shrink: 0;
+}

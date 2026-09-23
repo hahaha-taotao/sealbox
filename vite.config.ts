@@ -12,6 +12,7 @@ export default defineConfig(() => ({
       input: {
         main: "index.html",
         quick: "quick.html",
+        confirm: "confirm.html",
       },
     },
   },

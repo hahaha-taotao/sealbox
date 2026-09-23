@@ -102,8 +102,11 @@ pub fn run() {
             commands::extension_open_folder,
             commands::extension_open_browser,
             commands::window_control,
+            commands::confirm_payload,
+            commands::confirm_respond,
         ])
         .setup(|app| {
+            crate::confirm::set_app(app.handle().clone());
             let handle = app.handle().clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
@@ -143,6 +146,9 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
+                if window.label() == "confirm" {
+                    crate::confirm::on_window_closed();
+                }
                 let _ = window.hide();
             }
             if window.label() == "quick" {

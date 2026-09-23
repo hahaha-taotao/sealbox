@@ -1290,6 +1290,16 @@ pub fn extension_open_browser(app: AppHandle, browser: String) -> Result<String,
 }
 
 #[tauri::command]
+pub fn confirm_payload() -> Option<crate::confirm::ConfirmPayload> {
+    crate::confirm::payload()
+}
+
+#[tauri::command]
+pub fn confirm_respond(app: AppHandle, allow: bool) -> Result<(), String> {
+    crate::confirm::respond(&app, allow)
+}
+
+#[tauri::command]
 pub fn window_control(app: AppHandle, action: String) -> Result<(), String> {
     let win = app.get_webview_window("main").ok_or("no window")?;
     match action.as_str() {

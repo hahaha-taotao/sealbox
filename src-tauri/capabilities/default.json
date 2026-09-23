@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for main and quick-search windows",
-  "windows": ["main", "quick"],
+  "description": "Capability for main, quick-search, and confirm windows",
+  "windows": ["main", "quick", "confirm"],
   "permissions": [
     "core:default",
     "opener:default",

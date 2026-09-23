@@ -863,11 +863,13 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let make_latest = enum_arg(&args, "make_latest", &["true", "false", "legacy"], "legacy")?;
             confirm_github_write(
                 "创建 GitHub Release",
-                &format!(
-                    "仓库 {repository}\n标签 {tag_name}\n草稿 {}\n凭据 {}",
-                    if draft { "是" } else { "否" },
-                    credential_label
-                ),
+                "允许这次 GitHub 写操作？",
+                &[
+                    ("仓库", repository.clone()),
+                    ("标签", tag_name.clone()),
+                    ("草稿", if draft { "是".into() } else { "否".into() }),
+                    ("凭据", credential_label.clone()),
+                ],
             )?;
             let mut request = Map::new();
             request.insert("tag_name".into(), Value::String(tag_name));
@@ -899,7 +901,12 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let labels = optional_csv(&args, "labels")?;
             confirm_github_write(
                 "创建 GitHub Issue",
-                &format!("仓库 {repository}\n标题 {title}\n凭据 {credential_label}"),
+                "允许这次 GitHub 写操作？",
+                &[
+                    ("仓库", repository.clone()),
+                    ("标题", title.clone()),
+                    ("凭据", credential_label.clone()),
+                ],
             )?;
             let mut request = Map::new();
             request.insert("title".into(), Value::String(title));
@@ -922,7 +929,11 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let body = required_text(&args, "body", MAX_RELEASE_BODY_BYTES)?;
             confirm_github_write(
                 "评论 GitHub Issue/PR",
-                &format!("仓库 {repository}#{number}\n凭据 {credential_label}"),
+                "允许这次 GitHub 写操作？",
+                &[
+                    ("仓库", format!("{repository}#{number}")),
+                    ("凭据", credential_label.clone()),
+                ],
             )?;
             post_json(
                 &token,
@@ -946,10 +957,14 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let draft = bool_arg(&args, "draft", true)?;
             confirm_github_write(
                 "创建 GitHub Pull Request",
-                &format!(
-                    "仓库 {repository}\n{head} → {base}\n标题 {title}\n草稿 {}\n凭据 {credential_label}",
-                    if draft { "是" } else { "否" }
-                ),
+                "允许这次 GitHub 写操作？",
+                &[
+                    ("仓库", repository.clone()),
+                    ("分支", format!("{head} → {base}")),
+                    ("标题", title.clone()),
+                    ("草稿", if draft { "是".into() } else { "否".into() }),
+                    ("凭据", credential_label.clone()),
+                ],
             )?;
             let mut request = Map::new();
             request.insert("title".into(), Value::String(title));
@@ -1105,8 +1120,8 @@ fn prepare(session: &Session, name: &str, args: &Value) -> Result<(String, Strin
     Ok((resolved.token, resolved.title))
 }
 
-fn confirm_github_write(title: &str, detail: &str) -> Result<(), String> {
-    if crate::confirm::ask(title, &format!("{detail}\n\n允许这次 GitHub 写操作？")) {
+fn confirm_github_write(title: &str, prompt: &str, fields: &[(&str, String)]) -> Result<(), String> {
+    if crate::confirm::ask(title, prompt, fields) {
         Ok(())
     } else {
         Err("用户拒绝了这次 GitHub 写操作".into())

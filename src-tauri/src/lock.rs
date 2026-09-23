@@ -31,6 +31,7 @@ fn sweep_mcp(mcp: &McpState) {
 /// lock (idle, tray, command, Drop) must drop them even if the caller only
 /// has the session mutex.
 pub fn on_session_locked() {
+    crate::confirm::deny_pending();
     if let Some(mcp) = recover_lock(active_mcp_slot()).as_ref() {
         sweep_mcp(mcp);
     }
@@ -38,6 +39,7 @@ pub fn on_session_locked() {
 
 /// Zeroize DEK, clear an owned clipboard secret, close pairing, wipe HTTP logs.
 pub fn lock_everything(session: &Mutex<Session>, mcp: &McpState) {
+    crate::confirm::deny_pending();
     lock_session(session).lock();
     sweep_mcp(mcp);
 }

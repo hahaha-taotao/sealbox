@@ -247,12 +247,29 @@ fn git_secrets(session: &Session, args: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn confirm_git_write(title: &str, detail: &str) -> Result<(), String> {
-    if crate::confirm::ask(title, &format!("{detail}\n\n允许这次本地 git 写操作？")) {
+fn confirm_git_write(title: &str, prompt: &str, fields: &[(&str, String)]) -> Result<(), String> {
+    if crate::confirm::ask(title, prompt, fields) {
         Ok(())
     } else {
         Err("用户拒绝了这次 git 写操作".into())
     }
+}
+
+fn display_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        return rest.to_string();
+    }
+    if let Some(rest) = raw.strip_prefix("//?/UNC/") {
+        return format!(r"\\{}", rest.replace('/', "\\"));
+    }
+    if let Some(rest) = raw.strip_prefix("//?/") {
+        return rest.replace('/', "\\");
+    }
+    raw.into_owned()
 }
 
 fn list_workspaces(session: &Session) -> Result<String, String> {
@@ -263,7 +280,7 @@ fn list_workspaces(session: &Session) -> Result<String, String> {
         .map(|workspace| {
             json!({
                 "name": workspace.name,
-                "path": workspace.path,
+                "path": display_path(Path::new(&workspace.path)),
                 "has_default_credential": workspace.default_credential_id.is_some(),
             })
         })
@@ -290,7 +307,8 @@ fn register_workspace(session: &Session, args: &Value) -> Result<String, String>
     };
     confirm_git_write(
         "登记 git 工作区",
-        &format!("短名 {name}\n路径 {}", root.display()),
+        "允许把这个本地仓库登记为短名？之后可用短名代替绝对路径。",
+        &[("短名", name.clone()), ("路径", display_path(&root))],
     )?;
     let mut policy = current_policy(session)?;
     if let Some(existing) = policy
@@ -298,19 +316,19 @@ fn register_workspace(session: &Session, args: &Value) -> Result<String, String>
         .iter_mut()
         .find(|workspace| workspace.name == name)
     {
-        existing.path = root.to_string_lossy().into_owned();
+        existing.path = display_path(&root);
         if credential_id.is_some() {
             existing.default_credential_id = credential_id.clone();
         }
     } else {
         policy.workspaces.push(GithubWorkspace {
             name: name.clone(),
-            path: root.to_string_lossy().into_owned(),
+            path: display_path(&root),
             default_credential_id: credential_id,
         });
     }
     save_current_policy(session, &policy)?;
-    Ok(format!("已登记工作区 {name} -> {}", root.display()))
+    Ok(format!("已登记工作区 {name} -> {}", display_path(&root)))
 }
 
 fn status(session: &Session, args: &Value) -> Result<String, String> {
@@ -381,15 +399,18 @@ fn stage(session: &Session, args: &Value) -> Result<String, String> {
     let file = optional_rel_path(args, "file")?;
     confirm_git_write(
         "暂存本地改动",
-        &format!(
-            "仓库 {}\n{}",
-            root.display(),
-            if all {
-                "git add -A".into()
-            } else {
-                format!("git add {}", file.as_deref().unwrap_or("?"))
-            }
-        ),
+        "允许这次本地 git 写操作？",
+        &[
+            ("仓库", display_path(&root)),
+            (
+                "操作",
+                if all {
+                    "git add -A".into()
+                } else {
+                    format!("git add {}", file.as_deref().unwrap_or("?"))
+                },
+            ),
+        ],
     )?;
     if all {
         return git_output(&root, &["add", "-A"], None);
@@ -408,7 +429,11 @@ fn commit(session: &Session, args: &Value) -> Result<String, String> {
         .ok_or_else(|| "缺少提交说明".to_string())?;
     confirm_git_write(
         "创建 git 提交",
-        &format!("仓库 {}\n说明 {message}", root.display()),
+        "允许这次本地 git 写操作？",
+        &[
+            ("仓库", display_path(&root)),
+            ("说明", message.to_string()),
+        ],
     )?;
     git_output(&root, &["commit", "-m", message], None)
 }
@@ -460,16 +485,22 @@ fn push(session: &Session, args: &Value) -> Result<String, String> {
     }
     confirm_git_write(
         "推送到 GitHub",
-        &format!(
-            "仓库 {}\n目标 {target_label}{}\n{}",
-            root.display(),
-            if tags { " + tags" } else { "" },
-            if force_with_lease {
-                "force-with-lease"
-            } else {
-                "普通 push"
-            }
-        ),
+        "允许这次本地 git 写操作？",
+        &[
+            ("仓库", display_path(&root)),
+            (
+                "目标",
+                format!("{target_label}{}", if tags { " + tags" } else { "" }),
+            ),
+            (
+                "方式",
+                if force_with_lease {
+                    "force-with-lease".into()
+                } else {
+                    "普通 push".into()
+                },
+            ),
+        ],
     )?;
     let args_ref: Vec<&str> = cmd.iter().map(String::as_str).collect();
     let output = git_with_token(&root, &args_ref, &token)?;
@@ -492,14 +523,17 @@ fn pull(session: &Session, args: &Value) -> Result<String, String> {
     let token = github_token(session, args)?;
     confirm_git_write(
         "从 GitHub 拉取",
-        &format!(
-            "仓库 {}\n{}",
-            root.display(),
-            branch
-                .as_deref()
-                .map(|value| format!("{remote}/{value}"))
-                .unwrap_or_else(|| format!("{remote} 当前分支"))
-        ),
+        "允许这次本地 git 写操作？",
+        &[
+            ("仓库", display_path(&root)),
+            (
+                "目标",
+                branch
+                    .as_deref()
+                    .map(|value| format!("{remote}/{value}"))
+                    .unwrap_or_else(|| format!("{remote} 当前分支")),
+            ),
+        ],
     )?;
     let mut cmd = vec!["pull".to_string(), "--ff-only".into(), remote];
     if let Some(branch) = branch {
@@ -524,12 +558,16 @@ fn clone_repo(session: &Session, args: &Value) -> Result<String, String> {
     let dir_name = clone_dir_name(name)?;
     let dest = parent.join(&dir_name);
     if dest.exists() {
-        return Err(format!("目标目录已存在：{}", dest.display()));
+        return Err(format!("目标目录已存在：{}", display_path(&dest)));
     }
     let token = github_token(session, args)?;
     confirm_git_write(
         "克隆 GitHub 仓库",
-        &format!("https://github.com/{repository}.git\n到 {}", dest.display()),
+        "允许这次本地 git 写操作？",
+        &[
+            ("来源", format!("https://github.com/{repository}.git")),
+            ("目标", display_path(&dest)),
+        ],
     )?;
     let url = format!("https://github.com/{owner}/{repo}.git");
     git_with_token(&parent, &["clone", &url, &dir_name], &token)?;
@@ -539,14 +577,14 @@ fn clone_repo(session: &Session, args: &Value) -> Result<String, String> {
         policy.workspaces.retain(|item| item.name != name);
         policy.workspaces.push(GithubWorkspace {
             name,
-            path: dest.to_string_lossy().into_owned(),
+            path: display_path(&dest),
             default_credential_id: Some(
                 github_mcp::resolve_github_credential(session, args)?.id,
             ),
         });
         save_current_policy(session, &policy)?;
     }
-    Ok(format!("已克隆到 {}", dest.display()))
+    Ok(format!("已克隆到 {}", display_path(&dest)))
 }
 
 fn clone_repo_name(args: &Value) -> Result<String, String> {
@@ -583,13 +621,13 @@ fn repo_root(session: &Session, args: &Value) -> Result<PathBuf, String> {
 
 fn repo_root_from_path(path: &Path) -> Result<PathBuf, String> {
     if !path.exists() {
-        return Err(format!("路径不存在：{}", path.display()));
+        return Err(format!("路径不存在：{}", display_path(path)));
     }
     let output = git_output(path, &["rev-parse", "--show-toplevel"], None)?;
     let toplevel = PathBuf::from(output.trim());
     let canonical = toplevel
         .canonicalize()
-        .map_err(|_| format!("仓库路径无效：{}", toplevel.display()))?;
+        .map_err(|_| format!("仓库路径无效：{}", display_path(&toplevel)))?;
     if !canonical.join(".git").exists() && !canonical.join(".git").is_file() {
         return Err("该目录不是 git 仓库".into());
     }
@@ -669,7 +707,7 @@ fn existing_dir(args: &Value) -> Result<PathBuf, String> {
     let path = absolute_path(args)?;
     let canonical = path
         .canonicalize()
-        .map_err(|_| format!("路径无效：{}", path.display()))?;
+        .map_err(|_| format!("路径无效：{}", display_path(&path)))?;
     if !canonical.is_dir() {
         return Err("path 必须是已存在的文件夹".into());
     }
@@ -1279,6 +1317,7 @@ mod tests {
         )
         .unwrap();
         assert!(registered.contains("sealbox"), "{registered}");
+        assert!(!registered.contains(r#"\\?\"#), "{registered}");
         let status = call_tool_text(
             &mut session,
             "github_git_status",
@@ -1292,6 +1331,23 @@ mod tests {
             "{status}"
         );
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn display_path_strips_verbatim_prefix() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\E:\project\密码管理器")),
+            r"E:\project\密码管理器"
+        );
+        assert_eq!(
+            display_path(Path::new(r"\\?\UNC\server\share\repo")),
+            r"\\server\share\repo"
+        );
+        assert_eq!(display_path(Path::new(r"E:\project\sealbox")), r"E:\project\sealbox");
+        assert_eq!(
+            display_path(Path::new("//?/E:/project/sealbox")),
+            r"E:\project\sealbox"
+        );
     }
 
     #[test]
