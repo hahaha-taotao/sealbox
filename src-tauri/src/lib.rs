@@ -110,18 +110,27 @@ pub fn run() {
             let hide_app = app.handle().clone();
             crate::confirm::set_hooks(
                 move |payload| {
-                    let _ = show_app.emit_to("confirm", "confirm-open", payload);
-                    if let Some(win) = show_app.get_webview_window("confirm") {
-                        let _ = win.show();
-                        let _ = win.unminimize();
-                        let _ = win.set_always_on_top(true);
-                        let _ = win.set_focus();
-                    }
+                    let payload = payload.clone();
+                    let show_app = show_app.clone();
+                    let shown = show_app.clone();
+                    let _ = show_app.run_on_main_thread(move || {
+                        let _ = shown.emit_to("confirm", "confirm-open", payload);
+                        if let Some(win) = shown.get_webview_window("confirm") {
+                            let _ = win.show();
+                            let _ = win.unminimize();
+                            let _ = win.set_always_on_top(true);
+                            let _ = win.set_focus();
+                        }
+                    });
                 },
                 move || {
-                    if let Some(win) = hide_app.get_webview_window("confirm") {
-                        let _ = win.hide();
-                    }
+                    let hide_app = hide_app.clone();
+                    let hidden = hide_app.clone();
+                    let _ = hide_app.run_on_main_thread(move || {
+                        if let Some(win) = hidden.get_webview_window("confirm") {
+                            let _ = win.hide();
+                        }
+                    });
                 },
             );
             let handle = app.handle().clone();

@@ -336,19 +336,94 @@ fn handle_rpc(session: &Mutex<Session>, mcp: &McpState, req: JsonRpcReq) -> Opti
     Some(out)
 }
 
+fn call_git_tool(
+    session: &Mutex<Session>,
+    name: &str,
+    args: Value,
+) -> Result<String, String> {
+    let context = github_mcp::GithubAuditContext {
+        path: args.get("path").and_then(Value::as_str).map(str::to_string),
+        reference: args
+            .get("branch")
+            .or_else(|| args.get("tag"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        ..Default::default()
+    };
+    let prepared = {
+        let mut s = lock_session(session);
+        crate::git_workspace::prepare_tool(&mut s, name, args)
+    };
+    let text = match prepared {
+        Ok(crate::git_workspace::PreparedGitOp::Immediate(text)) => Ok(text),
+        Ok(crate::git_workspace::PreparedGitOp::Pending {
+            payload,
+            deny,
+            exec,
+        }) => {
+            if crate::confirm::ask_payload(&payload) {
+                let mut s = lock_session(session);
+                if !s.is_unlocked() {
+                    Err("金库已锁定。请先在 Sealbox 窗口解锁，再让我重试。".into())
+                } else {
+                    exec(&mut s)
+                }
+            } else {
+                Err(deny)
+            }
+        }
+        Err(error) => Err(error),
+    };
+    let s = lock_session(session);
+    if let Ok(vault) = s.vault() {
+        let detail = match &text {
+            Ok(_) => format_github_audit_detail(name, "allow", "ok", Some(200), None, "", &context),
+            Err(error) => format_github_audit_detail(
+                name,
+                "deny",
+                if error.contains("拒绝") {
+                    "denied"
+                } else {
+                    "error"
+                },
+                None,
+                None,
+                "",
+                &context,
+            ),
+        };
+        let action = if text.is_ok() {
+            "mcp_github"
+        } else {
+            "mcp_github_denied"
+        };
+        let _ = vault.audit(action, None, &detail);
+    }
+    text
+}
+
 fn call_tool(
     session: &Mutex<Session>,
     mcp: &McpState,
     name: &str,
     args: Value,
 ) -> Result<String, String> {
-    let mut s = lock_session(session);
-    idle_lock_if_needed(&mut s, mcp);
-    if !s.is_unlocked() {
-        return Err("金库已锁定。请先在 Sealbox 窗口解锁，再让我重试。".into());
+    {
+        let mut s = lock_session(session);
+        idle_lock_if_needed(&mut s, mcp);
+        if !s.is_unlocked() {
+            return Err("金库已锁定。请先在 Sealbox 窗口解锁，再让我重试。".into());
+        }
     }
     if github_mcp::is_github_tool(name) {
-        let result = github_mcp::call_tool_detailed(&mut s, name, args);
+        if crate::git_workspace::is_git_tool(name) {
+            return call_git_tool(session, name, args);
+        }
+        let result = {
+            let mut s = lock_session(session);
+            github_mcp::call_tool_detailed(&mut s, name, args)
+        };
+        let s = lock_session(session);
         if let Ok(vault) = s.vault() {
             let detail = match &result {
                 Ok(result) => format_github_audit_detail(
@@ -382,7 +457,11 @@ fn call_tool(
             .map_err(|error| error.message);
     }
     if crate::zoomkey::is_zoomkey_tool(name) {
-        let result = crate::zoomkey::call_tool_detailed(&mut s, name, args);
+        let result = {
+            let mut s = lock_session(session);
+            crate::zoomkey::call_tool_detailed(&mut s, name, args)
+        };
+        let s = lock_session(session);
         if let Ok(vault) = s.vault() {
             let detail = match &result {
                 Ok(result) => format_zoomkey_audit_detail(

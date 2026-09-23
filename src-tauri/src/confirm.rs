@@ -74,6 +74,28 @@ pub fn ask(title: &str, prompt: &str, fields: &[(&str, String)]) -> bool {
     native_ask(title, prompt, fields)
 }
 
+/// Run `prepare` while the session mutex is held, then wait for desktop
+/// confirmation after that mutex has been released.
+pub fn after_prepare<T, E: From<String>>(
+    prepare: impl FnOnce() -> Result<(T, ConfirmPayload), E>,
+) -> Result<T, E> {
+    let (value, payload) = prepare()?;
+    if ask_payload(&payload) {
+        Ok(value)
+    } else {
+        Err(E::from("用户拒绝了这次写操作".into()))
+    }
+}
+
+pub fn ask_payload(payload: &ConfirmPayload) -> bool {
+    match AUTO.with(std::cell::Cell::get) {
+        1 => return true,
+        n if n < 0 => return false,
+        _ => {}
+    }
+    native_ask_payload(payload.clone())
+}
+
 pub fn payload() -> Option<ConfirmPayload> {
     pending().as_ref().map(|item| item.payload.clone())
 }
@@ -102,12 +124,7 @@ pub fn deny_pending() {
 }
 
 fn native_ask(title: &str, prompt: &str, fields: &[(&str, String)]) -> bool {
-    if hooks().is_none() {
-        return false;
-    }
-    let _gate = ASK_GATE.lock().unwrap_or_else(|e| e.into_inner());
-    let (tx, rx) = mpsc::channel();
-    let payload = ConfirmPayload {
+    native_ask_payload(ConfirmPayload {
         title: title.to_string(),
         prompt: prompt.to_string(),
         fields: fields
@@ -117,7 +134,15 @@ fn native_ask(title: &str, prompt: &str, fields: &[(&str, String)]) -> bool {
                 value: value.clone(),
             })
             .collect(),
-    };
+    })
+}
+
+fn native_ask_payload(payload: ConfirmPayload) -> bool {
+    if hooks().is_none() {
+        return false;
+    }
+    let _gate = ASK_GATE.lock().unwrap_or_else(|e| e.into_inner());
+    let (tx, rx) = mpsc::channel();
     *pending() = Some(PendingConfirm {
         payload: payload.clone(),
         tx,
@@ -163,5 +188,19 @@ mod tests {
     fn deny_pending_without_window_hooks() {
         deny_pending();
         assert!(payload().is_none());
+    }
+
+    #[test]
+    fn after_prepare_denies_without_running_work() {
+        let result: Result<i32, String> = with_auto(Some(false), || {
+            after_prepare(|| {
+                Ok((42, ConfirmPayload {
+                    title: "t".into(),
+                    prompt: "m".into(),
+                    fields: Vec::new(),
+                }))
+            })
+        });
+        assert_eq!(result, Err("用户拒绝了这次写操作".to_string()));
     }
 }

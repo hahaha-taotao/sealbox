@@ -209,6 +209,36 @@ pub fn is_git_tool(name: &str) -> bool {
 }
 
 pub fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<String, String> {
+    match prepare_tool(session, name, args)? {
+        PreparedGitOp::Immediate(text) => Ok(text),
+        PreparedGitOp::Pending {
+            payload,
+            deny,
+            exec,
+        } => {
+            if crate::confirm::ask_payload(&payload) {
+                exec(session)
+            } else {
+                Err(deny)
+            }
+        }
+    }
+}
+
+pub enum PreparedGitOp {
+    Immediate(String),
+    Pending {
+        payload: crate::confirm::ConfirmPayload,
+        deny: String,
+        exec: Box<dyn FnOnce(&mut Session) -> Result<String, String> + Send>,
+    },
+}
+
+pub fn prepare_tool(
+    session: &mut Session,
+    name: &str,
+    args: Value,
+) -> Result<PreparedGitOp, String> {
     let definition = tool_definitions()
         .into_iter()
         .find(|definition| definition.get("name").and_then(Value::as_str) == Some(name))
@@ -220,25 +250,46 @@ pub fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<
         return Err("GitHub MCP 能力未启用".into());
     }
     let secrets = git_secrets(session, &args);
-    let result = match name {
-        "github_git_workspace_list" => list_workspaces(session),
-        "github_git_workspace_register" => register_workspace(session, &args),
-        "github_git_status" => status(session, &args),
-        "github_git_diff" => diff(session, &args),
-        "github_git_log" => log(session, &args),
-        "github_git_branches" => branches(session, &args),
-        "github_git_stage" => stage(session, &args),
-        "github_git_commit" => commit(session, &args),
-        "github_git_push" => push(session, &args),
-        "github_git_pull" => pull(session, &args),
-        "github_git_clone" => clone_repo(session, &args),
-        _ => Err("未知 GitHub git 工具".into()),
-    }?;
+    let prepared = match name {
+        "github_git_workspace_list" => PreparedGitOp::Immediate(list_workspaces(session)?),
+        "github_git_workspace_register" => prepare_register_workspace(session, &args)?,
+        "github_git_status" => PreparedGitOp::Immediate(status(session, &args)?),
+        "github_git_diff" => PreparedGitOp::Immediate(diff(session, &args)?),
+        "github_git_log" => PreparedGitOp::Immediate(log(session, &args)?),
+        "github_git_branches" => PreparedGitOp::Immediate(branches(session, &args)?),
+        "github_git_stage" => prepare_stage(session, &args)?,
+        "github_git_commit" => prepare_commit(session, &args)?,
+        "github_git_push" => prepare_push(session, &args)?,
+        "github_git_pull" => prepare_pull(session, &args)?,
+        "github_git_clone" => prepare_clone(session, &args)?,
+        _ => return Err("未知 GitHub git 工具".into()),
+    };
     session.touch();
-    Ok(redact_text(
-        &result,
-        &secrets.iter().map(String::as_str).collect::<Vec<_>>(),
-    ))
+    Ok(redact_prepared(prepared, secrets))
+}
+
+fn redact_prepared(prepared: PreparedGitOp, secrets: Vec<String>) -> PreparedGitOp {
+    match prepared {
+        PreparedGitOp::Immediate(text) => PreparedGitOp::Immediate(redact_text(
+            &text,
+            &secrets.iter().map(String::as_str).collect::<Vec<_>>(),
+        )),
+        PreparedGitOp::Pending {
+            payload,
+            deny,
+            exec,
+        } => PreparedGitOp::Pending {
+            payload,
+            deny,
+            exec: Box::new(move |session| {
+                let text = exec(session)?;
+                Ok(redact_text(
+                    &text,
+                    &secrets.iter().map(String::as_str).collect::<Vec<_>>(),
+                ))
+            }),
+        },
+    }
 }
 
 fn git_secrets(session: &Session, args: &Value) -> Vec<String> {
@@ -247,11 +298,17 @@ fn git_secrets(session: &Session, args: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn confirm_git_write(title: &str, prompt: &str, fields: &[(&str, String)]) -> Result<(), String> {
-    if crate::confirm::ask(title, prompt, fields) {
-        Ok(())
-    } else {
-        Err("用户拒绝了这次 git 写操作".into())
+fn git_confirm_payload(title: &str, prompt: &str, fields: &[(&str, String)]) -> crate::confirm::ConfirmPayload {
+    crate::confirm::ConfirmPayload {
+        title: title.to_string(),
+        prompt: prompt.to_string(),
+        fields: fields
+            .iter()
+            .map(|(label, value)| crate::confirm::ConfirmField {
+                label: (*label).to_string(),
+                value: value.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -292,7 +349,7 @@ fn list_workspaces(session: &Session) -> Result<String, String> {
     .map_err(|e| e.to_string())
 }
 
-fn register_workspace(session: &Session, args: &Value) -> Result<String, String> {
+fn prepare_register_workspace(session: &Session, args: &Value) -> Result<PreparedGitOp, String> {
     let name = github_mcp::normalize_workspace_name(
         args.get("name")
             .and_then(Value::as_str)
@@ -305,30 +362,37 @@ fn register_workspace(session: &Session, args: &Value) -> Result<String, String>
     } else {
         None
     };
-    confirm_git_write(
+    let payload = git_confirm_payload(
         "登记 git 工作区",
         "允许把这个本地仓库登记为短名？之后可用短名代替绝对路径。",
         &[("短名", name.clone()), ("路径", display_path(&root))],
-    )?;
-    let mut policy = current_policy(session)?;
-    if let Some(existing) = policy
-        .workspaces
-        .iter_mut()
-        .find(|workspace| workspace.name == name)
-    {
-        existing.path = display_path(&root);
-        if credential_id.is_some() {
-            existing.default_credential_id = credential_id.clone();
-        }
-    } else {
-        policy.workspaces.push(GithubWorkspace {
-            name: name.clone(),
-            path: display_path(&root),
-            default_credential_id: credential_id,
-        });
-    }
-    save_current_policy(session, &policy)?;
-    Ok(format!("已登记工作区 {name} -> {}", display_path(&root)))
+    );
+    let display = display_path(&root);
+    Ok(PreparedGitOp::Pending {
+        payload,
+        deny: "用户拒绝了这次 git 写操作".into(),
+        exec: Box::new(move |session| {
+            let mut policy = current_policy(session)?;
+            if let Some(existing) = policy
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.name == name)
+            {
+                existing.path = display.clone();
+                if credential_id.is_some() {
+                    existing.default_credential_id = credential_id.clone();
+                }
+            } else {
+                policy.workspaces.push(GithubWorkspace {
+                    name: name.clone(),
+                    path: display.clone(),
+                    default_credential_id: credential_id,
+                });
+            }
+            save_current_policy(session, &policy)?;
+            Ok(format!("已登记工作区 {name} -> {display}"))
+        }),
+    })
 }
 
 fn status(session: &Session, args: &Value) -> Result<String, String> {
@@ -393,11 +457,11 @@ fn branches(session: &Session, args: &Value) -> Result<String, String> {
     Ok(json_text(parse_branches(&raw)))
 }
 
-fn stage(session: &Session, args: &Value) -> Result<String, String> {
+fn prepare_stage(session: &Session, args: &Value) -> Result<PreparedGitOp, String> {
     let root = repo_root(session, args)?;
     let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
     let file = optional_rel_path(args, "file")?;
-    confirm_git_write(
+    let payload = git_confirm_payload(
         "暂存本地改动",
         "允许这次本地 git 写操作？",
         &[
@@ -411,34 +475,45 @@ fn stage(session: &Session, args: &Value) -> Result<String, String> {
                 },
             ),
         ],
-    )?;
-    if all {
-        return git_output(&root, &["add", "-A"], None);
-    }
-    let file = file.ok_or_else(|| "请提供 file，或设 all=true".to_string())?;
-    git_output(&root, &["add", "--", &file], None)
+    );
+    Ok(PreparedGitOp::Pending {
+        payload,
+        deny: "用户拒绝了这次 git 写操作".into(),
+        exec: Box::new(move |_session| {
+            if all {
+                return git_output(&root, &["add", "-A"], None);
+            }
+            let file = file.ok_or_else(|| "请提供 file，或设 all=true".to_string())?;
+            git_output(&root, &["add", "--", &file], None)
+        }),
+    })
 }
 
-fn commit(session: &Session, args: &Value) -> Result<String, String> {
+fn prepare_commit(session: &Session, args: &Value) -> Result<PreparedGitOp, String> {
     let root = repo_root(session, args)?;
     let message = args
         .get("message")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "缺少提交说明".to_string())?;
-    confirm_git_write(
+        .ok_or_else(|| "缺少提交说明".to_string())?
+        .to_string();
+    let payload = git_confirm_payload(
         "创建 git 提交",
         "允许这次本地 git 写操作？",
         &[
             ("仓库", display_path(&root)),
-            ("说明", message.to_string()),
+            ("说明", message.clone()),
         ],
-    )?;
-    git_output(&root, &["commit", "-m", message], None)
+    );
+    Ok(PreparedGitOp::Pending {
+        payload,
+        deny: "用户拒绝了这次 git 写操作".into(),
+        exec: Box::new(move |_session| git_output(&root, &["commit", "-m", &message], None)),
+    })
 }
 
-fn push(session: &Session, args: &Value) -> Result<String, String> {
+fn prepare_push(session: &Session, args: &Value) -> Result<PreparedGitOp, String> {
     let root = repo_root(session, args)?;
     let remote = remote_name(args)?;
     require_github_https_remote(&root, &remote)?;
@@ -483,7 +558,7 @@ fn push(session: &Session, args: &Value) -> Result<String, String> {
         }
         branch = Some(name);
     }
-    confirm_git_write(
+    let payload = git_confirm_payload(
         "推送到 GitHub",
         "允许这次本地 git 写操作？",
         &[
@@ -501,18 +576,24 @@ fn push(session: &Session, args: &Value) -> Result<String, String> {
                 },
             ),
         ],
-    )?;
-    let args_ref: Vec<&str> = cmd.iter().map(String::as_str).collect();
-    let output = git_with_token(&root, &args_ref, &token)?;
-    Ok(classify_push_output(
-        &output,
-        &remote,
-        branch.as_deref(),
-        tag.as_deref(),
-    ))
+    );
+    Ok(PreparedGitOp::Pending {
+        payload,
+        deny: "用户拒绝了这次 git 写操作".into(),
+        exec: Box::new(move |_session| {
+            let args_ref: Vec<&str> = cmd.iter().map(String::as_str).collect();
+            let output = git_with_token(&root, &args_ref, &token)?;
+            Ok(classify_push_output(
+                &output,
+                &remote,
+                branch.as_deref(),
+                tag.as_deref(),
+            ))
+        }),
+    })
 }
 
-fn pull(session: &Session, args: &Value) -> Result<String, String> {
+fn prepare_pull(session: &Session, args: &Value) -> Result<PreparedGitOp, String> {
     let root = repo_root(session, args)?;
     let remote = remote_name(args)?;
     require_github_https_remote(&root, &remote)?;
@@ -521,7 +602,7 @@ fn pull(session: &Session, args: &Value) -> Result<String, String> {
     }
     let branch = requested_branch(args)?;
     let token = github_token(session, args)?;
-    confirm_git_write(
+    let payload = git_confirm_payload(
         "从 GitHub 拉取",
         "允许这次本地 git 写操作？",
         &[
@@ -534,57 +615,77 @@ fn pull(session: &Session, args: &Value) -> Result<String, String> {
                     .unwrap_or_else(|| format!("{remote} 当前分支")),
             ),
         ],
-    )?;
-    let mut cmd = vec!["pull".to_string(), "--ff-only".into(), remote];
-    if let Some(branch) = branch {
-        cmd.push(branch);
-    }
-    let args_ref: Vec<&str> = cmd.iter().map(String::as_str).collect();
-    git_with_token(&root, &args_ref, &token)
+    );
+    Ok(PreparedGitOp::Pending {
+        payload,
+        deny: "用户拒绝了这次 git 写操作".into(),
+        exec: Box::new(move |_session| {
+            let mut cmd = vec!["pull".to_string(), "--ff-only".into(), remote];
+            if let Some(branch) = branch {
+                cmd.push(branch);
+            }
+            let args_ref: Vec<&str> = cmd.iter().map(String::as_str).collect();
+            git_with_token(&root, &args_ref, &token)
+        }),
+    })
 }
 
-fn clone_repo(session: &Session, args: &Value) -> Result<String, String> {
+fn prepare_clone(session: &Session, args: &Value) -> Result<PreparedGitOp, String> {
     let parent = existing_dir(args)?;
     let repository = github_mcp::normalize_repository(&clone_repo_name(args)?)?;
     let mut parts = repository.split('/');
-    let owner = parts.next().unwrap_or_default();
-    let repo = parts.next().unwrap_or_default();
+    let owner = parts.next().unwrap_or_default().to_string();
+    let repo = parts.next().unwrap_or_default().to_string();
     let name = args
         .get("name")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(repo);
-    let dir_name = clone_dir_name(name)?;
+        .unwrap_or(repo.as_str())
+        .to_string();
+    let dir_name = clone_dir_name(&name)?;
     let dest = parent.join(&dir_name);
     if dest.exists() {
         return Err(format!("目标目录已存在：{}", display_path(&dest)));
     }
     let token = github_token(session, args)?;
-    confirm_git_write(
+    let workspace = args
+        .get("workspace")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let credential_id = if workspace.is_some() {
+        Some(github_mcp::resolve_github_credential(session, args)?.id)
+    } else {
+        None
+    };
+    let payload = git_confirm_payload(
         "克隆 GitHub 仓库",
         "允许这次本地 git 写操作？",
         &[
             ("来源", format!("https://github.com/{repository}.git")),
             ("目标", display_path(&dest)),
         ],
-    )?;
-    let url = format!("https://github.com/{owner}/{repo}.git");
-    git_with_token(&parent, &["clone", &url, &dir_name], &token)?;
-    if let Some(workspace) = args.get("workspace").and_then(Value::as_str) {
-        let name = github_mcp::normalize_workspace_name(workspace)?;
-        let mut policy = current_policy(session)?;
-        policy.workspaces.retain(|item| item.name != name);
-        policy.workspaces.push(GithubWorkspace {
-            name,
-            path: display_path(&dest),
-            default_credential_id: Some(
-                github_mcp::resolve_github_credential(session, args)?.id,
-            ),
-        });
-        save_current_policy(session, &policy)?;
-    }
-    Ok(format!("已克隆到 {}", display_path(&dest)))
+    );
+    Ok(PreparedGitOp::Pending {
+        payload,
+        deny: "用户拒绝了这次 git 写操作".into(),
+        exec: Box::new(move |session| {
+            let url = format!("https://github.com/{owner}/{repo}.git");
+            git_with_token(&parent, &["clone", &url, &dir_name], &token)?;
+            if let Some(workspace) = workspace {
+                let name = github_mcp::normalize_workspace_name(&workspace)?;
+                let mut policy = current_policy(session)?;
+                policy.workspaces.retain(|item| item.name != name);
+                policy.workspaces.push(GithubWorkspace {
+                    name,
+                    path: display_path(&dest),
+                    default_credential_id: credential_id,
+                });
+                save_current_policy(session, &policy)?;
+            }
+            Ok(format!("已克隆到 {}", display_path(&dest)))
+        }),
+    })
 }
 
 fn clone_repo_name(args: &Value) -> Result<String, String> {

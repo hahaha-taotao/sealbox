@@ -861,7 +861,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let prerelease = bool_arg(&args, "prerelease", false)?;
             let generate_release_notes = bool_arg(&args, "generate_release_notes", false)?;
             let make_latest = enum_arg(&args, "make_latest", &["true", "false", "legacy"], "legacy")?;
-            confirm_github_write(
+            let payload = github_confirm_payload(
                 "创建 GitHub Release",
                 "允许这次 GitHub 写操作？",
                 &[
@@ -870,7 +870,10 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                     ("草稿", if draft { "是".into() } else { "否".into() }),
                     ("凭据", credential_label.clone()),
                 ],
-            )?;
+            );
+            if !crate::confirm::ask_payload(&payload) {
+                return Err("用户拒绝了这次 GitHub 写操作".into());
+            }
             let mut request = Map::new();
             request.insert("tag_name".into(), Value::String(tag_name));
             if let Some(value) = target_commitish {
@@ -899,7 +902,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let title = required_text(&args, "title", 256)?;
             let body = optional_release_body(&args)?;
             let labels = optional_csv(&args, "labels")?;
-            confirm_github_write(
+            let payload = github_confirm_payload(
                 "创建 GitHub Issue",
                 "允许这次 GitHub 写操作？",
                 &[
@@ -907,7 +910,10 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                     ("标题", title.clone()),
                     ("凭据", credential_label.clone()),
                 ],
-            )?;
+            );
+            if !crate::confirm::ask_payload(&payload) {
+                return Err("用户拒绝了这次 GitHub 写操作".into());
+            }
             let mut request = Map::new();
             request.insert("title".into(), Value::String(title));
             if let Some(value) = body {
@@ -927,14 +933,17 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let repository = repository_args(&args)?;
             let number = issue_number(&args)?;
             let body = required_text(&args, "body", MAX_RELEASE_BODY_BYTES)?;
-            confirm_github_write(
+            let payload = github_confirm_payload(
                 "评论 GitHub Issue/PR",
                 "允许这次 GitHub 写操作？",
                 &[
                     ("仓库", format!("{repository}#{number}")),
                     ("凭据", credential_label.clone()),
                 ],
-            )?;
+            );
+            if !crate::confirm::ask_payload(&payload) {
+                return Err("用户拒绝了这次 GitHub 写操作".into());
+            }
             post_json(
                 &token,
                 &format!("/repos/{repository}/issues/{number}/comments"),
@@ -955,7 +964,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let base = required_text(&args, "base", 200)?;
             let body = optional_release_body(&args)?;
             let draft = bool_arg(&args, "draft", true)?;
-            confirm_github_write(
+            let payload = github_confirm_payload(
                 "创建 GitHub Pull Request",
                 "允许这次 GitHub 写操作？",
                 &[
@@ -965,7 +974,10 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                     ("草稿", if draft { "是".into() } else { "否".into() }),
                     ("凭据", credential_label.clone()),
                 ],
-            )?;
+            );
+            if !crate::confirm::ask_payload(&payload) {
+                return Err("用户拒绝了这次 GitHub 写操作".into());
+            }
             let mut request = Map::new();
             request.insert("title".into(), Value::String(title));
             request.insert("head".into(), Value::String(head));
@@ -1120,11 +1132,21 @@ fn prepare(session: &Session, name: &str, args: &Value) -> Result<(String, Strin
     Ok((resolved.token, resolved.title))
 }
 
-fn confirm_github_write(title: &str, prompt: &str, fields: &[(&str, String)]) -> Result<(), String> {
-    if crate::confirm::ask(title, prompt, fields) {
-        Ok(())
-    } else {
-        Err("用户拒绝了这次 GitHub 写操作".into())
+fn github_confirm_payload(
+    title: &str,
+    prompt: &str,
+    fields: &[(&str, String)],
+) -> crate::confirm::ConfirmPayload {
+    crate::confirm::ConfirmPayload {
+        title: title.to_string(),
+        prompt: prompt.to_string(),
+        fields: fields
+            .iter()
+            .map(|(label, value)| crate::confirm::ConfirmField {
+                label: (*label).to_string(),
+                value: value.clone(),
+            })
+            .collect(),
     }
 }
 
