@@ -493,13 +493,23 @@ fn schema(properties: &[(&str, Value)], required: &[&str]) -> Value {
     })
 }
 
+pub(crate) fn annotations(read_only: bool, destructive: bool) -> Value {
+    json!({
+        "readOnlyHint": read_only,
+        "destructiveHint": destructive,
+        "idempotentHint": read_only,
+        "openWorldHint": true
+    })
+}
+
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
     json!({
         "name": name,
         "description": description,
         "inputSchema": input_schema,
         "readOnly": true,
-        "risk": "low"
+        "risk": "low",
+        "annotations": annotations(true, false)
     })
 }
 
@@ -509,7 +519,8 @@ fn write_tool(name: &str, description: &str, input_schema: Value) -> Value {
         "description": description,
         "inputSchema": input_schema,
         "readOnly": false,
-        "risk": "high"
+        "risk": "high",
+        "annotations": annotations(false, true)
     })
 }
 
@@ -1857,6 +1868,8 @@ mod tests {
             .expect("release tool must be registered");
         assert_eq!(definition["readOnly"], false);
         assert_eq!(definition["risk"], "high");
+        assert_eq!(definition["annotations"]["readOnlyHint"], false);
+        assert_eq!(definition["annotations"]["destructiveHint"], true);
         assert_eq!(definition["inputSchema"]["additionalProperties"], false);
         assert!(definition["inputSchema"]["required"]
             .as_array()
@@ -1912,6 +1925,8 @@ mod tests {
                 .expect("tool must be registered");
             assert_eq!(definition["readOnly"], true);
             assert_eq!(definition["risk"], "low");
+            assert_eq!(definition["annotations"]["readOnlyHint"], true);
+            assert_eq!(definition["annotations"]["destructiveHint"], false);
             assert_eq!(definition["inputSchema"]["additionalProperties"], false);
             assert!(is_github_api_tool(name));
             assert!(is_github_tool(name));

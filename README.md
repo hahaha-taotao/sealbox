@@ -4,7 +4,7 @@
 
 A local credential vault for Windows. Unlock with a master password (optional Windows Hello). Website logins, API tokens, SSH keys, mailboxes, servers, and databases stay encrypted on disk. Copied secrets are cleared from the clipboard on a timer. Encrypted `.svbak` backups can be exported and imported. An optional localhost MCP lets Cursor / Claude Code use credentials without seeing plaintext. A Chrome / Edge extension can fill or save website logins.
 
-当前版本 Current version: **v0.1.6** (`0.1.6`)
+当前版本 Current version: **v0.1.7** (`0.1.7`)
 
 ## 在线更新 Online updates
 
@@ -30,7 +30,7 @@ A local credential vault for Windows. Unlock with a master password (optional Wi
 
 ## 安装 Install
 
-Windows x64 使用 NSIS 安装包 `Sealbox_0.1.6_x64-setup.exe`。向导会让你选择：
+Windows x64 使用 NSIS 安装包 `Sealbox_0.1.7_x64-setup.exe`。向导会让你选择：
 
 1. 安装范围：当前用户，或所有用户（后者需要管理员权限）
 2. **安装盘符与目录**，例如 `D:\Sealbox`；默认在当前用户下是 `%LOCALAPPDATA%\Sealbox`，在所有用户下是 `C:\Program Files\Sealbox`
@@ -83,12 +83,12 @@ npm run tauri build
 
 ## 发布 Release
 
-发布只接受形如 `v0.1.6` 的 Git tag。`.github/workflows/release.yml` 在 Windows runner 上依次执行 `npm ci`、版本一致性校验、Rust 测试、前端构建和扩展测试，全部通过后由 `tauri-apps/tauri-action` 构建并发布 NSIS 安装包、`latest.json` 和对应的 `.sig` updater 签名文件。
+发布只接受形如 `v0.1.7` 的 Git tag。`.github/workflows/release.yml` 在 Windows runner 上依次执行 `npm ci`、版本一致性校验、Rust 测试、前端构建和扩展测试，全部通过后由 `tauri-apps/tauri-action` 构建并发布 NSIS 安装包、`latest.json` 和对应的 `.sig` updater 签名文件。
 
 版本号必须同时匹配以下文件：`package.json`、`package-lock.json`（根版本和 `packages[""].version`）、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json`、`extension/manifest.json`。本地可在打 tag 前运行：
 
 ```bash
-node scripts/check-version.mjs v0.1.6
+node scripts/check-version.mjs v0.1.7
 ```
 
 GitHub Actions 只从 Secrets 注入签名材料，不会把私钥写入仓库或工作区。请在仓库 Settings → Secrets and variables → Actions 中配置：
@@ -125,11 +125,11 @@ On first launch, set a master password (at least 10 characters). Closing the win
 - `github_list_issues` / `github_list_pull_requests` / `github_get_pull_request` — Issue / PR，含 head/base、draft、mergeable、assignees
 - `github_list_workflow_runs` — 轮询 Actions 状态
 - `github_git_workspace_list` / `github_git_workspace_register` — 把本机仓库登记成短名，之后传 `workspace="sealbox"`
-- `github_git_status` / `github_git_diff` / `github_git_log` / `github_git_branches` — 本地只读 git
-- `github_git_stage` / `github_git_commit` / `github_git_push` / `github_git_pull` / `github_git_clone` — 日常写入；push 可指定 branch、tags、force-with-lease，并区分「已推送 / 远端已是最新」
+- `github_git_status` / `github_git_diff` / `github_git_log` / `github_git_branches` — 本地只读 git，返回 JSON（含 branch、commits），并进入 MCP `structuredContent`
+- `github_git_stage` / `github_git_commit` / `github_git_push` / `github_git_pull` / `github_git_clone` — 日常写入；push 可指定 `remote`（默认 origin）、`branch`、`tag`（只推该标签）、`tags`、`force_with_lease`，并区分「已推送 / 远端已是最新」
 - `github_create_issue` / `github_create_issue_comment` / `github_create_pull_request` / `github_create_release` — GitHub 写操作，需单独启用 API 写入，且每次弹出桌面确认
 
-GitHub MCP 默认停用。启用后开放只读 API 和 `github_git_*`。凭据可传标题（`credential="agentos"`），也可省略后使用 MCP 页默认 Token；金库里只有一条 GitHub Token 时自动选用。仓库推荐 `repo="owner/repo"`。git 可先登记工作区短名，不必每次传绝对路径。GitHub API 写入由 `api_write_enabled` 控制；打开后会出现 Issue / 评论 / Draft PR / Release，但每一次仍要桌面确认。侧栏助手只调用只读低风险工具。
+GitHub MCP 默认停用。启用后开放只读 API 和 `github_git_*`。凭据可传标题（`credential="agentos"`），也可省略后使用 MCP 页默认 Token；金库里只有一条 GitHub Token 时自动选用。仓库推荐 `repo="owner/repo"`。git 可先登记工作区短名，不必每次传绝对路径。`tools/list` 带 MCP 标准 `annotations.readOnlyHint` / `destructiveHint`。GitHub API 写入由 `api_write_enabled` 控制；打开后会出现 Issue / 评论 / Draft PR / Release，但每一次仍要桌面确认。侧栏助手只调用只读低风险工具。
 
 停用时这些工具都不会出现在 `tools/list`，直接调用也会被拒绝。模型收到的是结构化字段或截断后的 git 输出，不包含 Token、请求头、Release body 或完整远端响应。金库锁定时工具会失败。后续接口规划见 [`docs/superpowers/specs/2026-09-20-github-mcp-roadmap.md`](docs/superpowers/specs/2026-09-20-github-mcp-roadmap.md)。MCP Token 可在页面轮换。
 

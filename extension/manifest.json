@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Sealbox 印盒",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "按当前网址从本地 Sealbox 填充或登记网站密码。密钥不离开本机。",
   "action": {
     "default_title": "Sealbox",

@@ -156,7 +156,8 @@ fn tool(name: &str, description: &str, input_schema: Value) -> Value {
         "description": description,
         "inputSchema": input_schema,
         "readOnly": true,
-        "risk": "low"
+        "risk": "low",
+        "annotations": crate::github_mcp::annotations(true, false)
     })
 }
 
@@ -1234,6 +1235,8 @@ mod tests {
         for definition in &definitions {
             assert_eq!(definition["readOnly"], true);
             assert_eq!(definition["risk"], "low");
+            assert_eq!(definition["annotations"]["readOnlyHint"], true);
+            assert_eq!(definition["annotations"]["destructiveHint"], false);
             assert_eq!(definition["inputSchema"]["additionalProperties"], false);
             assert!(definition["name"]
                 .as_str()

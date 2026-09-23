@@ -151,15 +151,17 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "github_git_push",
-            "推送到 origin。可指定 branch、tags=true 推标签、force_with_lease=true（先 ls-remote 再 --force-with-lease）。发布、同步远端时调用。返回是否真的推上去了。每次弹出桌面确认。",
+            "推送到 GitHub 远程。默认 remote=origin。可指定 branch、tag（只推该标签）、tags=true（连同所有标签）、force_with_lease=true（先 ls-remote 再 --force-with-lease）。发布、同步远端时调用。返回 pushed / up_to_date。每次弹出桌面确认。",
             schema(
                 &[
                     ("workspace", workspace_prop()),
                     ("path", path_prop()),
                     ("credential", credential_prop()),
                     ("credential_id", credential_id_prop()),
+                    ("remote", json!({"type":"string","minLength":1,"maxLength":64,"description":"远程名，默认 origin。必须是 https://github.com"})),
                     ("branch", string_schema(1, 200)),
-                    ("tags", json!({"type":"boolean","default":false,"description":"同时推送标签"})),
+                    ("tag", json!({"type":"string","minLength":1,"maxLength":200,"description":"只推这个标签，例如 v0.1.7。与 branch / tags=true 互斥"})),
+                    ("tags", json!({"type":"boolean","default":false,"description":"同时推送全部标签"})),
                     ("force_with_lease", json!({"type":"boolean","default":false})),
                 ],
                 &[],
@@ -168,13 +170,14 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "github_git_pull",
-            "从 origin 快进拉取当前分支。工作区有未提交改动时拒绝。无 rebase、无 force。同步远端更新时调用。每次弹出桌面确认。",
+            "从 GitHub 远程快进拉取。默认 remote=origin、当前分支。工作区有未提交改动时拒绝。无 rebase、无 force。同步远端更新时调用。每次弹出桌面确认。",
             schema(
                 &[
                     ("workspace", workspace_prop()),
                     ("path", path_prop()),
                     ("credential", credential_prop()),
                     ("credential_id", credential_id_prop()),
+                    ("remote", json!({"type":"string","minLength":1,"maxLength":64,"description":"远程名，默认 origin。必须是 https://github.com"})),
                     ("branch", string_schema(1, 200)),
                 ],
                 &[],
@@ -312,7 +315,8 @@ fn register_workspace(session: &Session, args: &Value) -> Result<String, String>
 
 fn status(session: &Session, args: &Value) -> Result<String, String> {
     let root = repo_root(session, args)?;
-    git_output(&root, &["status", "--porcelain=v1", "-b"], None)
+    let raw = git_output(&root, &["status", "--porcelain=v1", "-b"], None)?;
+    Ok(json_text(parse_status(&raw)))
 }
 
 fn diff(session: &Session, args: &Value) -> Result<String, String> {
@@ -327,13 +331,17 @@ fn diff(session: &Session, args: &Value) -> Result<String, String> {
         cmd.push("--stat");
     }
     let file = optional_rel_path(args, "file")?;
-    let owned;
-    if let Some(rel) = file {
-        owned = rel;
+    if let Some(rel) = file.as_deref() {
         cmd.push("--");
-        cmd.push(&owned);
+        cmd.push(rel);
     }
-    git_output(&root, &cmd, None)
+    let raw = git_output(&root, &cmd, None)?;
+    Ok(json_text(json!({
+        "staged": staged,
+        "stat_only": stat_only,
+        "file": file,
+        "output": raw,
+    })))
 }
 
 fn log(session: &Session, args: &Value) -> Result<String, String> {
@@ -344,16 +352,27 @@ fn log(session: &Session, args: &Value) -> Result<String, String> {
         .unwrap_or(DEFAULT_LOG)
         .clamp(1, MAX_LOG);
     let n = format!("-{limit}");
-    git_output(
+    let raw = git_output(
         &root,
-        &["log", "--pretty=format:%h %ad %an %s", "--date=short", &n],
+        &[
+            "log",
+            "--pretty=format:%h%x09%ad%x09%an%x09%s",
+            "--date=short",
+            &n,
+        ],
         None,
-    )
+    )?;
+    let commits = parse_log(&raw);
+    Ok(json_text(json!({
+        "count": commits.len(),
+        "commits": commits,
+    })))
 }
 
 fn branches(session: &Session, args: &Value) -> Result<String, String> {
     let root = repo_root(session, args)?;
-    git_output(&root, &["branch", "-vv"], None)
+    let raw = git_output(&root, &["branch", "-vv"], None)?;
+    Ok(json_text(parse_branches(&raw)))
 }
 
 fn stage(session: &Session, args: &Value) -> Result<String, String> {
@@ -396,21 +415,53 @@ fn commit(session: &Session, args: &Value) -> Result<String, String> {
 
 fn push(session: &Session, args: &Value) -> Result<String, String> {
     let root = repo_root(session, args)?;
-    require_github_https_origin(&root)?;
-    let branch = match requested_branch(args)? {
-        Some(name) => name,
-        None => current_branch(&root)?,
-    };
+    let remote = remote_name(args)?;
+    require_github_https_remote(&root, &remote)?;
+    let tag = requested_tag(args)?;
     let tags = args.get("tags").and_then(Value::as_bool).unwrap_or(false);
+    if tag.is_some() && (tags || args.get("branch").is_some()) {
+        return Err("tag 与 branch / tags=true 不能同时使用。只推某个标签时只传 tag。".into());
+    }
     let force_with_lease = args
         .get("force_with_lease")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    if force_with_lease && tag.is_some() {
+        return Err("只推标签时不能使用 force_with_lease".into());
+    }
     let token = github_token(session, args)?;
+    let mut cmd = vec!["push".to_string(), remote.clone()];
+    let branch;
+    let target_label;
+    if let Some(tag_name) = tag.as_ref() {
+        branch = None;
+        target_label = format!("refs/tags/{tag_name}");
+        cmd.push(format!("refs/tags/{tag_name}"));
+    } else {
+        let name = match requested_branch(args)? {
+            Some(name) => name,
+            None => current_branch(&root)?,
+        };
+        target_label = format!("{remote}/{name}");
+        cmd.push("-u".into());
+        cmd.push(name.clone());
+        if tags {
+            cmd.push("--tags".into());
+        }
+        if force_with_lease {
+            let before = ls_remote_sha(&root, &token, &remote, &name)?;
+            if before.is_empty() {
+                cmd.push(format!("--force-with-lease=refs/heads/{name}:"));
+            } else {
+                cmd.push(format!("--force-with-lease=refs/heads/{name}:{before}"));
+            }
+        }
+        branch = Some(name);
+    }
     confirm_git_write(
         "推送到 GitHub",
         &format!(
-            "仓库 {}\n目标 origin/{branch}{}\n{}",
+            "仓库 {}\n目标 {target_label}{}\n{}",
             root.display(),
             if tags { " + tags" } else { "" },
             if force_with_lease {
@@ -420,30 +471,20 @@ fn push(session: &Session, args: &Value) -> Result<String, String> {
             }
         ),
     )?;
-    let before = if force_with_lease {
-        Some(ls_remote_sha(&root, &token, &branch)?)
-    } else {
-        None
-    };
-    let mut cmd = vec!["push".to_string(), "-u".into(), "origin".into(), branch.clone()];
-    if tags {
-        cmd.push("--tags".into());
-    }
-    if force_with_lease {
-        if let Some(sha) = before.as_deref().filter(|value| !value.is_empty()) {
-            cmd.push(format!("--force-with-lease=refs/heads/{branch}:{sha}"));
-        } else {
-            cmd.push(format!("--force-with-lease=refs/heads/{branch}:"));
-        }
-    }
     let args_ref: Vec<&str> = cmd.iter().map(String::as_str).collect();
     let output = git_with_token(&root, &args_ref, &token)?;
-    Ok(classify_push_output(&output, &branch))
+    Ok(classify_push_output(
+        &output,
+        &remote,
+        branch.as_deref(),
+        tag.as_deref(),
+    ))
 }
 
 fn pull(session: &Session, args: &Value) -> Result<String, String> {
     let root = repo_root(session, args)?;
-    require_github_https_origin(&root)?;
+    let remote = remote_name(args)?;
+    require_github_https_remote(&root, &remote)?;
     if working_tree_dirty(&root)? {
         return Err("工作区有未提交改动，已拒绝 pull".into());
     }
@@ -456,17 +497,16 @@ fn pull(session: &Session, args: &Value) -> Result<String, String> {
             root.display(),
             branch
                 .as_deref()
-                .map(|value| format!("origin/{value}"))
-                .unwrap_or_else(|| "origin 当前分支".into())
+                .map(|value| format!("{remote}/{value}"))
+                .unwrap_or_else(|| format!("{remote} 当前分支"))
         ),
     )?;
-    let mut cmd = vec!["pull", "--ff-only", "origin"];
-    let owned;
+    let mut cmd = vec!["pull".to_string(), "--ff-only".into(), remote];
     if let Some(branch) = branch {
-        owned = branch;
-        cmd.push(&owned);
+        cmd.push(branch);
     }
-    git_with_token(&root, &cmd, &token)
+    let args_ref: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    git_with_token(&root, &args_ref, &token)
 }
 
 fn clone_repo(session: &Session, args: &Value) -> Result<String, String> {
@@ -581,25 +621,12 @@ fn current_branch(root: &Path) -> Result<String, String> {
 }
 
 fn validate_branch(raw: &str) -> Result<String, String> {
-    let branch = raw.trim();
-    if branch.is_empty()
-        || branch == "HEAD"
-        || branch.starts_with("refs/")
-        || branch.chars().count() > 200
-        || branch.contains("..")
-        || branch.chars().any(char::is_control)
-        || branch
-            .split('/')
-            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
-    {
-        return Err("branch 格式不合法".into());
-    }
-    Ok(branch.to_string())
+    validate_ref_name(raw, "branch")
 }
 
-fn ls_remote_sha(root: &Path, token: &str, branch: &str) -> Result<String, String> {
+fn ls_remote_sha(root: &Path, token: &str, remote: &str, branch: &str) -> Result<String, String> {
     let spec = format!("refs/heads/{branch}");
-    let output = git_with_token(root, &["ls-remote", "origin", &spec], token)?;
+    let output = git_with_token(root, &["ls-remote", remote, &spec], token)?;
     let sha = output
         .lines()
         .find_map(|line| {
@@ -616,7 +643,7 @@ fn ls_remote_sha(root: &Path, token: &str, branch: &str) -> Result<String, Strin
     Ok(sha)
 }
 
-fn classify_push_output(output: &str, branch: &str) -> String {
+fn classify_push_output(output: &str, remote: &str, branch: Option<&str>, tag: Option<&str>) -> String {
     let lower = output.to_ascii_lowercase();
     let up_to_date = lower.contains("everything up-to-date")
         || lower.contains("already up to date")
@@ -627,14 +654,15 @@ fn classify_push_output(output: &str, branch: &str) -> String {
             || lower.contains("[new branch]")
             || lower.contains("[new tag]")
             || lower.contains("forced update"));
-    serde_json::to_string_pretty(&json!({
+    json_text(json!({
         "ok": true,
+        "remote": remote,
         "branch": branch,
+        "tag": tag,
         "up_to_date": up_to_date,
         "pushed": pushed || (!up_to_date && !output.trim().is_empty()),
         "output": output,
     }))
-    .unwrap_or_else(|_| output.to_string())
 }
 
 fn existing_dir(args: &Value) -> Result<PathBuf, String> {
@@ -705,7 +733,11 @@ fn working_tree_dirty(root: &Path) -> Result<bool, String> {
 }
 
 fn require_github_https_origin(root: &Path) -> Result<(), String> {
-    let url = git_output(root, &["remote", "get-url", "origin"], None)?;
+    require_github_https_remote(root, "origin")
+}
+
+fn require_github_https_remote(root: &Path, remote: &str) -> Result<(), String> {
+    let url = git_output(root, &["remote", "get-url", remote], None)?;
     let url = url.trim();
     if url.starts_with("git@") || url.starts_with("ssh://") {
         return Err("只允许 https://github.com 远程，已拒绝 SSH".into());
@@ -715,6 +747,135 @@ fn require_github_https_origin(root: &Path) -> Result<(), String> {
         return Err("只允许 https://github.com 远程".into());
     }
     Ok(())
+}
+
+fn remote_name(args: &Value) -> Result<String, String> {
+    let Some(raw) = args.get("remote").and_then(Value::as_str) else {
+        return Ok("origin".into());
+    };
+    let name = raw.trim();
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        || name.contains("..")
+    {
+        return Err("remote 只能是字母、数字、点、下划线或连字符，默认 origin".into());
+    }
+    Ok(name.to_string())
+}
+
+fn requested_tag(args: &Value) -> Result<Option<String>, String> {
+    let Some(raw) = args.get("tag").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    Ok(Some(validate_ref_name(raw, "tag")?))
+}
+
+fn validate_ref_name(raw: &str, label: &str) -> Result<String, String> {
+    let value = raw.trim();
+    if value.is_empty()
+        || value == "HEAD"
+        || value.starts_with("refs/")
+        || value.chars().count() > 200
+        || value.contains("..")
+        || value.chars().any(char::is_control)
+        || value
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(format!("{label} 格式不合法"));
+    }
+    Ok(value.to_string())
+}
+
+fn json_text(value: Value) -> String {
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+}
+
+fn parse_status(raw: &str) -> Value {
+    let mut branch = None;
+    let mut ahead: Option<u64> = None;
+    let mut behind: Option<u64> = None;
+    let mut files = Vec::new();
+    for line in raw.lines() {
+        if let Some(rest) = line.strip_prefix("## ") {
+            let (head, extra) = rest.split_once(" [").unwrap_or((rest, ""));
+            if let Some((local, upstream)) = head.split_once("...") {
+                branch = Some(local.trim().to_string());
+                let _ = upstream;
+            } else {
+                branch = Some(head.trim().to_string());
+            }
+            if extra.contains("ahead ") {
+                ahead = extra
+                    .split("ahead ")
+                    .nth(1)
+                    .and_then(|part| part.chars().take_while(|ch| ch.is_ascii_digit()).collect::<String>().parse().ok());
+            }
+            if extra.contains("behind ") {
+                behind = extra
+                    .split("behind ")
+                    .nth(1)
+                    .and_then(|part| part.chars().take_while(|ch| ch.is_ascii_digit()).collect::<String>().parse().ok());
+            }
+            continue;
+        }
+        if line.len() < 3 {
+            continue;
+        }
+        let index = line.chars().next().unwrap_or(' ');
+        let worktree = line.chars().nth(1).unwrap_or(' ');
+        let path = line[3..].to_string();
+        files.push(json!({
+            "index": index.to_string(),
+            "worktree": worktree.to_string(),
+            "path": path,
+        }));
+    }
+    json!({
+        "branch": branch,
+        "ahead": ahead,
+        "behind": behind,
+        "dirty": !files.is_empty(),
+        "files": files,
+        "output": raw,
+    })
+}
+
+fn parse_log(raw: &str) -> Vec<Value> {
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| {
+            let mut parts = line.splitn(4, '\t');
+            Some(json!({
+                "sha": parts.next()?,
+                "date": parts.next().unwrap_or(""),
+                "author": parts.next().unwrap_or(""),
+                "subject": parts.next().unwrap_or(""),
+            }))
+        })
+        .collect()
+}
+
+fn parse_branches(raw: &str) -> Value {
+    let items: Vec<Value> = raw
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let current = line.starts_with('*');
+            json!({
+                "current": current,
+                "line": line.trim(),
+            })
+        })
+        .collect();
+    json!({
+        "count": items.len(),
+        "branches": items,
+        "output": raw,
+    })
 }
 
 fn github_token(session: &Session, args: &Value) -> Result<Zeroizing<String>, String> {
@@ -881,7 +1042,8 @@ fn tool(name: &str, description: &str, input_schema: Value, read_only: bool) -> 
         "description": description,
         "inputSchema": input_schema,
         "readOnly": read_only,
-        "risk": if read_only { "low" } else { "high" }
+        "risk": if read_only { "low" } else { "high" },
+        "annotations": github_mcp::annotations(read_only, !read_only)
     })
 }
 
@@ -1034,8 +1196,10 @@ mod tests {
             json!({ "path": path }),
         )
         .unwrap();
+        let status_json: Value = serde_json::from_str(&status).unwrap();
+        let branch = status_json["branch"].as_str().unwrap_or_default();
         assert!(
-            status.contains("master") || status.contains("main") || status.contains("##"),
+            branch.contains("master") || branch.contains("main") || status.contains("master"),
             "{status}"
         );
         let log = call_tool_text(
@@ -1044,7 +1208,11 @@ mod tests {
             json!({ "path": path, "limit": 5 }),
         )
         .unwrap();
-        assert!(log.contains("init"), "{log}");
+        let log_json: Value = serde_json::from_str(&log).unwrap();
+        assert!(
+            log.contains("init") || log_json["commits"][0]["subject"] == "init",
+            "{log}"
+        );
         let _ = fs::remove_dir_all(&repo);
     }
 
@@ -1088,6 +1256,8 @@ mod tests {
                 .unwrap();
             assert_eq!(definition["readOnly"], false);
             assert_eq!(definition["risk"], "high");
+            assert_eq!(definition["annotations"]["readOnlyHint"], false);
+            assert_eq!(definition["annotations"]["destructiveHint"], true);
         }
         assert!(!tool_definitions()
             .iter()
@@ -1115,8 +1285,10 @@ mod tests {
             json!({ "workspace": "sealbox" }),
         )
         .unwrap();
+        let status_json: Value = serde_json::from_str(&status).unwrap();
+        let branch = status_json["branch"].as_str().unwrap_or_default();
         assert!(
-            status.contains("master") || status.contains("main") || status.contains("##"),
+            branch.contains("master") || branch.contains("main") || status.contains("master"),
             "{status}"
         );
         let _ = fs::remove_dir_all(&repo);
@@ -1124,10 +1296,47 @@ mod tests {
 
     #[test]
     fn classify_push_distinguishes_up_to_date() {
-        let up_to_date = classify_push_output("Everything up-to-date", "main");
+        let up_to_date = classify_push_output("Everything up-to-date", "origin", Some("main"), None);
         assert!(up_to_date.contains("\"up_to_date\": true"), "{up_to_date}");
-        let pushed = classify_push_output("   abc1234..def5678  HEAD -> main", "main");
+        let pushed = classify_push_output(
+            "   abc1234..def5678  HEAD -> main",
+            "origin",
+            Some("main"),
+            None,
+        );
         assert!(pushed.contains("\"pushed\": true"), "{pushed}");
+        let tag_only = classify_push_output(
+            " * [new tag]         v0.1.7 -> v0.1.7",
+            "origin",
+            None,
+            Some("v0.1.7"),
+        );
+        assert!(tag_only.contains("\"tag\": \"v0.1.7\""), "{tag_only}");
+        assert!(tag_only.contains("\"pushed\": true"), "{tag_only}");
+    }
+
+    #[test]
+    fn push_rejects_tag_combined_with_branch() {
+        let repo = temp_git_repo();
+        let mut session = enabled_session();
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["remote", "add", "origin", "https://github.com/octocat/hello.git"])
+            .status()
+            .unwrap();
+        let err = call_tool_text(
+            &mut session,
+            "github_git_push",
+            json!({
+                "path": repo.to_string_lossy(),
+                "tag": "v0.1.7",
+                "branch": "master"
+            }),
+        )
+        .unwrap_err();
+        assert!(err.contains("互斥") || err.contains("不能同时"), "{err}");
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]

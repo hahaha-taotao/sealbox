@@ -735,6 +735,18 @@ mod tests {
             .filter(|name| name.starts_with("github_"))
             .collect::<Vec<_>>();
         assert_eq!(names.len(), 24);
+        let listed_tools = listed["tools"].as_array().unwrap();
+        let status = listed_tools
+            .iter()
+            .find(|tool| tool["name"] == "github_git_status")
+            .unwrap();
+        assert_eq!(status["annotations"]["readOnlyHint"], true);
+        let push = listed_tools
+            .iter()
+            .find(|tool| tool["name"] == "github_git_push")
+            .unwrap();
+        assert_eq!(push["annotations"]["readOnlyHint"], false);
+        assert_eq!(push["annotations"]["destructiveHint"], true);
         assert!(names.contains(&"github_list_credentials"));
         assert!(names.contains(&"github_get_file"));
         assert!(names.contains(&"github_git_status"));

@@ -583,14 +583,21 @@ fn safe_tool_definitions(value: &Value) -> Vec<McpToolDefinition> {
         .filter_map(|tool| {
             let name = tool.get("name").and_then(Value::as_str)?;
             let read_only = tool
-                .get("readOnly")
+                .get("annotations")
+                .and_then(|value| value.get("readOnlyHint"))
+                .and_then(Value::as_bool)
+                .or_else(|| tool.get("readOnly").and_then(Value::as_bool))
+                .unwrap_or(false);
+            let destructive = tool
+                .get("annotations")
+                .and_then(|value| value.get("destructiveHint"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let risk = tool
                 .get("risk")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            if !read_only || risk != "low" || !assistant_tool_allowed(name) {
+            if !read_only || destructive || risk != "low" || !assistant_tool_allowed(name) {
                 return None;
             }
             let description = tool
