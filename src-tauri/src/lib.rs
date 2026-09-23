@@ -106,7 +106,24 @@ pub fn run() {
             commands::confirm_respond,
         ])
         .setup(|app| {
-            crate::confirm::set_app(app.handle().clone());
+            let show_app = app.handle().clone();
+            let hide_app = app.handle().clone();
+            crate::confirm::set_hooks(
+                move |payload| {
+                    let _ = show_app.emit_to("confirm", "confirm-open", payload);
+                    if let Some(win) = show_app.get_webview_window("confirm") {
+                        let _ = win.show();
+                        let _ = win.unminimize();
+                        let _ = win.set_always_on_top(true);
+                        let _ = win.set_focus();
+                    }
+                },
+                move || {
+                    if let Some(win) = hide_app.get_webview_window("confirm") {
+                        let _ = win.hide();
+                    }
+                },
+            );
             let handle = app.handle().clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));

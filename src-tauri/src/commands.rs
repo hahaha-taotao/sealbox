@@ -1295,8 +1295,8 @@ pub fn confirm_payload() -> Option<crate::confirm::ConfirmPayload> {
 }
 
 #[tauri::command]
-pub fn confirm_respond(app: AppHandle, allow: bool) -> Result<(), String> {
-    crate::confirm::respond(&app, allow)
+pub fn confirm_respond(allow: bool) -> Result<(), String> {
+    crate::confirm::respond(allow)
 }
 
 #[tauri::command]
