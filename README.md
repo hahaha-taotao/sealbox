@@ -55,7 +55,7 @@ npm run tauri build
 - **速查 Quick search** — 默认全局热键 `Ctrl+Shift+Space`，回车复制主秘密
 - **安全习惯 Hygiene** — 空闲自动锁定、审计日志（不记明文）、回收站、置顶、标签、文件夹
 - **备份 Backup** — 加密 `.svbak` 导出 / 导入（默认合并，覆盖需确认）
-- **MCP** — 本机 `127.0.0.1` 服务；GitHub MCP 总开关提供 api.github.com 只读工具和本地 `github_git_*`，API 写入另有独立开关；模型按 Token ID 选择活动 GitHub Token，git 写入不会把 Token 回给模型
+- **MCP** — 本机 `127.0.0.1` 服务；GitHub MCP 提供只读 API、本地 git 和工作区短名；Issue / PR / Release 写入另有独立开关，且每次弹出桌面确认。模型可用 Token 标题或默认凭据，不必先抄 UUID
 - **客户端证书 Client cert** — 保险库里可以导入 mTLS 用的客户端证书与私钥（PEM），由 Rust 侧限长、解析并校验证书/私钥匹配后加密保存，随金库一起备份；列表和速查不会显示或复制私钥，锁定时会清理 TLS 运行时缓存
 - **助手 Assistant** — 位于「插件」下方的 OpenAI 兼容对话页；可测试本机 MCP 连通性，并让模型调用当前暴露的 GitHub 只读工具
 - **插件 Plugin** — Chrome / Edge 从客户端安装后按当前网址填充或一键登记；在侧栏「插件」页配对
@@ -119,18 +119,17 @@ On first launch, set a master password (at least 10 characters). Closing the win
 
 默认工具 Tools:
 
-- `github_list_credentials` — 列出活动 GitHub API Token 的 ID、名称和账号，不含 Token
-- `github_get_authenticated_user` — 读取指定 Token 对应账号的公开资料
-- `github_list_repositories` — 列出该 Token 可见的仓库元数据
-- `github_get_repository` — 查看仓库元数据
-- `github_get_file` — 读取仓库中的文本文件，带大小和二进制限制
-- `github_list_issues` — 列出仓库的 Issue
-- `github_list_pull_requests` — 列出仓库的 Pull Request 元数据
-- `github_git_status` / `github_git_diff` / `github_git_log` / `github_git_branches` — 本地仓库只读 git，`path` 为仓库绝对路径
-- `github_git_stage` / `github_git_commit` / `github_git_push` / `github_git_pull` / `github_git_clone` — 日常写入；push / pull / clone 用 `credential_id` 从金库取 Token，经 askpass 注入，不写进 `.git/config`
-- `github_create_release` — 高风险 GitHub API 写入，需在 MCP 页面另外启用；默认创建草稿，仍会在远程仓库创建 Release 对象
+- `github_list_credentials` — 列出活动 GitHub Token 的标题、账号和是否为默认凭据，不含 Token
+- `github_get_authenticated_user` — 当前 Token 对应账号
+- `github_list_repositories` / `github_get_repository` / `github_get_file` — 仓库与文件
+- `github_list_issues` / `github_list_pull_requests` / `github_get_pull_request` — Issue / PR，含 head/base、draft、mergeable、assignees
+- `github_list_workflow_runs` — 轮询 Actions 状态
+- `github_git_workspace_list` / `github_git_workspace_register` — 把本机仓库登记成短名，之后传 `workspace="sealbox"`
+- `github_git_status` / `github_git_diff` / `github_git_log` / `github_git_branches` — 本地只读 git
+- `github_git_stage` / `github_git_commit` / `github_git_push` / `github_git_pull` / `github_git_clone` — 日常写入；push 可指定 branch、tags、force-with-lease，并区分「已推送 / 远端已是最新」
+- `github_create_issue` / `github_create_issue_comment` / `github_create_pull_request` / `github_create_release` — GitHub 写操作，需单独启用 API 写入，且每次弹出桌面确认
 
-GitHub MCP 默认停用。启用后会开放 API 只读工具和 `github_git_*`；GitHub API 写入由单独的 `api_write_enabled` 开关控制，只有同时打开两个开关时才会出现 `github_create_release`。模型先调用 `github_list_credentials`，再通过 `credential_id` 选择活动 GitHub Token。GitHub API 只访问 `https://api.github.com:443`；只读 API 固定使用 GET，Release 创建使用固定 POST 和白名单请求字段。git 工具由 Agent 传入本机绝对路径，远程必须是 `https://github.com`。侧栏助手只调用只读低风险工具，不会自动调用 Release 创建。
+GitHub MCP 默认停用。启用后开放只读 API 和 `github_git_*`。凭据可传标题（`credential="agentos"`），也可省略后使用 MCP 页默认 Token；金库里只有一条 GitHub Token 时自动选用。仓库推荐 `repo="owner/repo"`。git 可先登记工作区短名，不必每次传绝对路径。GitHub API 写入由 `api_write_enabled` 控制；打开后会出现 Issue / 评论 / Draft PR / Release，但每一次仍要桌面确认。侧栏助手只调用只读低风险工具。
 
 停用时这些工具都不会出现在 `tools/list`，直接调用也会被拒绝。模型收到的是结构化字段或截断后的 git 输出，不包含 Token、请求头、Release body 或完整远端响应。金库锁定时工具会失败。后续接口规划见 [`docs/superpowers/specs/2026-09-20-github-mcp-roadmap.md`](docs/superpowers/specs/2026-09-20-github-mcp-roadmap.md)。MCP Token 可在页面轮换。
 
@@ -142,7 +141,7 @@ GitHub MCP 默认停用。启用后会开放 API 只读工具和 `github_git_*`�
 
 The Assistant page is below Plugin in the sidebar. It uses an OpenAI Chat Completions-compatible endpoint, stores the API key encrypted in the vault, probes the real local MCP HTTP endpoint, and automatically follows the single GitHub MCP enable/disable switch. The first version is non-streaming and does not support external MCP servers or stdio/SSE transports.
 
-GitHub MCP is disabled by default. When enabled, the assistant discovers the low-risk read-only GitHub and local-git tools; high-risk tools such as `github_create_release` are not offered to the assistant. GitHub API reads remain fixed GET calls to `https://api.github.com:443`; the separate API-write switch exposes only the allowlisted Release POST and never accepts arbitrary URLs, headers, bodies, or methods.
+GitHub MCP is disabled by default. When enabled, the assistant discovers the low-risk read-only GitHub and local-git tools; write tools such as commit, push, PR and Release stay behind desktop confirmation and are not offered to the assistant. GitHub API reads remain fixed GET calls to `https://api.github.com:443`; the separate API-write switch exposes allowlisted Issue / PR / Release POSTs and never accepts arbitrary URLs, headers, bodies, or methods.
 
 ## 插件 Plugin（Chrome / Edge）
 

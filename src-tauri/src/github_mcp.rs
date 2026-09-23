@@ -71,9 +71,29 @@ impl From<&str> for GithubCallError {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct GithubWorkspace {
+    pub name: String,
+    pub path: String,
+    pub default_credential_id: Option<String>,
+}
+
+impl Default for GithubWorkspace {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            path: String::new(),
+            default_credential_id: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct GithubMcpPolicy {
     pub enabled: bool,
     pub api_write_enabled: bool,
+    pub default_credential_id: Option<String>,
+    pub workspaces: Vec<GithubWorkspace>,
 }
 
 impl Default for GithubMcpPolicy {
@@ -81,6 +101,8 @@ impl Default for GithubMcpPolicy {
         Self {
             enabled: false,
             api_write_enabled: false,
+            default_credential_id: None,
+            workspaces: Vec::new(),
         }
     }
 }
@@ -90,6 +112,41 @@ pub struct GithubCredentialMeta {
     pub id: String,
     pub title: String,
     pub account: Option<String>,
+    pub is_default: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedGithubCredential {
+    pub id: String,
+    pub title: String,
+    pub token: String,
+}
+
+fn credential_prop() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 100,
+        "description": "GitHub Token 的标题、账号或 ID。可省略：使用 MCP 页的默认 Token；若金库里只有一个 GitHub Token 则自动选用。"
+    })
+}
+
+fn credential_id_prop() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 100,
+        "description": "兼容旧参数，等同于 credential。"
+    })
+}
+
+fn repo_prop() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 201,
+        "description": "仓库，推荐 owner/repo，例如 hahaha-taotao/sealbox。也兼容 https://github.com/owner/repo，或与 owner 字段拆开填写。"
+    })
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -131,7 +188,54 @@ struct GithubIssueDto {
     html_url: Option<String>,
     user: GithubOwnerDto,
     labels: Vec<String>,
+    assignees: Vec<String>,
+    comments: Option<i64>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    closed_at: Option<String>,
     body: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GithubRefDto {
+    #[serde(rename = "ref")]
+    git_ref: Option<String>,
+    sha: Option<String>,
+    repo: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GithubPullDto {
+    number: Option<i64>,
+    title: Option<String>,
+    state: Option<String>,
+    html_url: Option<String>,
+    user: GithubOwnerDto,
+    labels: Vec<String>,
+    assignees: Vec<String>,
+    requested_reviewers: Vec<String>,
+    draft: Option<bool>,
+    mergeable: Option<bool>,
+    mergeable_state: Option<String>,
+    head: GithubRefDto,
+    base: GithubRefDto,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    body: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GithubWorkflowRunDto {
+    id: Option<i64>,
+    name: Option<String>,
+    display_title: Option<String>,
+    status: Option<String>,
+    conclusion: Option<String>,
+    event: Option<String>,
+    head_branch: Option<String>,
+    html_url: Option<String>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -161,92 +265,184 @@ pub fn api_tool_definitions() -> Vec<Value> {
     vec![
         tool(
             "github_list_credentials",
-            "列出本地活动 GitHub API Token 的元数据（ID、名称、账号）。永不返回 Token。",
+            "列出本地活动 GitHub Token 的标题、账号和是否为默认凭据。回答「我有哪些 GitHub Token / 该用哪条凭据」时调用。日常读写不必先调这个：可直接传标题，或省略后使用默认 Token。永不返回 Token 明文。",
             schema(&[], &[]),
         ),
         tool(
             "github_get_authenticated_user",
-            "读取指定 GitHub Token 对应账号的非敏感公开资料。只执行固定的 GET /user。",
-            schema(&[("credential_id", string_schema(1, 100))], &["credential_id"]),
+            "读取当前 GitHub 账号的 login、姓名、公开/私有仓库数。回答「我是谁 / 这个 Token 属于哪个账号」时调用。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                ],
+                &[],
+            ),
         ),
         tool(
             "github_list_repositories",
-            "列出 GitHub 账号可见的仓库元数据。只执行固定的 GET /user/repos，并使用指定 Token。",
+            "列出当前 Token 可见的仓库（full_name、默认分支、私有与否）。回答「我有多少 GitHub 仓库 / 列出我的仓库」时调用。默认只看自己拥有的仓库。",
             schema(
                 &[
-                    ("credential_id", string_schema(1, 100)),
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
                     ("visibility", json!({"type":"string","enum":["all","public","private"],"default":"all"})),
                     ("affiliation", json!({"type":"string","enum":["owner","collaborator","organization_member"],"default":"owner"})),
                     ("page", json!({"type":"integer","minimum":1,"maximum":100,"default":1})),
                     ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":30})),
                 ],
-                &["credential_id"],
+                &[],
             ),
         ),
         tool(
             "github_get_repository",
-            "读取 GitHub 仓库的非敏感元数据。只执行固定的 GET /repos/{owner}/{repo}。",
+            "读取单个仓库的元数据：默认分支、是否私有、描述、更新时间。需要确认某个 owner/repo 是否存在或默认分支是什么时调用。",
             schema(
                 &[
-                    ("credential_id", string_schema(1, 100)),
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
                     ("owner", string_schema(1, 100)),
-                    ("repo", string_schema(1, 100)),
                 ],
-                &["credential_id", "owner", "repo"],
+                &["repo"],
             ),
         ),
         tool(
             "github_get_file",
-            "读取 GitHub 仓库中的文本文件。只执行固定的 GET contents endpoint，不接受任意 URL、请求头或请求体。",
+            "读取 GitHub 仓库里的单个文本文件（README、工作流 YAML 等）。需要看远端文件内容而不是本地工作区时调用。目录会报错。",
             schema(
                 &[
-                    ("credential_id", string_schema(1, 100)),
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
                     ("owner", string_schema(1, 100)),
-                    ("repo", string_schema(1, 100)),
                     ("path", string_schema(1, 500)),
                     ("ref", string_schema(1, 200)),
                 ],
-                &["credential_id", "owner", "repo", "path"],
+                &["repo", "path"],
             ),
         ),
         tool(
             "github_list_issues",
-            "列出 GitHub 仓库的 Issue。只执行固定的 GET issues endpoint。",
+            "列出仓库 Issue（不含 PR）：编号、标题、状态、标签、指派人、评论数。回答「这个仓库有哪些未关闭 Issue」时调用。",
             schema(
                 &[
-                    ("credential_id", string_schema(1, 100)),
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
                     ("owner", string_schema(1, 100)),
-                    ("repo", string_schema(1, 100)),
                     ("state", json!({"type":"string","enum":["open","closed","all"],"default":"open"})),
                     ("page", json!({"type":"integer","minimum":1,"maximum":100,"default":1})),
                     ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":30})),
                 ],
-                &["credential_id", "owner", "repo"],
+                &["repo"],
             ),
         ),
         tool(
             "github_list_pull_requests",
-            "列出 GitHub 仓库的 Pull Request 元数据。只执行固定的 GET pulls endpoint。",
+            "列出仓库 Pull Request：编号、标题、draft、head/base、mergeable、指派人和 requested reviewers。回答「有哪些未合并 PR / 这个 PR 能不能合」时调用。",
             schema(
                 &[
-                    ("credential_id", string_schema(1, 100)),
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
                     ("owner", string_schema(1, 100)),
-                    ("repo", string_schema(1, 100)),
                     ("state", json!({"type":"string","enum":["open","closed","all"],"default":"open"})),
                     ("page", json!({"type":"integer","minimum":1,"maximum":100,"default":1})),
                     ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":30})),
                 ],
-                &["credential_id", "owner", "repo"],
+                &["repo"],
+            ),
+        ),
+        tool(
+            "github_get_pull_request",
+            "读取单个 PR 的完整协作状态：draft、head/base SHA、mergeable、reviewers。需要判断某个 PR 能否合并或当前基于哪条分支时调用。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("number", json!({"type":"integer","minimum":1,"maximum":1000000000})),
+                ],
+                &["repo", "number"],
+            ),
+        ),
+        tool(
+            "github_list_workflow_runs",
+            "列出仓库最近的 GitHub Actions 运行：status、conclusion、head_branch、html_url。轮询 CI / 发布流水线状态时调用。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("branch", string_schema(1, 200)),
+                    ("status", json!({"type":"string","enum":["queued","in_progress","completed"]})),
+                    ("page", json!({"type":"integer","minimum":1,"maximum":100,"default":1})),
+                    ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":20})),
+                ],
+                &["repo"],
+            ),
+        ),
+        write_tool(
+            "github_create_issue",
+            "在仓库创建 Issue。用户说「帮我开一个 bug / 功能单」时调用。每次都会弹出 Sealbox 桌面确认。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("title", string_schema(1, 256)),
+                    ("body", string_schema(0, MAX_RELEASE_BODY_BYTES as u64)),
+                    ("labels", json!({"type":"string","minLength":1,"maxLength":400,"description":"逗号分隔的标签名"})),
+                ],
+                &["repo", "title"],
+            ),
+        ),
+        write_tool(
+            "github_create_issue_comment",
+            "在已有 Issue 或 PR 下追加一条评论。需要回复 Issue/PR 时调用。每次都会弹出 Sealbox 桌面确认。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("number", json!({"type":"integer","minimum":1,"maximum":1000000000})),
+                    ("body", string_schema(1, MAX_RELEASE_BODY_BYTES as u64)),
+                ],
+                &["repo", "number", "body"],
+            ),
+        ),
+        write_tool(
+            "github_create_pull_request",
+            "从 head 分支向 base 开 PR。用户说「帮我提 PR」时调用。默认 draft=true。每次都会弹出 Sealbox 桌面确认。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("title", string_schema(1, 256)),
+                    ("head", string_schema(1, 200)),
+                    ("base", string_schema(1, 200)),
+                    ("body", string_schema(0, MAX_RELEASE_BODY_BYTES as u64)),
+                    ("draft", json!({"type":"boolean","default":true})),
+                ],
+                &["repo", "title", "head", "base"],
             ),
         ),
         write_tool(
             "github_create_release",
-            "在指定 GitHub 仓库创建 Release。默认创建草稿；这是高风险远端写操作，需要单独打开 GitHub API 写入权限。",
+            "在仓库创建 Release。用户说「打一个 GitHub Release」时调用。默认 draft=true。每次都会弹出 Sealbox 桌面确认。",
             schema(
                 &[
-                    ("credential_id", string_schema(1, 100)),
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
                     ("owner", string_schema(1, 100)),
-                    ("repo", string_schema(1, 100)),
                     ("tag_name", string_schema(1, MAX_RELEASE_TAG_CHARS as u64)),
                     ("target_commitish", string_schema(1, 200)),
                     ("name", string_schema(1, 200)),
@@ -256,7 +452,7 @@ pub fn api_tool_definitions() -> Vec<Value> {
                     ("generate_release_notes", json!({"type":"boolean","default":false})),
                     ("make_latest", json!({"type":"string","enum":["true","false","legacy"],"default":"legacy"})),
                 ],
-                &["credential_id", "owner", "repo", "tag_name"],
+                &["repo", "tag_name"],
             ),
         ),
     ]
@@ -334,11 +530,16 @@ pub fn load_policy(vault: &Vault, dek: &[u8; 32]) -> GithubMcpPolicy {
     let Ok(value) = serde_json::from_str::<Value>(&raw) else {
         return GithubMcpPolicy::default();
     };
-    if value.get("credential_id").is_some()
-        || value.get("scopes").is_some()
-        || value.get("allowed_repositories").is_some()
-    {
+    if value.get("scopes").is_some() || value.get("allowed_repositories").is_some() {
         return GithubMcpPolicy::default();
+    }
+    let mut value = value;
+    if value.get("default_credential_id").is_none() {
+        if let Some(legacy) = value.get("credential_id").cloned() {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("default_credential_id".into(), legacy);
+            }
+        }
     }
     normalize_policy(serde_json::from_value(value).unwrap_or_default()).unwrap_or_default()
 }
@@ -352,10 +553,58 @@ pub fn save_policy(vault: &Vault, dek: &[u8; 32], policy: &GithubMcpPolicy) -> R
 }
 
 pub fn normalize_policy(policy: GithubMcpPolicy) -> Result<GithubMcpPolicy, String> {
+    let mut names = std::collections::HashSet::new();
+    let mut workspaces = Vec::new();
+    for workspace in policy.workspaces {
+        let name = normalize_workspace_name(&workspace.name)?;
+        if !names.insert(name.clone()) {
+            return Err(format!("工作区短名重复：{name}"));
+        }
+        let path = workspace.path.trim().to_string();
+        if path.is_empty() {
+            return Err(format!("工作区 {name} 缺少绝对路径"));
+        }
+        let path_buf = std::path::PathBuf::from(&path);
+        if !path_buf.is_absolute() {
+            return Err(format!("工作区 {name} 的 path 必须是绝对路径"));
+        }
+        let default_credential_id = workspace
+            .default_credential_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        workspaces.push(GithubWorkspace {
+            name,
+            path,
+            default_credential_id,
+        });
+    }
+    let default_credential_id = policy
+        .default_credential_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     Ok(GithubMcpPolicy {
         enabled: policy.enabled,
         api_write_enabled: policy.enabled && policy.api_write_enabled,
+        default_credential_id,
+        workspaces,
     })
+}
+
+pub fn normalize_workspace_name(raw: &str) -> Result<String, String> {
+    let name = raw.trim();
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+    {
+        return Err("工作区短名只能是字母、数字、下划线或连字符".into());
+    }
+    Ok(name.to_string())
 }
 
 pub fn list_credentials(session: &Session) -> Result<Vec<GithubCredentialMeta>, String> {
@@ -380,10 +629,140 @@ pub fn list_credentials(session: &Session) -> Result<Vec<GithubCredentialMeta>, 
                 id: entry.id,
                 title: entry.title,
                 account,
+                is_default: false,
             });
         }
     }
+    if let Ok(policy) = session
+        .vault()
+        .and_then(|vault| session.dek().map(|dek| load_policy(vault, dek)))
+    {
+        if let Some(default_id) = policy.default_credential_id.as_deref() {
+            for item in &mut out {
+                item.is_default = item.id == default_id;
+            }
+        } else if out.len() == 1 {
+            out[0].is_default = true;
+        }
+    }
     Ok(out)
+}
+
+pub fn resolve_github_credential(
+    session: &Session,
+    args: &Value,
+) -> Result<ResolvedGithubCredential, String> {
+    let requested = args
+        .get("credential")
+        .or_else(|| args.get("credential_id"))
+        .or_else(|| args.get("credential_name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let credentials = list_credentials(session)?;
+    if credentials.is_empty() {
+        return Err("金库里没有活动的 GitHub API Token。请先在保险库新建一条服务为 github 的 API Token。".into());
+    }
+    let vault = session.vault().map_err(|e| e.to_string())?;
+    let dek = session.dek().map_err(|e| e.to_string())?;
+    let policy = load_policy(vault, dek);
+    let selected = if let Some(requested) = requested {
+        match_credential(&credentials, requested)?
+    } else if let Some(default_id) = policy.default_credential_id.as_deref() {
+        credentials
+            .iter()
+            .find(|item| item.id == default_id)
+            .ok_or_else(|| "MCP 页选择的默认 GitHub Token 已不存在，请重新选择".to_string())?
+    } else if credentials.len() == 1 {
+        &credentials[0]
+    } else {
+        let titles = credentials
+            .iter()
+            .map(|item| {
+                if item.account.as_deref().unwrap_or("").is_empty() {
+                    item.title.clone()
+                } else {
+                    format!("{} ({})", item.title, item.account.as_deref().unwrap_or(""))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("、");
+        return Err(format!(
+            "有多条 GitHub Token，请传 credential=标题，或在 Sealbox MCP 页选定默认 Token。可选：{titles}"
+        ));
+    };
+    token_from_id(session, &selected.id).map(|token| ResolvedGithubCredential {
+        id: selected.id.clone(),
+        title: selected.title.clone(),
+        token,
+    })
+}
+
+fn match_credential<'a>(
+    credentials: &'a [GithubCredentialMeta],
+    requested: &str,
+) -> Result<&'a GithubCredentialMeta, String> {
+    if let Some(exact_id) = credentials.iter().find(|item| item.id == requested) {
+        return Ok(exact_id);
+    }
+    let lowered = requested.to_ascii_lowercase();
+    let mut matches = credentials
+        .iter()
+        .filter(|item| {
+            item.title.eq_ignore_ascii_case(requested)
+                || item
+                    .account
+                    .as_deref()
+                    .is_some_and(|account| account.eq_ignore_ascii_case(requested))
+        })
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        return Ok(matches[0]);
+    }
+    if matches.is_empty() {
+        matches = credentials
+            .iter()
+            .filter(|item| {
+                item.title.to_ascii_lowercase().contains(&lowered)
+                    || item
+                        .account
+                        .as_deref()
+                        .is_some_and(|account| account.to_ascii_lowercase().contains(&lowered))
+            })
+            .collect();
+    }
+    match matches.as_slice() {
+        [only] => Ok(*only),
+        [] => Err(format!(
+            "找不到 GitHub Token「{requested}」。先调 github_list_credentials，或在 MCP 页选定默认 Token。"
+        )),
+        many => {
+            let titles = many
+                .iter()
+                .map(|item| item.title.as_str())
+                .collect::<Vec<_>>()
+                .join("、");
+            Err(format!("有多条 GitHub Token 匹配「{requested}」：{titles}。请改用更精确的标题或 ID。"))
+        }
+    }
+}
+
+pub fn token_from_id(session: &Session, credential_id: &str) -> Result<String, String> {
+    let vault = session.vault().map_err(|e| e.to_string())?;
+    let dek = session.dek().map_err(|e| e.to_string())?;
+    let payload = vault
+        .get_active_secret(dek, credential_id)
+        .map_err(|_| "GitHub Token 不存在或已在回收站".to_string())?;
+    let SecretPayload::ApiToken { service, token, .. } = payload else {
+        return Err("凭据必须是 GitHub API Token".into());
+    };
+    if !service.trim().eq_ignore_ascii_case("github") {
+        return Err("凭据不是 GitHub API Token".into());
+    }
+    if token.trim().is_empty() {
+        return Err("GitHub Token 不能为空".into());
+    }
+    Ok(token)
 }
 
 pub fn call_tool(session: &mut Session, name: &str, args: Value) -> Result<String, String> {
@@ -398,13 +777,14 @@ pub fn call_tool_detailed(
     args: Value,
 ) -> Result<GithubCallResult, GithubCallError> {
     let context = audit_context(&args);
-    let fingerprint = github_credential_fingerprint(&args);
+    let fingerprint = github_credential_fingerprint(session, &args);
     match call_tool_text(session, name, args) {
         Ok((status, text)) => {
             let result_count = serde_json::from_str::<Value>(&text).ok().and_then(|value| {
                 value
                     .get("items")
                     .or_else(|| value.get("repositories"))
+                    .or_else(|| value.get("workflow_runs"))
                     .and_then(Value::as_array)
                     .map(Vec::len)
             });
@@ -420,6 +800,8 @@ pub fn call_tool_detailed(
             let (status, parsed_reason, message) = parse_call_error(&raw);
             let reason = if raw == "GitHub MCP 能力未启用" {
                 "disabled"
+            } else if raw.contains("用户拒绝") {
+                "denied"
             } else {
                 parsed_reason
             };
@@ -456,7 +838,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             .map(|text| (200, text))
             .map_err(|e| e.to_string());
     }
-    let token = prepare(session, name, &args)?;
+    let (token, credential_label) = prepare(session, name, &args)?;
     let (status, result) = match name {
         "github_create_release" => {
             let repository = repository_args(&args)?;
@@ -468,6 +850,14 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let prerelease = bool_arg(&args, "prerelease", false)?;
             let generate_release_notes = bool_arg(&args, "generate_release_notes", false)?;
             let make_latest = enum_arg(&args, "make_latest", &["true", "false", "legacy"], "legacy")?;
+            confirm_github_write(
+                "创建 GitHub Release",
+                &format!(
+                    "仓库 {repository}\n标签 {tag_name}\n草稿 {}\n凭据 {}",
+                    if draft { "是" } else { "否" },
+                    credential_label
+                ),
+            )?;
             let mut request = Map::new();
             request.insert("tag_name".into(), Value::String(tag_name));
             if let Some(value) = target_commitish {
@@ -489,6 +879,77 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let request = Value::Object(request);
             post_json(&token, &format!("/repos/{repository}/releases"), &request, |value| {
                 release_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into())
+            })
+        }
+        "github_create_issue" => {
+            let repository = repository_args(&args)?;
+            let title = required_text(&args, "title", 256)?;
+            let body = optional_release_body(&args)?;
+            let labels = optional_csv(&args, "labels")?;
+            confirm_github_write(
+                "创建 GitHub Issue",
+                &format!("仓库 {repository}\n标题 {title}\n凭据 {credential_label}"),
+            )?;
+            let mut request = Map::new();
+            request.insert("title".into(), Value::String(title));
+            if let Some(value) = body {
+                request.insert("body".into(), Value::String(value));
+            }
+            if !labels.is_empty() {
+                request.insert(
+                    "labels".into(),
+                    Value::Array(labels.into_iter().map(Value::String).collect()),
+                );
+            }
+            post_json(&token, &format!("/repos/{repository}/issues"), &Value::Object(request), |value| {
+                issue_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into())
+            })
+        }
+        "github_create_issue_comment" => {
+            let repository = repository_args(&args)?;
+            let number = issue_number(&args)?;
+            let body = required_text(&args, "body", MAX_RELEASE_BODY_BYTES)?;
+            confirm_github_write(
+                "评论 GitHub Issue/PR",
+                &format!("仓库 {repository}#{number}\n凭据 {credential_label}"),
+            )?;
+            post_json(
+                &token,
+                &format!("/repos/{repository}/issues/{number}/comments"),
+                &json!({"body": body}),
+                |value| {
+                    Ok(json!({
+                        "id": value.get("id").and_then(Value::as_i64),
+                        "html_url": limited_string(value.get("html_url")),
+                        "user": limited_string(value.get("user").and_then(|item| item.get("login"))),
+                    }))
+                },
+            )
+        }
+        "github_create_pull_request" => {
+            let repository = repository_args(&args)?;
+            let title = required_text(&args, "title", 256)?;
+            let head = required_text(&args, "head", 200)?;
+            let base = required_text(&args, "base", 200)?;
+            let body = optional_release_body(&args)?;
+            let draft = bool_arg(&args, "draft", true)?;
+            confirm_github_write(
+                "创建 GitHub Pull Request",
+                &format!(
+                    "仓库 {repository}\n{head} → {base}\n标题 {title}\n草稿 {}\n凭据 {credential_label}",
+                    if draft { "是" } else { "否" }
+                ),
+            )?;
+            let mut request = Map::new();
+            request.insert("title".into(), Value::String(title));
+            request.insert("head".into(), Value::String(head));
+            request.insert("base".into(), Value::String(base));
+            request.insert("draft".into(), Value::Bool(draft));
+            if let Some(value) = body {
+                request.insert("body".into(), Value::String(value));
+            }
+            post_json(&token, &format!("/repos/{repository}/pulls"), &Value::Object(request), |value| {
+                pull_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into())
             })
         }
         "github_get_authenticated_user" => request_json(&token, "/user", |value| {
@@ -566,6 +1027,47 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                 list_dto(value, per_page, pull_dto)
             })
         }
+        "github_get_pull_request" => {
+            let repository = repository_args(&args)?;
+            let number = issue_number(&args)?;
+            request_json(&token, &format!("/repos/{repository}/pulls/{number}"), |value| {
+                pull_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into())
+            })
+        }
+        "github_list_workflow_runs" => {
+            let repository = repository_args(&args)?;
+            let (page, per_page) = page_args_with_default(&args, 20)?;
+            let mut endpoint = format!(
+                "/repos/{repository}/actions/runs?page={page}&per_page={per_page}"
+            );
+            if let Some(branch) = optional_release_string(&args, "branch", 200)? {
+                endpoint.push_str("&branch=");
+                endpoint.push_str(&percent_encode(&branch, false));
+            }
+            if let Some(status) = args.get("status").and_then(Value::as_str) {
+                let status = enum_arg(
+                    &json!({"status": status}),
+                    "status",
+                    &["queued", "in_progress", "completed"],
+                    "completed",
+                )?;
+                endpoint.push_str("&status=");
+                endpoint.push_str(&status);
+            }
+            request_json(&token, &endpoint, |value| {
+                let runs = value
+                    .get("workflow_runs")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "GitHub 响应格式不正确".to_string())?;
+                let items: Vec<Value> = runs
+                    .iter()
+                    .filter_map(workflow_run_dto)
+                    .take(per_page as usize)
+                    .collect();
+                let count = items.len();
+                Ok(json!({"workflow_runs": items, "count": count}))
+            })
+        }
         _ => return Err("未知 GitHub 工具".into()),
     }?;
     session.touch();
@@ -573,7 +1075,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
     Ok((status, redact_text(&serialized, &[token.as_str()])))
 }
 
-fn prepare(session: &Session, name: &str, args: &Value) -> Result<String, String> {
+fn prepare(session: &Session, name: &str, args: &Value) -> Result<(String, String), String> {
     let definition = tool_definitions()
         .into_iter()
         .find(|definition| definition.get("name").and_then(Value::as_str) == Some(name))
@@ -588,47 +1090,39 @@ fn prepare(session: &Session, name: &str, args: &Value) -> Result<String, String
         return Err("GitHub API 写入能力未启用".into());
     }
     validate_arguments(&definition["inputSchema"], args)?;
-    let credential_id = args
-        .get("credential_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "缺少参数 credential_id".to_string())?;
-    let payload = vault
-        .get_active_secret(dek, credential_id)
-        .map_err(|_| "GitHub Token 不存在或已在回收站".to_string())?;
-    let SecretPayload::ApiToken { service, token, .. } = payload else {
-        return Err("凭据必须是 GitHub API Token".into());
-    };
-    if !service.trim().eq_ignore_ascii_case("github") {
-        return Err("凭据不是 GitHub API Token".into());
+    let resolved = resolve_github_credential(session, args)?;
+    Ok((resolved.token, resolved.title))
+}
+
+fn confirm_github_write(title: &str, detail: &str) -> Result<(), String> {
+    if crate::confirm::ask(title, &format!("{detail}\n\n允许这次 GitHub 写操作？")) {
+        Ok(())
+    } else {
+        Err("用户拒绝了这次 GitHub 写操作".into())
     }
-    if token.trim().is_empty() {
-        return Err("GitHub Token 不能为空".into());
-    }
-    Ok(token)
 }
 
 fn audit_context(args: &Value) -> GithubAuditContext {
-    let repository = match (
-        args.get("owner").and_then(Value::as_str),
-        args.get("repo").and_then(Value::as_str),
-    ) {
-        (Some(owner), Some(repo)) => Some(format!("{owner}/{repo}")),
-        _ => None,
-    };
+    let repository = repository_args(args).ok().or_else(|| {
+        args.get("repo")
+            .and_then(Value::as_str)
+            .map(|value| truncate(value, 201))
+    });
     GithubAuditContext {
         repository,
         path: args.get("path").and_then(Value::as_str).map(str::to_string),
         reference: args
             .get("ref")
             .or_else(|| args.get("tag_name"))
+            .or_else(|| args.get("head"))
             .and_then(Value::as_str)
             .map(|value| truncate(value, MAX_RELEASE_TAG_CHARS).replace(['\r', '\n'], " ")),
     }
 }
 
-fn github_credential_fingerprint(args: &Value) -> Option<String> {
-    let id = args.get("credential_id").and_then(Value::as_str)?;
-    Some(sha256_hex(id.as_bytes())[..12].to_string())
+fn github_credential_fingerprint(session: &Session, args: &Value) -> Option<String> {
+    let resolved = resolve_github_credential(session, args).ok()?;
+    Some(sha256_hex(resolved.id.as_bytes())[..12].to_string())
 }
 
 fn parse_call_error(raw: &str) -> (Option<u16>, &'static str, String) {
@@ -721,31 +1215,67 @@ fn validate_value(name: &str, value: &Value, definition: &Value) -> Result<(), S
 }
 
 fn repository_args(args: &Value) -> Result<String, String> {
-    let owner = args
-        .get("owner")
-        .and_then(Value::as_str)
-        .ok_or("缺少参数 owner")?;
-    let repo = args
-        .get("repo")
-        .and_then(Value::as_str)
-        .ok_or("缺少参数 repo")?;
-    normalize_repository(&format!("{owner}/{repo}"))
+    if let Some(repo) = args.get("repo").and_then(Value::as_str) {
+        let trimmed = repo.trim();
+        if trimmed.contains('/') || looks_like_github_url(trimmed) {
+            return normalize_repository(trimmed);
+        }
+        if let Some(owner) = args.get("owner").and_then(Value::as_str) {
+            return normalize_repository(&format!("{}/{}", owner.trim(), trimmed));
+        }
+        return Err("请传 repo=\"owner/repo\"，例如 hahaha-taotao/sealbox".into());
+    }
+    if let (Some(owner), Some(name)) = (
+        args.get("owner").and_then(Value::as_str),
+        args.get("name").and_then(Value::as_str),
+    ) {
+        return normalize_repository(&format!("{}/{}", owner.trim(), name.trim()));
+    }
+    Err("缺少仓库。请传 repo=\"owner/repo\"".into())
+}
+
+fn looks_like_github_url(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    lower.contains("github.com/") || lower.starts_with("https://") || lower.starts_with("http://")
 }
 
 pub fn normalize_repository(raw: &str) -> Result<String, String> {
-    if raw.len() > 201
-        || raw.is_empty()
-        || raw.contains('%')
-        || raw.contains('\\')
-        || raw.chars().any(char::is_control)
-    {
-        return Err("仓库名格式不合法".into());
+    let mut value = raw.trim().trim_end_matches('/').to_string();
+    if value.ends_with(".git") {
+        value.truncate(value.len() - 4);
     }
-    let mut parts = raw.split('/');
+    for prefix in [
+        "https://github.com/",
+        "http://github.com/",
+        "https://www.github.com/",
+        "git@github.com:",
+    ] {
+        if let Some(stripped) = value
+            .strip_prefix(prefix)
+            .or_else(|| value.strip_prefix(&prefix.to_ascii_uppercase()))
+        {
+            value = stripped.to_string();
+            break;
+        }
+        let lower = value.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            value = value[value.len() - rest.len()..].to_string();
+            break;
+        }
+    }
+    if value.len() > 201
+        || value.is_empty()
+        || value.contains('%')
+        || value.contains('\\')
+        || value.chars().any(char::is_control)
+    {
+        return Err("仓库名格式不合法。请使用 owner/repo，例如 hahaha-taotao/sealbox".into());
+    }
+    let mut parts = value.split('/');
     let owner = parts.next().unwrap_or_default();
     let repo = parts.next().unwrap_or_default();
     if parts.next().is_some() || !valid_segment(owner) || !valid_segment(repo) {
-        return Err("仓库名格式不合法".into());
+        return Err("仓库名格式不合法。请使用 owner/repo，例如 hahaha-taotao/sealbox".into());
     }
     Ok(format!("{owner}/{repo}"))
 }
@@ -830,12 +1360,55 @@ fn enum_arg(args: &Value, name: &str, allowed: &[&str], default: &str) -> Result
 }
 
 fn page_args(args: &Value) -> Result<(u64, u64), String> {
+    page_args_with_default(args, 30)
+}
+
+fn page_args_with_default(args: &Value, default_per_page: u64) -> Result<(u64, u64), String> {
     let page = args.get("page").and_then(Value::as_u64).unwrap_or(1);
-    let per_page = args.get("per_page").and_then(Value::as_u64).unwrap_or(30);
+    let per_page = args
+        .get("per_page")
+        .and_then(Value::as_u64)
+        .unwrap_or(default_per_page);
     if !(1..=100).contains(&page) || !(1..=MAX_PAGE_SIZE).contains(&per_page) {
         return Err("分页参数超出范围".into());
     }
     Ok((page, per_page))
+}
+
+fn issue_number(args: &Value) -> Result<u64, String> {
+    args.get("number")
+        .and_then(Value::as_u64)
+        .filter(|value| *value >= 1)
+        .ok_or_else(|| "缺少参数 number".to_string())
+}
+
+fn required_text(args: &Value, name: &str, max: usize) -> Result<String, String> {
+    let value = args
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("缺少参数 {name}"))?;
+    if value.chars().count() > max || value.chars().any(char::is_control) {
+        return Err(format!("参数 {name} 长度或格式不合法"));
+    }
+    Ok(value.to_string())
+}
+
+fn optional_csv(args: &Value, name: &str) -> Result<Vec<String>, String> {
+    let Some(raw) = args.get(name).and_then(Value::as_str) else {
+        return Ok(Vec::new());
+    };
+    let labels = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    if labels.len() > 20 || labels.iter().any(|value| value.chars().count() > 50) {
+        return Err(format!("参数 {name} 不合法"));
+    }
+    Ok(labels)
 }
 
 fn bool_arg(args: &Value, name: &str, default: bool) -> Result<bool, String> {
@@ -979,7 +1552,7 @@ fn post_json<T>(
         Err(_) => return Err("GitHub 网络请求失败".into()),
     };
     if status != 201 {
-        return Err(format!("GitHub 创建 Release 返回异常状态 {status}"));
+        return Err(format!("GitHub 写入返回异常状态 {status}"));
     }
     if truncated {
         return Err("GitHub 响应超过安全大小限制".into());
@@ -1068,6 +1641,44 @@ fn repository_dto(value: &Value) -> Option<Value> {
     .ok()
 }
 
+fn login_list(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .take(20)
+                .filter_map(|item| limited_string(item.get("login").or_else(|| item.get("name"))))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn label_list(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .take(20)
+                .filter_map(|item| limited_string(item.get("name")))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn git_ref_dto(value: Option<&Value>) -> GithubRefDto {
+    GithubRefDto {
+        git_ref: limited_string(value.and_then(|item| item.get("ref"))),
+        sha: limited_string(value.and_then(|item| item.get("sha"))),
+        repo: limited_string(
+            value
+                .and_then(|item| item.get("repo"))
+                .and_then(|item| item.get("full_name")),
+        ),
+    }
+}
+
 fn issue_dto(value: &Value) -> Option<Value> {
     if value.get("pull_request").is_some() {
         return None;
@@ -1080,24 +1691,19 @@ fn issue_dto(value: &Value) -> Option<Value> {
         user: GithubOwnerDto {
             login: limited_string(value.get("user").and_then(|v| v.get("login"))),
         },
-        labels: value
-            .get("labels")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .take(20)
-                    .filter_map(|item| limited_string(item.get("name")))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        labels: label_list(value.get("labels")),
+        assignees: login_list(value.get("assignees")),
+        comments: value.get("comments").and_then(Value::as_i64),
+        created_at: limited_string(value.get("created_at")),
+        updated_at: limited_string(value.get("updated_at")),
+        closed_at: limited_string(value.get("closed_at")),
         body: limited_string_with_cap(value.get("body"), MAX_DESCRIPTION_BYTES),
     })
     .ok()
 }
 
 fn pull_dto(value: &Value) -> Option<Value> {
-    serde_json::to_value(GithubIssueDto {
+    serde_json::to_value(GithubPullDto {
         number: value.get("number").and_then(Value::as_i64),
         title: limited_string(value.get("title")),
         state: limited_string(value.get("state")),
@@ -1105,18 +1711,33 @@ fn pull_dto(value: &Value) -> Option<Value> {
         user: GithubOwnerDto {
             login: limited_string(value.get("user").and_then(|v| v.get("login"))),
         },
-        labels: value
-            .get("labels")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .take(20)
-                    .filter_map(|item| limited_string(item.get("name")))
-                    .collect()
-            })
-            .unwrap_or_default(),
+        labels: label_list(value.get("labels")),
+        assignees: login_list(value.get("assignees")),
+        requested_reviewers: login_list(value.get("requested_reviewers")),
+        draft: value.get("draft").and_then(Value::as_bool),
+        mergeable: value.get("mergeable").and_then(Value::as_bool),
+        mergeable_state: limited_string(value.get("mergeable_state")),
+        head: git_ref_dto(value.get("head")),
+        base: git_ref_dto(value.get("base")),
+        created_at: limited_string(value.get("created_at")),
+        updated_at: limited_string(value.get("updated_at")),
         body: limited_string_with_cap(value.get("body"), MAX_DESCRIPTION_BYTES),
+    })
+    .ok()
+}
+
+fn workflow_run_dto(value: &Value) -> Option<Value> {
+    serde_json::to_value(GithubWorkflowRunDto {
+        id: value.get("id").and_then(Value::as_i64),
+        name: limited_string(value.get("name")),
+        display_title: limited_string(value.get("display_title")),
+        status: limited_string(value.get("status")),
+        conclusion: limited_string(value.get("conclusion")),
+        event: limited_string(value.get("event")),
+        head_branch: limited_string(value.get("head_branch")),
+        html_url: limited_string(value.get("html_url")),
+        created_at: limited_string(value.get("created_at")),
+        updated_at: limited_string(value.get("updated_at")),
     })
     .ok()
 }
@@ -1249,6 +1870,7 @@ mod tests {
         let read_only = tool_definitions_for_policy(&GithubMcpPolicy {
             enabled: true,
             api_write_enabled: false,
+            ..Default::default()
         });
         assert!(!read_only
             .iter()
@@ -1256,14 +1878,21 @@ mod tests {
         let with_write = tool_definitions_for_policy(&GithubMcpPolicy {
             enabled: true,
             api_write_enabled: true,
+            ..Default::default()
         });
         assert!(with_write
             .iter()
             .any(|definition| definition["name"] == "github_create_release"));
+        assert!(with_write
+            .iter()
+            .any(|definition| definition["name"] == "github_create_pull_request"));
+        assert!(with_write
+            .iter()
+            .any(|definition| definition["name"] == "github_create_issue"));
     }
 
     #[test]
-    fn all_seven_tools_have_read_only_contracts_and_closed_schemas() {
+    fn read_only_tools_have_closed_schemas() {
         let expected = [
             "github_list_credentials",
             "github_get_authenticated_user",
@@ -1272,6 +1901,8 @@ mod tests {
             "github_get_file",
             "github_list_issues",
             "github_list_pull_requests",
+            "github_get_pull_request",
+            "github_list_workflow_runs",
         ];
         let definitions = tool_definitions();
         for name in expected {
@@ -1352,7 +1983,7 @@ mod tests {
             .into_iter()
             .filter(|definition| definition["readOnly"] == true)
             .count();
-        assert_eq!(read_only, 7);
+        assert_eq!(read_only, 9);
     }
 
     #[test]
@@ -1370,6 +2001,7 @@ mod tests {
         let policy = normalize_policy(GithubMcpPolicy {
             enabled: false,
             api_write_enabled: true,
+            ..Default::default()
         })
         .unwrap();
         assert!(!policy.enabled);
@@ -1427,7 +2059,16 @@ mod tests {
     #[test]
     fn enabled_policy_requires_no_preselected_token() {
         let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
-        save_policy(&vault, &dek, &GithubMcpPolicy { enabled: true, api_write_enabled: false }).unwrap();
+        save_policy(
+            &vault,
+            &dek,
+            &GithubMcpPolicy {
+                enabled: true,
+                api_write_enabled: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let policy = load_policy(&vault, &dek);
         assert!(policy.enabled);
         assert!(!policy.api_write_enabled);
@@ -1436,10 +2077,19 @@ mod tests {
     #[test]
     fn active_token_is_selected_by_tool_argument() {
         let (vault, dek, id) = token_entry("github");
-        save_policy(&vault, &dek, &GithubMcpPolicy { enabled: true, api_write_enabled: false }).unwrap();
+        save_policy(
+            &vault,
+            &dek,
+            &GithubMcpPolicy {
+                enabled: true,
+                api_write_enabled: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
-        let token = prepare(
+        let (token, _) = prepare(
             &session,
             "github_get_repository",
             &json!({"credential_id":id,"owner":"octocat","repo":"other"}),
@@ -1449,13 +2099,95 @@ mod tests {
     }
 
     #[test]
+    fn credential_can_be_matched_by_title_or_omitted_when_unique() {
+        let (vault, dek, _) = token_entry("github");
+        save_policy(
+            &vault,
+            &dek,
+            &GithubMcpPolicy {
+                enabled: true,
+                api_write_enabled: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut session = Session::default();
+        session.set_unlocked(vault, dek);
+        let by_title = prepare(
+            &session,
+            "github_get_authenticated_user",
+            &json!({"credential":"github"}),
+        )
+        .unwrap();
+        assert_eq!(by_title.0, "ghp_test_token_value");
+        let implicit = prepare(&session, "github_get_authenticated_user", &json!({})).unwrap();
+        assert_eq!(implicit.0, "ghp_test_token_value");
+    }
+
+    #[test]
+    fn repository_accepts_owner_slash_repo() {
+        assert_eq!(
+            repository_args(&json!({"repo":"hahaha-taotao/sealbox"})).unwrap(),
+            "hahaha-taotao/sealbox"
+        );
+        assert_eq!(
+            repository_args(&json!({"repo":"https://github.com/octocat/hello-world.git"})).unwrap(),
+            "octocat/hello-world"
+        );
+        assert_eq!(
+            repository_args(&json!({"owner":"octocat","repo":"hello-world"})).unwrap(),
+            "octocat/hello-world"
+        );
+    }
+
+    #[test]
     fn credential_discovery_returns_metadata_without_token() {
         let (vault, dek, _) = token_entry("github");
-        save_policy(&vault, &dek, &GithubMcpPolicy { enabled: true, api_write_enabled: false }).unwrap();
+        save_policy(
+            &vault,
+            &dek,
+            &GithubMcpPolicy {
+                enabled: true,
+                api_write_enabled: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
         let text = call_tool(&mut session, "github_list_credentials", json!({})).unwrap();
         assert!(text.contains("github"));
+        assert!(text.contains("is_default"));
         assert!(!text.contains("ghp_test_token_value"));
+    }
+
+    #[test]
+    fn write_is_denied_when_desktop_confirm_rejects() {
+        let (vault, dek, id) = token_entry("github");
+        save_policy(
+            &vault,
+            &dek,
+            &GithubMcpPolicy {
+                enabled: true,
+                api_write_enabled: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut session = Session::default();
+        session.set_unlocked(vault, dek);
+        let error = crate::confirm::with_auto(Some(false), || {
+            call_tool(
+                &mut session,
+                "github_create_issue",
+                json!({
+                    "credential_id": id,
+                    "repo": "octocat/hello-world",
+                    "title": "bug"
+                }),
+            )
+        })
+        .unwrap_err();
+        assert!(error.contains("拒绝"), "{error}");
     }
 }

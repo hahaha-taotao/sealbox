@@ -9,11 +9,11 @@
 |---|---|---|
 | 1 | 分组 / 开关 | 本地 git 继续共用 `GithubMcpPolicy.enabled`；GitHub API 写入另有 `api_write_enabled` |
 | 2 | 提交路径 | 本地 `git` CLI，不是 GitHub Contents PUT |
-| 3 | 人闸 | 仅启用时确认一次；stage / commit / push / pull / clone 不再逐次审批 |
+| 3 | 人闸 | 启用时确认一次；stage / commit / push / pull / clone / 工作区登记每次再弹桌面确认 |
 | 4 | 工具命名 | 本地 git 用 `github_git_*`；现有 `github_*` API 工具名不变 |
-| 5 | 工具范围 | 只读 status / diff / log / branches；写入 stage / commit / push / pull / clone |
-| 6 | 路径 | Agent 传入本机绝对路径。不登记工作区白名单，不配置 clone 根目录 |
-| 7 | 明确不做 | force、amend、创建/删除分支、push tag、SSH 注入、Gitee/GitLab、助手页调用写工具 |
+| 5 | 工具范围 | 只读 status / diff / log / branches / workspace list；写入 stage / commit / push / pull / clone / workspace register |
+| 6 | 路径 | 可先 `github_git_workspace_register(name, path)`，之后传 `workspace` 短名；仍接受绝对路径 |
+| 7 | 明确不做 | 裸 force、amend、创建/删除分支、SSH 注入、Gitee/GitLab、助手页调用写工具。允许可选 tags 与 force-with-lease |
 
 ## 1. 目标
 

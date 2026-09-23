@@ -292,6 +292,20 @@ fn rpc_ok(id: Option<Value>, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
+fn tool_call_result(text: &str, is_error: bool) -> Value {
+    let structured = serde_json::from_str::<Value>(text)
+        .ok()
+        .filter(|value| value.is_object() || value.is_array());
+    let mut result = json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": is_error
+    });
+    if let Some(value) = structured {
+        result["structuredContent"] = value;
+    }
+    result
+}
+
 fn handle_rpc(session: &Mutex<Session>, mcp: &McpState, req: JsonRpcReq) -> Option<Value> {
     let out = match req.method.as_str() {
         "initialize" => rpc_ok(
@@ -313,14 +327,8 @@ fn handle_rpc(session: &Mutex<Session>, mcp: &McpState, req: JsonRpcReq) -> Opti
                 .unwrap_or("");
             let args = req.params.get("arguments").cloned().unwrap_or(json!({}));
             match call_tool(session, mcp, name, args) {
-                Ok(text) => rpc_ok(
-                    req.id,
-                    json!({ "content": [{ "type": "text", "text": text }] }),
-                ),
-                Err(e) => rpc_ok(
-                    req.id,
-                    json!({ "content": [{ "type": "text", "text": e }], "isError": true }),
-                ),
+                Ok(text) => rpc_ok(req.id, tool_call_result(&text, false)),
+                Err(e) => rpc_ok(req.id, tool_call_result(&e, true)),
             }
         }
         _ => rpc_error(req.id, -32601, "method not found"),
@@ -726,12 +734,15 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .filter(|name| name.starts_with("github_"))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 17);
+        assert_eq!(names.len(), 24);
         assert!(names.contains(&"github_list_credentials"));
         assert!(names.contains(&"github_get_file"));
         assert!(names.contains(&"github_git_status"));
         assert!(names.contains(&"github_git_clone"));
+        assert!(names.contains(&"github_git_workspace_register"));
         assert!(names.contains(&"github_create_release"));
+        assert!(names.contains(&"github_create_pull_request"));
+        assert!(names.contains(&"github_list_workflow_runs"));
         assert!(!names.contains(&"github_git_list"));
     }
 
@@ -758,6 +769,17 @@ mod tests {
     }
 
     #[test]
+    fn json_tool_results_include_structured_content() {
+        let result = tool_call_result(r#"{"ok":true,"pushed":false}"#, false);
+        assert_eq!(result["structuredContent"]["ok"], true);
+        assert_eq!(result["isError"], false);
+        let list = tool_call_result(r#"[{"title":"github"}]"#, false);
+        assert_eq!(list["structuredContent"][0]["title"], "github");
+        let text = tool_call_result("not json", false);
+        assert!(text.get("structuredContent").is_none());
+    }
+
+    #[test]
     fn enabled_github_tools_are_exposed_as_single_toggle() {
         let (vault, dek) =
             crate::vault::Vault::create_in_memory("correct horse battery staple extra").unwrap();
@@ -774,10 +796,11 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .filter(|name| name.starts_with("github_"))
             .collect::<Vec<_>>();
-        assert_eq!(github_names.len(), 17);
+        assert_eq!(github_names.len(), 24);
         assert!(github_names.contains(&"github_list_credentials"));
         assert!(github_names.contains(&"github_git_push"));
         assert!(github_names.contains(&"github_create_release"));
+        assert!(github_names.contains(&"github_git_workspace_list"));
     }
 
     #[test]

@@ -1,18 +1,19 @@
 # GitHub MCP 扩展路线
 
 日期：2026-09-20  
-状态：已实现 `github_create_release`，其余接口为路线规划
+状态：2026-09-23 已补齐凭据标题、owner/repo、工作区短名、更完整的 push、逐次桌面确认和常用写接口
 
 ## 当前能力
 
 GitHub MCP 仍默认停用，并继续只访问固定的 `https://api.github.com:443`。启用后提供：
 
-- 7 个低风险只读 API 工具：用户、仓库、文件、Issue、Pull Request 和凭据元数据
-- 本地 `github_git_*` 工具：受限的 status / diff / log / branches 读取，以及 stage / commit / push / pull / clone 写入
-- 通过独立的 `api_write_enabled` 开关控制 GitHub API 写入
-- `github_create_release`：固定 POST `/repos/{owner}/{repo}/releases`
+- 只读 API：用户、仓库、文件、Issue、Pull Request（含 head/base/draft/mergeable）、Actions 运行、凭据元数据
+- 本地 `github_git_*`：工作区短名、status / diff / log / branches，以及 stage / commit / push / pull / clone
+- 凭据可用标题匹配或 MCP 页默认 Token；仓库推荐 `owner/repo`
+- 通过独立的 `api_write_enabled` 开关控制 GitHub API 写入；每次写操作弹出桌面确认
+- 写入：`github_create_issue`、`github_create_issue_comment`、`github_create_pull_request`（默认草稿）、`github_create_release`（默认草稿）
 
-`github_create_release` 的安全约束：
+写工具的安全约束：
 
 - 工具标记为 `readOnly: false`、`risk: "high"`，不会进入内置助手的自动只读工具列表
 - `enabled` 和 `api_write_enabled` 两个开关都必须开启
@@ -46,15 +47,16 @@ Workflow 日志和 Artifacts 即使是 GET，也可能包含部署信息或意�
 
 ## P1：普通写入
 
-在独立写入开关和审计基础上，可以考虑：
+已实现（均需桌面确认）：
 
 - `github_create_pull_request`：默认 Draft，不自动合并
 - `github_create_issue`
 - `github_create_issue_comment`
+
+仍可考虑：
+
 - `github_create_pr_comment`
 - `github_update_issue`
-
-这些操作会触发通知或 Webhook，仍需明确说明和参数白名单。
 
 ## 高风险写入
 
@@ -74,5 +76,5 @@ Release asset 上传尤其需要单独的 `uploads.github.com:443` 域名、二�
 
 - 不提供任意 HTTP、任意 URL、任意请求头、任意方法或任意原始请求体
 - 不把 GitHub Token、主密码、金库备份、Authorization header 或完整远端响应返回给模型
-- 不自动合并 PR、不 force push、不 push tag、不修改远端分支保护
+- 不自动合并 PR、不裸 force push（仅可选 force-with-lease）、不修改远端分支保护
 - 不把高风险写工具加入内置助手的自动调用白名单

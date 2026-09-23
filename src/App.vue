@@ -27,6 +27,7 @@ import {
   type EntryKind,
   type ExtensionInstallStatus,
   type FolderDto,
+  type GithubCredentialOption,
   type GithubMcpPolicy,
   type ListFilter,
   type McpStatus,
@@ -362,7 +363,14 @@ const revealedFillToken = ref("");
 const revealedMcpToken = ref("");
 const revealedMcpSnippet = ref("");
 const mcpTools = ref<McpToolInfo[]>([]);
-const githubPolicy = ref<GithubMcpPolicy>({ enabled: false, api_write_enabled: false });
+const emptyGithubPolicy = (): GithubMcpPolicy => ({
+  enabled: false,
+  api_write_enabled: false,
+  default_credential_id: null,
+  workspaces: [],
+});
+const githubPolicy = ref<GithubMcpPolicy>(emptyGithubPolicy());
+const githubCredentials = ref<GithubCredentialOption[]>([]);
 const githubPolicyBusy = ref(false);
 const zoomkeyPolicy = ref<ZoomkeyMcpPolicy | null>(null);
 const zoomkeyCandidates = ref<ZoomkeyCandidates>({
@@ -396,9 +404,15 @@ async function refreshMcp() {
   hideBridgeTokens();
   mcp.value = await api.mcpStatus();
   try {
-    githubPolicy.value = await api.githubMcpPolicyGet();
+    githubPolicy.value = coerceGithubPolicy(await api.githubMcpPolicyGet());
+    try {
+      githubCredentials.value = await api.githubMcpCredentials();
+    } catch {
+      githubCredentials.value = [];
+    }
   } catch {
-    githubPolicy.value = { enabled: false, api_write_enabled: false };
+    githubPolicy.value = emptyGithubPolicy();
+    githubCredentials.value = [];
   }
   try {
     zoomkeyPolicy.value = await api.zoomkeyPolicyGet();
@@ -488,14 +502,14 @@ async function saveGithubPolicy() {
   const next = { ...githubPolicy.value, enabled: !previous.enabled, api_write_enabled: previous.enabled ? previous.api_write_enabled : false };
   if (!previous.enabled) {
     const ok = confirm(
-      "开启后，Cursor / Claude Code 可以使用 GitHub 只读 API，并在模型给出的本地路径上执行 git（含 commit / push / pull / clone）。Token 不会返回给模型。继续？",
+      "开启后，Cursor / Claude Code 可以使用 GitHub API 和本地 git。写操作（commit / push / 开 PR / 建 Issue / 发 Release）每次都会弹出 Sealbox 桌面确认。Token 不会返回给模型。继续？",
     );
     if (!ok) return;
   }
   githubPolicyBusy.value = true;
   githubPolicy.value = next;
   try {
-    githubPolicy.value = await api.githubMcpPolicySet(next);
+    githubPolicy.value = coerceGithubPolicy(await api.githubMcpPolicySet(normalizeGithubPolicyForSave(next)));
     mcp.value = await api.mcpStatus();
     mcpTools.value = await api.mcpTools();
     showToast(githubPolicy.value.enabled ? "GitHub MCP 已启用" : "GitHub MCP 已停用");
@@ -512,7 +526,7 @@ async function toggleGithubApiWrite() {
   const nextEnabled = !githubPolicy.value.api_write_enabled;
   if (nextEnabled) {
     const ok = confirm(
-      "这会允许外部 MCP 客户端使用 GitHub API 创建 Release（默认草稿，但仍会在远程仓库创建对象）。请确认 Token 具备目标仓库的写权限。继续？",
+      "这会允许外部 MCP 客户端创建 Issue、评论、Draft PR 和 Release。每一次写操作仍会弹出 Sealbox 桌面确认。请确认 Token 具备目标仓库的写权限。继续？",
     );
     if (!ok) return;
   }
@@ -520,7 +534,9 @@ async function toggleGithubApiWrite() {
   githubPolicyBusy.value = true;
   githubPolicy.value = { ...previous, api_write_enabled: nextEnabled };
   try {
-    githubPolicy.value = await api.githubMcpPolicySet(githubPolicy.value);
+    githubPolicy.value = coerceGithubPolicy(
+      await api.githubMcpPolicySet(normalizeGithubPolicyForSave(githubPolicy.value)),
+    );
     mcpTools.value = await api.mcpTools();
     showToast(nextEnabled ? "GitHub API 写入已启用" : "GitHub API 写入已停用");
   } catch (e) {
@@ -529,6 +545,47 @@ async function toggleGithubApiWrite() {
   } finally {
     githubPolicyBusy.value = false;
   }
+}
+
+function coerceGithubPolicy(policy: GithubMcpPolicy): GithubMcpPolicy {
+  return {
+    ...policy,
+    default_credential_id: policy.default_credential_id || "",
+    workspaces: policy.workspaces ?? [],
+  };
+}
+
+function normalizeGithubPolicyForSave(policy: GithubMcpPolicy): GithubMcpPolicy {
+  const defaultId = policy.default_credential_id?.trim() || null;
+  return {
+    ...policy,
+    default_credential_id: defaultId,
+    workspaces: (policy.workspaces ?? []).map((workspace) => ({
+      ...workspace,
+      default_credential_id: workspace.default_credential_id?.trim() || null,
+    })),
+  };
+}
+
+async function saveGithubPolicyDetails() {
+  if (githubPolicyBusy.value || !githubPolicy.value.enabled) return;
+  githubPolicyBusy.value = true;
+  try {
+    githubPolicy.value = coerceGithubPolicy(
+      await api.githubMcpPolicySet(normalizeGithubPolicyForSave(githubPolicy.value)),
+    );
+    mcpTools.value = await api.mcpTools();
+    showToast("GitHub MCP 设置已保存");
+  } catch (e) {
+    showToast(String(e));
+    await refreshMcp();
+  } finally {
+    githubPolicyBusy.value = false;
+  }
+}
+
+function removeGithubWorkspace(name: string) {
+  githubPolicy.value.workspaces = githubPolicy.value.workspaces.filter((item) => item.name !== name);
 }
 
 async function rotateMcp() {
@@ -1919,8 +1976,9 @@ onMounted(async () => {
           <div class="mcp-card">
             <h3>GitHub MCP</h3>
             <p class="crumb">
-              启用后开放 api.github.com 只读 GET 工具，以及本地 git 工具 github_git_*（status / diff / commit / push / pull / clone）。
-              Agent 传入本机绝对路径；Token 只在 Rust 里注入，不会返回给模型。
+              启用后开放 GitHub 只读 API、本地 git，以及可单独打开的 Issue / PR / Release 写入。
+              模型可用 Token 标题或默认凭据，不必先抄 UUID；仓库传 owner/repo；已登记工作区可用短名代替绝对路径。
+              每一次写操作都会弹出 Sealbox 桌面确认。Token 不会返回给模型。
             </p>
             <div class="mcp-actions">
               <button class="btn primary" type="button" :disabled="githubPolicyBusy" @click="saveGithubPolicy">
@@ -1935,8 +1993,37 @@ onMounted(async () => {
                 {{ githubPolicy.api_write_enabled ? "停用 GitHub API 写入" : "启用 GitHub API 写入" }}
               </button>
             </div>
+            <template v-if="githubPolicy.enabled">
+              <div class="field">
+                <label>默认 GitHub Token</label>
+                <select v-model="githubPolicy.default_credential_id">
+                  <option value="">未选择（金库里只有一条时自动用）</option>
+                  <option v-for="c in githubCredentials" :key="c.id" :value="c.id">
+                    {{ c.title }}{{ c.account ? ` · ${c.account}` : "" }}
+                  </option>
+                </select>
+                <p class="crumb" v-if="!githubCredentials.length">
+                  还没有 GitHub API Token。请在保险库新建一条：服务填 github。
+                </p>
+              </div>
+              <div class="field" v-if="githubPolicy.workspaces.length">
+                <label>已登记工作区</label>
+                <div class="tool-list">
+                  <div class="tool-item" v-for="ws in githubPolicy.workspaces" :key="ws.name">
+                    <div class="tool-heading">
+                      <code class="tool-name">{{ ws.name }}</code>
+                      <button class="btn" type="button" @click="removeGithubWorkspace(ws.name)">移除</button>
+                    </div>
+                    <p class="crumb">{{ ws.path }}</p>
+                  </div>
+                </div>
+              </div>
+              <div class="mcp-actions">
+                <button class="btn" type="button" :disabled="githubPolicyBusy" @click="saveGithubPolicyDetails">保存默认 Token / 工作区</button>
+              </div>
+            </template>
             <p class="crumb">
-              GitHub API 写入目前仅包含创建 Release，默认创建草稿；它仍会在远程仓库创建对象，需要单独启用。
+              GitHub API 写入包含创建 Issue、评论、Draft PR 和 Release；每次仍需桌面确认。
               GitHub Token 在 GitHub 侧的实际权限仍由 GitHub 返回结果决定；Sealbox 不把 Token、请求头或任意请求体返回给模型。
             </p>
           </div>
@@ -2256,7 +2343,7 @@ onMounted(async () => {
               <form class="assistant-composer" @submit.prevent="sendAssistantMessage">
                 <textarea v-model="assistantInput" rows="3" :disabled="assistantChatBusy" placeholder="输入消息，Enter 发送，Shift+Enter 换行" @keydown.enter.exact.prevent="sendAssistantMessage" />
                 <div class="assistant-composer-foot">
-                  <span class="crumb">助手不会调用 github_git_commit / push / pull / clone</span>
+                  <span class="crumb">助手不会调用 commit / push / 开 PR / 发 Release 等写工具</span>
                   <button class="btn primary" type="submit" :disabled="assistantChatBusy || !assistantInput.trim()">{{ assistantChatBusy ? "发送中…" : "发送" }}</button>
                 </div>
               </form>

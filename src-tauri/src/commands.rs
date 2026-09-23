@@ -1,7 +1,7 @@
 use crate::assistant;
 use crate::backup::{export_envelope, import_envelope};
 use crate::clipboard;
-use crate::github_mcp::{self, GithubMcpPolicy};
+use crate::github_mcp::{self, GithubCredentialMeta, GithubMcpPolicy};
 use crate::hello;
 use crate::lock::{idle_lock_if_needed, lock_everything, lock_session, recover_lock};
 use crate::mcp::{self, McpState};
@@ -1141,11 +1141,25 @@ pub fn github_mcp_policy_set(
     let vault = session.vault().map_err(map_err)?;
     github_mcp::save_policy(vault, &dek, &normalized)?;
     let detail = format!(
-        "enabled={} api_write_enabled={}",
-        normalized.enabled, normalized.api_write_enabled
+        "enabled={} api_write_enabled={} default={} workspaces={}",
+        normalized.enabled,
+        normalized.api_write_enabled,
+        if normalized.default_credential_id.is_some() {
+            "set"
+        } else {
+            "-"
+        },
+        normalized.workspaces.len()
     );
     let _ = vault.audit("mcp_github_policy", None, &detail);
     Ok(normalized)
+}
+
+#[tauri::command]
+pub fn github_mcp_credentials(state: State<AppState>) -> Result<Vec<GithubCredentialMeta>, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    github_mcp::list_credentials(&session)
 }
 
 #[tauri::command]

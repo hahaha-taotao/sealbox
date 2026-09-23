@@ -3,6 +3,7 @@ pub mod backup;
 pub mod certificate;
 pub mod clipboard;
 pub mod commands;
+pub mod confirm;
 pub mod crypto;
 pub mod db;
 pub mod fill;
@@ -91,6 +92,7 @@ pub fn run() {
             commands::mcp_tools,
             commands::github_mcp_policy_get,
             commands::github_mcp_policy_set,
+            commands::github_mcp_credentials,
             commands::zoomkey_policy_get,
             commands::zoomkey_policy_set,
             commands::zoomkey_candidates,
