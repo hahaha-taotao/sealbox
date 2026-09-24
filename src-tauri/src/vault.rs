@@ -39,6 +39,8 @@ pub enum VaultError {
     Certificate(#[from] certificate::CertificateError),
     #[error("master password too short")]
     PasswordTooShort,
+    #[error("{0}")]
+    InvalidTotp(String),
     #[error("备份文件损坏或格式不正确")]
     CorruptBackup,
     #[error("备份密钥拉伸参数超出允许范围")]
@@ -422,6 +424,28 @@ impl Vault {
     ) -> Result<EntryDto, VaultError> {
         if input.kind != input.secret.kind() {
             return Err(VaultError::KindMismatch);
+        }
+        if let SecretPayload::Website {
+            totp_secret: Some(raw),
+            ..
+        } = &mut input.secret
+        {
+            if raw.trim().is_empty() {
+                *raw = String::new();
+            } else {
+                *raw = crate::totp::normalize_totp_secret(raw).map_err(VaultError::InvalidTotp)?;
+            }
+        }
+        if let SecretPayload::Website {
+            totp_secret: Some(raw),
+            ..
+        } = &input.secret
+        {
+            if raw.is_empty() {
+                if let SecretPayload::Website { totp_secret, .. } = &mut input.secret {
+                    *totp_secret = None;
+                }
+            }
         }
         let certificate_metadata = if let SecretPayload::ClientCert {
             cert_pem,
@@ -1081,7 +1105,8 @@ impl Vault {
             return Ok(false);
         }
         let secret = decrypt(source_dek, &Encrypted::from_bytes(&entry.secret_blob)?)?;
-        let payload: SecretPayload = serde_json::from_slice(&secret).map_err(|_| VaultError::CorruptBackup)?;
+        let payload: SecretPayload =
+            serde_json::from_slice(&secret).map_err(|_| VaultError::CorruptBackup)?;
         let expected_kind = EntryKind::parse(&entry.kind).map_err(|_| VaultError::CorruptBackup)?;
         if payload.kind() != expected_kind {
             return Err(VaultError::CorruptBackup);
@@ -1489,5 +1514,84 @@ fn now_rfc3339() -> String {
 fn remove_db_files(path: &str) {
     for suffix in ["", "-wal", "-shm", "-journal"] {
         let _ = std::fs::remove_file(format!("{path}{suffix}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upsert_normalizes_website_totp() {
+        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        let entry = vault
+            .upsert_entry(
+                &dek,
+                UpsertEntry {
+                    id: None,
+                    kind: EntryKind::Website,
+                    title: "GitHub".into(),
+                    account: Some("octocat".into()),
+                    url: Some("https://github.com".into()),
+                    folder_id: None,
+                    tags: vec![],
+                    pinned: false,
+                    expires_at: None,
+                    notes: None,
+                    secret: SecretPayload::Website {
+                        url: Some("https://github.com".into()),
+                        username: Some("octocat".into()),
+                        password: "pw".into(),
+                        totp_secret: Some(
+                            "otpauth://totp/GitHub:octocat?secret=JBSWY3DPEHPK3PXP".into(),
+                        ),
+                    },
+                },
+            )
+            .unwrap();
+        match vault.get_secret(&dek, &entry.id).unwrap() {
+            SecretPayload::Website {
+                totp_secret: Some(secret),
+                ..
+            } => assert_eq!(secret, "JBSWY3DPEHPK3PXP"),
+            other => panic!("{other:?}"),
+        }
+        assert!(entry.has_totp);
+    }
+
+    #[test]
+    fn upsert_treats_blank_totp_as_unconfigured() {
+        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        let entry = vault
+            .upsert_entry(
+                &dek,
+                UpsertEntry {
+                    id: None,
+                    kind: EntryKind::Website,
+                    title: "GitHub".into(),
+                    account: Some("octocat".into()),
+                    url: Some("https://github.com".into()),
+                    folder_id: None,
+                    tags: vec![],
+                    pinned: false,
+                    expires_at: None,
+                    notes: None,
+                    secret: SecretPayload::Website {
+                        url: Some("https://github.com".into()),
+                        username: Some("octocat".into()),
+                        password: "pw".into(),
+                        totp_secret: Some("  ".into()),
+                    },
+                },
+            )
+            .unwrap();
+        assert!(!entry.has_totp);
+        assert!(matches!(
+            vault.get_secret(&dek, &entry.id).unwrap(),
+            SecretPayload::Website {
+                totp_secret: None,
+                ..
+            }
+        ));
     }
 }

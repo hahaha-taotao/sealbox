@@ -80,13 +80,90 @@ pub fn generate_passphrase(words: usize, separator: &str) -> String {
         .join(separator)
 }
 
-pub fn totp_now(secret: &str) -> Result<String, String> {
-    let secret = Secret::Encoded(secret.to_string())
+pub fn normalize_totp_secret(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("TOTP 密钥不能为空".into());
+    }
+    let secret = if let Some(rest) = trimmed.strip_prefix("otpauth://") {
+        parse_otpauth(rest)?
+    } else {
+        compact_base32(trimmed)?
+    };
+    Secret::Encoded(secret.clone())
         .to_bytes()
-        .or_else(|_| Secret::Raw(secret.as_bytes().to_vec()).to_bytes())
+        .map_err(|_| "TOTP 密钥不是有效 Base32".to_string())?;
+    Ok(secret)
+}
+
+fn parse_otpauth(rest: &str) -> Result<String, String> {
+    let (kind, query) = rest.split_once('?').ok_or("otpauth URI 缺少参数")?;
+    if !kind.to_ascii_lowercase().starts_with("totp/") {
+        return Err("只支持 otpauth://totp".into());
+    }
+    let mut secret = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let key = percent_decode(key)?.to_ascii_lowercase();
+        let value = percent_decode(value)?;
+        match key.as_str() {
+            "secret" => secret = Some(compact_base32(&value)?),
+            "digits" if value != "6" => return Err("只支持 6 位 TOTP".into()),
+            "period" if value != "30" => return Err("只支持 30 秒周期".into()),
+            "algorithm" if !value.eq_ignore_ascii_case("sha1") => {
+                return Err("只支持 SHA1 TOTP".into())
+            }
+            _ => {}
+        }
+    }
+    secret.ok_or_else(|| "otpauth URI 缺少 secret".into())
+}
+
+fn compact_base32(raw: &str) -> Result<String, String> {
+    let compact: String = raw
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+    if compact.len() < 8 || compact.len() > 128 {
+        return Err("TOTP 密钥长度不合法".into());
+    }
+    if !compact
+        .chars()
+        .all(|c| matches!(c, 'A'..='Z' | '2'..='7' | '='))
+    {
+        return Err("TOTP 密钥不是有效 Base32".into());
+    }
+    Ok(compact)
+}
+
+fn percent_decode(value: &str) -> Result<String, String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err("otpauth URI 编码无效".into());
+            }
+            let hex =
+                std::str::from_utf8(&bytes[i + 1..i + 3]).map_err(|_| "otpauth URI 编码无效")?;
+            decoded.push(u8::from_str_radix(hex, 16).map_err(|_| "otpauth URI 编码无效")?);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| "otpauth URI 编码无效".into())
+}
+
+pub fn totp_now(secret: &str) -> Result<String, String> {
+    let secret = normalize_totp_secret(secret)?;
+    let secret = Secret::Encoded(secret)
+        .to_bytes()
         .map_err(|e| e.to_string())?;
-    let totp = TOTP::new(Algorithm::SHA1, 6, 1, 30, secret, None, "Sealbox".into())
-        .map_err(|e| e.to_string())?;
+    let totp = TOTP::new_unchecked(Algorithm::SHA1, 6, 1, 30, secret, None, "Sealbox".into());
     totp.generate_current().map_err(|e| e.to_string())
 }
 
@@ -158,5 +235,32 @@ mod tests {
         assert_eq!(generate_passphrase(1, "").split('-').count(), 3);
         assert_eq!(generate_passphrase(0, "").split('-').count(), 4);
         assert_eq!(generate_passphrase(99, "-").split('-').count(), 8);
+    }
+
+    #[test]
+    fn normalize_accepts_otpauth_and_spaces() {
+        let secret = super::normalize_totp_secret(
+            "otpauth://totp/GitHub:octocat?secret=JBSWY3DPEHPK3PXP&issuer=GitHub",
+        )
+        .unwrap();
+        assert_eq!(secret, "JBSWY3DPEHPK3PXP");
+        assert!(super::normalize_totp_secret("jbsw y3dp ehpk 3pxp").is_ok());
+        assert!(super::normalize_totp_secret("").is_err());
+        assert!(
+            super::normalize_totp_secret("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&digits=8")
+                .is_err()
+        );
+        assert!(super::normalize_totp_secret("otpauth://hotp/x?secret=JBSWY3DPEHPK3PXP").is_err());
+        assert!(
+            super::normalize_totp_secret("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP%ZZ").is_err()
+        );
+    }
+
+    #[test]
+    fn totp_now_accepts_normalized_secret() {
+        let secret = super::normalize_totp_secret("JBSWY3DPEHPK3PXP").unwrap();
+        let code = super::totp_now(&secret).unwrap();
+        assert_eq!(code.len(), 6);
+        assert!(code.chars().all(|c| c.is_ascii_digit()));
     }
 }

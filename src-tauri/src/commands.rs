@@ -556,11 +556,14 @@ pub fn client_cert_info(state: State<AppState>, id: String) -> Result<ClientCert
     else {
         return Err("条目不是客户端证书".into());
     };
-    let metadata = crate::certificate::validate_client_cert(&cert_pem, &key_pem, passphrase.as_deref()).ok();
+    let metadata =
+        crate::certificate::validate_client_cert(&cert_pem, &key_pem, passphrase.as_deref()).ok();
     Ok(ClientCertInfo {
         id: entry.id,
         title: entry.title,
-        fingerprint: entry.fingerprint.or_else(|| metadata.as_ref().map(|value| value.fingerprint.clone())),
+        fingerprint: entry
+            .fingerprint
+            .or_else(|| metadata.as_ref().map(|value| value.fingerprint.clone())),
         certificate_count: metadata.as_ref().map(|value| value.certificate_count),
         has_passphrase: passphrase.is_some(),
     })
@@ -810,6 +813,40 @@ pub fn import_backup(
     let dek = *session.dek().map_err(map_err)?;
     let vault = session.vault().map_err(map_err)?;
     import_envelope(vault, &dek, &bytes, &password, overwrite).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn import_csv_preview(
+    state: State<AppState>,
+    path: String,
+) -> Result<crate::csv_import::CsvImportPreview, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let vault = session.vault().map_err(map_err)?;
+    let dek = session.dek().map_err(map_err)?;
+    crate::csv_import::preview_file(vault, dek, &path).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn import_csv_commit(
+    state: State<AppState>,
+    path: String,
+    overwrite: bool,
+) -> Result<crate::csv_import::CsvImportResult, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let vault = session.vault().map_err(map_err)?;
+    let dek = *session.dek().map_err(map_err)?;
+    let result = crate::csv_import::commit_file(vault, &dek, &path, overwrite).map_err(map_err)?;
+    let _ = vault.audit(
+        "import_csv",
+        None,
+        &format!(
+            "format={} inserted={} updated={} skipped={} overwrite={}",
+            result.format, result.inserted, result.updated, result.skipped_existing, overwrite
+        ),
+    );
+    Ok(result)
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1182,11 +1219,7 @@ pub fn zoomkey_policy_set(
     let dek = *session.dek().map_err(map_err)?;
     let vault = session.vault().map_err(map_err)?;
     zoomkey::save_policy(vault, &dek, &normalized)?;
-    let _ = vault.audit(
-        "mcp_zoomkey_policy",
-        None,
-        on_off(normalized.enabled),
-    );
+    let _ = vault.audit("mcp_zoomkey_policy", None, on_off(normalized.enabled));
     Ok(normalized)
 }
 

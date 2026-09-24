@@ -32,6 +32,12 @@ function render(matches) {
         "display:block;margin-top:2px;font-size:11px;line-height:1.3;color:rgba(255,255,255,.72);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
       b.appendChild(noteEl);
     }
+    if (m.has_totp || m.badge) {
+      const badge = document.createElement("span");
+      badge.textContent = "验证码";
+      badge.style.cssText = "display:inline-block;margin-top:3px;font-size:10px;line-height:1.2;color:rgba(255,255,255,.55);";
+      b.appendChild(badge);
+    }
     b.onclick = async () => {
       showError("");
       const res = await chrome.runtime.sendMessage({ type: "fill-tab", id: m.id });

@@ -240,7 +240,7 @@
   }
 
   function usernameScore(field) {
-    if (!field || isPasswordLike(field)) return -1;
+    if (!field || isPasswordLike(field) || isOtpField(field)) return -1;
     const type = String(field.type || "").toLowerCase();
     if (["hidden", "submit", "button", "checkbox", "radio", "file", "image", "reset"].includes(type)) {
       return -1;
@@ -293,6 +293,31 @@
       usernameIndex,
       passwordIndex,
     };
+  }
+
+  function isOtpField(field) {
+    if (!field) return false;
+    const type = String(field.type || "").toLowerCase();
+    if (type === "password" || type === "hidden" || type === "submit") return false;
+    const text = `${field.name || ""} ${field.id || ""} ${field.placeholder || ""} ${field.ariaLabel || ""} ${field.className || ""} ${field.label || ""} ${field.autocomplete || ""}`;
+    if (/password|passwd|pwd|secret|密码|口令/i.test(text)) return false;
+    if (String(field.autocomplete || "").toLowerCase().trim() === "one-time-code") return true;
+    const max = Number(field.maxlength || field.maxLength || 0);
+    const numericBox = (type === "text" || type === "number" || type === "tel" || !type) && (max === 6 || max === 8) && /^\d*$/.test(String(field.value || ""));
+    const otpLabel = /otp|totp|2fa|mfa|one[-_ ]?time|verification|验证码|动态码|校验码|安全码/i.test(text);
+    return (otpLabel && (!max || max === 6 || max === 8)) || numericBox;
+  }
+
+  function pendingTotpPlan(entry, now) {
+    const code = String(entry?.totp || "");
+    if (!/^\d{6}$/.test(code)) return null;
+    const remaining = Math.min(30, Math.max(1, Number(entry.totp_period_remaining) || 30));
+    return { code, expiresAt: (now == null ? Date.now() : now) + remaining * 1000 };
+  }
+
+  function isPendingTotpExpired(pending, now) {
+    if (!pending || !Number(pending.expiresAt)) return true;
+    return (now == null ? Date.now() : now) >= Number(pending.expiresAt);
   }
 
   function fillTokenFromStores({ sessionToken, localToken } = {}) {
@@ -361,6 +386,9 @@
     classifySave,
     overlayDecision,
     isPendingExpired,
+    isOtpField,
+    pendingTotpPlan,
+    isPendingTotpExpired,
     shouldSkipSavePrompt,
     isLoginActionText,
     looksLikeSubmitControl,

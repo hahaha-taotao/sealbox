@@ -93,8 +93,13 @@
       id: el.id || "",
       placeholder: el.placeholder || "",
       autocomplete: el.autocomplete || "",
+      maxlength: el.getAttribute?.("maxlength") || el.maxLength || "",
       className: String(el.className || ""),
       ariaLabel: el.getAttribute?.("aria-label") || "",
+      label: (() => {
+        const labels = el.labels ? Array.from(el.labels).map((label) => label.textContent || "").join(" ") : "";
+        return labels || el.closest?.("label")?.textContent || "";
+      })(),
       value: nativeValue(el),
       hidden,
       rendered,
@@ -151,12 +156,23 @@
     }
   }
 
-  function fill(username, password) {
+  function findOtpField(rootEl) {
+    const Fill = root.SealboxFill || globalThis.SealboxFill;
+    if (!Fill?.isOtpField) return null;
+    return collectInputs(rootEl || document, []).find((el) => {
+      const info = snapshot(el);
+      return info.rendered && !info.hidden && !info.disabled && !info.readOnly && Fill.isOtpField(info);
+    }) || null;
+  }
+
+  function fill(username, password, totp) {
     const fields = findFields(document);
-    if (!fields?.password) return { ok: false, error: "no-password-field" };
+    if (!fields?.password) return { ok: false, error: "no-password-field", filledTotp: false };
     setValue(fields.user, username || "");
     setValue(fields.password, password || "");
-    return { ok: true };
+    const otpField = totp ? findOtpField(document) : null;
+    if (otpField) setValue(otpField, totp);
+    return { ok: true, filledTotp: Boolean(otpField) };
   }
 
   function readFields() {
@@ -180,5 +196,5 @@
     };
   }
 
-  root.SealboxPageFill = { findFields, setValue, fill, readFields };
+  root.SealboxPageFill = { findFields, findOtpField, setValue, fill, readFields };
 })(typeof globalThis !== "undefined" ? globalThis : this);

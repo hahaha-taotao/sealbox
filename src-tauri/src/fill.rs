@@ -14,6 +14,7 @@ pub struct FillMatch {
     pub url: Option<String>,
     pub notes: Option<String>,
     pub score: i32,
+    pub has_totp: bool,
 }
 
 #[derive(Serialize)]
@@ -22,6 +23,8 @@ pub struct FillSecret {
     pub title: String,
     pub username: String,
     pub password: String,
+    pub totp: Option<String>,
+    pub totp_period_remaining: Option<u8>,
 }
 
 pub fn host_of(url: &str) -> Option<String> {
@@ -151,6 +154,7 @@ pub fn match_websites(session: &Mutex<Session>, page_url: &str) -> Result<Vec<Fi
                 url: e.url,
                 notes,
                 score,
+                has_totp: e.has_totp,
             });
         }
     }
@@ -194,10 +198,21 @@ pub fn reveal_for_fill(
     }
     let payload = vault.get_secret(&dek, id).map_err(|e| e.to_string())?;
     let SecretPayload::Website {
-        username, password, ..
+        username,
+        password,
+        totp_secret,
+        ..
     } = payload
     else {
         return Err("not a website entry".into());
+    };
+    let (totp, totp_period_remaining) = match totp_secret.as_deref() {
+        Some(secret) if !secret.is_empty() => {
+            let code = crate::totp::totp_now(secret).map_err(|e| e.to_string())?;
+            let remaining = 30 - (chrono::Utc::now().timestamp().rem_euclid(30) as u8);
+            (Some(code), Some(remaining.max(1)))
+        }
+        _ => (None, None),
     };
     let _ = vault.bump_use(id);
     let _ = vault.audit("browser_fill", Some(id), "ok");
@@ -207,6 +222,8 @@ pub fn reveal_for_fill(
         title: dto.title,
         username: username.unwrap_or_default(),
         password,
+        totp,
+        totp_period_remaining,
     })
 }
 
@@ -465,6 +482,67 @@ mod tests {
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
         Mutex::new(session)
+    }
+
+    fn unlocked_github_totp() -> Mutex<Session> {
+        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        vault
+            .upsert_entry(
+                &dek,
+                UpsertEntry {
+                    id: None,
+                    kind: EntryKind::Website,
+                    title: "GitHub".into(),
+                    account: Some("octocat".into()),
+                    url: Some("https://github.com".into()),
+                    folder_id: None,
+                    tags: vec![],
+                    pinned: false,
+                    expires_at: None,
+                    notes: None,
+                    secret: SecretPayload::Website {
+                        url: Some("https://github.com".into()),
+                        username: Some("octocat".into()),
+                        password: "gh-pass".into(),
+                        totp_secret: Some("JBSWY3DPEHPK3PXP".into()),
+                    },
+                },
+            )
+            .unwrap();
+        let mut session = Session::default();
+        session.set_unlocked(vault, dek);
+        Mutex::new(session)
+    }
+
+    #[test]
+    fn match_and_secret_include_totp_code_not_secret() {
+        let mutex = unlocked_github_totp();
+        let hits = match_websites(&mutex, "https://github.com/login").unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].has_totp);
+        let body = format!(
+            r#"{{"id":"{}","url":"https://github.com/login"}}"#,
+            hits[0].id
+        );
+        let json = handle_fill_http(&mutex, "/fill/secret", body.as_bytes()).unwrap();
+        let entry = &json["entry"];
+        assert_eq!(entry["password"], "gh-pass");
+        let code = entry["totp"].as_str().unwrap();
+        assert_eq!(code.len(), 6);
+        assert!(entry["totp_secret"].is_null() || entry.get("totp_secret").is_none());
+        let remaining = entry["totp_period_remaining"].as_u64().unwrap();
+        assert!((1..=30).contains(&remaining));
+        let dumped = json.to_string();
+        assert!(!dumped.contains("JBSWY3DPEHPK3PXP"));
+    }
+
+    #[test]
+    fn secret_without_totp_returns_null_code() {
+        let mutex = unlocked_github();
+        let hits = match_websites(&mutex, "https://github.com/login").unwrap();
+        assert!(!hits[0].has_totp);
+        let sec = reveal_for_fill(&mutex, &hits[0].id, "https://github.com/login").unwrap();
+        assert!(sec.totp.is_none());
     }
 
     #[test]

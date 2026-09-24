@@ -239,6 +239,13 @@ test("pickLoginValues treats a filled text field next to a password as the usern
   ]);
   assert.equal(picked.username, "18698459937");
   assert.equal(picked.password, "secret");
+  const withOtp = fill.pickLoginValues([
+    { type: "text", name: "username", value: "alice", rendered: true },
+    { type: "password", name: "password", value: "secret", rendered: true },
+    { type: "text", autocomplete: "one-time-code", maxlength: "6", value: "123456", rendered: true },
+  ]);
+  assert.equal(withOtp.username, "alice");
+  assert.equal(withOtp.password, "secret");
 });
 
 test("pickLoginValues reads a CSS-masked password and still returns the phone number", () => {
@@ -352,6 +359,30 @@ test("background.js never writes fillToken to chrome.storage.local", async () =>
   const src = await readFile(new URL("./background.js", import.meta.url), "utf8");
   assert.equal(/storage\.local\.set\(\s*\{[^}]*fillToken/.test(src), false);
   assert.match(src, /storage\.local\.remove\(\s*(?:\[\s*"fillToken"|"fillToken")/);
+});
+
+test("isOtpField matches 2FA fields and rejects password or username fields", () => {
+  assert.equal(fill.isOtpField({ type: "text", autocomplete: "one-time-code", maxlength: "6" }), true);
+  assert.equal(fill.isOtpField({ type: "tel", name: "totp", maxlength: "6" }), true);
+  assert.equal(fill.isOtpField({ type: "text", placeholder: "验证码", maxlength: "6" }), true);
+  assert.equal(fill.isOtpField({ type: "text", name: "token", maxlength: "8" }), true);
+  assert.equal(fill.isOtpField({ type: "text", name: "description", maxlength: "6", value: "hello" }), false);
+  assert.equal(fill.isOtpField({ type: "password", name: "otp" }), false);
+  assert.equal(fill.isOtpField({ type: "text", name: "password_otp", maxlength: "6" }), false);
+  assert.equal(fill.isOtpField({ type: "text", name: "username" }), false);
+});
+
+test("pendingTotpPlan expires in at most 30 seconds and validates its code", () => {
+  const now = 1_000_000;
+  assert.deepEqual(fill.pendingTotpPlan({ totp: "123456", totp_period_remaining: 8 }, now), {
+    code: "123456",
+    expiresAt: now + 8000,
+  });
+  assert.equal(fill.pendingTotpPlan({ totp: "123456", totp_period_remaining: 90 }, now).expiresAt, now + 30000);
+  assert.equal(fill.pendingTotpPlan({ totp: null }, now), null);
+  assert.equal(fill.pendingTotpPlan({ totp: "12345x" }, now), null);
+  assert.equal(fill.isPendingTotpExpired({ expiresAt: now - 1 }, now), true);
+  assert.equal(fill.isPendingTotpExpired({ expiresAt: now + 1000 }, now), false);
 });
 
 test("pickSaveUrl keeps the login-page url when the tab stayed on the same site", () => {

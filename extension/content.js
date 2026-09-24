@@ -149,7 +149,7 @@ chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
     return true;
   }
   if (msg.type === "apply-secret") {
-    sendResponse(PageFill?.fill?.(msg.username, msg.password) || { ok: false, error: "no-page-fill" });
+    sendResponse(PageFill?.fill?.(msg.username, msg.password, msg.totp) || { ok: false, error: "no-page-fill" });
     return;
   }
   if (msg.type === "open-fill") {

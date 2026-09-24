@@ -23,6 +23,7 @@ import {
   type AssistantToolTrace,
   type ClientCertInfo,
   type Counts,
+  type CsvImportPreview,
   type EntryDto,
   type EntryKind,
   type ExtensionInstallStatus,
@@ -126,6 +127,11 @@ const backupMode = ref<"export" | "import">("export");
 const backupPath = ref("");
 const backupPassword = ref("");
 const backupOverwrite = ref(false);
+const csvImportOpen = ref(false);
+const csvImportPath = ref("");
+const csvImportPreview = ref<CsvImportPreview | null>(null);
+const csvImportOverwrite = ref(false);
+const csvImportBusy = ref(false);
 
 const KIND_ITEMS: { id: EntryKind; label: string }[] = [
   { id: "website", label: "网站账号" },
@@ -1330,6 +1336,10 @@ function clearSecrets() {
   certInfoFor.value = null;
   closeForm();
   backupPassword.value = "";
+  csvImportOpen.value = false;
+  csvImportPath.value = "";
+  csvImportPreview.value = null;
+  csvImportOverwrite.value = false;
   assistantApiKey.value = "";
   assistantInput.value = "";
   assistantMessages.value = [];
@@ -1503,6 +1513,56 @@ async function loadHome() {
   expiring.value = h.expiring;
   status.value = { ...(status.value as Status), counts: h.counts };
 }
+function openCsvImport() {
+  csvImportPath.value = "";
+  csvImportPreview.value = null;
+  csvImportOverwrite.value = false;
+  csvImportOpen.value = true;
+}
+
+async function pickCsvImportFile() {
+  try {
+    const picked = await withNativeDialog(async () => {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      return open({
+        multiple: false,
+        title: "选择 CSV 文件",
+        filters: [{ name: "CSV", extensions: ["csv"] }],
+      });
+    });
+    if (typeof picked !== "string") return;
+    csvImportPath.value = picked;
+    csvImportPreview.value = null;
+    csvImportBusy.value = true;
+    try {
+      csvImportPreview.value = await api.importCsvPreview(picked);
+    } catch (e) {
+      showToast(String(e));
+    } finally {
+      csvImportBusy.value = false;
+    }
+  } catch (e) {
+    showToast(`打开文件选择框失败：${String(e)}`);
+  }
+}
+
+async function runCsvImport() {
+  if (!csvImportPath.value || !csvImportPreview.value || csvImportBusy.value) return;
+  csvImportBusy.value = true;
+  try {
+    const result = await api.importCsvCommit(csvImportPath.value, csvImportOverwrite.value);
+    const skipped = result.skipped_existing + result.skipped_invalid;
+    showToast(`导入 ${result.inserted + result.updated} 条，跳过 ${skipped} 条`);
+    csvImportOpen.value = false;
+    csvImportPreview.value = null;
+    await refreshVault();
+  } catch (e) {
+    showToast(String(e));
+  } finally {
+    csvImportBusy.value = false;
+  }
+}
+
 async function pickBackupFile(mode: "export" | "import") {
   try {
     if (mode === "export") {
@@ -1770,6 +1830,9 @@ onMounted(async () => {
             </button>
             <button class="side-item" type="button" @click="backupMode = 'export'; backupOpen = true">
               <span>备份 / 还原</span>
+            </button>
+            <button class="side-item" type="button" :disabled="!status?.unlocked" @click="openCsvImport">
+              <span>从 CSV 导入</span>
             </button>
           </div>
         </aside>
@@ -2546,7 +2609,7 @@ onMounted(async () => {
             </div>
           </div>
         </div>
-        <div class="field" v-if="form.kind === 'website'"><label>TOTP 密钥（可选）</label><input v-model="form.totp" /></div>
+        <div class="field" v-if="form.kind === 'website'"><label>TOTP 密钥（可选）</label><input v-model="form.totp" placeholder="Base32 或 otpauth://totp/..." /></div>
         <div class="field" v-if="form.kind === 'api_token'"><label>服务</label>
           <select v-model="form.service">
             <option value="github">GitHub</option>
@@ -2659,6 +2722,48 @@ onMounted(async () => {
         <div style="display:flex;gap:8px;justify-content:flex-end">
           <button class="btn" @click="backupOpen = false">取消</button>
           <button class="btn primary" @click="runBackup">确定</button>
+        </div>
+      </div>
+    </div>
+    <div class="dialog-mask" v-if="csvImportOpen && status?.unlocked" @click.self="csvImportOpen = false">
+      <div class="dialog">
+        <h3>从 CSV 导入</h3>
+        <p class="crumb">支持 Chrome / Edge、Bitwarden 和 1Password 导出的 CSV。预览仅显示账号元数据，不会显示密码或 TOTP 密钥。</p>
+        <div class="field">
+          <label>CSV 文件</label>
+          <div style="display:flex;gap:8px">
+            <input :value="csvImportPath || '请选择 CSV 文件'" readonly style="flex:1" />
+            <button class="btn" type="button" :disabled="csvImportBusy" @click="pickCsvImportFile">浏览</button>
+          </div>
+        </div>
+        <p class="crumb" v-if="csvImportBusy">正在读取并预览…</p>
+        <template v-if="csvImportPreview">
+          <p class="crumb">
+            格式：{{ csvImportPreview.format }}；共 {{ csvImportPreview.total }} 条；可导入 {{ csvImportPreview.importable }} 条；
+            已有 {{ csvImportPreview.skipped_existing }} 条；无效 {{ csvImportPreview.skipped_invalid }} 条。
+          </p>
+          <div class="table" v-if="csvImportPreview.sample.length">
+            <table>
+              <thead><tr><th>名称</th><th>网址</th><th>账号</th><th>密码</th><th>TOTP</th></tr></thead>
+              <tbody>
+                <tr v-for="(row, index) in csvImportPreview.sample.slice(0, 20)" :key="`${row.title}-${index}`">
+                  <td>{{ row.title }}</td><td>{{ row.url }}</td><td>{{ row.username }}</td>
+                  <td>{{ row.has_password ? '已设置' : '—' }}</td><td>{{ row.has_totp ? '已设置' : '—' }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="crumb" v-else>没有可预览的有效条目。</p>
+          <label class="check" style="margin:12px 0">
+            <input type="checkbox" v-model="csvImportOverwrite" />
+            覆盖已有同站同账号
+          </label>
+        </template>
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+          <button class="btn" type="button" @click="csvImportOpen = false">取消</button>
+          <button class="btn primary" type="button" :disabled="csvImportBusy || !csvImportPreview || (csvImportPreview.importable === 0 && !(csvImportOverwrite && csvImportPreview.skipped_existing > 0))" @click="runCsvImport">
+            {{ csvImportBusy ? "导入中…" : "确认导入" }}
+          </button>
         </div>
       </div>
     </div>

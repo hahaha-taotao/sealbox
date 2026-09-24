@@ -35,6 +35,31 @@ export interface ClientCertInfo {
   hasPassphrase: boolean;
 }
 
+export interface CsvImportSample {
+  title: string;
+  url: string;
+  username: string;
+  has_password: boolean;
+  has_totp: boolean;
+}
+
+export interface CsvImportPreview {
+  format: string;
+  total: number;
+  importable: number;
+  skipped_existing: number;
+  skipped_invalid: number;
+  sample: CsvImportSample[];
+}
+
+export interface CsvImportResult {
+  format: string;
+  inserted: number;
+  updated: number;
+  skipped_existing: number;
+  skipped_invalid: number;
+}
+
 export interface ImportClientCertInput {
   id?: string | null;
   title: string;
@@ -306,6 +331,9 @@ export const api = {
   exportBackup: (password: string, path: string) => invoke("export_backup", { password, path }),
   importBackup: (password: string, path: string, overwrite: boolean) =>
     invoke<[number, number]>("import_backup", { password, path, overwrite }),
+  importCsvPreview: (path: string) => invoke<CsvImportPreview>("import_csv_preview", { path }),
+  importCsvCommit: (path: string, overwrite: boolean) =>
+    invoke<CsvImportResult>("import_csv_commit", { path, overwrite }),
   settingsGet: () => invoke<{ idle_secs: number; clipboard_secs: number; hotkey: string }>("settings_get"),
   settingsSet: (settings: { idle_secs: number; clipboard_secs: number; hotkey: string }) =>
     invoke("settings_set", { settings }),

@@ -158,6 +158,7 @@ async function fetchLocal(path, { body, token, timeoutMs } = {}) {
 }
 
 async function pair(code) {
+  await sessionRemove(["pendingTotp"]);
   const submitted = String(code || "").trim();
   if (!submitted) throw new Error("请输入一次性配对码");
   const { port, res, data } = await fetchLocal("/fill/pair", { body: { code: submitted } });
@@ -185,10 +186,15 @@ async function api(path, body) {
   }
   const { res, data } = await fetchLocal(path, { body, token: fillToken });
   if (res.status === 401) {
+    await sessionRemove(["pendingTotp"]);
     throw new Error("填表 Token 已失效，请重新配对");
   }
   if (!res.ok || data.ok === false) {
-    if (res.status === 403) throw new Error(data.error === "vault locked" ? "金库已锁定，请先解锁 Sealbox" : (data.error || "拒绝访问"));
+    if (res.status === 403 && data.error === "vault locked") {
+      await sessionRemove(["pendingTotp"]);
+      throw new Error("金库已锁定，请先解锁 Sealbox");
+    }
+    if (res.status === 403) throw new Error(data.error || "拒绝访问");
     throw new Error(data.error || `HTTP ${res.status}`);
   }
   return data;
@@ -235,6 +241,13 @@ async function getPending() {
 
 async function rememberFill(entry, pageUrl) {
   if (!entry) return;
+  const pendingTotp = Fill.pendingTotpPlan?.(entry);
+  const cfg = pendingTotp ? await getSettings() : null;
+  if (pendingTotp && Fill.originOf?.(pageUrl) && !Fill.isExcluded(pageUrl, cfg.excludeHosts)) {
+    await sessionSet({ pendingTotp: { ...pendingTotp, url: pageUrl, username: entry.username || "" } });
+  } else {
+    await sessionRemove(["pendingTotp"]);
+  }
   await sessionSet({
     lastFilled: {
       username: entry.username || "",
@@ -370,6 +383,8 @@ async function excludeSite(url) {
   await chrome.storage.local.set({ excludeText });
   const pending = await getPending();
   if (pending && Fill.sameSite(pending.url, url)) await sessionRemove(["pendingSave"]);
+  const pendingTotp = (await sessionGet(["pendingTotp"])).pendingTotp;
+  if (pendingTotp && Fill.sameSite(pendingTotp.url, url)) await sessionRemove(["pendingTotp"]);
   return getSettings();
 }
 
@@ -386,14 +401,18 @@ async function injectFrame(tabId, frameId) {
   }
 }
 
-async function listFrameIds(tabId) {
+async function listFrames(tabId) {
   try {
     const frames = await chrome.webNavigation.getAllFrames({ tabId });
-    if (Array.isArray(frames) && frames.length) return frames.map((f) => f.frameId);
+    if (Array.isArray(frames) && frames.length) return frames;
   } catch (_) {
     /* webNavigation unavailable */
   }
-  return [0];
+  return [{ frameId: 0, url: (await chrome.tabs.get(tabId)).url }];
+}
+
+async function listFrameIds(tabId) {
+  return (await listFrames(tabId)).map((frame) => frame.frameId);
 }
 
 async function injectTab(tabId) {
@@ -417,7 +436,7 @@ async function pingFrames(tabId, message) {
   return replies;
 }
 
-function fillFunc(username, password) {
+function fillFunc(username, password, totp) {
   const collect = (root, acc) => {
     if (!root) return acc;
     for (const el of root.querySelectorAll("input, textarea")) acc.push(el);
@@ -434,10 +453,22 @@ function fillFunc(username, password) {
   };
   const passwordEl = inputs.find(isPwd);
   if (!passwordEl) return { ok: false, error: "no-password-field", count: inputs.length };
+  const isOtp = (el) => {
+    const type = String(el.type || "").toLowerCase();
+    const labelText = el.labels ? Array.from(el.labels).map((label) => label.textContent || "").join(" ") : el.closest("label")?.textContent || "";
+      const text = `${el.name || ""} ${el.id || ""} ${el.placeholder || ""} ${el.getAttribute("aria-label") || ""} ${labelText} ${el.className || ""} ${el.autocomplete || ""}`;
+      if (type === "password" || type === "hidden" || /password|passwd|pwd|secret|密码|口令/i.test(text)) return false;
+      if (String(el.autocomplete || "").toLowerCase().trim() === "one-time-code") return true;
+      const max = Number(el.getAttribute("maxlength") || el.maxLength || 0);
+      const numericOnly = /^\d*$/.test(String(el.value || ""));
+      return /otp|totp|2fa|mfa|one[-_ ]?time|verification|验证码|动态码|校验码|安全码/i.test(text) && (!max || max === 6 || max === 8) ||
+        (["text", "number", "tel", ""].includes(type) && (max === 6 || max === 8) && numericOnly);
+  };
+  const otpEl = totp ? inputs.find((el) => isOtp(el) && !el.disabled && !el.readOnly && el.getClientRects().length) : null;
   const userEl =
-    inputs.find((el) => String(el.type || "").toLowerCase() === "email") ||
-    inputs.find((el) => /user|login|email|account|phone|mobile|账号|用户|工号/i.test(`${el.name} ${el.id} ${el.placeholder}`)) ||
-    inputs.find((el) => el !== passwordEl && ["text", "tel", "number", ""].includes(String(el.type || "").toLowerCase()));
+    inputs.find((el) => el !== passwordEl && el !== otpEl && String(el.type || "").toLowerCase() === "email") ||
+    inputs.find((el) => el !== passwordEl && el !== otpEl && /user|login|email|account|phone|mobile|账号|用户|工号/i.test(`${el.name} ${el.id} ${el.placeholder}`)) ||
+    inputs.find((el) => el !== passwordEl && el !== otpEl && ["text", "tel", "number", ""].includes(String(el.type || "").toLowerCase()));
   const set = (el, value) => {
     if (!el) return;
     const wasReadOnly = el.readOnly;
@@ -455,7 +486,8 @@ function fillFunc(username, password) {
   };
   set(userEl, username || "");
   set(passwordEl, password || "");
-  return { ok: true };
+  if (otpEl) set(otpEl, totp);
+  return { ok: true, filledTotp: Boolean(otpEl) };
 }
 
 async function executeFill(tabId, frameId, entry, world) {
@@ -465,30 +497,81 @@ async function executeFill(tabId, frameId, entry, world) {
       target,
       world,
       func: fillFunc,
-      args: [entry.username || "", entry.password || ""],
+      args: [entry.username || "", entry.password || "", entry.totp || ""],
     });
-    return Boolean(results?.some((r) => r?.result?.ok));
+    return results?.find((r) => r?.result?.ok)?.result || { ok: false };
   } catch (_) {
     return false;
   }
 }
 
-async function applySecretToTab(tabId, entry) {
-  const ids = await listFrameIds(tabId);
-  for (const world of ["ISOLATED", "MAIN"]) {
-    for (const frameId of ids) {
-      if (await executeFill(tabId, frameId, entry, world)) return { ok: true };
+async function applyPendingTotpIfNeeded(tab) {
+  if (!tab?.id || !/^https?:/i.test(tab.url || "")) return false;
+  const pending = (await sessionGet(["pendingTotp"])).pendingTotp;
+  if (!pending) return false;
+  if (Fill.isPendingTotpExpired?.(pending, Date.now()) || !Fill.sameSite?.(pending.url, tab.url)) {
+    await sessionRemove(["pendingTotp"]);
+    return false;
+  }
+  const cfg = await getSettings();
+  if (Fill.isExcluded(pending.url, cfg.excludeHosts) || Fill.isExcluded(tab.url, cfg.excludeHosts)) {
+    await sessionRemove(["pendingTotp"]);
+    return false;
+  }
+  const otpFunc = (code) => {
+    const collect = (root, acc) => {
+      if (!root) return acc;
+      try {
+        for (const el of root.querySelectorAll("input, textarea")) acc.push(el);
+        for (const el of root.querySelectorAll("*")) if (el.shadowRoot) collect(el.shadowRoot, acc);
+      } catch (_) { /* closed shadow */ }
+      return acc;
+    };
+    const isOtp = (el) => {
+      const type = String(el.type || "").toLowerCase();
+      const labelText = el.labels ? Array.from(el.labels).map((label) => label.textContent || "").join(" ") : el.closest("label")?.textContent || "";
+      const text = `${el.name || ""} ${el.id || ""} ${el.placeholder || ""} ${el.getAttribute("aria-label") || ""} ${labelText} ${el.className || ""} ${el.autocomplete || ""}`;
+      if (type === "password" || type === "hidden" || /password|passwd|pwd|secret|密码|口令/i.test(text)) return false;
+      if (String(el.autocomplete || "").toLowerCase().trim() === "one-time-code") return true;
+      const max = Number(el.getAttribute("maxlength") || el.maxLength || 0);
+      const numericOnly = /^\\d*$/.test(String(el.value || ""));
+      return /otp|totp|2fa|mfa|one[-_ ]?time|verification|验证码|动态码|校验码|安全码/i.test(text) && (!max || max === 6 || max === 8) ||
+        (["text", "number", "tel", ""].includes(type) && (max === 6 || max === 8) && numericOnly);
+    };
+    const el = collect(document, []).find((item) => isOtp(item) && !item.disabled && !item.readOnly && item.getClientRects().length);
+    if (!el) return { ok: false };
+    el.focus();
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    setter ? setter.call(el, code) : (el.value = code);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return { ok: true };
+  };
+  const frame = (await listFrames(tab.id)).find((item) => item.frameId === 0);
+  if (!frame || !Fill.sameSite(pending.url, frame.url || "")) return false;
+  try {
+    const results = await chrome.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] }, world: "ISOLATED", func: otpFunc, args: [pending.code] });
+    if (results?.some((r) => r?.result?.ok)) {
+      await sessionRemove(["pendingTotp"]);
+      return true;
     }
-    try {
-      const results = await chrome.scripting.executeScript({
-        target: { tabId, allFrames: true },
-        world,
-        func: fillFunc,
-        args: [entry.username || "", entry.password || ""],
-      });
-      if (results?.some((r) => r?.result?.ok)) return { ok: true };
-    } catch (_) {
-      /* some frames blocked allFrames */
+  } catch (_) { /* frame unavailable */ }
+  return false;
+}
+
+async function applySecretToTab(tabId, entry, pageUrl) {
+  const frames = await listFrames(tabId);
+  for (const world of ["ISOLATED", "MAIN"]) {
+    for (const frame of frames) {
+      const frameEntry = {
+        ...entry,
+        totp: Fill.sameSite(pageUrl, frame.url || "") ? entry.totp || "" : "",
+      };
+      const result = await executeFill(tabId, frame.frameId, frameEntry, world);
+      if (result?.ok) {
+        if (result.filledTotp) await sessionRemove(["pendingTotp"]);
+        return { ok: true };
+      }
     }
   }
   await injectTab(tabId);
@@ -496,8 +579,9 @@ async function applySecretToTab(tabId, entry) {
     type: "apply-secret",
     username: entry.username,
     password: entry.password,
+    totp: "",
   });
-  if (replies.some((r) => r?.ok)) return { ok: true };
+  if (replies.some((reply) => reply?.ok)) return { ok: true };
   return { ok: false, error: "页面上没有密码框，或当前页无法注入脚本。请刷新登录页后再点填充。" };
 }
 
@@ -758,9 +842,10 @@ function paintOverlayFunc(payload) {
   };
   const captions = (list || []).map((m) => {
     const note = m.note || shortNote(m.notes);
-    if (m.primary) return { primary: m.primary, note };
+    const badge = m.has_totp || m.badge ? "验证码" : "";
+    if (m.primary) return { primary: m.primary, note, badge };
     const user = String(m.username || "").trim() || "未填账号";
-    return { primary: m.label || user, note };
+    return { primary: m.label || user, note, badge };
   });
   const send = (message, done) => {
     const runtime = globalThis.chrome?.runtime;
@@ -857,6 +942,12 @@ function paintOverlayFunc(payload) {
         noteEl.style.cssText = `${lineStyle}margin-top:2px;font-size:11px;line-height:1.3;color:rgba(255,255,255,.72);`;
         b.appendChild(noteEl);
       }
+      if (caption.badge) {
+        const badgeEl = document.createElement("span");
+        badgeEl.textContent = "验证码";
+        badgeEl.style.cssText = "display:inline-block;margin-top:3px;font-size:10px;line-height:1.2;color:rgba(255,255,255,.55);";
+        b.appendChild(badgeEl);
+      }
       b.style.cssText = btnStyle;
       b.addEventListener("click", (e) => {
         if (!e.isTrusted) return;
@@ -944,6 +1035,7 @@ async function matchesForTab(tab) {
 
 async function showOverlayOnTab(tab) {
   if (!tab?.id || !/^https?:/i.test(tab.url || "")) return { ok: false };
+  await applyPendingTotpIfNeeded(tab).catch(() => false);
   const pendingRes = await describePending(tab.url, tab.id).catch(() => ({ pending: null }));
   const pending = pendingRes?.pending || null;
   let matches = [];
@@ -966,6 +1058,8 @@ async function showOverlayOnTab(tab) {
       title: m.title,
       username: m.username,
       notes: m.notes || "",
+      has_totp: Boolean(m.has_totp),
+      badge: m.has_totp ? "验证码" : "",
       primary,
       note,
       label: note ? `${primary} · ${note}` : primary,
@@ -1041,7 +1135,7 @@ async function fillTab(tabId, id, url) {
   const data = await api("/fill/secret", { id, url });
   if (!data?.ok || !data.entry) throw new Error(data?.error || "无法读取凭据");
   await rememberFill(data.entry, url);
-  const applied = await applySecretToTab(tabId, data.entry);
+  const applied = await applySecretToTab(tabId, data.entry, url);
   if (!applied.ok) throw new Error(applied.error);
   return { ok: true };
 }
@@ -1118,7 +1212,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return data;
     }
     if (msg.type === "clear-pending") {
-      await sessionRemove(["pendingSave"]);
+      await sessionRemove(["pendingSave", "pendingTotp"]);
       const tabId = sender.tab?.id;
       if (tabId) scheduleOverlay(tabId, 50);
       return { ok: true };

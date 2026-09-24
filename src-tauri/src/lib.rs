@@ -5,11 +5,12 @@ pub mod clipboard;
 pub mod commands;
 pub mod confirm;
 pub mod crypto;
+pub mod csv_import;
 pub mod db;
-pub mod fill;
 pub mod extension_install;
-pub mod github_mcp;
+pub mod fill;
 pub mod git_workspace;
+pub mod github_mcp;
 pub mod hello;
 pub mod http_guard;
 pub mod lock;
@@ -69,6 +70,8 @@ pub fn run() {
             commands::gen_password,
             commands::export_backup,
             commands::import_backup,
+            commands::import_csv_preview,
+            commands::import_csv_commit,
             commands::settings_get,
             commands::settings_set,
             commands::set_hello_enabled,
