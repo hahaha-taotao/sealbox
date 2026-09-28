@@ -385,6 +385,202 @@ pub fn api_tool_definitions() -> Vec<Value> {
                 &["repo"],
             ),
         ),
+        tool(
+            "github_list_pull_request_files",
+            "列出某个 PR 改了哪些文件：filename、status、增删行数、blob SHA。看 diff 范围时调用。不含 patch 全文。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("number", json!({"type":"integer","minimum":1,"maximum":1000000000})),
+                    ("page", json!({"type":"integer","minimum":1,"maximum":100,"default":1})),
+                    ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":30})),
+                ],
+                &["repo", "number"],
+            ),
+        ),
+        tool(
+            "github_list_pull_request_commits",
+            "列出某个 PR 的 commit SHA、标题和作者。需要把 PR 和本地提交对上时调用。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("number", json!({"type":"integer","minimum":1,"maximum":1000000000})),
+                    ("page", json!({"type":"integer","minimum":1,"maximum":100,"default":1})),
+                    ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":30})),
+                ],
+                &["repo", "number"],
+            ),
+        ),
+        tool(
+            "github_list_pull_request_reviews",
+            "列出某个 PR 的 review：state、提交者、提交时间。判断谁批准或要求修改时调用。不含 review 正文全文。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("number", json!({"type":"integer","minimum":1,"maximum":1000000000})),
+                    ("page", json!({"type":"integer","minimum":1,"maximum":100,"default":1})),
+                    ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":30})),
+                ],
+                &["repo", "number"],
+            ),
+        ),
+        tool(
+            "github_list_pull_request_comments",
+            "列出某个 PR 的行内评论：path、line、用户、截断后的正文。看 review 讨论时调用。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("number", json!({"type":"integer","minimum":1,"maximum":1000000000})),
+                    ("page", json!({"type":"integer","minimum":1,"maximum":100,"default":1})),
+                    ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":30})),
+                ],
+                &["repo", "number"],
+            ),
+        ),
+        tool(
+            "github_get_pull_request_status",
+            "读取 PR head 或指定 ref 的 combined status：state 与各 context。判断 CI 是否通过时调用。不返回日志。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("number", json!({"type":"integer","minimum":1,"maximum":1000000000})),
+                    ("ref", string_schema(1, 200)),
+                ],
+                &["repo"],
+            ),
+        ),
+        tool(
+            "github_list_releases",
+            "列出仓库 Release：tag、名称、是否草稿、是否预发布、html_url。不含 body 全文，也不含资产文件。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("page", json!({"type":"integer","minimum":1,"maximum":100,"default":1})),
+                    ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":30})),
+                ],
+                &["repo"],
+            ),
+        ),
+        tool(
+            "github_get_release",
+            "读取单个 Release 的元数据。传 id 或 tag_name 之一。body 截断，不含资产二进制。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("id", json!({"type":"integer","minimum":1,"maximum":9007199254740991u64})),
+                    ("tag_name", string_schema(1, 200)),
+                ],
+                &["repo"],
+            ),
+        ),
+        tool(
+            "github_list_release_assets",
+            "列出某个 Release 的资产名、大小、content_type 和下载次数。不下载文件。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("id", json!({"type":"integer","minimum":1,"maximum":9007199254740991u64})),
+                ],
+                &["repo", "id"],
+            ),
+        ),
+        tool(
+            "github_list_tags",
+            "列出仓库 tag 名和对应 commit SHA。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("page", json!({"type":"integer","minimum":1,"maximum":100,"default":1})),
+                    ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":30})),
+                ],
+                &["repo"],
+            ),
+        ),
+        tool(
+            "github_compare_commits",
+            "比较 base 与 head：ahead/behind、提交数和文件名列表。不含 patch 全文。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("base", string_schema(1, 200)),
+                    ("head", string_schema(1, 200)),
+                ],
+                &["repo", "base", "head"],
+            ),
+        ),
+        tool(
+            "github_list_workflows",
+            "列出仓库 Actions workflow：id、name、path、state。不含 workflow 文件内容。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("page", json!({"type":"integer","minimum":1,"maximum":100,"default":1})),
+                    ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":30})),
+                ],
+                &["repo"],
+            ),
+        ),
+        tool(
+            "github_get_workflow_run",
+            "读取单次 workflow run：status、conclusion、head_sha、head_branch、html_url。不含日志。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("run_id", json!({"type":"integer","minimum":1,"maximum":9007199254740991u64})),
+                ],
+                &["repo", "run_id"],
+            ),
+        ),
+        tool(
+            "github_list_workflow_jobs",
+            "列出某次 run 的 jobs：name、status、conclusion，以及各 step 的名称和结论。不含日志。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("run_id", json!({"type":"integer","minimum":1,"maximum":9007199254740991u64})),
+                ],
+                &["repo", "run_id"],
+            ),
+        ),
         write_tool(
             "github_create_issue",
             "在仓库创建 Issue。用户说「帮我开一个 bug / 功能单」时调用。每次都会弹出 Sealbox 桌面确认。",
@@ -1953,6 +2149,19 @@ mod tests {
             "github_list_pull_requests",
             "github_get_pull_request",
             "github_list_workflow_runs",
+            "github_list_pull_request_files",
+            "github_list_pull_request_commits",
+            "github_list_pull_request_reviews",
+            "github_list_pull_request_comments",
+            "github_get_pull_request_status",
+            "github_list_releases",
+            "github_get_release",
+            "github_list_release_assets",
+            "github_list_tags",
+            "github_compare_commits",
+            "github_list_workflows",
+            "github_get_workflow_run",
+            "github_list_workflow_jobs",
         ];
         let definitions = tool_definitions();
         for name in expected {
@@ -2035,7 +2244,7 @@ mod tests {
             .into_iter()
             .filter(|definition| definition["readOnly"] == true)
             .count();
-        assert_eq!(read_only, 9);
+        assert_eq!(read_only, 22);
     }
 
     #[test]
