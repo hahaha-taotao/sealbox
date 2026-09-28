@@ -813,7 +813,7 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .filter(|name| name.starts_with("github_"))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 24);
+        assert_eq!(names.len(), 37);
         let listed_tools = listed["tools"].as_array().unwrap();
         let status = listed_tools
             .iter()
@@ -834,6 +834,10 @@ mod tests {
         assert!(names.contains(&"github_create_release"));
         assert!(names.contains(&"github_create_pull_request"));
         assert!(names.contains(&"github_list_workflow_runs"));
+        assert!(names.contains(&"github_list_pull_request_files"));
+        assert!(names.contains(&"github_get_pull_request_status"));
+        assert!(names.contains(&"github_compare_commits"));
+        assert!(names.contains(&"github_list_workflow_jobs"));
         assert!(!names.contains(&"github_git_list"));
     }
 
@@ -887,7 +891,7 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .filter(|name| name.starts_with("github_"))
             .collect::<Vec<_>>();
-        assert_eq!(github_names.len(), 24);
+        assert_eq!(github_names.len(), 37);
         assert!(github_names.contains(&"github_list_credentials"));
         assert!(github_names.contains(&"github_git_push"));
         assert!(github_names.contains(&"github_create_release"));
