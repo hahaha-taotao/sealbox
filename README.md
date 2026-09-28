@@ -123,7 +123,9 @@ On first launch, set a master password (at least 10 characters). Closing the win
 - `github_get_authenticated_user` — 当前 Token 对应账号
 - `github_list_repositories` / `github_get_repository` / `github_get_file` — 仓库与文件
 - `github_list_issues` / `github_list_pull_requests` / `github_get_pull_request` — Issue / PR，含 head/base、draft、mergeable、assignees
-- `github_list_workflow_runs` — 轮询 Actions 状态
+- `github_list_pull_request_files` / `github_list_pull_request_commits` / `github_list_pull_request_reviews` / `github_list_pull_request_comments` / `github_get_pull_request_status` — PR 文件、提交、review、行内评论和 combined status；不含 patch 全文和日志
+- `github_list_releases` / `github_get_release` / `github_list_release_assets` / `github_list_tags` / `github_compare_commits` — Release 元数据、资产清单、tag 和 commit 对比；不下载资产
+- `github_list_workflows` / `github_list_workflow_runs` / `github_get_workflow_run` / `github_list_workflow_jobs` — Actions workflow、运行、单次 run 和 jobs；不含日志和 artifacts
 - `github_git_workspace_list` / `github_git_workspace_register` — 把本机仓库登记成短名，之后传 `workspace="sealbox"`
 - `github_git_status` / `github_git_diff` / `github_git_log` / `github_git_branches` — 本地只读 git，返回 JSON（含 branch、commits），并进入 MCP `structuredContent`
 - `github_git_stage` / `github_git_commit` / `github_git_push` / `github_git_pull` / `github_git_clone` — 日常写入；push 可指定 `remote`（默认 origin）、`branch`、`tag`（只推该标签）、`tags`、`force_with_lease`，并区分「已推送 / 远端已是最新」

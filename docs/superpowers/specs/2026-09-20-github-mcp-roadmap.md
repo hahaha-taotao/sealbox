@@ -7,7 +7,7 @@
 
 GitHub MCP 仍默认停用，并继续只访问固定的 `https://api.github.com:443`。启用后提供：
 
-- 只读 API：用户、仓库、文件、Issue、Pull Request（含 head/base/draft/mergeable）、Actions 运行、凭据元数据
+- 只读 API：用户、仓库、文件、Issue、Pull Request（含 head/base/draft/mergeable）、Actions 运行、凭据元数据。以下已实现，均为 `risk: low`：PR 文件 / 提交 / review / 行内评论 / combined status、Releases、Release assets、tags、compare、workflow 定义、单次 run、jobs
 - 本地 `github_git_*`：工作区短名、status / diff / log / branches，以及 stage / commit / push / pull / clone
 - 凭据可用标题匹配或 MCP 页默认 Token；仓库推荐 `owner/repo`
 - 通过独立的 `api_write_enabled` 开关控制 GitHub API 写入；每次写操作弹出桌面确认
@@ -27,21 +27,21 @@ GitHub MCP 仍默认停用，并继续只访问固定的 `https://api.github.com
 
 这些接口不产生远端写入，适合先增加并纳入只读工具测试：
 
-- `github_get_pull_request`
-- `github_list_pull_request_files`
-- `github_list_pull_request_commits`
-- `github_list_pull_request_reviews`
-- `github_list_pull_request_comments`
-- `github_get_pull_request_status`
-- `github_list_releases`
-- `github_get_release`
-- `github_list_release_assets`
-- `github_list_tags`
-- `github_compare_commits`
-- `github_list_workflows`
-- `github_list_workflow_runs`
-- `github_get_workflow_run`
-- `github_list_workflow_jobs`
+- ~~`github_get_pull_request`~~（本分支之前已交付）
+- ~~`github_list_pull_request_files`~~
+- ~~`github_list_pull_request_commits`~~
+- ~~`github_list_pull_request_reviews`~~
+- ~~`github_list_pull_request_comments`~~
+- ~~`github_get_pull_request_status`~~
+- ~~`github_list_releases`~~
+- ~~`github_get_release`~~
+- ~~`github_list_release_assets`~~
+- ~~`github_list_tags`~~
+- ~~`github_compare_commits`~~
+- ~~`github_list_workflows`~~
+- ~~`github_list_workflow_runs`~~（本分支之前已交付）
+- ~~`github_get_workflow_run`~~
+- ~~`github_list_workflow_jobs`~~
 
 Workflow 日志和 Artifacts 即使是 GET，也可能包含部署信息或意外泄露的 Secret，建议标为 `risk: "medium"`，不要自动提供给内置助手。
 
