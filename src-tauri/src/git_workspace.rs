@@ -124,12 +124,21 @@ pub fn tool_definitions() -> Vec<Value> {
         ),
         tool(
             "github_git_stage",
-            "把仓库内相对路径加入暂存区。all=true 才等价 git add -A。准备提交时调用。每次弹出桌面确认。",
+            "把仓库内相对路径加入暂存区。files 一次传入多个路径，只弹一次桌面确认；file 仍可用。all=true 才等价 git add -A。准备提交时调用。",
             schema(
                 &[
                     ("workspace", workspace_prop()),
                     ("path", path_prop()),
                     ("file", string_schema(1, 500)),
+                    (
+                        "files",
+                        json!({
+                            "type": "array",
+                            "maxItems": 100,
+                            "items": string_schema(1, 500),
+                            "description": "一次暂存的仓库内相对路径。与 file 可同时使用，确认框只弹一次。"
+                        }),
+                    ),
                     ("all", json!({"type":"boolean","default":false})),
                 ],
                 &[],
@@ -460,21 +469,21 @@ fn branches(session: &Session, args: &Value) -> Result<String, String> {
 fn prepare_stage(session: &Session, args: &Value) -> Result<PreparedGitOp, String> {
     let root = repo_root(session, args)?;
     let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
-    let file = optional_rel_path(args, "file")?;
+    let files = stage_paths(args)?;
+    if all && !files.is_empty() {
+        return Err("all=true 时不要再传 file 或 files".into());
+    }
+    let operation = if all {
+        "git add -A".to_string()
+    } else if files.is_empty() {
+        return Err("请提供 file、files，或设 all=true".into());
+    } else {
+        format!("git add -- {}", files.join(" "))
+    };
     let payload = git_confirm_payload(
         "暂存本地改动",
         "允许这次本地 git 写操作？",
-        &[
-            ("仓库", display_path(&root)),
-            (
-                "操作",
-                if all {
-                    "git add -A".into()
-                } else {
-                    format!("git add {}", file.as_deref().unwrap_or("?"))
-                },
-            ),
-        ],
+        &[("仓库", display_path(&root)), ("操作", operation)],
     );
     Ok(PreparedGitOp::Pending {
         payload,
@@ -483,10 +492,36 @@ fn prepare_stage(session: &Session, args: &Value) -> Result<PreparedGitOp, Strin
             if all {
                 return git_output(&root, &["add", "-A"], None);
             }
-            let file = file.ok_or_else(|| "请提供 file，或设 all=true".to_string())?;
-            git_output(&root, &["add", "--", &file], None)
+            let mut cmd = vec!["add".to_string(), "--".to_string()];
+            cmd.extend(files);
+            let args = cmd.iter().map(String::as_str).collect::<Vec<_>>();
+            git_output(&root, &args, None)
         }),
     })
+}
+
+fn stage_paths(args: &Value) -> Result<Vec<String>, String> {
+    let mut files = Vec::new();
+    if let Some(file) = optional_rel_path(args, "file")? {
+        files.push(file);
+    }
+    if let Some(list) = args.get("files") {
+        let list = list
+            .as_array()
+            .ok_or_else(|| "files 必须是路径数组".to_string())?;
+        if list.len() > 100 {
+            return Err("一次最多暂存 100 个路径".into());
+        }
+        for item in list {
+            let raw = item
+                .as_str()
+                .ok_or_else(|| "files 里的每一项都必须是路径字符串".to_string())?;
+            files.push(rel_path(raw)?);
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
 }
 
 fn prepare_commit(session: &Session, args: &Value) -> Result<PreparedGitOp, String> {
@@ -1510,6 +1545,90 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.contains("拒绝"), "{error}");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn stage_files_confirms_once_and_stages_all() {
+        let repo = temp_git_repo();
+        fs::write(repo.join("a.txt"), "a\n").unwrap();
+        fs::write(repo.join("b.txt"), "b\n").unwrap();
+        let mut session = enabled_session();
+        let path = repo.to_string_lossy().into_owned();
+        let prepared = prepare_tool(
+            &mut session,
+            "github_git_stage",
+            json!({ "path": path, "files": ["b.txt", "a.txt", "a.txt"] }),
+        )
+        .unwrap();
+        let PreparedGitOp::Pending { payload, exec, .. } = prepared else {
+            panic!("stage must wait for one confirmation");
+        };
+        let operation = payload
+            .fields
+            .iter()
+            .find(|field| field.label == "操作")
+            .map(|field| field.value.as_str())
+            .unwrap_or_default();
+        assert_eq!(operation, "git add -- a.txt b.txt");
+        exec(&mut session).unwrap();
+        let staged = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["diff", "--cached", "--name-only"])
+            .output()
+            .unwrap();
+        let names = String::from_utf8_lossy(&staged.stdout);
+        assert!(staged.status.success());
+        assert!(names.contains("a.txt"), "{names}");
+        assert!(names.contains("b.txt"), "{names}");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn denied_stage_files_leaves_worktree_unstaged() {
+        let repo = temp_git_repo();
+        fs::write(repo.join("a.txt"), "a\n").unwrap();
+        fs::write(repo.join("b.txt"), "b\n").unwrap();
+        let mut session = enabled_session();
+        let path = repo.to_string_lossy().into_owned();
+        let prepared = prepare_tool(
+            &mut session,
+            "github_git_stage",
+            json!({ "path": path, "files": ["a.txt", "b.txt"] }),
+        )
+        .unwrap();
+        let PreparedGitOp::Pending { payload, deny, exec: _ } = prepared else {
+            panic!("stage must wait for confirmation before touching the index");
+        };
+        assert!(payload.fields.iter().any(|field| field.value.contains("a.txt")));
+        assert!(payload.fields.iter().any(|field| field.value.contains("b.txt")));
+        assert!(deny.contains("拒绝"));
+        let staged = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["diff", "--cached", "--name-only"])
+            .output()
+            .unwrap();
+        assert!(staged.status.success());
+        assert!(String::from_utf8_lossy(&staged.stdout).trim().is_empty());
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn stage_files_rejects_parent_path_before_confirm() {
+        let repo = temp_git_repo();
+        let mut session = enabled_session();
+        let path = repo.to_string_lossy().into_owned();
+        let error = match prepare_tool(
+            &mut session,
+            "github_git_stage",
+            json!({ "path": path, "files": ["ok.txt", "../secret"] }),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("parent path must be rejected before confirmation"),
+        };
+        assert!(error.contains(".."), "{error}");
         let _ = fs::remove_dir_all(&repo);
     }
 }
