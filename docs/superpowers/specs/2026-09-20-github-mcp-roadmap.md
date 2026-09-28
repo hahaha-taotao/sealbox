@@ -25,7 +25,7 @@ GitHub MCP 仍默认停用，并继续只访问固定的 `https://api.github.com
 
 ## P0：优先补齐只读上下文
 
-这些接口不产生远端写入，适合先增加并纳入只读工具测试：
+这些只读接口现已实现；Workflow 日志和 Artifacts 仍不在范围内，也不会自动提供给内置助手：
 
 - ~~`github_get_pull_request`~~（本分支之前已交付）
 - ~~`github_list_pull_request_files`~~
