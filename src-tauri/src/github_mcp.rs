@@ -569,7 +569,7 @@ pub fn api_tool_definitions() -> Vec<Value> {
         ),
         tool(
             "github_get_release",
-            "读取单个 Release 的元数据。传 id 或 tag_name 之一。body 截断，不含资产二进制。",
+            "读取单个 Release 的元数据。传 id 或 tag_name 之一。不含 body，不含资产二进制。",
             schema(
                 &[
                     ("credential", credential_prop()),
@@ -1483,9 +1483,11 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
         "github_list_release_assets" => {
             let repository = repository_args(&args)?;
             let id = positive_id(&args, "id")?;
-            request_json(&token, &format!("/repos/{repository}/releases/{id}/assets"), |value| {
-                list_dto(value, MAX_PAGE_SIZE, release_asset_dto)
-            })
+            request_json(
+                &token,
+                &format!("/repos/{repository}/releases/{id}/assets?per_page={MAX_PAGE_SIZE}"),
+                |value| list_dto(value, MAX_PAGE_SIZE, release_asset_dto),
+            )
         }
         "github_list_tags" => {
             let repository = repository_args(&args)?;
@@ -1523,7 +1525,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let run_id = positive_id(&args, "run_id")?;
             request_json(
                 &token,
-                &format!("/repos/{repository}/actions/runs/{run_id}/jobs"),
+                &format!("/repos/{repository}/actions/runs/{run_id}/jobs?per_page={MAX_PAGE_SIZE}"),
                 |value| object_list_dto(value, "jobs", MAX_PAGE_SIZE, workflow_job_dto),
             )
         }
