@@ -706,15 +706,20 @@ pub fn get_notes(state: State<AppState>, id: String) -> Result<Option<String>, S
         .map_err(map_err)
 }
 
-#[tauri::command]
-pub fn tick_idle(state: State<AppState>) -> Result<bool, String> {
+/// Clipboard wipe and idle lock. Runs on the Rust clock, not a webview listener,
+/// so hiding the main window to the tray cannot stall either invariant.
+pub fn tick_security(state: &AppState) -> bool {
     let mut session = lock_session(&state.session);
     if session.clipboard_should_clear(&clipboard::read_text().unwrap_or_default()) {
         let _ = clipboard::clear();
         session.clear_clipboard_mark();
     }
-    let locked = idle_lock_if_needed(&mut session, &state.mcp);
-    Ok(locked)
+    idle_lock_if_needed(&mut session, &state.mcp)
+}
+
+#[tauri::command]
+pub fn tick_idle(state: State<AppState>) -> Result<bool, String> {
+    Ok(tick_security(&state))
 }
 
 #[derive(Deserialize)]
@@ -1629,5 +1634,43 @@ mod tests {
         session.lock();
         let after = clipboard::read_text().unwrap_or_default();
         assert_ne!(after, secret);
+    }
+
+    #[test]
+    fn security_tick_clears_owned_clipboard_without_a_window() {
+        let secret = format!("sealbox-tick-clipboard-{}", uuid::Uuid::new_v4());
+        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        let mut session = Session::default();
+        session.set_unlocked(vault, dek);
+        session.clipboard_secs = 0;
+        session.remember_clipboard(&secret);
+        let state = AppState {
+            session: Arc::new(Mutex::new(session)),
+            mcp: McpState::default(),
+            db_path: Mutex::new(None),
+        };
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let _ = clipboard::write_text(&secret);
+        assert!(!tick_security(&state));
+        assert!(!lock_session(&state.session).clipboard_owned(&secret));
+        assert!(!lock_session(&state.session).clipboard_should_clear(&secret));
+    }
+
+    #[test]
+    fn security_tick_idle_locks_without_a_window() {
+        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        let mut session = Session::default();
+        session.set_unlocked(vault, dek);
+        session.idle_secs = 1;
+        session.age_last_active(std::time::Duration::from_secs(2));
+        let state = AppState {
+            session: Arc::new(Mutex::new(session)),
+            mcp: McpState::default(),
+            db_path: Mutex::new(None),
+        };
+        state.mcp.open_pairing();
+        assert!(tick_security(&state));
+        assert!(!lock_session(&state.session).is_unlocked());
+        assert!(!state.mcp.pairing_status().active);
     }
 }

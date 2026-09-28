@@ -316,7 +316,6 @@ export const api = {
   }) => invoke<EntryDto>("update_client_cert_metadata", { input }),
   importClientCert: (input: ImportClientCertInput) => invoke<EntryDto>("import_client_cert", { input }),
   notes: (id: string) => invoke<string | null>("get_notes", { id }),
-  tick: () => invoke<boolean>("tick_idle"),
   genPassword: (opts: {
     mode?: "password" | "passphrase";
     length?: number;

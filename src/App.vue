@@ -1609,20 +1609,12 @@ onMounted(async () => {
   const unFocus = await getCurrentWindow().onFocusChanged((event) => {
     if (!event.payload) hideVisibleSecrets();
   });
-  const unTick = await listen("tick", async () => {
-    const locked = await api.tick();
-    if (locked) {
-      applyLockedUi();
-      await refreshStatus();
-    }
-  });
   const unLock = await listen("lock-now", () => doLock());
   onUnmounted(() => {
     applyLockedUi();
     window.removeEventListener("keydown", onKey);
     document.removeEventListener("visibilitychange", onVisibility);
     unFocus();
-    unTick();
     unLock();
     stopPairingTimer();
   });

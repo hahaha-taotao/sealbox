@@ -17,6 +17,10 @@ target
 .worktrees
 *.svbak
 
+# Local debug leftovers
+tmp-*.png
+NUL
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

@@ -139,7 +139,12 @@ pub fn run() {
             let handle = app.handle().clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                let _ = handle.emit("tick", ());
+                let Some(state) = handle.try_state::<AppState>() else {
+                    continue;
+                };
+                if commands::tick_security(&state) {
+                    let _ = handle.emit("lock-now", ());
+                }
             });
             let show = MenuItem::with_id(app, "show", "打开", true, None::<&str>)?;
             let lock = MenuItem::with_id(app, "lock", "锁定", true, None::<&str>)?;
