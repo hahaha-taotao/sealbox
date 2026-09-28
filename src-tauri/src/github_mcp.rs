@@ -266,7 +266,6 @@ struct GithubCommitDto {
     html_url: Option<String>,
 }
 
-#[allow(dead_code)] // wired by later read-only tool tasks
 #[derive(Clone, Debug, Serialize)]
 struct GithubReviewDto {
     id: Option<i64>,
@@ -276,7 +275,6 @@ struct GithubReviewDto {
     body: Option<String>,
 }
 
-#[allow(dead_code)] // wired by later read-only tool tasks
 #[derive(Clone, Debug, Serialize)]
 struct GithubReviewCommentDto {
     id: Option<i64>,
@@ -289,7 +287,6 @@ struct GithubReviewCommentDto {
     created_at: Option<String>,
 }
 
-#[allow(dead_code)] // wired by later read-only tool tasks
 #[derive(Clone, Debug, Serialize)]
 struct GithubStatusContextDto {
     context: Option<String>,
@@ -298,7 +295,6 @@ struct GithubStatusContextDto {
     target_url: Option<String>,
 }
 
-#[allow(dead_code)] // wired by later read-only tool tasks
 #[derive(Clone, Debug, Serialize)]
 struct GithubTagDto {
     name: Option<String>,
@@ -314,7 +310,6 @@ struct GithubReleaseAssetDto {
     download_count: Option<i64>,
 }
 
-#[allow(dead_code)] // wired by later read-only tool tasks
 #[derive(Clone, Debug, Serialize)]
 struct GithubWorkflowDto {
     id: Option<i64>,
@@ -1395,6 +1390,143 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                 Ok(json!({"workflow_runs": items, "count": count}))
             })
         }
+        "github_list_pull_request_files" => {
+            let repository = repository_args(&args)?;
+            let number = issue_number(&args)?;
+            let (page, per_page) = page_args(&args)?;
+            let endpoint = format!(
+                "/repos/{repository}/pulls/{number}/files?page={page}&per_page={per_page}"
+            );
+            request_json(&token, &endpoint, |value| list_dto(value, per_page, pull_file_dto))
+        }
+        "github_list_pull_request_commits" => {
+            let repository = repository_args(&args)?;
+            let number = issue_number(&args)?;
+            let (page, per_page) = page_args(&args)?;
+            let endpoint = format!(
+                "/repos/{repository}/pulls/{number}/commits?page={page}&per_page={per_page}"
+            );
+            request_json(&token, &endpoint, |value| list_dto(value, per_page, commit_dto))
+        }
+        "github_list_pull_request_reviews" => {
+            let repository = repository_args(&args)?;
+            let number = issue_number(&args)?;
+            let (page, per_page) = page_args(&args)?;
+            let endpoint = format!(
+                "/repos/{repository}/pulls/{number}/reviews?page={page}&per_page={per_page}"
+            );
+            request_json(&token, &endpoint, |value| list_dto(value, per_page, review_dto))
+        }
+        "github_list_pull_request_comments" => {
+            let repository = repository_args(&args)?;
+            let number = issue_number(&args)?;
+            let (page, per_page) = page_args(&args)?;
+            let endpoint = format!(
+                "/repos/{repository}/pulls/{number}/comments?page={page}&per_page={per_page}"
+            );
+            request_json(&token, &endpoint, |value| {
+                list_dto(value, per_page, review_comment_dto)
+            })
+        }
+        "github_get_pull_request_status" => {
+            let repository = repository_args(&args)?;
+            let reference = match pull_status_selector(&args)? {
+                PullStatusSelector::Ref(reference) => reference,
+                PullStatusSelector::Pull(number) => {
+                    let (_, pull) = request_json(
+                        &token,
+                        &format!("/repos/{repository}/pulls/{number}"),
+                        |value| pull_dto(value).ok_or_else(|| "GitHub 响应格式不正确".to_string()),
+                    )?;
+                    pull.get("head")
+                        .and_then(|item| item.get("sha"))
+                        .and_then(Value::as_str)
+                        .filter(|sha| {
+                            !sha.is_empty()
+                                && sha.len() <= 200
+                                && sha.chars().all(|c| c.is_ascii_hexdigit())
+                        })
+                        .ok_or_else(|| "PR head SHA 不可用".to_string())?
+                        .to_string()
+                }
+            };
+            request_json(
+                &token,
+                &format!("/repos/{repository}/commits/{reference}/status"),
+                combined_status_dto,
+            )
+        }
+        "github_list_releases" => {
+            let repository = repository_args(&args)?;
+            let (page, per_page) = page_args(&args)?;
+            let endpoint =
+                format!("/repos/{repository}/releases?page={page}&per_page={per_page}");
+            request_json(&token, &endpoint, |value| {
+                list_dto(value, per_page, release_list_dto)
+            })
+        }
+        "github_get_release" => {
+            let repository = repository_args(&args)?;
+            let endpoint = if args.get("id").is_some() {
+                let id = positive_id(&args, "id")?;
+                format!("/repos/{repository}/releases/{id}")
+            } else if args.get("tag_name").is_some() {
+                let tag = compare_ref_arg(&args, "tag_name")?;
+                format!("/repos/{repository}/releases/tags/{tag}")
+            } else {
+                return Err("缺少参数 id".into());
+            };
+            request_json(&token, &endpoint, |value| {
+                release_list_dto(value).ok_or_else(|| "GitHub 响应格式不正确".to_string())
+            })
+        }
+        "github_list_release_assets" => {
+            let repository = repository_args(&args)?;
+            let id = positive_id(&args, "id")?;
+            request_json(&token, &format!("/repos/{repository}/releases/{id}/assets"), |value| {
+                list_dto(value, MAX_PAGE_SIZE, release_asset_dto)
+            })
+        }
+        "github_list_tags" => {
+            let repository = repository_args(&args)?;
+            let (page, per_page) = page_args(&args)?;
+            let endpoint = format!("/repos/{repository}/tags?page={page}&per_page={per_page}");
+            request_json(&token, &endpoint, |value| list_dto(value, per_page, tag_dto))
+        }
+        "github_compare_commits" => {
+            let repository = repository_args(&args)?;
+            let base = compare_ref_arg(&args, "base")?;
+            let head = compare_ref_arg(&args, "head")?;
+            let endpoint = compare_endpoint(&repository, &base, &head)?;
+            request_json(&token, &endpoint, compare_dto)
+        }
+        "github_list_workflows" => {
+            let repository = repository_args(&args)?;
+            let (page, per_page) = page_args(&args)?;
+            let endpoint =
+                format!("/repos/{repository}/actions/workflows?page={page}&per_page={per_page}");
+            request_json(&token, &endpoint, |value| {
+                object_list_dto(value, "workflows", per_page, workflow_summary_dto)
+            })
+        }
+        "github_get_workflow_run" => {
+            let repository = repository_args(&args)?;
+            let run_id = positive_id(&args, "run_id")?;
+            request_json(
+                &token,
+                &format!("/repos/{repository}/actions/runs/{run_id}"),
+                |value| workflow_run_dto(value).ok_or_else(|| "GitHub 响应格式不正确".to_string()),
+            )
+        }
+        "github_list_workflow_jobs" => {
+            let repository = repository_args(&args)?;
+            let run_id = positive_id(&args, "run_id")?;
+            request_json(
+                &token,
+                &format!("/repos/{repository}/actions/runs/{run_id}/jobs"),
+                |value| object_list_dto(value, "jobs", MAX_PAGE_SIZE, workflow_job_dto),
+            )
+        }
         _ => return Err("未知 GitHub 工具".into()),
     }?;
     session.touch();
@@ -1719,25 +1851,21 @@ fn issue_number(args: &Value) -> Result<u64, String> {
         .ok_or_else(|| "缺少参数 number".to_string())
 }
 
-// Task 4 wires these into call_tool_text.
-#[allow(dead_code)]
-fn positive_id(args: &Value, name: &str) -> Result<u64, String> {
+    fn positive_id(args: &Value, name: &str) -> Result<u64, String> {
     args.get(name)
         .and_then(Value::as_u64)
         .filter(|value| *value >= 1)
         .ok_or_else(|| format!("缺少参数 {name}"))
 }
 
-#[allow(dead_code)]
-fn compare_ref_arg(args: &Value, name: &str) -> Result<String, String> {
+    fn compare_ref_arg(args: &Value, name: &str) -> Result<String, String> {
     let wrapped = json!({ "ref": args.get(name).cloned().unwrap_or(Value::Null) });
     optional_ref(&wrapped)?
         .filter(|value| !value.contains("..."))
         .ok_or_else(|| format!("参数 {name} 格式不合法"))
 }
 
-#[allow(dead_code)]
-fn compare_endpoint(repository: &str, base: &str, head: &str) -> Result<String, String> {
+    fn compare_endpoint(repository: &str, base: &str, head: &str) -> Result<String, String> {
     if base.contains("...") || head.contains("...") {
         return Err("比较引用不能包含 ...".into());
     }
@@ -1745,14 +1873,12 @@ fn compare_endpoint(repository: &str, base: &str, head: &str) -> Result<String, 
 }
 
 #[derive(Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 enum PullStatusSelector {
     Ref(String),
     Pull(u64),
 }
 
-#[allow(dead_code)]
-fn pull_status_selector(args: &Value) -> Result<PullStatusSelector, String> {
+    fn pull_status_selector(args: &Value) -> Result<PullStatusSelector, String> {
     if let Some(reference) = optional_ref(args)? {
         if reference.contains("...") {
             return Err("ref 格式不合法".into());
@@ -1991,6 +2117,21 @@ fn github_error(status: u16, body: &[u8], truncated: bool) -> String {
     format!("GitHub HTTP {status}: {message}")
 }
 
+fn release_list_dto(value: &Value) -> Option<Value> {
+    serde_json::to_value(GithubReleaseDto {
+        id: value.get("id").and_then(Value::as_i64),
+        tag_name: limited_string(value.get("tag_name")),
+        name: limited_string(value.get("name")),
+        target_commitish: limited_string(value.get("target_commitish")),
+        draft: value.get("draft").and_then(Value::as_bool),
+        prerelease: value.get("prerelease").and_then(Value::as_bool),
+        html_url: limited_string(value.get("html_url")),
+        created_at: limited_string(value.get("created_at")),
+        published_at: limited_string(value.get("published_at")),
+    })
+    .ok()
+}
+
 fn release_dto(value: &Value) -> Option<Value> {
     serde_json::to_value(GithubReleaseDto {
         id: value.get("id").and_then(Value::as_i64),
@@ -2156,7 +2297,6 @@ fn commit_dto(value: &Value) -> Option<Value> {
     .ok()
 }
 
-#[allow(dead_code)] // wired by later read-only tool tasks
 fn review_dto(value: &Value) -> Option<Value> {
     serde_json::to_value(GithubReviewDto {
         id: value.get("id").and_then(Value::as_i64),
@@ -2168,7 +2308,6 @@ fn review_dto(value: &Value) -> Option<Value> {
     .ok()
 }
 
-#[allow(dead_code)] // wired by later read-only tool tasks
 fn review_comment_dto(value: &Value) -> Option<Value> {
     serde_json::to_value(GithubReviewCommentDto {
         id: value.get("id").and_then(Value::as_i64),
@@ -2183,7 +2322,6 @@ fn review_comment_dto(value: &Value) -> Option<Value> {
     .ok()
 }
 
-#[allow(dead_code)] // wired by later read-only tool tasks
 fn status_context_dto(value: &Value) -> Option<GithubStatusContextDto> {
     Some(GithubStatusContextDto {
         context: limited_string(value.get("context")),
@@ -2193,7 +2331,6 @@ fn status_context_dto(value: &Value) -> Option<GithubStatusContextDto> {
     })
 }
 
-#[allow(dead_code)] // wired by later read-only tool tasks
 fn tag_dto(value: &Value) -> Option<Value> {
     serde_json::to_value(GithubTagDto {
         name: limited_string(value.get("name")),
@@ -2213,7 +2350,6 @@ fn release_asset_dto(value: &Value) -> Option<Value> {
     .ok()
 }
 
-#[allow(dead_code)] // wired by later read-only tool tasks
 fn workflow_summary_dto(value: &Value) -> Option<Value> {
     serde_json::to_value(GithubWorkflowDto {
         id: value.get("id").and_then(Value::as_i64),
@@ -2285,7 +2421,6 @@ fn compare_dto(value: &Value) -> Result<Value, String> {
     }))
 }
 
-#[allow(dead_code)] // wired by later read-only tool tasks
 fn combined_status_dto(value: &Value) -> Result<Value, String> {
     let statuses = value
         .get("statuses")
@@ -2306,7 +2441,6 @@ fn combined_status_dto(value: &Value) -> Result<Value, String> {
     }))
 }
 
-#[allow(dead_code)] // wired by later read-only tool tasks
 fn object_list_dto(
     value: &Value,
     key: &str,
@@ -2570,6 +2704,34 @@ mod tests {
                 "github_list_pull_requests",
                 json!({"credential_id":"id","owner":"octocat","repo":"hello-world"}),
             ),
+            (
+                "github_list_pull_request_files",
+                json!({"repo":"octocat/hello-world","number":1}),
+            ),
+            (
+                "github_get_pull_request_status",
+                json!({"repo":"octocat/hello-world","number":1}),
+            ),
+            (
+                "github_list_releases",
+                json!({"repo":"octocat/hello-world"}),
+            ),
+            (
+                "github_get_release",
+                json!({"repo":"octocat/hello-world","tag_name":"v1.0.0"}),
+            ),
+            (
+                "github_compare_commits",
+                json!({"repo":"octocat/hello-world","base":"main","head":"feature"}),
+            ),
+            (
+                "github_get_workflow_run",
+                json!({"repo":"octocat/hello-world","run_id":1}),
+            ),
+            (
+                "github_list_workflow_jobs",
+                json!({"repo":"octocat/hello-world","run_id":1}),
+            ),
         ];
         for (name, args) in cases {
             let error = call_tool(&mut session, name, args).unwrap_err();
@@ -2594,6 +2756,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(git_error.contains("未启用"), "{git_error}");
+    }
+
+    #[test]
+    fn new_readonly_tools_stay_visible_without_api_write() {
+        let definitions = tool_definitions_for_policy(&GithubMcpPolicy {
+            enabled: true,
+            api_write_enabled: false,
+            ..Default::default()
+        });
+        for name in [
+            "github_list_pull_request_files",
+            "github_get_pull_request_status",
+            "github_list_releases",
+            "github_get_release",
+            "github_list_release_assets",
+            "github_compare_commits",
+            "github_list_workflow_jobs",
+        ] {
+            assert!(
+                definitions.iter().any(|definition| definition["name"] == name),
+                "{name} missing"
+            );
+        }
     }
 
     #[test]
