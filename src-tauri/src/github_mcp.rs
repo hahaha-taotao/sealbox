@@ -1719,6 +1719,52 @@ fn issue_number(args: &Value) -> Result<u64, String> {
         .ok_or_else(|| "缺少参数 number".to_string())
 }
 
+// Task 4 wires these into call_tool_text.
+#[allow(dead_code)]
+fn positive_id(args: &Value, name: &str) -> Result<u64, String> {
+    args.get(name)
+        .and_then(Value::as_u64)
+        .filter(|value| *value >= 1)
+        .ok_or_else(|| format!("缺少参数 {name}"))
+}
+
+#[allow(dead_code)]
+fn compare_ref_arg(args: &Value, name: &str) -> Result<String, String> {
+    let wrapped = json!({ "ref": args.get(name).cloned().unwrap_or(Value::Null) });
+    optional_ref(&wrapped)?
+        .filter(|value| !value.contains("..."))
+        .ok_or_else(|| format!("参数 {name} 格式不合法"))
+}
+
+#[allow(dead_code)]
+fn compare_endpoint(repository: &str, base: &str, head: &str) -> Result<String, String> {
+    if base.contains("...") || head.contains("...") {
+        return Err("比较引用不能包含 ...".into());
+    }
+    Ok(format!("/repos/{repository}/compare/{base}...{head}"))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+enum PullStatusSelector {
+    Ref(String),
+    Pull(u64),
+}
+
+#[allow(dead_code)]
+fn pull_status_selector(args: &Value) -> Result<PullStatusSelector, String> {
+    if let Some(reference) = optional_ref(args)? {
+        if reference.contains("...") {
+            return Err("ref 格式不合法".into());
+        }
+        return Ok(PullStatusSelector::Ref(reference));
+    }
+    if args.get("number").is_some() {
+        return Ok(PullStatusSelector::Pull(issue_number(args)?));
+    }
+    Err("缺少参数 number".into())
+}
+
 fn required_text(args: &Value, name: &str, max: usize) -> Result<String, String> {
     let value = args
         .get(name)
@@ -2387,6 +2433,25 @@ mod tests {
             "docs/my%20file%402.txt"
         );
         assert!(optional_ref(&json!({"ref":"refs/../main"})).is_err());
+    }
+
+    #[test]
+    fn readonly_paths_reject_bad_refs_and_encode_compare() {
+        assert!(positive_id(&json!({"id": 0}), "id").is_err());
+        assert_eq!(positive_id(&json!({"run_id": 42}), "run_id").unwrap(), 42);
+        assert!(compare_ref_arg(&json!({"base": "refs/../main"}), "base").is_err());
+        assert!(compare_ref_arg(&json!({"head": "feature%2Fx"}), "head").is_err());
+        assert_eq!(
+            compare_endpoint("octocat/hello-world", "main", "feature%2Fui").unwrap(),
+            "/repos/octocat/hello-world/compare/main...feature%2Fui"
+        );
+        assert!(compare_endpoint("octocat/hello-world", "a...b", "main").is_err());
+        let missing = pull_status_selector(&json!({"repo": "octocat/hello-world"})).unwrap_err();
+        assert!(missing.contains("number"), "{missing}");
+        assert_eq!(
+            pull_status_selector(&json!({"repo": "octocat/hello-world", "ref": "abc123"})).unwrap(),
+            PullStatusSelector::Ref("abc123".into())
+        );
     }
 
     #[test]
