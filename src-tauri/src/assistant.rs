@@ -751,10 +751,18 @@ mod tests {
             ]
         });
         let tools = safe_tool_definitions(&value);
-        let names: Vec<&str> = tools.iter().map(|tool| tool.summary.name.as_str()).collect();
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|tool| tool.summary.name.as_str())
+            .collect();
         assert_eq!(
             names,
-            vec!["github_get_file", "github_git_status", "zoomkey_jira_nav", "zoomkey_crm_query"]
+            vec![
+                "github_get_file",
+                "github_git_status",
+                "zoomkey_jira_nav",
+                "zoomkey_crm_query"
+            ]
         );
     }
 

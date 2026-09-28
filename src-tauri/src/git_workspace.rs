@@ -307,7 +307,11 @@ fn git_secrets(session: &Session, args: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn git_confirm_payload(title: &str, prompt: &str, fields: &[(&str, String)]) -> crate::confirm::ConfirmPayload {
+fn git_confirm_payload(
+    title: &str,
+    prompt: &str,
+    fields: &[(&str, String)],
+) -> crate::confirm::ConfirmPayload {
     crate::confirm::ConfirmPayload {
         title: title.to_string(),
         prompt: prompt.to_string(),
@@ -413,7 +417,10 @@ fn status(session: &Session, args: &Value) -> Result<String, String> {
 fn diff(session: &Session, args: &Value) -> Result<String, String> {
     let root = repo_root(session, args)?;
     let staged = args.get("staged").and_then(Value::as_bool).unwrap_or(false);
-    let stat_only = args.get("stat_only").and_then(Value::as_bool).unwrap_or(true);
+    let stat_only = args
+        .get("stat_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let mut cmd = vec!["diff"];
     if staged {
         cmd.push("--cached");
@@ -536,10 +543,7 @@ fn prepare_commit(session: &Session, args: &Value) -> Result<PreparedGitOp, Stri
     let payload = git_confirm_payload(
         "创建 git 提交",
         "允许这次本地 git 写操作？",
-        &[
-            ("仓库", display_path(&root)),
-            ("说明", message.clone()),
-        ],
+        &[("仓库", display_path(&root)), ("说明", message.clone())],
     );
     Ok(PreparedGitOp::Pending {
         payload,
@@ -817,7 +821,12 @@ fn ls_remote_sha(root: &Path, token: &str, remote: &str, branch: &str) -> Result
     Ok(sha)
 }
 
-fn classify_push_output(output: &str, remote: &str, branch: Option<&str>, tag: Option<&str>) -> String {
+fn classify_push_output(
+    output: &str,
+    remote: &str,
+    branch: Option<&str>,
+    tag: Option<&str>,
+) -> String {
     let lower = output.to_ascii_lowercase();
     let up_to_date = lower.contains("everything up-to-date")
         || lower.contains("already up to date")
@@ -983,16 +992,22 @@ fn parse_status(raw: &str) -> Value {
                 branch = Some(head.trim().to_string());
             }
             if extra.contains("ahead ") {
-                ahead = extra
-                    .split("ahead ")
-                    .nth(1)
-                    .and_then(|part| part.chars().take_while(|ch| ch.is_ascii_digit()).collect::<String>().parse().ok());
+                ahead = extra.split("ahead ").nth(1).and_then(|part| {
+                    part.chars()
+                        .take_while(|ch| ch.is_ascii_digit())
+                        .collect::<String>()
+                        .parse()
+                        .ok()
+                });
             }
             if extra.contains("behind ") {
-                behind = extra
-                    .split("behind ")
-                    .nth(1)
-                    .and_then(|part| part.chars().take_while(|ch| ch.is_ascii_digit()).collect::<String>().parse().ok());
+                behind = extra.split("behind ").nth(1).and_then(|part| {
+                    part.chars()
+                        .take_while(|ch| ch.is_ascii_digit())
+                        .collect::<String>()
+                        .parse()
+                        .ok()
+                });
             }
             continue;
         }
@@ -1186,7 +1201,9 @@ fn truncate(value: &str) -> String {
     if value.len() <= MAX_OUTPUT_BYTES {
         return value.to_string();
     }
-    let mut end = MAX_OUTPUT_BYTES.saturating_sub(ELLIPSIS.len()).min(value.len());
+    let mut end = MAX_OUTPUT_BYTES
+        .saturating_sub(ELLIPSIS.len())
+        .min(value.len());
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }
@@ -1351,7 +1368,12 @@ mod tests {
         Command::new("git")
             .arg("-C")
             .arg(&repo)
-            .args(["remote", "add", "origin", "git@github.com:octocat/hello.git"])
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:octocat/hello.git",
+            ])
             .status()
             .unwrap();
         let err = require_github_https_origin(&repo).unwrap_err();
@@ -1364,12 +1386,8 @@ mod tests {
         let repo = temp_git_repo();
         let mut session = enabled_session();
         let path = repo.to_string_lossy().into_owned();
-        let status = call_tool_text(
-            &mut session,
-            "github_git_status",
-            json!({ "path": path }),
-        )
-        .unwrap();
+        let status =
+            call_tool_text(&mut session, "github_git_status", json!({ "path": path })).unwrap();
         let status_json: Value = serde_json::from_str(&status).unwrap();
         let branch = status_json["branch"].as_str().unwrap_or_default();
         assert!(
@@ -1398,7 +1416,12 @@ mod tests {
         Command::new("git")
             .arg("-C")
             .arg(&repo)
-            .args(["remote", "add", "origin", "https://github.com/octocat/hello.git"])
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/octocat/hello.git",
+            ])
             .status()
             .unwrap();
         let creds = crate::github_mcp::list_credentials(&session).unwrap();
@@ -1479,7 +1502,10 @@ mod tests {
             display_path(Path::new(r"\\?\UNC\server\share\repo")),
             r"\\server\share\repo"
         );
-        assert_eq!(display_path(Path::new(r"E:\project\sealbox")), r"E:\project\sealbox");
+        assert_eq!(
+            display_path(Path::new(r"E:\project\sealbox")),
+            r"E:\project\sealbox"
+        );
         assert_eq!(
             display_path(Path::new("//?/E:/project/sealbox")),
             r"E:\project\sealbox"
@@ -1488,7 +1514,8 @@ mod tests {
 
     #[test]
     fn classify_push_distinguishes_up_to_date() {
-        let up_to_date = classify_push_output("Everything up-to-date", "origin", Some("main"), None);
+        let up_to_date =
+            classify_push_output("Everything up-to-date", "origin", Some("main"), None);
         assert!(up_to_date.contains("\"up_to_date\": true"), "{up_to_date}");
         let pushed = classify_push_output(
             "   abc1234..def5678  HEAD -> main",
@@ -1514,7 +1541,12 @@ mod tests {
         Command::new("git")
             .arg("-C")
             .arg(&repo)
-            .args(["remote", "add", "origin", "https://github.com/octocat/hello.git"])
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/octocat/hello.git",
+            ])
             .status()
             .unwrap();
         let err = call_tool_text(
@@ -1598,11 +1630,22 @@ mod tests {
             json!({ "path": path, "files": ["a.txt", "b.txt"] }),
         )
         .unwrap();
-        let PreparedGitOp::Pending { payload, deny, exec: _ } = prepared else {
+        let PreparedGitOp::Pending {
+            payload,
+            deny,
+            exec: _,
+        } = prepared
+        else {
             panic!("stage must wait for confirmation before touching the index");
         };
-        assert!(payload.fields.iter().any(|field| field.value.contains("a.txt")));
-        assert!(payload.fields.iter().any(|field| field.value.contains("b.txt")));
+        assert!(payload
+            .fields
+            .iter()
+            .any(|field| field.value.contains("a.txt")));
+        assert!(payload
+            .fields
+            .iter()
+            .any(|field| field.value.contains("b.txt")));
         assert!(deny.contains("拒绝"));
         let staged = Command::new("git")
             .arg("-C")

@@ -188,7 +188,12 @@ fn tools_list(session: &Mutex<Session>) -> Value {
         let policy = locked
             .vault()
             .ok()
-            .and_then(|vault| locked.dek().ok().map(|dek| github_mcp::load_policy(vault, dek)))
+            .and_then(|vault| {
+                locked
+                    .dek()
+                    .ok()
+                    .map(|dek| github_mcp::load_policy(vault, dek))
+            })
             .unwrap_or_default();
         tools.extend(github_mcp::tool_definitions_for_policy(&policy));
     }
@@ -336,11 +341,7 @@ fn handle_rpc(session: &Mutex<Session>, mcp: &McpState, req: JsonRpcReq) -> Opti
     Some(out)
 }
 
-fn call_git_tool(
-    session: &Mutex<Session>,
-    name: &str,
-    args: Value,
-) -> Result<String, String> {
+fn call_git_tool(session: &Mutex<Session>, name: &str, args: Value) -> Result<String, String> {
     let context = github_mcp::GithubAuditContext {
         path: args.get("path").and_then(Value::as_str).map(str::to_string),
         reference: args
@@ -801,7 +802,11 @@ mod tests {
         let (vault, dek) =
             crate::vault::Vault::create_in_memory("correct horse battery staple extra").unwrap();
         vault
-            .set_secret_setting(&dek, "github_mcp_policy", r#"{"enabled":true,"api_write_enabled":true}"#)
+            .set_secret_setting(
+                &dek,
+                "github_mcp_policy",
+                r#"{"enabled":true,"api_write_enabled":true}"#,
+            )
             .unwrap();
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
@@ -858,9 +863,15 @@ mod tests {
     fn pairing_code_is_one_shot_and_windowed() {
         let mcp = McpState::default();
         let status = mcp.open_pairing();
+        assert!(status.active);
+        assert_eq!(status.expires_in_secs, 60);
         let code = status.code.unwrap();
+        let current = mcp.pairing_status();
+        assert!(current.active);
+        assert!((1..=60).contains(&current.expires_in_secs));
         mcp.consume_pairing(&code).unwrap();
         assert!(mcp.consume_pairing(&code).is_err());
+        assert!(!mcp.pairing_status().active);
     }
 
     #[test]
@@ -879,7 +890,11 @@ mod tests {
         let (vault, dek) =
             crate::vault::Vault::create_in_memory("correct horse battery staple extra").unwrap();
         vault
-            .set_secret_setting(&dek, "github_mcp_policy", r#"{"enabled":true,"api_write_enabled":true}"#)
+            .set_secret_setting(
+                &dek,
+                "github_mcp_policy",
+                r#"{"enabled":true,"api_write_enabled":true}"#,
+            )
             .unwrap();
         let mut session = Session::default();
         session.set_unlocked(vault, dek);

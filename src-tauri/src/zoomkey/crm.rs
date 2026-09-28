@@ -242,7 +242,10 @@ fn nav(runtime: &EndpointRuntime, args: &Value) -> Result<ToolOutcome, ToolFailu
     })
 }
 
-pub(crate) fn connection_status(runtime: &EndpointRuntime, args: &Value) -> Result<ToolOutcome, ToolFailure> {
+pub(crate) fn connection_status(
+    runtime: &EndpointRuntime,
+    args: &Value,
+) -> Result<ToolOutcome, ToolFailure> {
     let challenge = call_operation(
         runtime,
         "GET",
@@ -981,7 +984,10 @@ fn call_operation(
                 Some(status),
             )
         } else {
-            ToolFailure::request(non_json_message(status, &bytes, &runtime.base_url), Some(status))
+            ToolFailure::request(
+                non_json_message(status, &bytes, &runtime.base_url),
+                Some(status),
+            )
         }
     })?;
     if value.get("success").and_then(Value::as_bool) == Some(false) {
@@ -1182,7 +1188,9 @@ fn non_json_message(status: u16, body: &[u8], base_url: &str) -> String {
 
 fn body_looks_like_html(body: &[u8]) -> bool {
     let lower = body.to_ascii_lowercase();
-    lower.windows(b"<!doctype html".len()).any(|w| w == b"<!doctype html")
+    lower
+        .windows(b"<!doctype html".len())
+        .any(|w| w == b"<!doctype html")
         || lower.windows(b"<html".len()).any(|w| w == b"<html")
 }
 
@@ -1368,7 +1376,11 @@ mod tests {
 
     #[test]
     fn non_json_plain_text_keeps_a_short_preview() {
-        let message = non_json_message(200, b"Invalid request", "https://crm.zoomkey.com.cn/webservice.php");
+        let message = non_json_message(
+            200,
+            b"Invalid request",
+            "https://crm.zoomkey.com.cn/webservice.php",
+        );
         assert!(message.contains("Invalid request"), "{message}");
         assert!(!message.contains("登录页 HTML"), "{message}");
     }

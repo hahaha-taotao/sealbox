@@ -501,6 +501,103 @@ fn list_filter_kinds_and_folder_combine() {
 }
 
 #[test]
+fn organization_management_keeps_entries_recoverable() {
+    let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+    let source = vault.create_folder("  工作  ").unwrap();
+    let target = vault.create_folder("个人").unwrap();
+    assert_eq!(source.name, "工作");
+    assert!(matches!(
+        vault.create_folder("工作"),
+        Err(VaultError::FolderAlreadyExists)
+    ));
+    assert!(matches!(
+        vault.create_folder("   "),
+        Err(VaultError::FolderNameEmpty)
+    ));
+
+    let mut first = sample_website("first", None);
+    first.folder_id = Some(source.id.clone());
+    first.tags = vec!["  shared ".into(), "source-only".into(), "shared".into()];
+    let first = vault.upsert_entry(&dek, first).unwrap();
+    let mut second = sample_website("second", None);
+    second.folder_id = Some(target.id.clone());
+    second.tags = vec!["shared".into(), "target-only".into()];
+    vault.upsert_entry(&dek, second).unwrap();
+
+    let renamed = vault.rename_folder(&source.id, "团队").unwrap();
+    assert_eq!(renamed.id, source.id);
+    assert_eq!(renamed.name, "团队");
+    assert!(matches!(
+        vault.rename_folder(&source.id, "个人"),
+        Err(VaultError::FolderAlreadyExists)
+    ));
+    let renamed_entry = vault
+        .list_entries(&ListFilter::default())
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.title == "first")
+        .expect("renamed folder entry should remain listed");
+    assert_eq!(renamed_entry.folder_id, Some(source.id.clone()));
+
+    vault.merge_folders(&source.id, &target.id).unwrap();
+    assert!(vault
+        .list_folders()
+        .unwrap()
+        .iter()
+        .all(|folder| folder.id != source.id));
+    assert!(vault
+        .list_entries(&ListFilter::default())
+        .unwrap()
+        .iter()
+        .all(|entry| entry.folder_id.as_deref() == Some(target.id.as_str())));
+
+    vault.rename_tag("shared", "common").unwrap();
+    assert!(vault.list_tags().unwrap().contains(&"common".to_string()));
+    assert!(!vault.list_tags().unwrap().contains(&"shared".to_string()));
+    assert!(matches!(
+        vault.rename_tag("common", "target-only"),
+        Err(VaultError::TagAlreadyExists)
+    ));
+    vault.merge_tags("source-only", "common").unwrap();
+    assert!(!vault
+        .list_tags()
+        .unwrap()
+        .contains(&"source-only".to_string()));
+    vault.delete_tag("target-only").unwrap();
+    assert!(!vault
+        .list_tags()
+        .unwrap()
+        .contains(&"target-only".to_string()));
+
+    vault.delete_folder(&target.id).unwrap();
+    let listed = vault.list_entries(&ListFilter::default()).unwrap();
+    assert!(listed.iter().all(|entry| entry.folder_id.is_none()));
+    assert!(matches!(
+        vault.upsert_entry(
+            &dek,
+            UpsertEntry {
+                folder_id: Some("missing-folder".into()),
+                ..sample_website("invalid", None)
+            },
+        ),
+        Err(VaultError::FolderNotFound)
+    ));
+    assert!(vault.get_secret(&dek, &first.id).is_ok());
+}
+
+#[test]
+fn empty_trash_removes_entry_links_and_orphan_tags() {
+    let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+    let row = vault
+        .upsert_entry(&dek, sample_website("trash", None))
+        .unwrap();
+    assert!(vault.list_tags().unwrap().contains(&"work".to_string()));
+    vault.soft_delete(&[row.id]).unwrap();
+    vault.empty_trash().unwrap();
+    assert!(vault.list_tags().unwrap().is_empty());
+}
+
+#[test]
 fn change_master_password() {
     let (vault, dek) = Vault::create_in_memory("old password long enough").unwrap();
     vault

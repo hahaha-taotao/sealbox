@@ -1,0 +1,3551 @@
+[
+  {
+    "name": "github_ref_delete",
+    "description": "用 API 直接删除 git ref（tag 或分支），无需本地仓库。git_ref 用短名 heads/<分支> 或 tags/<标签>（不带 refs/ 前缀）。「删 tag 重推」发版场景常用；注意：删 tag 不会删对应 Release（如需一并删，另调 github_release_delete）。⚠️⚠️ 破坏性，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "凭据 name（github_token，需 repo + 写权限）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "git_ref",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "ref 短名：heads/<分支> 或 tags/<标签>（不带 refs/ 前缀）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "list_credentials",
+    "description": "列出 Sigil 金库中保存的凭据元数据（绝不含明文 value，仅 name/kind/account/remark/expires_at/last_used_at/use_count/allowed_capabilities）。可按 kind 或 name 子串过滤，可按 use_count/last_used_at/expires_at 等排序，支持 limit/offset 分页。当用户问『我有多少 X 凭据』『最久没用的凭据』时**先调这个**。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "kind",
+        "required": false,
+        "type": "string",
+        "enum": [
+          "github_token",
+          "gitee_token",
+          "gitcode_token",
+          "gitlab_token",
+          "http_api",
+          "generic_password",
+          "s3_compatible",
+          "code_signing",
+          "maven_central",
+          "mail_authcode",
+          "mail_oauth",
+          "custom"
+        ],
+        "default": null,
+        "desc": "可选凭据类型过滤"
+      },
+      {
+        "name": "name_contains",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "可选：按 name 子串过滤（不区分大小写）"
+      },
+      {
+        "name": "sort_by",
+        "required": false,
+        "type": "string",
+        "enum": [
+          "updated_at",
+          "created_at",
+          "use_count",
+          "last_used_at",
+          "expires_at",
+          "name"
+        ],
+        "default": null,
+        "desc": "排序字段（默认 updated_at）"
+      },
+      {
+        "name": "ascending",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "升序（默认 false = 降序）"
+      },
+      {
+        "name": "limit",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "返回上限（默认不限）"
+      },
+      {
+        "name": "offset",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "偏移（分页用，默认 0）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "get_credential_meta",
+    "description": "取单个凭据的元数据（按 name 精确查找，区分大小写）。绝不含明文 value。当 AI 想知道某个凭据的 account / 过期时间 / 调用历史时使用。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "凭据 name（精确匹配，区分大小写）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "list_capabilities",
+    "description": "列出 Sigil 当前可用的所有能力（MCP 工具），按用途分组。让 AI 知道工具箱里有什么、哪些需要桌面端二次确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "enabled_only",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "只列已启用的（默认 false 列全部）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "get_capability_detail",
+    "description": "取单个能力的完整详情：描述 / 入参 JSON Schema / 引用的凭据 / 是否需确认 / 是否启用。当 AI 想知道某能力『要传什么参数』『用了哪些凭据』时使用（list_capabilities 不含 input_schema）。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "能力 name（精确匹配）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "credentials_for_capability",
+    "description": "反查：给定一个能力 name，列出金库里『允许被该能力使用』的凭据（依据每条凭据的 allowed_capabilities 白名单；无白名单的凭据允许所有能力）。帮 AI 判断某能力能用哪些凭据。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "capability_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "能力 name"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_repo_list",
+    "description": "列出 GitHub 当前 token 账号的仓库（按 updated 倒序，含 stars/visibility/desc）。回答『我有多少 GitHub 仓库』时调这个。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "per_page",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "默认 30"
+      },
+      {
+        "name": "page",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "默认 1"
+      },
+      {
+        "name": "name_contains",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "可选：按 full_name 子串过滤（仅过滤当前页！跨全量过滤请用 *_repo_search）"
+      },
+      {
+        "name": "type",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库范围 all/owner/member/public/private（平台取值略异）"
+      },
+      {
+        "name": "visibility",
+        "required": false,
+        "type": "string",
+        "enum": [
+          "all",
+          "public",
+          "private"
+        ],
+        "default": null,
+        "desc": "可见性"
+      },
+      {
+        "name": "affiliation",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "归属 owner/collaborator/organization_member（逗号分隔）"
+      },
+      {
+        "name": "sort",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "排序 created/updated/pushed/full_name（默认 updated）"
+      },
+      {
+        "name": "direction",
+        "required": false,
+        "type": "string",
+        "enum": [
+          "asc",
+          "desc"
+        ],
+        "default": null,
+        "desc": "方向"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_repo_search",
+    "description": "搜索 GitHub 仓库（服务端搜索，支持 `cli in:name stars:>100` 语法，跨全量）。按名字/条件找仓库用这个。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "q",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "搜索关键词（服务端搜索，跨全量；GitHub 支持 `cli in:name stars:>100` 语法）"
+      },
+      {
+        "name": "per_page",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "默认 30"
+      },
+      {
+        "name": "page",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "默认 1"
+      },
+      {
+        "name": "sort",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "排序（stars/forks/updated 等，平台相关）"
+      },
+      {
+        "name": "order",
+        "required": false,
+        "type": "string",
+        "enum": [
+          "asc",
+          "desc"
+        ],
+        "default": null,
+        "desc": "方向"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_repo_get",
+    "description": "取 GitHub 单个仓库详情（owner/repo）：star/fork/默认分支/语言/open_issues 等。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo 格式）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_user_info",
+    "description": "GitHub 当前 token 账号信息（login / name / public_repos / followers / rate_limit）。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_issues_list",
+    "description": "列出 GitHub issues。必须指定 repo（owner/repo）。支持 labels/assignee/creator/since 等过滤，state 默认 open。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo 格式）"
+      },
+      {
+        "name": "state",
+        "required": false,
+        "type": "string",
+        "enum": [
+          "open",
+          "closed",
+          "all"
+        ],
+        "default": null,
+        "desc": "默认 open"
+      },
+      {
+        "name": "per_page",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": null
+      },
+      {
+        "name": "page",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": null
+      },
+      {
+        "name": "labels",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "标签过滤（逗号分隔）"
+      },
+      {
+        "name": "assignee",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "指派人登录名"
+      },
+      {
+        "name": "creator",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "创建者登录名"
+      },
+      {
+        "name": "since",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仅此 ISO8601 时间后更新的（如 2026-01-01T00:00:00Z）"
+      },
+      {
+        "name": "sort",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "排序 created/updated/comments"
+      },
+      {
+        "name": "direction",
+        "required": false,
+        "type": "string",
+        "enum": [
+          "asc",
+          "desc"
+        ],
+        "default": null,
+        "desc": null
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_pulls_list",
+    "description": "列出 GitHub 仓库的 Pull Request（owner/repo，state 默认 open）。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "state",
+        "required": false,
+        "type": "string",
+        "enum": [
+          "open",
+          "closed",
+          "all"
+        ],
+        "default": null,
+        "desc": "默认 open"
+      },
+      {
+        "name": "per_page",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": null
+      },
+      {
+        "name": "page",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": null
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_commits_list",
+    "description": "列出 GitHub 仓库的提交历史（owner/repo，可指定 sha=分支/tag/commit 起点）。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "sha",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "分支 / tag / commit sha（限定起点）"
+      },
+      {
+        "name": "per_page",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": null
+      },
+      {
+        "name": "page",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": null
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_branches_list",
+    "description": "列出 GitHub 仓库的分支（owner/repo）。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "per_page",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": null
+      },
+      {
+        "name": "page",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": null
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_tags_list",
+    "description": "列出 GitHub 仓库的 tag（owner/repo）。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "per_page",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": null
+      },
+      {
+        "name": "page",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": null
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_issue_create",
+    "description": "在 GitHub 仓库提一个新 issue。⚠️ 改动型，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo 格式）"
+      },
+      {
+        "name": "title",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "issue 标题"
+      },
+      {
+        "name": "body",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "issue 正文（Markdown）"
+      },
+      {
+        "name": "labels",
+        "required": false,
+        "type": "array",
+        "enum": null,
+        "default": null,
+        "desc": "标签数组（如 [\"bug\", \"P0\"]）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_issue_comment",
+    "description": "在 GitHub 仓库的某个 issue 下加一条评论。⚠️ 改动型，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo 格式）"
+      },
+      {
+        "name": "number",
+        "required": true,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "issue number"
+      },
+      {
+        "name": "body",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "评论正文（Markdown）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_issue_update",
+    "description": "更新 GitHub issue（state=closed 关闭 / open 重开 / 改 title/body/labels）。⚠️ 改动型，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "owner/repo 格式"
+      },
+      {
+        "name": "number",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "issue number（GitHub 数字；Gitee/GitCode 可能是 I8XXXX）"
+      },
+      {
+        "name": "state",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "新状态：open / closed（关闭用 closed）"
+      },
+      {
+        "name": "title",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "新标题（可选）"
+      },
+      {
+        "name": "body",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "新正文（可选）"
+      },
+      {
+        "name": "labels",
+        "required": false,
+        "type": "array",
+        "enum": null,
+        "default": null,
+        "desc": "替换标签（可选）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_pr_create",
+    "description": "在 GitHub 创建 Pull Request（head→base，跨仓 head 用 user:branch）。⚠️ 改动型，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "owner/repo 格式"
+      },
+      {
+        "name": "title",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "PR 标题"
+      },
+      {
+        "name": "head",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "源分支（要合入的，跨仓用 user:branch）"
+      },
+      {
+        "name": "base",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "目标分支（合入到，如 master）"
+      },
+      {
+        "name": "body",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "PR 描述（Markdown，可选）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_pr_merge",
+    "description": "合并 GitHub Pull Request（merge/squash/rebase）。⚠️ 改动型，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "owner/repo 格式"
+      },
+      {
+        "name": "number",
+        "required": true,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "PR number"
+      },
+      {
+        "name": "merge_method",
+        "required": false,
+        "type": "string",
+        "enum": [
+          "merge",
+          "squash",
+          "rebase"
+        ],
+        "default": null,
+        "desc": "合并方式，默认 merge"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_repo_update",
+    "description": "修改 GitHub 仓库设置：描述 / 主页 / 默认分支 / 可见性 / issues·wiki·projects 开关 / 归档。只发送提供了的字段。⚠️ 改动型，需要桌面端确认。改可见性为公开请谨慎（违反默认私有规范）。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "凭据 name（github_token，需仓库 admin）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "description",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库描述"
+      },
+      {
+        "name": "homepage",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "主页 URL"
+      },
+      {
+        "name": "default_branch",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "默认分支名"
+      },
+      {
+        "name": "private",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "true=私有 / false=公开（慎用）"
+      },
+      {
+        "name": "has_issues",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": null
+      },
+      {
+        "name": "has_wiki",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": null
+      },
+      {
+        "name": "has_projects",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": null
+      },
+      {
+        "name": "archived",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "归档/取消归档"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_file_get",
+    "description": "读取 GitHub 仓库单文件内容（base64 自动解码为文本）或列目录条目。改文件前先用它取当前 sha。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo 格式）"
+      },
+      {
+        "name": "path",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "文件路径（相对仓库根，如 src/main.rs）；传目录路径则列出该目录条目"
+      },
+      {
+        "name": "ref",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "分支 / tag / commit（可选，默认仓库默认分支）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_file_put",
+    "description": "创建或更新 GitHub 仓库文件（content 传明文，自动 base64；更新已有文件必须带 sha）。⚠️ 改动型，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo 格式）"
+      },
+      {
+        "name": "path",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "文件路径（相对仓库根）"
+      },
+      {
+        "name": "content",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "文件明文内容（UTF-8）；工具内部自动 base64 编码"
+      },
+      {
+        "name": "message",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "提交信息"
+      },
+      {
+        "name": "branch",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "目标分支（可选，默认仓库默认分支）"
+      },
+      {
+        "name": "sha",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "更新已有文件时必填：该文件当前的 blob sha（先用 file_get 取）；创建新文件时留空"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_file_delete",
+    "description": "删除 GitHub 仓库文件（需带当前 sha）。⚠️ 破坏性改动，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo 格式）"
+      },
+      {
+        "name": "path",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "要删除的文件路径（相对仓库根）"
+      },
+      {
+        "name": "message",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "提交信息"
+      },
+      {
+        "name": "sha",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "被删文件当前的 blob sha（必填，先用 file_get 取）"
+      },
+      {
+        "name": "branch",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "目标分支（可选，默认仓库默认分支）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_release_create",
+    "description": "在 GitHub 仓库创建 release。tag 不存在时会从 target_commitish 自动建。⚠️ 改动型，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "owner/repo 格式"
+      },
+      {
+        "name": "tag_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "tag 名（如 v1.2.3）"
+      },
+      {
+        "name": "name",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "release 标题，缺省 = tag_name"
+      },
+      {
+        "name": "body",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "release 正文 / changelog（Markdown）"
+      },
+      {
+        "name": "prerelease",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "是否预发布，默认 false"
+      },
+      {
+        "name": "target_commitish",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "（仅 GitHub）目标分支或 commit sha，默认 master"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_release_delete",
+    "description": "⚠️ [需要桌面端确认] 在 GitHub 仓库删除指定 release（按 release_id；tag 本身不会被删）。⚠️⚠️ 破坏性，需要桌面端确认。 —— 调用此工具会触发桌面弹窗，请告诉用户检查 Sigil 桌面端。",
+    "requireConfirm": true,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "owner/repo 格式"
+      },
+      {
+        "name": "release_id",
+        "required": true,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "release 数据库 id（先用 release_list 查到）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_repo_delete",
+    "description": "⚠️ [需要桌面端确认] ⚠️⚠️⚠️ 在 GitHub 永久删除整个仓库（含 issue / PR / release / wiki）。强制要求 confirm_name 与 repo 完全一致防误删。仅在用户明确要求时调用。 —— 调用此工具会触发桌面弹窗，请告诉用户检查 Sigil 桌面端。",
+    "requireConfirm": true,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "要删除的仓库 owner/repo"
+      },
+      {
+        "name": "confirm_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "必须与 repo 完全相同；防止 AI 误删（双重输入校验）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "workspace_register",
+    "description": "登记一个本地 git 工作区到 sigil。AI 后续可用 name 引用该工作区做 git 操作。路径必须是已存在的本地 git 仓库（含 .git）。可选绑定默认凭据用于 push。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "短名，AI 工具调用里引用（如 'sigil'）"
+      },
+      {
+        "name": "path",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "工作区根目录绝对路径"
+      },
+      {
+        "name": "default_credential_name",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "可选：默认推送凭据 name（github_token/gitee_token/gitcode_token 等）"
+      },
+      {
+        "name": "remarks",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "可选备注"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "workspace_unregister",
+    "description": "从 sigil 删除工作区登记（**不删本地代码**，只是 sigil 不再认识它）。⚠️ 改动型，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "工作区 name"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "workspace_list",
+    "description": "列出所有已登记的 git 工作区。AI 调 git 操作前先调这个看可用工作区。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [],
+    "additionalProperties": true
+  },
+  {
+    "name": "workspace_scan_roots",
+    "description": "扫描指定根目录下所有 .git 子目录，返回候选列表（**不自动登记**，AI 拿到列表后用户/AI 再决定哪些用 workspace_register 加入）。深度上限 4 层；自动跳过 node_modules / target / dist 等噪音目录。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "roots",
+        "required": true,
+        "type": "array",
+        "enum": null,
+        "default": null,
+        "desc": "一个或多个根目录绝对路径"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "workspace_status",
+    "description": "查工作区当前 git 状态：未跟踪 / 未暂存 / 已暂存的文件清单 + 当前分支。等价 `git status --porcelain -b`。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "workspace",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "工作区 name"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "workspace_diff",
+    "description": "看工作区当前的 git diff。支持 unstaged / staged / head / branch:<name> 四种比较模式。可选 paths 过滤，stat_only=true 只返摘要。**优先用 stat_only=true 看摘要再决定是否拉完整 patch**（避免 chat 上下文爆炸）。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "workspace",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "工作区 name"
+      },
+      {
+        "name": "mode",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "unstaged(默认) / staged / head / branch:<name>"
+      },
+      {
+        "name": "paths",
+        "required": false,
+        "type": "array",
+        "enum": null,
+        "default": null,
+        "desc": "可选：仅 diff 这些路径"
+      },
+      {
+        "name": "stat_only",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "默认 false；true 只返 --stat 摘要"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "workspace_log",
+    "description": "看工作区的 git log（默认 20 条，上限 200）。支持作者 / 路径过滤。返回格式：`<short-sha> <author> <relative-time> <subject>`。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "workspace",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "工作区 name"
+      },
+      {
+        "name": "limit",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "默认 20，上限 200"
+      },
+      {
+        "name": "author",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "作者 substr 过滤"
+      },
+      {
+        "name": "paths",
+        "required": false,
+        "type": "array",
+        "enum": null,
+        "default": null,
+        "desc": "可选：仅看这些路径的历史"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "workspace_stage",
+    "description": "把工作区指定路径加入 git 暂存区（git add）。paths 留空 = git add -A（全部含未跟踪）；指定数组 = 只 stage 这些路径。⚠️ 改动型，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "workspace",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "工作区 name"
+      },
+      {
+        "name": "paths",
+        "required": false,
+        "type": "array",
+        "enum": null,
+        "default": null,
+        "desc": "可选路径数组；不传 = 暂存全部"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "workspace_commit",
+    "description": "在工作区提交已暂存的改动（git commit）。message 必填，支持多行（\\n 分隔）。可选 author 覆盖 git 配置；amend=true 修补上次 commit。⚠️ 改动型，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "workspace",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "工作区 name"
+      },
+      {
+        "name": "message",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "commit message（必填）"
+      },
+      {
+        "name": "author",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "可选：'Name <email>' 格式"
+      },
+      {
+        "name": "amend",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "默认 false；true = 修补上次 commit"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "workspace_push",
+    "description": "推送工作区当前分支到远程。**自动用 workspace.default_credential 注入 token**（URL 拼成 https://<用户名>:<token>@host/.../repo.git，用户名按平台自动选：GitHub 用 x-access-token，Gitee/GitCode 用凭据 account 登录名），AI 不见明文。remote 默认 origin，branch 默认当前分支；force_with_lease=true 即可强制覆盖（Sigil 自动取远程 sha 作安全 lease，不开放裸 --force）。⚠️⚠️ 高危改动型，必经桌面端确认 + 凭据明文不出 Rust。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "workspace",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "工作区 name"
+      },
+      {
+        "name": "remote",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "远程名（默认 origin）"
+      },
+      {
+        "name": "branch",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "分支名（默认当前分支）"
+      },
+      {
+        "name": "force_with_lease",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "强制覆盖远程，用于重写历史后推送（默认 false）。设 true 即可——Sigil 自动 ls-remote 读取远程当前 sha 作 force-with-lease 基准，安全覆盖。等价 git_push 的 force 参数；不开放裸 --force。别名: force"
+      },
+      {
+        "name": "lease_sha",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "（可选，通常不用传）显式 lease（远程当前分支 SHA）。留空时 force_with_lease=true 会自动读取远程 sha"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "workspace_branches",
+    "description": "列出工作区分支（git branch）。默认只列本地，include_remote=true 才带远程 origin/* 等。当前分支用 '* ' 前缀标记。limit 默认 50（防上下文爆炸，硬上限 200）。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "workspace",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "工作区 name"
+      },
+      {
+        "name": "include_remote",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "默认 false；true = 同时列 remotes/origin/*"
+      },
+      {
+        "name": "limit",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "默认 50；硬上限 200"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "workspace_remotes",
+    "description": "列出工作区配置的远程仓库（git remote -v）。**自动脱敏 URL 中的 token**：`https://user:abc123@host/...` → `https://user:***@host/...`，避免把凭据回灌给 AI。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "workspace",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "工作区 name"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "workspace_read_file",
+    "description": "读取工作区内某个文件内容（仅本地文件，不走 git）。路径必须是工作区内相对路径，禁止 `..` 或绝对路径（防穿越）。默认最多 64KB（硬上限 1MB），二进制文件返回提示而不返回内容。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "workspace",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "工作区 name"
+      },
+      {
+        "name": "path",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "工作区内相对路径，如 'src/main.rs'"
+      },
+      {
+        "name": "max_bytes",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "默认 65536；硬上限 1048576 (1MB)"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "workspace_fetch",
+    "description": "从远端拉取最新引用（git fetch）。**只更新 refs/remotes/，不改 working tree**。自动用 default_credential 注入 token；明文不出 Rust。可选 prune（清理远端删除的分支）/ tags（同步标签）。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "workspace",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "工作区 name"
+      },
+      {
+        "name": "remote",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "远程名（默认 origin）"
+      },
+      {
+        "name": "prune",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "--prune；默认 false"
+      },
+      {
+        "name": "tags",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "--tags；默认 false"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "workspace_pull",
+    "description": "从远端拉取并合并到当前分支（git pull）。**会改 working tree**，必经桌面端确认。自动用 default_credential 注入 token。可选 ff_only（拒绝非 ff 合并）/ rebase（拉下来后 rebase 而非 merge）；ff_only 与 rebase 互斥。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "workspace",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "工作区 name"
+      },
+      {
+        "name": "remote",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "远程名（默认 origin）"
+      },
+      {
+        "name": "branch",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "远端分支名（默认当前分支）"
+      },
+      {
+        "name": "ff_only",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "--ff-only；默认 false"
+      },
+      {
+        "name": "rebase",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "--rebase；默认 false（与 ff_only 互斥）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "workspace_branch_create",
+    "description": "在工作区创建新分支（git branch <name> [<from>]）。可选 from 指定起点 ref（默认从当前 HEAD）；可选 checkout=true 顺手切过去。⚠️ 改动型（创建分支算改动 git 状态），需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "workspace",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "工作区 name"
+      },
+      {
+        "name": "name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "新分支名（git 合法 ref）"
+      },
+      {
+        "name": "from",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "起点 ref（可选；默认 HEAD）"
+      },
+      {
+        "name": "checkout",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "默认 false；true = 创建后切过去"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "workspace_push_tag",
+    "description": "把本地 tag 推送到远端（git push <remote> <tag>）。自动用 default_credential 注入 token。可选 force=true 覆盖远端同名 tag（谨慎）。返回值区分「真推上去」与「远端已有同名 tag」——后者不产生 push 事件、tag 触发的 CI 不会启动，看 structured.pushed 判断，别只看有没有报错。⚠️ 改动型，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "workspace",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "工作区 name"
+      },
+      {
+        "name": "tag",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "本地 tag 名"
+      },
+      {
+        "name": "remote",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "默认 origin"
+      },
+      {
+        "name": "force",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "默认 false；true = 覆盖远端同名 tag"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "workspace_branch_delete",
+    "description": "⚠️ [需要桌面端确认] 删除本地分支（git branch -d <name>）。默认 -d（拒删未 merge 到 HEAD/upstream 的分支）；force=true 时走 -D 强删。**禁止删除当前分支**（先校验）。⚠️ 改动型，需要桌面端确认。 —— 调用此工具会触发桌面弹窗，请告诉用户检查 Sigil 桌面端。",
+    "requireConfirm": true,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "workspace",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "工作区 name"
+      },
+      {
+        "name": "name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "要删除的本地分支名"
+      },
+      {
+        "name": "force",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "默认 false (-d)；true 走 -D 强删"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_workflow_list",
+    "description": "列出 GitHub 仓库的所有 workflow（.github/workflows/*.yml）。返回每个 workflow 的 id / name / 文件路径 / 状态。触发 workflow_dispatch 前用它拿到 workflow 的 id 或文件名。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo 格式）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_runs_list",
+    "description": "列出 GitHub Actions 的 workflow run（可按分支/tag 和状态过滤）。**轮询 CI 状态用这个**：每条返回 run id / 名称 / status / conclusion / 分支 / 触发事件 / 创建时间。典型用法：branch 传你刚推的 tag 名（如 v1.12.0），看构建是否完成。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo 格式）"
+      },
+      {
+        "name": "branch",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "按分支或 tag 名过滤（如 v1.12.0）"
+      },
+      {
+        "name": "status",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "按状态过滤：queued / in_progress / completed / success / failure"
+      },
+      {
+        "name": "per_page",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "返回条数，默认 10"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_run_get",
+    "description": "查询单个 GitHub Actions run 的详细状态（按 run id）。返回 status / conclusion / 分支 / 触发事件 / 页面 URL，以及失败时的提示。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo 格式）"
+      },
+      {
+        "name": "run_id",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "workflow run 的数字 id（来自 github_runs_list）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_run_artifacts",
+    "description": "列出某个 GitHub Actions run 产出的 artifact（id / 名称 / 大小 / 是否过期）。拿到 artifact id 后用 github_download_artifact 下载 zip。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo 格式）"
+      },
+      {
+        "name": "run_id",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "workflow run 的数字 id"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_billing_actions",
+    "description": "查询 GitHub Actions 用量与计费（增强计费平台）：指定周期内 Actions 已用分钟合计、净费用（已扣套餐含量折扣后的实际计费；>0 即代表已超免费额度开始扣费）、按 SKU(Ubuntu/Windows/macOS) 明细。个人账号 account 可留空（用 token 自动识别真实登录名，比传可能是简称的关联账号更可靠）；组织账号传组织名 + is_org=true。⚠️ 周期：**不传 year/month 返回的是「本年至今累计」，不是当月**——要当月用量必须同时显式传 year + month。⚠️ 本接口没有「免费额度余量」字段，答不了「还剩多少分钟」；判断配额是否耗尽看 github_run_jobs 的 quota_exhausted_suspect，别拿这里的分钟数去和 2000 比。⚠️ 账号须已接入增强计费平台、且 token 有账单读权限（组织端点需组织 owner / 企业管理员），否则 403/404/410。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "account",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "账号登录名：个人账号可留空（token 自动识别）；组织账号必填组织名"
+      },
+      {
+        "name": "is_org",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "true=组织(/organizations)，false=个人(/users)，默认 false"
+      },
+      {
+        "name": "year",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "账单年份（可选，默认当年）"
+      },
+      {
+        "name": "month",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "账单月份 1-12。**留空不是「默认当月」，而是返回全年至今累计**——要单月用量必须显式传（配 year 一起传）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_workflow_dispatch",
+    "description": "手动触发 GitHub Actions 的 workflow_dispatch 事件。workflow 用数字 id 或文件名（如 release.yml）；git_ref 指定分支或 tag。⚠️ 改动型，需要桌面端确认。注意：目标 workflow 必须已声明 on: workflow_dispatch。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo 格式）"
+      },
+      {
+        "name": "workflow",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "workflow 数字 id 或文件名（如 release.yml）"
+      },
+      {
+        "name": "git_ref",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "运行所在的分支或 tag 名（API 的 ref 字段）"
+      },
+      {
+        "name": "inputs",
+        "required": false,
+        "type": "object",
+        "enum": null,
+        "default": null,
+        "desc": "workflow inputs（可选键值对）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_run_jobs",
+    "description": "列出某个 GitHub Actions run 的所有 job 及其状态/结论；对失败的 job 额外列出失败的 step。**CI 失败时第一步用这个定位是哪个 job / step 挂了**。若所有 job 失败但无任何失败 step（quota_exhausted_suspect=true），会就地提示该账号 Actions 配额可能耗尽、建议换有额度的 GitHub 账号重推 tag。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token，需 repo + workflow 权限）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "run_id",
+        "required": true,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "workflow run 的数字 id"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_run_rerun",
+    "description": "整体重跑一个 GitHub Actions run（所有 job 重来）。⚠️ 改动型，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token，需 repo + workflow 权限）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "run_id",
+        "required": true,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "workflow run 的数字 id"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_rerun_failed_jobs",
+    "description": "只重跑某个 GitHub Actions run 里失败的 job（CI flake 时省时）。⚠️ 改动型，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token，需 repo + workflow 权限）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "run_id",
+        "required": true,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "workflow run 的数字 id"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_run_cancel",
+    "description": "取消一个正在运行的 GitHub Actions run。⚠️ 改动型，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token，需 repo + workflow 权限）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "run_id",
+        "required": true,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "workflow run 的数字 id"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_actions_enable",
+    "description": "⚠️ [需要桌面端确认] 启用（或禁用）仓库的 GitHub Actions，并设置允许的 action 范围（all / local_only / selected）。新建 CI 仓库时用来确保 Actions 已开启。⚠️ 改动型，需要桌面端确认。 —— 调用此工具会触发桌面弹窗，请告诉用户检查 Sigil 桌面端。",
+    "requireConfirm": true,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token，需仓库 admin）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "enabled",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "是否启用 Actions（默认 true）"
+      },
+      {
+        "name": "allowed_actions",
+        "required": false,
+        "type": "string",
+        "enum": [
+          "all",
+          "local_only",
+          "selected"
+        ],
+        "default": null,
+        "desc": "允许的 action 范围（默认 all）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_workflow_permissions_set",
+    "description": "⚠️ [需要桌面端确认] 设置仓库内 workflow 的默认 GITHUB_TOKEN 权限（read / write）。很多发布类 action（如 tauri-action 创建 release）需要 write。⚠️ 改动型，需要桌面端确认。 —— 调用此工具会触发桌面弹窗，请告诉用户检查 Sigil 桌面端。",
+    "requireConfirm": true,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token，需仓库 admin）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "permission",
+        "required": true,
+        "type": "string",
+        "enum": [
+          "read",
+          "write"
+        ],
+        "default": null,
+        "desc": "GITHUB_TOKEN 默认权限"
+      },
+      {
+        "name": "can_approve_pull_request_reviews",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "可选：是否允许 Actions 审批 PR"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_repo_variable_list",
+    "description": "列出 GitHub 仓库的 Actions 变量（名称 + 值 + 更新时间）。变量是明文，值会一并返回。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_repo_variable_set",
+    "description": "设置/更新 GitHub 仓库的 Actions 变量（明文配置，workflow 里用 ${{ vars.NAME }} 读）。已存在则更新，不存在则创建（自动判断）。适合非敏感配置；敏感值请用 github_repo_secret_set。⚠️ 改动型，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token，需 repo 权限）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "变量名（如 ANDROID_KEY_ALIAS）"
+      },
+      {
+        "name": "value",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "变量值（明文）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_repo_variable_delete",
+    "description": "⚠️ [需要桌面端确认] 删除 GitHub 仓库的某个 Actions 变量。⚠️ 改动型，需要桌面端确认。 —— 调用此工具会触发桌面弹窗，请告诉用户检查 Sigil 桌面端。",
+    "requireConfirm": true,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "要删除的变量名"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_release_list",
+    "description": "列出 GitHub 仓库的 release（包含 draft 草稿）。每条返回 release id / tag / 名称 / 是否 draft / 是否 prerelease / asset 数量。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "per_page",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "返回条数，默认 10"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_release_get",
+    "description": "查询单个 GitHub release 详情（按 tag 或 release id），列出全部 asset（id / 名称 / 大小）。注意：按 tag 查**查不到 draft 草稿**（GitHub 限制），draft 请用 github_release_list 拿 id 后按 id 查。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "tag",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "按 tag 查（如 v1.12.0）；draft 查不到"
+      },
+      {
+        "name": "release_id",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "按 release 数字 id 查（draft 也能查）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_release_publish",
+    "description": "把 GitHub 的 draft 草稿 release 正式发布（draft=false），可同时修改名称/正文/prerelease。典型用法：CI 建好 draft release 并上传产物 → 本地校验产物齐全 → 用本能力正式发布。⚠️ 改动型，需要桌面端确认。release_id 用 github_release_list 获取。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "release_id",
+        "required": true,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "要发布的 release 数字 id"
+      },
+      {
+        "name": "name",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "可选：发布时改 release 名称"
+      },
+      {
+        "name": "body",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "可选：发布时改 release 正文（Markdown）"
+      },
+      {
+        "name": "prerelease",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "可选：是否标记 prerelease（默认不改）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_release_generate_notes",
+    "description": "基于两个 tag 之间的 PR/commit 自动生成 release notes（changelog）文本。只生成不发布，返回建议的标题 + 正文 Markdown，可拿去喂给 github_release_create / publish。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "tag_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "目标 tag（如 v1.12.0）"
+      },
+      {
+        "name": "previous_tag_name",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "上一个 tag（可选）"
+      },
+      {
+        "name": "target_commitish",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "tag 不存在时的基准 commit/branch（可选）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_release_asset_upload",
+    "description": "把本地文件作为 asset 上传到 GitHub release（走 uploads.github.com）。release_id 用 github_release_list 获取。⚠️ 改动型，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "release_id",
+        "required": true,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "目标 release 数字 id"
+      },
+      {
+        "name": "file_path",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "本地文件绝对路径"
+      },
+      {
+        "name": "name",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "上传后的 asset 名（默认取文件名）"
+      },
+      {
+        "name": "content_type",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "content-type（默认 application/octet-stream）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_download_release_asset",
+    "description": "下载 GitHub release 的某个 asset（二进制安装包等）到本地绝对路径。asset_id 用 github_release_get 获取。⚠️ 改动型（写本地磁盘），需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "asset_id",
+        "required": true,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "release asset 的数字 id"
+      },
+      {
+        "name": "dest_path",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "本地落盘绝对路径（含文件名）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_download_artifact",
+    "description": "下载 GitHub Actions artifact 的 zip 到本地绝对路径。artifact_id 用 github_run_artifacts 获取。⚠️ 改动型（写本地磁盘），需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "artifact_id",
+        "required": true,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "artifact 的数字 id"
+      },
+      {
+        "name": "dest_path",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "本地落盘绝对路径（建议 .zip 结尾）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_download_run_logs",
+    "description": "下载某个 GitHub Actions run 的完整日志 zip 到本地绝对路径。**CI 失败需要看详细日志时用这个**（zip 内每个 job/step 一个日志文件）。⚠️ 改动型（写本地磁盘），需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "run_id",
+        "required": true,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "workflow run 的数字 id"
+      },
+      {
+        "name": "dest_path",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "本地落盘绝对路径（建议 .zip 结尾）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_repo_secret_list",
+    "description": "列出 GitHub 仓库已配置的 Actions secret 名称和更新时间（GitHub 不返回值，只有名字）。用来核对某个 secret 是否已配置。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_repo_secret_set",
+    "description": "设置/更新 GitHub 仓库的 Actions secret（自动用仓库公钥做 libsodium 加密）。secret 值三选一（按推荐度）：① value_credential_name —— 指向的 sigil 凭据（AI 看不到值，最推荐）；② value_from_file —— 本地文件路径，Sigil 自己读、AI 看不到内容，专为 CI 构建签名私钥设计：本地 `tauri signer generate -w src-tauri/keys/app.key` 生成 .key 后，直接传 value_from_file=src-tauri/keys/app.key 即可，免去先把私钥导入金库（用此参数会弹一次桌面端确认）；③ value —— 明文（AI 会看到，不推荐）。典型用法：给新 CI 仓库配 updater 签名私钥 TAURI_SIGNING_PRIVATE_KEY，否则带自动更新的构建会失败。改动型：value_from_file 走桌面端阻塞确认，其余走右下角通知。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "鉴权用的 github_token 凭据名"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "secret_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "GitHub secret 名（如 TAURI_SIGNING_PRIVATE_KEY）"
+      },
+      {
+        "name": "value_credential_name",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "【推荐】secret 值来自的 sigil 凭据名（AI 看不到值）"
+      },
+      {
+        "name": "value_from_file",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "【次选】secret 值来自的本地文件路径（Sigil 自己读，AI 看不到内容）。专为 CI 构建签名私钥：tauri signer generate 生成 .key 后直接传此路径，免导金库。用此参数会触发一次桌面端确认弹窗。"
+      },
+      {
+        "name": "value",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "【不推荐】直接明文值（AI 会看到）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_ref_get",
+    "description": "读取一个 git ref 指向的 commit sha（git_ref 用短名，如 heads/main 或 tags/v1.0.0）。常用来拿到某分支 HEAD 的 sha，再传给 github_ref_create 建 tag/branch。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": true,
+      "idempotentHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "凭据 name（github_token）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "git_ref",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "ref 短名：heads/<分支> 或 tags/<标签>"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_ref_create",
+    "description": "用 API 直接创建 git ref（分支或 tag），无需本地仓库。new_ref 用完整格式 refs/heads/<分支> 或 refs/tags/<标签>；sha 是目标 commit。⚠️ 改动型，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "凭据 name（github_token，需 repo + 写权限）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "new_ref",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "完整 ref：refs/heads/<分支> 或 refs/tags/<标签>"
+      },
+      {
+        "name": "sha",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "目标 commit sha（用 github_ref_get 取）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_repository_dispatch",
+    "description": "发送 repository_dispatch 自定义事件触发 workflow（比 workflow_dispatch 更灵活，可带 client_payload）。目标 workflow 需声明 on: repository_dispatch 且 types 匹配 event_type。⚠️ 改动型，需要桌面端确认。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "凭据 name（github_token，需 repo + workflow）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "event_type",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "事件类型（与 workflow 的 types 匹配）"
+      },
+      {
+        "name": "client_payload",
+        "required": false,
+        "type": "object",
+        "enum": null,
+        "default": null,
+        "desc": "自定义 payload（可选，最多 10 个顶层键）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_collaborator_add",
+    "description": "⚠️ [需要桌面端确认] 邀请/添加协作者到 GitHub 仓库，可指定权限（pull / triage / push / maintain / admin）。对方需接受邀请。⚠️ 改动型，需要桌面端确认。 —— 调用此工具会触发桌面弹窗，请告诉用户检查 Sigil 桌面端。",
+    "requireConfirm": true,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "凭据 name（github_token，需仓库 admin）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "username",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "受邀用户名"
+      },
+      {
+        "name": "permission",
+        "required": false,
+        "type": "string",
+        "enum": [
+          "pull",
+          "triage",
+          "push",
+          "maintain",
+          "admin"
+        ],
+        "default": null,
+        "desc": "权限（默认 push）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_branch_protection_set",
+    "description": "⚠️ [需要桌面端确认] 为分支设置保护规则：强制管理员、要求 PR 审批数、要求通过的 status check。⚠️ 改动型，需要桌面端确认。注意：会覆盖该分支已有的保护配置。 —— 调用此工具会触发桌面弹窗，请告诉用户检查 Sigil 桌面端。",
+    "requireConfirm": true,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "凭据 name（github_token，需仓库 admin）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "branch",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "要保护的分支名"
+      },
+      {
+        "name": "enforce_admins",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "是否对管理员也强制（默认 true）"
+      },
+      {
+        "name": "required_approving_review_count",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "要求的 PR 审批数；0 或不填=不要求 PR 审批"
+      },
+      {
+        "name": "required_status_checks",
+        "required": false,
+        "type": "array",
+        "enum": null,
+        "default": null,
+        "desc": "要求通过的 status check 名称（如 CI job）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_deploy_key_add",
+    "description": "⚠️ [需要桌面端确认] 给 GitHub 仓库添加部署公钥（deploy key）。默认只读；read_only=false 才允许推送。⚠️ 改动型，需要桌面端确认。 —— 调用此工具会触发桌面弹窗，请告诉用户检查 Sigil 桌面端。",
+    "requireConfirm": true,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "凭据 name（github_token，需仓库 admin）"
+      },
+      {
+        "name": "repo",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库 full_name（owner/repo）"
+      },
+      {
+        "name": "title",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "key 标题"
+      },
+      {
+        "name": "key",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "SSH 公钥内容（ssh-ed25519 ... 或 ssh-rsa ...）"
+      },
+      {
+        "name": "read_only",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": null,
+        "desc": "是否只读（默认 true）"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "git_push",
+    "description": "用指定凭据把本地分支或 tag 推送到远程（自动注入 token，输出脱敏）。支持 GitHub / Gitee / GitCode 等任何 https 协议的 git 服务。推 tag 传 tag 参数（发布打版走这个，不必改用需先登记 workspace 的 workspace_push_tag）。返回值区分「真推上去」与「远端已是最新」——后者不产生 push 事件、tag/push 触发的 CI 不会启动，看 structured.pushed 判断，别只看有没有报错。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token / gitee_token / gitcode_token）"
+      },
+      {
+        "name": "repo_path",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "本地 git 仓库的绝对路径"
+      },
+      {
+        "name": "remote",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": "origin",
+        "desc": "远程名，默认 origin"
+      },
+      {
+        "name": "branch",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "要推送的分支，留空 = 当前分支。传了 tag 时本字段被忽略"
+      },
+      {
+        "name": "tag",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "要推送的本地 tag 名（如 v1.5.0）。传了就推 refs/tags/<tag> 而非分支——发布打版用这个，比把 tag 名塞进 branch 更明确（同名分支存在时不会有 refspec 歧义）。tag 必须已在本地存在；force=true 时走裸 --force（lease 基准是分支 sha，对 tag 无意义）"
+      },
+      {
+        "name": "force",
+        "required": false,
+        "type": "boolean",
+        "enum": null,
+        "default": false,
+        "desc": "强制覆盖远程，用于重写历史 / filter-repo 瘦身后推送（默认 false）。设 true 即可——Sigil 内部用安全的 force-with-lease，并自动读取远程当前 sha 作基准：既能覆盖重写后的历史，又能在远程被他人改动时拒绝覆盖。无需先查 sha、无需手写本地 tracking ref/reflog（那些对凭据 URL 直推无效）。别名: force_with_lease"
+      },
+      {
+        "name": "username",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "URL 中的用户名（一般无需传）。缺省自动按平台选择：GitHub 用 x-access-token；Gitee/GitCode 自动用凭据的 account 登录名"
+      },
+      {
+        "name": "lease_sha",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "（可选，通常不用传）显式指定 lease 基准（远程分支当前 SHA）。留空时 force=true 会自动 ls-remote 读取远程 sha，故一般无需手动传；仅在想锁定特定基准时使用"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "git_clone",
+    "description": "用指定凭据克隆私有 git 仓库到本地（支持 GitHub / Gitee / GitCode 的 https 协议）。成功后目标目录可像普通仓库一样使用。",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（github_token / gitee_token / gitcode_token）"
+      },
+      {
+        "name": "repo_url",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "远程仓库 URL，必须以 https:// 开头"
+      },
+      {
+        "name": "target_path",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "克隆到的本地目录（必须不存在或为空）"
+      },
+      {
+        "name": "branch",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "指定分支（可选）"
+      },
+      {
+        "name": "depth",
+        "required": false,
+        "type": "integer",
+        "enum": null,
+        "default": null,
+        "desc": "浅克隆深度（可选，提升速度）"
+      },
+      {
+        "name": "username",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "URL 中的用户名（一般无需传）。缺省自动按平台选择：GitHub 用 x-access-token；Gitee/GitCode 自动用凭据的 account 登录名"
+      }
+    ],
+    "additionalProperties": true
+  },
+  {
+    "name": "github_repo_create",
+    "description": "在 GitHub 创建私有仓库（强制 private=true）",
+    "requireConfirm": false,
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false
+    },
+    "fields": [
+      {
+        "name": "credential_name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "引用的凭据 name（类型应为 github_token）"
+      },
+      {
+        "name": "name",
+        "required": true,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库名"
+      },
+      {
+        "name": "description",
+        "required": false,
+        "type": "string",
+        "enum": null,
+        "default": null,
+        "desc": "仓库描述（可选）"
+      }
+    ],
+    "additionalProperties": true
+  }
+]

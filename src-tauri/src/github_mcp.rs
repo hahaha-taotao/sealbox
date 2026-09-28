@@ -751,13 +751,9 @@ pub fn tool_definitions() -> Vec<Value> {
 
 pub fn tool_definitions_for_policy(policy: &GithubMcpPolicy) -> Vec<Value> {
     let mut tools = crate::git_workspace::tool_definitions();
-    tools.extend(
-        api_tool_definitions()
-            .into_iter()
-            .filter(|definition| {
-                definition["readOnly"].as_bool().unwrap_or(false) || policy.api_write_enabled
-            }),
-    );
+    tools.extend(api_tool_definitions().into_iter().filter(|definition| {
+        definition["readOnly"].as_bool().unwrap_or(false) || policy.api_write_enabled
+    }));
     tools
 }
 
@@ -957,7 +953,10 @@ pub fn resolve_github_credential(
         .filter(|value| !value.is_empty());
     let credentials = list_credentials(session)?;
     if credentials.is_empty() {
-        return Err("金库里没有活动的 GitHub API Token。请先在保险库新建一条服务为 github 的 API Token。".into());
+        return Err(
+            "金库里没有活动的 GitHub API Token。请先在保险库新建一条服务为 github 的 API Token。"
+                .into(),
+        );
     }
     let vault = session.vault().map_err(|e| e.to_string())?;
     let dek = session.dek().map_err(|e| e.to_string())?;
@@ -1114,8 +1113,7 @@ pub fn call_tool_detailed(
 
 fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16, String), String> {
     if crate::git_workspace::is_git_tool(name) {
-        return crate::git_workspace::call_tool_text(session, name, args)
-            .map(|text| (200, text));
+        return crate::git_workspace::call_tool_text(session, name, args).map(|text| (200, text));
     }
     if name == "github_list_credentials" {
         let definition = tool_definitions()
@@ -1145,7 +1143,8 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let draft = bool_arg(&args, "draft", true)?;
             let prerelease = bool_arg(&args, "prerelease", false)?;
             let generate_release_notes = bool_arg(&args, "generate_release_notes", false)?;
-            let make_latest = enum_arg(&args, "make_latest", &["true", "false", "legacy"], "legacy")?;
+            let make_latest =
+                enum_arg(&args, "make_latest", &["true", "false", "legacy"], "legacy")?;
             let payload = github_confirm_payload(
                 "创建 GitHub Release",
                 "允许这次 GitHub 写操作？",
@@ -1178,9 +1177,12 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             );
             request.insert("make_latest".into(), Value::String(make_latest));
             let request = Value::Object(request);
-            post_json(&token, &format!("/repos/{repository}/releases"), &request, |value| {
-                release_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into())
-            })
+            post_json(
+                &token,
+                &format!("/repos/{repository}/releases"),
+                &request,
+                |value| release_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into()),
+            )
         }
         "github_create_issue" => {
             let repository = repository_args(&args)?;
@@ -1210,9 +1212,12 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                     Value::Array(labels.into_iter().map(Value::String).collect()),
                 );
             }
-            post_json(&token, &format!("/repos/{repository}/issues"), &Value::Object(request), |value| {
-                issue_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into())
-            })
+            post_json(
+                &token,
+                &format!("/repos/{repository}/issues"),
+                &Value::Object(request),
+                |value| issue_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into()),
+            )
         }
         "github_create_issue_comment" => {
             let repository = repository_args(&args)?;
@@ -1271,9 +1276,12 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             if let Some(value) = body {
                 request.insert("body".into(), Value::String(value));
             }
-            post_json(&token, &format!("/repos/{repository}/pulls"), &Value::Object(request), |value| {
-                pull_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into())
-            })
+            post_json(
+                &token,
+                &format!("/repos/{repository}/pulls"),
+                &Value::Object(request),
+                |value| pull_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into()),
+            )
         }
         "github_get_authenticated_user" => request_json(&token, "/user", |value| {
             serde_json::to_value(GithubUserDto {
@@ -1353,16 +1361,17 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
         "github_get_pull_request" => {
             let repository = repository_args(&args)?;
             let number = issue_number(&args)?;
-            request_json(&token, &format!("/repos/{repository}/pulls/{number}"), |value| {
-                pull_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into())
-            })
+            request_json(
+                &token,
+                &format!("/repos/{repository}/pulls/{number}"),
+                |value| pull_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into()),
+            )
         }
         "github_list_workflow_runs" => {
             let repository = repository_args(&args)?;
             let (page, per_page) = page_args_with_default(&args, 20)?;
-            let mut endpoint = format!(
-                "/repos/{repository}/actions/runs?page={page}&per_page={per_page}"
-            );
+            let mut endpoint =
+                format!("/repos/{repository}/actions/runs?page={page}&per_page={per_page}");
             if let Some(branch) = optional_release_string(&args, "branch", 200)? {
                 endpoint.push_str("&branch=");
                 endpoint.push_str(&percent_encode(&branch, false));
@@ -1395,10 +1404,11 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let repository = repository_args(&args)?;
             let number = issue_number(&args)?;
             let (page, per_page) = page_args(&args)?;
-            let endpoint = format!(
-                "/repos/{repository}/pulls/{number}/files?page={page}&per_page={per_page}"
-            );
-            request_json(&token, &endpoint, |value| list_dto(value, per_page, pull_file_dto))
+            let endpoint =
+                format!("/repos/{repository}/pulls/{number}/files?page={page}&per_page={per_page}");
+            request_json(&token, &endpoint, |value| {
+                list_dto(value, per_page, pull_file_dto)
+            })
         }
         "github_list_pull_request_commits" => {
             let repository = repository_args(&args)?;
@@ -1407,7 +1417,9 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let endpoint = format!(
                 "/repos/{repository}/pulls/{number}/commits?page={page}&per_page={per_page}"
             );
-            request_json(&token, &endpoint, |value| list_dto(value, per_page, commit_dto))
+            request_json(&token, &endpoint, |value| {
+                list_dto(value, per_page, commit_dto)
+            })
         }
         "github_list_pull_request_reviews" => {
             let repository = repository_args(&args)?;
@@ -1416,7 +1428,9 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let endpoint = format!(
                 "/repos/{repository}/pulls/{number}/reviews?page={page}&per_page={per_page}"
             );
-            request_json(&token, &endpoint, |value| list_dto(value, per_page, review_dto))
+            request_json(&token, &endpoint, |value| {
+                list_dto(value, per_page, review_dto)
+            })
         }
         "github_list_pull_request_comments" => {
             let repository = repository_args(&args)?;
@@ -1460,8 +1474,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
         "github_list_releases" => {
             let repository = repository_args(&args)?;
             let (page, per_page) = page_args(&args)?;
-            let endpoint =
-                format!("/repos/{repository}/releases?page={page}&per_page={per_page}");
+            let endpoint = format!("/repos/{repository}/releases?page={page}&per_page={per_page}");
             request_json(&token, &endpoint, |value| {
                 list_dto(value, per_page, release_list_dto)
             })
@@ -1494,7 +1507,9 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let repository = repository_args(&args)?;
             let (page, per_page) = page_args(&args)?;
             let endpoint = format!("/repos/{repository}/tags?page={page}&per_page={per_page}");
-            request_json(&token, &endpoint, |value| list_dto(value, per_page, tag_dto))
+            request_json(&token, &endpoint, |value| {
+                list_dto(value, per_page, tag_dto)
+            })
         }
         "github_compare_commits" => {
             let repository = repository_args(&args)?;
@@ -1854,21 +1869,21 @@ fn issue_number(args: &Value) -> Result<u64, String> {
         .ok_or_else(|| "缺少参数 number".to_string())
 }
 
-    fn positive_id(args: &Value, name: &str) -> Result<u64, String> {
+fn positive_id(args: &Value, name: &str) -> Result<u64, String> {
     args.get(name)
         .and_then(Value::as_u64)
         .filter(|value| *value >= 1)
         .ok_or_else(|| format!("缺少参数 {name}"))
 }
 
-    fn compare_ref_arg(args: &Value, name: &str) -> Result<String, String> {
+fn compare_ref_arg(args: &Value, name: &str) -> Result<String, String> {
     let wrapped = json!({ "ref": args.get(name).cloned().unwrap_or(Value::Null) });
     optional_ref(&wrapped)?
         .filter(|value| !value.contains("..."))
         .ok_or_else(|| format!("参数 {name} 格式不合法"))
 }
 
-    fn compare_endpoint(repository: &str, base: &str, head: &str) -> Result<String, String> {
+fn compare_endpoint(repository: &str, base: &str, head: &str) -> Result<String, String> {
     if base.contains("...") || head.contains("...") {
         return Err("比较引用不能包含 ...".into());
     }
@@ -1881,7 +1896,7 @@ enum PullStatusSelector {
     Pull(u64),
 }
 
-    fn pull_status_selector(args: &Value) -> Result<PullStatusSelector, String> {
+fn pull_status_selector(args: &Value) -> Result<PullStatusSelector, String> {
     if let Some(reference) = optional_ref(args)? {
         if reference.contains("...") {
             return Err("ref 格式不合法".into());
@@ -1942,7 +1957,9 @@ fn release_tag_arg(args: &Value) -> Result<String, String> {
         || tag.chars().any(char::is_control)
         || tag.contains('%')
         || tag.contains('\\')
-        || tag.split('/').any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        || tag
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
     {
         return Err("tag_name 格式不合法".into());
     }
@@ -2059,7 +2076,10 @@ fn post_json<T>(
         Ok(response) => read_response(response),
         Err(ureq::Error::Status(status, response)) => {
             let (_, body, truncated) = read_response(response);
-            return Err(redact_text(&github_error(status, &body, truncated), &[token]));
+            return Err(redact_text(
+                &github_error(status, &body, truncated),
+                &[token],
+            ));
         }
         Err(_) => return Err("GitHub 网络请求失败".into()),
     };
@@ -2069,8 +2089,8 @@ fn post_json<T>(
     if truncated {
         return Err("GitHub 响应超过安全大小限制".into());
     }
-    let value: Value = serde_json::from_slice(&body)
-        .map_err(|_| "GitHub 响应不是有效 JSON".to_string())?;
+    let value: Value =
+        serde_json::from_slice(&body).map_err(|_| "GitHub 响应不是有效 JSON".to_string())?;
     map(&value)
         .map(|value| (status, value))
         .map_err(|error| format!("GitHub 响应处理失败: {error}"))
@@ -2785,7 +2805,9 @@ mod tests {
             "github_list_workflow_jobs",
         ] {
             assert!(
-                definitions.iter().any(|definition| definition["name"] == name),
+                definitions
+                    .iter()
+                    .any(|definition| definition["name"] == name),
                 "{name} missing"
             );
         }

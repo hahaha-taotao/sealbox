@@ -315,7 +315,10 @@ fn nav(runtime: &EndpointRuntime, args: &Value) -> Result<ToolOutcome, ToolFailu
     })
 }
 
-pub(crate) fn connection_status(runtime: &EndpointRuntime, args: &Value) -> Result<ToolOutcome, ToolFailure> {
+pub(crate) fn connection_status(
+    runtime: &EndpointRuntime,
+    args: &Value,
+) -> Result<ToolOutcome, ToolFailure> {
     let server = get_json(runtime, "/rest/api/2/serverInfo")?;
     let version = server.get("version").and_then(Value::as_str).unwrap_or("-");
     let mut lines = vec![

@@ -103,7 +103,10 @@ fn normalize_crm_base_url(raw: &str) -> String {
         return DEFAULT_CRM_BASE.into();
     }
     let without_fragment = trimmed.split('#').next().unwrap_or(trimmed);
-    let without_query = without_fragment.split('?').next().unwrap_or(without_fragment);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
     let url = without_query.trim_end_matches('/');
     if url.is_empty() {
         return DEFAULT_CRM_BASE.into();
@@ -573,8 +576,8 @@ fn build_runtime_inner(
             "ZoomKey MCP 未启用，请先在 Sealbox 的 MCP 页面打开",
         ));
     }
-    let pinned = target::pin(&endpoint.base_url, &policy.allowed_hosts)
-        .map_err(ToolFailure::validation)?;
+    let pinned =
+        target::pin(&endpoint.base_url, &policy.allowed_hosts).map_err(ToolFailure::validation)?;
 
     if endpoint.credential_id.trim().is_empty() {
         return Err(ToolFailure::validation(format!(
@@ -925,7 +928,11 @@ mod tests {
             Ok(_) => panic!("锁定的端点不应构建出运行时"),
             Err(error) => error,
         };
-        assert!(error.message.contains("ZoomKey MCP 未启用"), "{}", error.message);
+        assert!(
+            error.message.contains("ZoomKey MCP 未启用"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]
@@ -1018,7 +1025,11 @@ mod tests {
                 .set("Content-Type", "application/x-www-form-urlencoded")
                 .send_string("operation=login&username=probe&accessKey=0")
                 .unwrap_or_else(|error| panic!("第 {round} 次请求失败: {error}"));
-            assert_eq!(response.into_string().unwrap(), "ok", "第 {round} 次响应体不符");
+            assert_eq!(
+                response.into_string().unwrap(),
+                "ok",
+                "第 {round} 次响应体不符"
+            );
         }
     }
 }

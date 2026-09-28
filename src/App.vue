@@ -132,6 +132,13 @@ const csvImportPath = ref("");
 const csvImportPreview = ref<CsvImportPreview | null>(null);
 const csvImportOverwrite = ref(false);
 const csvImportBusy = ref(false);
+const organizationOpen = ref(false);
+const organizationBusy = ref(false);
+const organizationTab = ref<"folders" | "tags">("folders");
+const folderDrafts = reactive<Record<string, string>>({});
+const folderMergeTargets = reactive<Record<string, string>>({});
+const tagDrafts = reactive<Record<string, string>>({});
+const tagMergeTargets = reactive<Record<string, string>>({});
 
 const KIND_ITEMS: { id: EntryKind; label: string }[] = [
   { id: "website", label: "网站账号" },
@@ -731,8 +738,13 @@ async function openFillPairing() {
 }
 async function copyPairingCode() {
   if (!pairing.value?.code) return;
-  await navigator.clipboard.writeText(pairing.value.code);
-  showToast("配对码已复制");
+  try {
+    await api.copyPairingCode();
+    showToast("配对码已复制");
+  } catch (e) {
+    pairingError.value = String(e);
+    showToast(pairingError.value);
+  }
 }
 async function openMcp() {
   goPage("mcp");
@@ -796,8 +808,13 @@ async function openExtensionBrowser(browser: "chrome" | "edge") {
 
 async function copyExtensionPath() {
   if (!extStatus.value?.dest_path) return;
-  await navigator.clipboard.writeText(extStatus.value.dest_path);
-  showToast("扩展目录已复制");
+  try {
+    await api.copyExtensionPath();
+    showToast("扩展目录已复制");
+  } catch (e) {
+    extError.value = String(e);
+    showToast(extError.value);
+  }
 }
 
 async function openPlugin() {
@@ -1243,8 +1260,85 @@ async function gen() {
 async function newFolder() {
   const name = prompt("文件夹名称");
   if (!name) return;
-  await api.createFolder(name);
-  await refreshVault();
+  try {
+    await api.createFolder(name);
+    await refreshVault();
+  } catch (e) {
+    showToast(String(e));
+  }
+}
+function openOrganization(tab: "folders" | "tags" = "folders") {
+  organizationTab.value = tab;
+  for (const folder of folders.value) {
+    folderDrafts[folder.id] = folder.name;
+    folderMergeTargets[folder.id] = "";
+  }
+  for (const tag of tags.value) {
+    tagDrafts[tag] = tag;
+    tagMergeTargets[tag] = "";
+  }
+  organizationOpen.value = true;
+}
+async function runOrganization(action: () => Promise<unknown>, success: string) {
+  if (organizationBusy.value) return;
+  organizationBusy.value = true;
+  try {
+    await action();
+    await refreshVault();
+    let filterChanged = false;
+    if (filter.folder_id && !folders.value.some((folder) => folder.id === filter.folder_id)) {
+      filter.folder_id = null;
+      filterChanged = true;
+    }
+    if (filter.tag && !tags.value.includes(filter.tag)) {
+      filter.tag = null;
+      filterChanged = true;
+    }
+    if (filterChanged) await refreshVault();
+    openOrganization(organizationTab.value);
+    showToast(success);
+  } catch (e) {
+    showToast(String(e));
+  } finally {
+    organizationBusy.value = false;
+  }
+}
+async function renameFolderFromManager(folder: FolderDto) {
+  const name = folderDrafts[folder.id]?.trim() || "";
+  if (name === folder.name) return;
+  await runOrganization(() => api.renameFolder(folder.id, name), "文件夹已重命名");
+}
+async function deleteFolderFromManager(folder: FolderDto) {
+  if (!confirm(`删除“${folder.name}”？其中的凭据会移到未归类，不会删除凭据。`)) return;
+  await runOrganization(() => api.deleteFolder(folder.id), "文件夹已删除");
+}
+async function mergeFolderFromManager(folder: FolderDto) {
+  const targetId = folderMergeTargets[folder.id];
+  const target = folders.value.find((item) => item.id === targetId);
+  if (!target) {
+    showToast("请选择合并目标");
+    return;
+  }
+  if (!confirm(`将“${folder.name}”合并到“${target.name}”？其中的凭据会归入目标文件夹。`)) return;
+  await runOrganization(() => api.mergeFolders(folder.id, target.id), "文件夹已合并");
+}
+async function renameTagFromManager(tag: string) {
+  const name = tagDrafts[tag]?.trim() || "";
+  if (name === tag) return;
+  await runOrganization(() => api.renameTag(tag, name), "标签已重命名");
+}
+async function deleteTagFromManager(tag: string) {
+  if (!confirm(`删除标签“${tag}”？只会解除标签关联，不会删除凭据。`)) return;
+  await runOrganization(() => api.deleteTag(tag), "标签已删除");
+}
+async function mergeTagFromManager(tag: string) {
+  const target = tagMergeTargets[tag];
+  if (!target) {
+    showToast("请选择合并目标");
+    return;
+  }
+  if (!confirm(`将标签“${tag}”合并到“${target}”？重复关联会自动去重。`)) return;
+  await runOrganization(() => api.mergeTags(tag, target), "标签已合并");
 }
 async function runBackup() {
   if (!backupPath.value || !backupPassword.value) {
@@ -1782,7 +1876,10 @@ onMounted(async () => {
           </div>
           <div class="side-scroll">
             <div class="side-section" v-if="tags.length">
-              <div class="side-label">标签</div>
+              <div class="side-label">
+                <span>标签</span>
+                <button class="side-link" type="button" @click="openOrganization('tags')">管理</button>
+              </div>
               <button
                 class="side-item"
                 v-for="t in tags"
@@ -1798,7 +1895,10 @@ onMounted(async () => {
             <div class="side-section">
               <div class="side-label">
                 <span>文件夹</span>
-                <button class="side-link" type="button" @click="newFolder">新建</button>
+                <span class="side-actions">
+                  <button class="side-link" type="button" @click="newFolder">新建</button>
+                  <button class="side-link" type="button" @click="openOrganization('folders')">管理</button>
+                </span>
               </div>
               <button class="side-item" type="button" :class="{ active: filter.uncategorized }" @click="setFilter({ uncategorized: true })">
                 <span>未归类</span>
@@ -2715,6 +2815,51 @@ onMounted(async () => {
           <button class="btn" @click="backupOpen = false">取消</button>
           <button class="btn primary" @click="runBackup">确定</button>
         </div>
+      </div>
+    </div>
+    <div class="dialog-mask" v-if="organizationOpen && status?.unlocked" @click.self="organizationOpen = false">
+      <div class="dialog organization-dialog">
+        <div class="dialog-heading">
+          <div>
+            <h3>管理分类</h3>
+            <p class="crumb">重命名会保留关联；删除不会删除凭据。</p>
+          </div>
+          <button class="nav-btn" type="button" @click="organizationOpen = false">×</button>
+        </div>
+        <div class="organization-tabs">
+          <button class="btn" :class="{ primary: organizationTab === 'folders' }" type="button" @click="openOrganization('folders')">文件夹</button>
+          <button class="btn" :class="{ primary: organizationTab === 'tags' }" type="button" @click="openOrganization('tags')">标签</button>
+        </div>
+        <template v-if="organizationTab === 'folders'">
+          <div class="organization-list" v-if="folders.length">
+            <div class="organization-row" v-for="folder in folders" :key="folder.id">
+              <input v-model="folderDrafts[folder.id]" :disabled="organizationBusy" aria-label="文件夹名称" />
+              <button class="btn" type="button" :disabled="organizationBusy || !folderDrafts[folder.id]?.trim() || folderDrafts[folder.id]?.trim() === folder.name" @click="renameFolderFromManager(folder)">保存</button>
+              <select v-model="folderMergeTargets[folder.id]" :disabled="organizationBusy">
+                <option value="">合并到…</option>
+                <option v-for="target in folders.filter((item) => item.id !== folder.id)" :key="target.id" :value="target.id">{{ target.name }}</option>
+              </select>
+              <button class="btn" type="button" :disabled="organizationBusy || !folderMergeTargets[folder.id]" @click="mergeFolderFromManager(folder)">合并</button>
+              <button class="btn danger" type="button" :disabled="organizationBusy" @click="deleteFolderFromManager(folder)">删除</button>
+            </div>
+          </div>
+          <p class="crumb" v-else>还没有文件夹。</p>
+        </template>
+        <template v-else>
+          <div class="organization-list" v-if="tags.length">
+            <div class="organization-row" v-for="tag in tags" :key="tag">
+              <input v-model="tagDrafts[tag]" :disabled="organizationBusy" aria-label="标签名称" />
+              <button class="btn" type="button" :disabled="organizationBusy || !tagDrafts[tag]?.trim() || tagDrafts[tag]?.trim() === tag" @click="renameTagFromManager(tag)">保存</button>
+              <select v-model="tagMergeTargets[tag]" :disabled="organizationBusy">
+                <option value="">合并到…</option>
+                <option v-for="target in tags.filter((item) => item !== tag)" :key="target" :value="target">{{ target }}</option>
+              </select>
+              <button class="btn" type="button" :disabled="organizationBusy || !tagMergeTargets[tag]" @click="mergeTagFromManager(tag)">合并</button>
+              <button class="btn danger" type="button" :disabled="organizationBusy" @click="deleteTagFromManager(tag)">删除</button>
+            </div>
+          </div>
+          <p class="crumb" v-else>还没有正在使用的标签。</p>
+        </template>
       </div>
     </div>
     <div class="dialog-mask" v-if="csvImportOpen && status?.unlocked" @click.self="csvImportOpen = false">

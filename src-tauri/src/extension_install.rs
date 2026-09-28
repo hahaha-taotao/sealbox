@@ -189,8 +189,12 @@ fn app_path_from_registry(exe_name: &str) -> Option<PathBuf> {
     let sub = format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}");
     for hive in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
         let hk = RegKey::predef(hive);
-        let Ok(key) = hk.open_subkey(&sub) else { continue };
-        let Ok(val) = key.get_value::<String, _>("") else { continue };
+        let Ok(key) = hk.open_subkey(&sub) else {
+            continue;
+        };
+        let Ok(val) = key.get_value::<String, _>("") else {
+            continue;
+        };
         let path = PathBuf::from(val);
         if path.is_file() {
             return Some(path);
@@ -258,6 +262,10 @@ fn local_dest(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dest_dir(&root))
 }
 
+pub fn dest_path_for_app(app: &AppHandle) -> Result<String, String> {
+    Ok(local_dest(app)?.to_string_lossy().into_owned())
+}
+
 pub fn status_for_app(app: &AppHandle) -> Result<ExtensionInstallStatus, String> {
     status_at(
         &bundled_dir(app)?,
@@ -275,7 +283,12 @@ pub fn install_for_app(app: &AppHandle) -> Result<ExtensionInstallStatus, String
         explorer_open_command(&dest),
         "无法打开扩展目录，请手动打开上面的路径。",
     );
-    status_at(&src, &dest, detect_chrome().is_some(), detect_edge().is_some())
+    status_at(
+        &src,
+        &dest,
+        detect_chrome().is_some(),
+        detect_edge().is_some(),
+    )
 }
 
 pub fn open_folder_for_app(app: &AppHandle) -> Result<(), String> {
@@ -283,7 +296,10 @@ pub fn open_folder_for_app(app: &AppHandle) -> Result<(), String> {
     if !dest.join("manifest.json").is_file() {
         return Err("请先安装到本机。".into());
     }
-    spawn_logged(explorer_open_command(&dest), "无法打开扩展目录，请手动打开上面的路径。")
+    spawn_logged(
+        explorer_open_command(&dest),
+        "无法打开扩展目录，请手动打开上面的路径。",
+    )
 }
 
 pub fn open_browser_for_app(app: &AppHandle, browser: &str) -> Result<String, String> {
@@ -375,7 +391,9 @@ mod windows_omnibox {
     }
 
     pub fn has_window(exe: &Path) -> bool {
-        find_windows(exe).map(|hwnds| !hwnds.is_empty()).unwrap_or(false)
+        find_windows(exe)
+            .map(|hwnds| !hwnds.is_empty())
+            .unwrap_or(false)
     }
 
     pub fn navigate(exe: &Path, url: &str) -> Result<(), String> {
@@ -466,7 +484,9 @@ mod windows_omnibox {
         if pid == 0 {
             return false;
         }
-        process_stem(pid).map(|stem| stem == wanted_stem).unwrap_or(false)
+        process_stem(pid)
+            .map(|stem| stem == wanted_stem)
+            .unwrap_or(false)
     }
 
     fn process_stem(pid: u32) -> Option<String> {
@@ -536,7 +556,10 @@ mod windows_omnibox {
             pattern
                 .SetValue(&BSTR::from(url))
                 .map_err(|_| "无法写入浏览器地址栏".to_string())?;
-            let native = omnibox.CurrentNativeWindowHandle().ok().filter(|h| !h.is_invalid());
+            let native = omnibox
+                .CurrentNativeWindowHandle()
+                .ok()
+                .filter(|h| !h.is_invalid());
             Ok(native)
         }
     }
@@ -563,7 +586,11 @@ mod windows_omnibox {
                 ki: KEYBDINPUT {
                     wVk: vk,
                     wScan: 0,
-                    dwFlags: if up { KEYEVENTF_KEYUP } else { Default::default() },
+                    dwFlags: if up {
+                        KEYEVENTF_KEYUP
+                    } else {
+                        Default::default()
+                    },
                     time: 0,
                     dwExtraInfo: 0,
                 },
@@ -639,7 +666,10 @@ mod tests {
         }
         assert!(!dest.join("fill-logic.test.js").exists());
         assert!(!dest.join("evil.js").exists());
-        assert_eq!(fs::read_to_string(dest.join("background.js")).unwrap(), "v1");
+        assert_eq!(
+            fs::read_to_string(dest.join("background.js")).unwrap(),
+            "v1"
+        );
     }
 
     #[test]
@@ -702,11 +732,15 @@ mod tests {
     #[test]
     fn exe_stem_matches_chrome_and_edge_paths() {
         assert_eq!(
-            exe_stem(Path::new(r"C:\Program Files\Google\Chrome\Application\chrome.exe")),
+            exe_stem(Path::new(
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+            )),
             "chrome"
         );
         assert_eq!(
-            exe_stem(Path::new(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")),
+            exe_stem(Path::new(
+                r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+            )),
             "msedge"
         );
         assert_ne!(exe_stem(Path::new(r"C:\Windows\explorer.exe")), "chrome");
@@ -714,7 +748,10 @@ mod tests {
 
     #[test]
     fn extensions_page_url_is_browser_specific() {
-        assert_eq!(extensions_page_url(BrowserKind::Chrome), "chrome://extensions");
+        assert_eq!(
+            extensions_page_url(BrowserKind::Chrome),
+            "chrome://extensions"
+        );
         assert_eq!(extensions_page_url(BrowserKind::Edge), "edge://extensions");
     }
 
@@ -743,7 +780,9 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert!(args.is_empty(), "{args:?}");
-        assert!(!args.iter().any(|a| a.contains("chrome://") || a.contains("edge://")));
+        assert!(!args
+            .iter()
+            .any(|a| a.contains("chrome://") || a.contains("edge://")));
     }
 
     #[test]

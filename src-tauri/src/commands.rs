@@ -303,6 +303,15 @@ fn copy_owned_text(session: &mut Session, text: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn copy_untracked_text(session: &mut Session, text: &str) -> Result<(), String> {
+    if text.is_empty() {
+        return Err("没有可复制的内容".into());
+    }
+    clipboard::write_text(text)?;
+    session.clear_clipboard_mark();
+    Ok(())
+}
+
 #[tauri::command]
 pub fn lock_vault(state: State<AppState>) -> Result<(), String> {
     lock_everything(&state.session, &state.mcp);
@@ -425,6 +434,47 @@ pub fn create_folder(state: State<AppState>, name: String) -> Result<FolderDto, 
 }
 
 #[tauri::command]
+pub fn rename_folder(
+    state: State<AppState>,
+    id: String,
+    name: String,
+) -> Result<FolderDto, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    session
+        .vault()
+        .map_err(map_err)?
+        .rename_folder(&id, &name)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn delete_folder(state: State<AppState>, id: String) -> Result<usize, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    session
+        .vault()
+        .map_err(map_err)?
+        .delete_folder(&id)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn merge_folders(
+    state: State<AppState>,
+    source_id: String,
+    target_id: String,
+) -> Result<usize, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    session
+        .vault()
+        .map_err(map_err)?
+        .merge_folders(&source_id, &target_id)
+        .map_err(map_err)
+}
+
+#[tauri::command]
 pub fn list_tags(state: State<AppState>) -> Result<Vec<String>, String> {
     let mut session = lock_session(&state.session);
     session.require_unlocked().map_err(map_err)?;
@@ -432,6 +482,47 @@ pub fn list_tags(state: State<AppState>) -> Result<Vec<String>, String> {
         .vault()
         .map_err(map_err)?
         .list_tags()
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn rename_tag(
+    state: State<AppState>,
+    old_name: String,
+    new_name: String,
+) -> Result<(), String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    session
+        .vault()
+        .map_err(map_err)?
+        .rename_tag(&old_name, &new_name)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn delete_tag(state: State<AppState>, name: String) -> Result<usize, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    session
+        .vault()
+        .map_err(map_err)?
+        .delete_tag(&name)
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn merge_tags(
+    state: State<AppState>,
+    source_name: String,
+    target_name: String,
+) -> Result<usize, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    session
+        .vault()
+        .map_err(map_err)?
+        .merge_tags(&source_name, &target_name)
         .map_err(map_err)
 }
 
@@ -1158,6 +1249,24 @@ pub fn fill_pairing_status(state: State<AppState>) -> mcp::PairingStatus {
 }
 
 #[tauri::command]
+pub fn copy_pairing_code(state: State<AppState>) -> Result<(), String> {
+    let status = state.mcp.pairing_status();
+    let code = status
+        .code
+        .filter(|_| status.active)
+        .ok_or_else(|| "当前没有开放的配对窗口".to_string())?;
+    let mut session = lock_session(&state.session);
+    copy_untracked_text(&mut session, &code)
+}
+
+#[tauri::command]
+pub fn copy_extension_path(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let path = crate::extension_install::dest_path_for_app(&app)?;
+    let mut session = lock_session(&state.session);
+    copy_untracked_text(&mut session, &path)
+}
+
+#[tauri::command]
 pub fn mcp_tools(state: State<AppState>) -> Vec<mcp::ToolInfo> {
     mcp::tool_catalog(&state.session)
 }
@@ -1634,6 +1743,27 @@ mod tests {
         session.lock();
         let after = clipboard::read_text().unwrap_or_default();
         assert_ne!(after, secret);
+    }
+
+    #[test]
+    fn copy_untracked_text_works_while_locked_and_clears_secret_mark() {
+        let secret = format!("sealbox-copy-secret-{}", uuid::Uuid::new_v4());
+        let path = format!(
+            "C:\\\\Users\\\\sealbox\\\\extension-{}",
+            uuid::Uuid::new_v4()
+        );
+        let mut session = Session::default();
+        session.remember_clipboard(&secret);
+        match copy_untracked_text(&mut session, &path) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!("skip: clipboard write failed: {e}");
+                return;
+            }
+        }
+        assert!(!session.clipboard_owned(&secret));
+        assert!(!session.clipboard_should_clear(&path));
+        assert_eq!(clipboard::read_text().unwrap_or_default(), path);
     }
 
     #[test]

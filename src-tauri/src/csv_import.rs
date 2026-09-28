@@ -655,10 +655,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(password, "new");
-                assert_eq!(
-                    totp_secret.as_deref(),
-                    Some("JBSWY3DPEHPK3PXP")
-                );
+                assert_eq!(totp_secret.as_deref(), Some("JBSWY3DPEHPK3PXP"));
             }
             other => panic!("{other:?}"),
         }

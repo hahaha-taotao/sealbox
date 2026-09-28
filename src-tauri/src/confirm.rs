@@ -194,11 +194,14 @@ mod tests {
     fn after_prepare_denies_without_running_work() {
         let result: Result<i32, String> = with_auto(Some(false), || {
             after_prepare(|| {
-                Ok((42, ConfirmPayload {
-                    title: "t".into(),
-                    prompt: "m".into(),
-                    fields: Vec::new(),
-                }))
+                Ok((
+                    42,
+                    ConfirmPayload {
+                        title: "t".into(),
+                        prompt: "m".into(),
+                        fields: Vec::new(),
+                    },
+                ))
             })
         });
         assert_eq!(result, Err("用户拒绝了这次写操作".to_string()));

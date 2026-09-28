@@ -32,7 +32,11 @@ fn main() {
         .timeout(Duration::from_secs(30))
         .timeout_connect(Duration::from_secs(10))
         .user_agent(concat!("Sealbox/", env!("CARGO_PKG_VERSION")))
-        .max_idle_connections(if std::env::var("PROBE_POOL").is_ok() { 100 } else { 0 })
+        .max_idle_connections(if std::env::var("PROBE_POOL").is_ok() {
+            100
+        } else {
+            0
+        })
         .build();
 
     // 与 App 相同的顺序：GET getchallenge → POST login，共用同一个 agent（连接池）。
@@ -48,7 +52,10 @@ fn main() {
             (
                 true,
                 base,
-                Some("operation=login&username=probe&accessKey=00000000000000000000000000000000".into()),
+                Some(
+                    "operation=login&username=probe&accessKey=00000000000000000000000000000000"
+                        .into(),
+                ),
             ),
         ]
     } else {
@@ -62,7 +69,12 @@ fn main() {
     };
 
     for (index, (is_post, url, body)) in steps.iter().enumerate() {
-        println!("--> [{}] {} {}", index + 1, if *is_post { "POST" } else { "GET" }, url);
+        println!(
+            "--> [{}] {} {}",
+            index + 1,
+            if *is_post { "POST" } else { "GET" },
+            url
+        );
         let request = if *is_post {
             agent.post(url)
         } else {

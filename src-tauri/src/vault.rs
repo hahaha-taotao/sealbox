@@ -7,7 +7,7 @@ use chrono::{DateTime, Duration, Utc};
 use rusqlite::types::Type;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -45,6 +45,20 @@ pub enum VaultError {
     CorruptBackup,
     #[error("备份密钥拉伸参数超出允许范围")]
     InvalidBackupKdf,
+    #[error("文件夹名称不能为空")]
+    FolderNameEmpty,
+    #[error("文件夹已存在")]
+    FolderAlreadyExists,
+    #[error("文件夹不存在")]
+    FolderNotFound,
+    #[error("标签名称不能为空")]
+    TagNameEmpty,
+    #[error("标签已存在")]
+    TagAlreadyExists,
+    #[error("标签不存在")]
+    TagNotFound,
+    #[error("来源和目标不能相同")]
+    SameOrganizationTarget,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -425,6 +439,11 @@ impl Vault {
         if input.kind != input.secret.kind() {
             return Err(VaultError::KindMismatch);
         }
+        input.folder_id = input
+            .folder_id
+            .and_then(|value| normalize_optional_id(&value));
+        self.validate_folder_id(input.folder_id.as_deref())?;
+        input.tags = normalize_tag_names(&input.tags);
         if let SecretPayload::Website {
             totp_secret: Some(raw),
             ..
@@ -684,6 +703,9 @@ impl Vault {
         if EntryKind::parse(&kind)? != EntryKind::ClientCert {
             return Err(VaultError::KindMismatch);
         }
+        let folder_id = folder_id.and_then(normalize_optional_id);
+        self.validate_folder_id(folder_id.as_deref())?;
+        let tags = normalize_tag_names(tags);
         let notes_blob = match notes {
             Some(value) if !value.is_empty() => Some(encrypt(dek, value.as_bytes())?.to_bytes()),
             _ => None,
@@ -706,7 +728,7 @@ impl Vault {
         )?;
         self.conn
             .execute("DELETE FROM entry_tags WHERE entry_id=?1", params![id])?;
-        for tag in tags {
+        for tag in &tags {
             let tag_id = self.ensure_tag(tag)?;
             self.conn.execute(
                 "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1,?2)",
@@ -896,11 +918,23 @@ impl Vault {
     }
 
     pub fn empty_trash(&self) -> Result<usize, VaultError> {
-        let n = self
-            .conn
-            .execute("DELETE FROM entries WHERE deleted_at IS NOT NULL", [])?;
-        self.audit("empty_trash", None, &format!("purged={n}"))?;
-        Ok(n)
+        self.with_transaction(|conn| {
+            let n: usize = conn.query_row(
+                "SELECT COUNT(*) FROM entries WHERE deleted_at IS NOT NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )? as usize;
+            conn.execute(
+                "DELETE FROM entry_tags WHERE entry_id IN (
+                    SELECT id FROM entries WHERE deleted_at IS NOT NULL
+                )",
+                [],
+            )?;
+            conn.execute("DELETE FROM entries WHERE deleted_at IS NOT NULL", [])?;
+            cleanup_orphan_tags(conn)?;
+            audit_on(conn, "empty_trash", None, &format!("purged={n}"))?;
+            Ok(n)
+        })
     }
 
     pub fn set_pinned(&self, id: &str, pinned: bool) -> Result<(), VaultError> {
@@ -917,11 +951,25 @@ impl Vault {
         retention_days: i64,
     ) -> Result<usize, VaultError> {
         let cutoff = (now - Duration::days(retention_days)).to_rfc3339();
-        let n = self.conn.execute(
-            "DELETE FROM entries WHERE deleted_at IS NOT NULL AND deleted_at <= ?1",
-            params![cutoff],
-        )?;
-        Ok(n)
+        self.with_transaction(|conn| {
+            let n: usize = conn.query_row(
+                "SELECT COUNT(*) FROM entries WHERE deleted_at IS NOT NULL AND deleted_at <= ?1",
+                params![&cutoff],
+                |row| row.get::<_, i64>(0),
+            )? as usize;
+            conn.execute(
+                "DELETE FROM entry_tags WHERE entry_id IN (
+                    SELECT id FROM entries WHERE deleted_at IS NOT NULL AND deleted_at <= ?1
+                )",
+                params![&cutoff],
+            )?;
+            conn.execute(
+                "DELETE FROM entries WHERE deleted_at IS NOT NULL AND deleted_at <= ?1",
+                params![&cutoff],
+            )?;
+            cleanup_orphan_tags(conn)?;
+            Ok(n)
+        })
     }
 
     pub fn bump_use(&self, id: &str) -> Result<(), VaultError> {
@@ -934,14 +982,101 @@ impl Vault {
     }
 
     pub fn create_folder(&self, name: &str) -> Result<FolderDto, VaultError> {
-        let id = Uuid::new_v4().to_string();
-        self.conn.execute(
-            "INSERT INTO folders (id, name, parent_id) VALUES (?1,?2,NULL)",
-            params![&id, name],
-        )?;
-        Ok(FolderDto {
-            id,
-            name: name.to_string(),
+        let name = normalize_name(name, true)?;
+        self.with_transaction(|conn| {
+            if folder_id_by_name(conn, &name)?.is_some() {
+                return Err(VaultError::FolderAlreadyExists);
+            }
+            let folder = insert_folder(conn, &name)?;
+            audit_on(conn, "create_folder", None, &format!("{name}"))?;
+            Ok(folder)
+        })
+    }
+
+    pub fn rename_folder(&self, id: &str, name: &str) -> Result<FolderDto, VaultError> {
+        let name = normalize_name(name, true)?;
+        self.with_transaction(|conn| {
+            let current_name: Option<String> = conn
+                .query_row("SELECT name FROM folders WHERE id=?1", params![id], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            let current_name = current_name.ok_or(VaultError::FolderNotFound)?;
+            if let Some(existing_id) = folder_id_by_name(conn, &name)? {
+                if existing_id != id {
+                    return Err(VaultError::FolderAlreadyExists);
+                }
+            }
+            conn.execute("UPDATE folders SET name=?1 WHERE id=?2", params![&name, id])?;
+            audit_on(
+                conn,
+                "rename_folder",
+                None,
+                &format!("{current_name} -> {name}"),
+            )?;
+            Ok(FolderDto {
+                id: id.to_string(),
+                name,
+            })
+        })
+    }
+
+    pub fn delete_folder(&self, id: &str) -> Result<usize, VaultError> {
+        self.with_transaction(|conn| {
+            let name: Option<String> = conn
+                .query_row("SELECT name FROM folders WHERE id=?1", params![id], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            let name = name.ok_or(VaultError::FolderNotFound)?;
+            let moved = conn.execute(
+                "UPDATE entries SET folder_id=NULL, updated_at=?1 WHERE folder_id=?2",
+                params![now_rfc3339(), id],
+            )?;
+            conn.execute("DELETE FROM folders WHERE id=?1", params![id])?;
+            audit_on(
+                conn,
+                "delete_folder",
+                None,
+                &format!("{name} moved={moved}"),
+            )?;
+            Ok(moved)
+        })
+    }
+
+    pub fn merge_folders(&self, source_id: &str, target_id: &str) -> Result<usize, VaultError> {
+        if source_id == target_id {
+            return Err(VaultError::SameOrganizationTarget);
+        }
+        self.with_transaction(|conn| {
+            let source_name: Option<String> = conn
+                .query_row(
+                    "SELECT name FROM folders WHERE id=?1",
+                    params![source_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let target_name: Option<String> = conn
+                .query_row(
+                    "SELECT name FROM folders WHERE id=?1",
+                    params![target_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let source_name = source_name.ok_or(VaultError::FolderNotFound)?;
+            let target_name = target_name.ok_or(VaultError::FolderNotFound)?;
+            let moved = conn.execute(
+                "UPDATE entries SET folder_id=?1, updated_at=?2 WHERE folder_id=?3",
+                params![target_id, now_rfc3339(), source_id],
+            )?;
+            conn.execute("DELETE FROM folders WHERE id=?1", params![source_id])?;
+            audit_on(
+                conn,
+                "merge_folders",
+                None,
+                &format!("{source_name} -> {target_name} moved={moved}"),
+            )?;
+            Ok(moved)
         })
     }
 
@@ -955,13 +1090,116 @@ impl Vault {
                 name: r.get(1)?,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(VaultError::from)
+    }
+
+    pub fn rename_tag(&self, old_name: &str, new_name: &str) -> Result<(), VaultError> {
+        let old_name = normalize_name(old_name, false)?;
+        let new_name = normalize_name(new_name, false)?;
+        self.with_transaction(|conn| {
+            let tag_id: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM tags WHERE name=?1",
+                    params![&old_name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let tag_id = tag_id.ok_or(VaultError::TagNotFound)?;
+            let conflict: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM tags WHERE name=?1",
+                    params![&new_name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if conflict.is_some() && new_name != old_name {
+                return Err(VaultError::TagAlreadyExists);
+            }
+            conn.execute(
+                "UPDATE tags SET name=?1 WHERE id=?2",
+                params![&new_name, &tag_id],
+            )?;
+            audit_on(
+                conn,
+                "rename_tag",
+                None,
+                &format!("{old_name} -> {new_name}"),
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn delete_tag(&self, name: &str) -> Result<usize, VaultError> {
+        let name = normalize_name(name, false)?;
+        self.with_transaction(|conn| {
+            let tag_id: Option<String> = conn
+                .query_row("SELECT id FROM tags WHERE name=?1", params![&name], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            let tag_id = tag_id.ok_or(VaultError::TagNotFound)?;
+            let removed =
+                conn.execute("DELETE FROM entry_tags WHERE tag_id=?1", params![&tag_id])?;
+            conn.execute("DELETE FROM tags WHERE id=?1", params![&tag_id])?;
+            audit_on(conn, "delete_tag", None, &format!("{name} links={removed}"))?;
+            Ok(removed)
+        })
+    }
+
+    pub fn merge_tags(&self, source_name: &str, target_name: &str) -> Result<usize, VaultError> {
+        let source_name = normalize_name(source_name, false)?;
+        let target_name = normalize_name(target_name, false)?;
+        if source_name == target_name {
+            return Err(VaultError::SameOrganizationTarget);
+        }
+        self.with_transaction(|conn| {
+            let source_id: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM tags WHERE name=?1",
+                    params![&source_name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let target_id: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM tags WHERE name=?1",
+                    params![&target_name],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let source_id = source_id.ok_or(VaultError::TagNotFound)?;
+            let target_id = target_id.ok_or(VaultError::TagNotFound)?;
+            let moved = conn.execute(
+                "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id)
+                 SELECT entry_id, ?1 FROM entry_tags WHERE tag_id=?2",
+                params![&target_id, &source_id],
+            )?;
+            conn.execute(
+                "DELETE FROM entry_tags WHERE tag_id=?1",
+                params![&source_id],
+            )?;
+            conn.execute("DELETE FROM tags WHERE id=?1", params![&source_id])?;
+            audit_on(
+                conn,
+                "merge_tags",
+                None,
+                &format!("{source_name} -> {target_name} links={moved}"),
+            )?;
+            Ok(moved)
+        })
     }
 
     pub fn list_tags(&self) -> Result<Vec<String>, VaultError> {
-        let mut stmt = self.conn.prepare("SELECT name FROM tags ORDER BY name")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT t.name FROM tags t
+             JOIN entry_tags et ON et.tag_id=t.id
+             JOIN entries e ON e.id=et.entry_id
+             ORDER BY t.name",
+        )?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(VaultError::from)
     }
 
     pub fn list_audit(&self, limit: i64) -> Result<Vec<AuditEvent>, VaultError> {
@@ -1166,8 +1404,8 @@ impl Vault {
             "DELETE FROM entry_tags WHERE entry_id=?1",
             params![&entry.id],
         )?;
-        for tag in &entry.tags {
-            let tag_id = self.ensure_tag(tag)?;
+        for tag in normalize_tag_names(&entry.tags) {
+            let tag_id = self.ensure_tag(&tag)?;
             self.conn.execute(
                 "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1,?2)",
                 params![&entry.id, &tag_id],
@@ -1234,22 +1472,20 @@ impl Vault {
     }
 
     fn ensure_folder_named(&self, name: &str) -> Result<String, VaultError> {
-        let existing: Option<String> = self
-            .conn
-            .query_row("SELECT id FROM folders WHERE name=?1", params![name], |r| {
-                r.get(0)
-            })
-            .optional()?;
-        if let Some(id) = existing {
+        let name = normalize_name(name, true)?;
+        if let Some(id) = folder_id_by_name(&self.conn, &name)? {
             return Ok(id);
         }
-        Ok(self.create_folder(name)?.id)
+        Ok(insert_folder(&self.conn, &name)?.id)
     }
 
     fn ensure_tag(&self, name: &str) -> Result<String, VaultError> {
+        let Some(name) = normalize_optional_name(name) else {
+            return Err(VaultError::TagNameEmpty);
+        };
         let existing: Option<String> = self
             .conn
-            .query_row("SELECT id FROM tags WHERE name=?1", params![name], |r| {
+            .query_row("SELECT id FROM tags WHERE name=?1", params![&name], |r| {
                 r.get(0)
             })
             .optional()?;
@@ -1262,6 +1498,44 @@ impl Vault {
             params![&id, name],
         )?;
         Ok(id)
+    }
+
+    fn validate_folder_id(&self, folder_id: Option<&str>) -> Result<(), VaultError> {
+        if let Some(folder_id) = folder_id {
+            let exists: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT id FROM folders WHERE id=?1",
+                    params![folder_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if exists.is_none() {
+                return Err(VaultError::FolderNotFound);
+            }
+        }
+        Ok(())
+    }
+
+    fn with_transaction<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> Result<T, VaultError>,
+    ) -> Result<T, VaultError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = operation(&self.conn);
+        match result {
+            Ok(value) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(value),
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(error.into())
+                }
+            },
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 
     fn tags_for(&self, entry_id: &str) -> Result<Vec<String>, VaultError> {
@@ -1509,6 +1783,88 @@ pub struct BackupEntry {
 
 fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
+}
+
+fn normalize_optional_name(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn normalize_name(value: &str, folder: bool) -> Result<String, VaultError> {
+    normalize_optional_name(value).ok_or(if folder {
+        VaultError::FolderNameEmpty
+    } else {
+        VaultError::TagNameEmpty
+    })
+}
+
+fn normalize_optional_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn normalize_tag_names(values: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    values
+        .iter()
+        .filter_map(|value| normalize_optional_name(value))
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
+}
+
+fn folder_id_by_name(conn: &Connection, name: &str) -> Result<Option<String>, VaultError> {
+    conn.query_row(
+        "SELECT id FROM folders WHERE name=?1",
+        params![name],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(VaultError::from)
+}
+
+fn insert_folder(conn: &Connection, name: &str) -> Result<FolderDto, VaultError> {
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO folders (id, name, parent_id) VALUES (?1,?2,NULL)",
+        params![&id, name],
+    )?;
+    Ok(FolderDto {
+        id,
+        name: name.to_string(),
+    })
+}
+
+fn cleanup_orphan_tags(conn: &Connection) -> Result<(), VaultError> {
+    conn.execute(
+        "DELETE FROM entry_tags
+         WHERE entry_id NOT IN (SELECT id FROM entries)
+            OR tag_id NOT IN (SELECT id FROM tags)",
+        [],
+    )?;
+    conn.execute(
+        "DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM entry_tags)",
+        [],
+    )?;
+    Ok(())
+}
+
+fn audit_on(
+    conn: &Connection,
+    action: &str,
+    entry_id: Option<&str>,
+    detail: &str,
+) -> Result<(), VaultError> {
+    conn.execute(
+        "INSERT INTO audit_events (id, at, action, entry_id, detail) VALUES (?1,?2,?3,?4,?5)",
+        params![
+            Uuid::new_v4().to_string(),
+            now_rfc3339(),
+            action,
+            entry_id,
+            detail
+        ],
+    )?;
+    Ok(())
 }
 
 fn remove_db_files(path: &str) {

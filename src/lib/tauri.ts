@@ -297,7 +297,15 @@ export const api = {
   pin: (id: string, pinned: boolean) => invoke("pin_entry", { id, pinned }),
   folders: () => invoke<FolderDto[]>("list_folders"),
   createFolder: (name: string) => invoke<FolderDto>("create_folder", { name }),
+  renameFolder: (id: string, name: string) => invoke<FolderDto>("rename_folder", { id, name }),
+  deleteFolder: (id: string) => invoke<number>("delete_folder", { id }),
+  mergeFolders: (sourceId: string, targetId: string) =>
+    invoke<number>("merge_folders", { sourceId, targetId }),
   tags: () => invoke<string[]>("list_tags"),
+  renameTag: (oldName: string, newName: string) => invoke<void>("rename_tag", { oldName, newName }),
+  deleteTag: (name: string) => invoke<number>("delete_tag", { name }),
+  mergeTags: (sourceName: string, targetName: string) =>
+    invoke<number>("merge_tags", { sourceName, targetName }),
   audit: () => invoke<AuditEvent[]>("list_audit"),
   copy: (id: string, field: string) => invoke("copy_secret", { id, field }),
   copyClientCert: (id: string) => invoke("copy_client_cert", { id }),
@@ -354,9 +362,11 @@ export const api = {
     invoke<{ active: boolean; code: string | null; expires_in_secs: number; port: number }>("fill_open_pairing"),
   fillPairingStatus: () =>
     invoke<{ active: boolean; code: string | null; expires_in_secs: number; port: number }>("fill_pairing_status"),
+  copyPairingCode: () => invoke("copy_pairing_code"),
   extensionInstallStatus: () => invoke<ExtensionInstallStatus>("extension_install_status"),
   extensionInstall: () => invoke<ExtensionInstallStatus>("extension_install"),
   extensionOpenFolder: () => invoke("extension_open_folder"),
+  copyExtensionPath: () => invoke("copy_extension_path"),
   extensionOpenBrowser: (browser: "chrome" | "edge") =>
     invoke<string>("extension_open_browser", { browser }),
   mcpTools: () => invoke<McpToolInfo[]>("mcp_tools"),
