@@ -249,6 +249,99 @@ struct GithubFileDto {
 }
 
 #[derive(Clone, Debug, Serialize)]
+struct GithubPullFileDto {
+    filename: Option<String>,
+    status: Option<String>,
+    additions: Option<i64>,
+    deletions: Option<i64>,
+    changes: Option<i64>,
+    sha: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GithubCommitDto {
+    sha: Option<String>,
+    message: Option<String>,
+    author: Option<String>,
+    html_url: Option<String>,
+}
+
+#[allow(dead_code)] // wired by later read-only tool tasks
+#[derive(Clone, Debug, Serialize)]
+struct GithubReviewDto {
+    id: Option<i64>,
+    user: Option<String>,
+    state: Option<String>,
+    submitted_at: Option<String>,
+    body: Option<String>,
+}
+
+#[allow(dead_code)] // wired by later read-only tool tasks
+#[derive(Clone, Debug, Serialize)]
+struct GithubReviewCommentDto {
+    id: Option<i64>,
+    user: Option<String>,
+    path: Option<String>,
+    line: Option<i64>,
+    side: Option<String>,
+    body: Option<String>,
+    html_url: Option<String>,
+    created_at: Option<String>,
+}
+
+#[allow(dead_code)] // wired by later read-only tool tasks
+#[derive(Clone, Debug, Serialize)]
+struct GithubStatusContextDto {
+    context: Option<String>,
+    state: Option<String>,
+    description: Option<String>,
+    target_url: Option<String>,
+}
+
+#[allow(dead_code)] // wired by later read-only tool tasks
+#[derive(Clone, Debug, Serialize)]
+struct GithubTagDto {
+    name: Option<String>,
+    sha: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GithubReleaseAssetDto {
+    id: Option<i64>,
+    name: Option<String>,
+    size: Option<i64>,
+    content_type: Option<String>,
+    download_count: Option<i64>,
+}
+
+#[allow(dead_code)] // wired by later read-only tool tasks
+#[derive(Clone, Debug, Serialize)]
+struct GithubWorkflowDto {
+    id: Option<i64>,
+    name: Option<String>,
+    path: Option<String>,
+    state: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GithubWorkflowStepDto {
+    name: Option<String>,
+    status: Option<String>,
+    conclusion: Option<String>,
+    number: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct GithubWorkflowJobDto {
+    id: Option<i64>,
+    name: Option<String>,
+    status: Option<String>,
+    conclusion: Option<String>,
+    html_url: Option<String>,
+    steps: Vec<GithubWorkflowStepDto>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct GithubReleaseDto {
     id: Option<i64>,
     tag_name: Option<String>,
@@ -1986,6 +2079,209 @@ fn workflow_run_dto(value: &Value) -> Option<Value> {
     .ok()
 }
 
+fn pull_file_dto(value: &Value) -> Option<Value> {
+    serde_json::to_value(GithubPullFileDto {
+        filename: limited_string(value.get("filename")),
+        status: limited_string(value.get("status")),
+        additions: value.get("additions").and_then(Value::as_i64),
+        deletions: value.get("deletions").and_then(Value::as_i64),
+        changes: value.get("changes").and_then(Value::as_i64),
+        sha: limited_string(value.get("sha")),
+    })
+    .ok()
+}
+
+fn commit_dto(value: &Value) -> Option<Value> {
+    let commit = value.get("commit");
+    serde_json::to_value(GithubCommitDto {
+        sha: limited_string(value.get("sha")),
+        message: limited_string_with_cap(
+            commit.and_then(|item| item.get("message")),
+            MAX_DESCRIPTION_BYTES,
+        ),
+        author: limited_string(
+            commit
+                .and_then(|item| item.get("author"))
+                .and_then(|item| item.get("name"))
+                .or_else(|| value.get("author").and_then(|item| item.get("login"))),
+        ),
+        html_url: limited_string(value.get("html_url")),
+    })
+    .ok()
+}
+
+#[allow(dead_code)] // wired by later read-only tool tasks
+fn review_dto(value: &Value) -> Option<Value> {
+    serde_json::to_value(GithubReviewDto {
+        id: value.get("id").and_then(Value::as_i64),
+        user: limited_string(value.get("user").and_then(|item| item.get("login"))),
+        state: limited_string(value.get("state")),
+        submitted_at: limited_string(value.get("submitted_at")),
+        body: limited_string_with_cap(value.get("body"), MAX_DESCRIPTION_BYTES),
+    })
+    .ok()
+}
+
+#[allow(dead_code)] // wired by later read-only tool tasks
+fn review_comment_dto(value: &Value) -> Option<Value> {
+    serde_json::to_value(GithubReviewCommentDto {
+        id: value.get("id").and_then(Value::as_i64),
+        user: limited_string(value.get("user").and_then(|item| item.get("login"))),
+        path: limited_string(value.get("path")),
+        line: value.get("line").and_then(Value::as_i64),
+        side: limited_string(value.get("side")),
+        body: limited_string_with_cap(value.get("body"), MAX_DESCRIPTION_BYTES),
+        html_url: limited_string(value.get("html_url")),
+        created_at: limited_string(value.get("created_at")),
+    })
+    .ok()
+}
+
+#[allow(dead_code)] // wired by later read-only tool tasks
+fn status_context_dto(value: &Value) -> Option<GithubStatusContextDto> {
+    Some(GithubStatusContextDto {
+        context: limited_string(value.get("context")),
+        state: limited_string(value.get("state")),
+        description: limited_string(value.get("description")),
+        target_url: limited_string(value.get("target_url")),
+    })
+}
+
+#[allow(dead_code)] // wired by later read-only tool tasks
+fn tag_dto(value: &Value) -> Option<Value> {
+    serde_json::to_value(GithubTagDto {
+        name: limited_string(value.get("name")),
+        sha: limited_string(value.get("commit").and_then(|item| item.get("sha"))),
+    })
+    .ok()
+}
+
+fn release_asset_dto(value: &Value) -> Option<Value> {
+    serde_json::to_value(GithubReleaseAssetDto {
+        id: value.get("id").and_then(Value::as_i64),
+        name: limited_string(value.get("name")),
+        size: value.get("size").and_then(Value::as_i64),
+        content_type: limited_string(value.get("content_type")),
+        download_count: value.get("download_count").and_then(Value::as_i64),
+    })
+    .ok()
+}
+
+#[allow(dead_code)] // wired by later read-only tool tasks
+fn workflow_summary_dto(value: &Value) -> Option<Value> {
+    serde_json::to_value(GithubWorkflowDto {
+        id: value.get("id").and_then(Value::as_i64),
+        name: limited_string(value.get("name")),
+        path: limited_string(value.get("path")),
+        state: limited_string(value.get("state")),
+    })
+    .ok()
+}
+
+fn workflow_job_dto(value: &Value) -> Option<Value> {
+    let steps = value
+        .get("steps")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .take(50)
+                .map(|step| GithubWorkflowStepDto {
+                    name: limited_string(step.get("name")),
+                    status: limited_string(step.get("status")),
+                    conclusion: limited_string(step.get("conclusion")),
+                    number: step.get("number").and_then(Value::as_i64),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    serde_json::to_value(GithubWorkflowJobDto {
+        id: value.get("id").and_then(Value::as_i64),
+        name: limited_string(value.get("name")),
+        status: limited_string(value.get("status")),
+        conclusion: limited_string(value.get("conclusion")),
+        html_url: limited_string(value.get("html_url")),
+        steps,
+    })
+    .ok()
+}
+
+fn compare_dto(value: &Value) -> Result<Value, String> {
+    let files = value
+        .get("files")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(pull_file_dto)
+                .take(MAX_PAGE_SIZE as usize)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let commits = value
+        .get("commits")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(commit_dto)
+                .take(MAX_PAGE_SIZE as usize)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(json!({
+        "status": limited_string(value.get("status")),
+        "ahead_by": value.get("ahead_by").and_then(Value::as_i64),
+        "behind_by": value.get("behind_by").and_then(Value::as_i64),
+        "total_commits": value.get("total_commits").and_then(Value::as_i64),
+        "files": files,
+        "commits": commits
+    }))
+}
+
+#[allow(dead_code)] // wired by later read-only tool tasks
+fn combined_status_dto(value: &Value) -> Result<Value, String> {
+    let statuses = value
+        .get("statuses")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(status_context_dto)
+                .take(MAX_PAGE_SIZE as usize)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(json!({
+        "state": limited_string(value.get("state")),
+        "sha": limited_string(value.get("sha")),
+        "total_count": value.get("total_count").and_then(Value::as_i64),
+        "statuses": statuses
+    }))
+}
+
+#[allow(dead_code)] // wired by later read-only tool tasks
+fn object_list_dto(
+    value: &Value,
+    key: &str,
+    per_page: u64,
+    mapper: fn(&Value) -> Option<Value>,
+) -> Result<Value, String> {
+    let items = value
+        .get(key)
+        .and_then(Value::as_array)
+        .ok_or_else(|| "GitHub 响应格式不正确".to_string())?
+        .iter()
+        .filter_map(mapper)
+        .take(per_page as usize)
+        .collect::<Vec<_>>();
+    let count = items.len();
+    let mut object = serde_json::Map::new();
+    object.insert(key.to_string(), Value::Array(items));
+    object.insert("count".to_string(), json!(count));
+    Ok(Value::Object(object))
+}
+
 fn list_dto(
     value: &Value,
     per_page: u64,
@@ -2288,6 +2584,71 @@ mod tests {
         let redacted = redact_text(&leaked, &["ghp_test_token_value"]);
         assert!(!redacted.contains("ghp_test_token_value"));
         assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn readonly_dtos_drop_patches_logs_and_download_urls() {
+        let file = pull_file_dto(&json!({
+            "filename": "src/main.rs",
+            "status": "modified",
+            "additions": 3,
+            "deletions": 1,
+            "changes": 4,
+            "sha": "abc",
+            "patch": "@@ secret patch",
+            "contents_url": "https://api.github.com/repos/a/b/contents/src/main.rs"
+        }))
+        .unwrap();
+        assert_eq!(file["filename"], "src/main.rs");
+        assert_eq!(file["additions"], 3);
+        assert!(file.get("patch").is_none());
+        assert!(file.get("contents_url").is_none());
+
+        let asset = release_asset_dto(&json!({
+            "id": 9,
+            "name": "Sealbox_setup.exe",
+            "size": 100,
+            "content_type": "application/octet-stream",
+            "download_count": 2,
+            "browser_download_url": "https://github.com/a/b/releases/download/v1/Sealbox_setup.exe",
+            "url": "https://api.github.com/repos/a/b/releases/assets/9"
+        }))
+        .unwrap();
+        assert_eq!(asset["name"], "Sealbox_setup.exe");
+        assert!(asset.get("browser_download_url").is_none());
+        assert!(asset.get("url").is_none());
+
+        let job = workflow_job_dto(&json!({
+            "id": 7,
+            "name": "build",
+            "status": "completed",
+            "conclusion": "success",
+            "html_url": "https://github.com/a/b/actions/runs/1/job/7",
+            "logs_url": "https://api.github.com/repos/a/b/actions/jobs/7/logs",
+            "steps": [
+                {"name": "checkout", "status": "completed", "conclusion": "success", "number": 1},
+                {"name": "secret-step", "status": "completed", "conclusion": "failure", "number": 2}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(job["name"], "build");
+        assert!(job.get("logs_url").is_none());
+        assert_eq!(job["steps"][1]["conclusion"], "failure");
+        assert!(job["steps"][0].get("log").is_none());
+
+        let compare = compare_dto(&json!({
+            "status": "ahead",
+            "ahead_by": 1,
+            "behind_by": 0,
+            "total_commits": 1,
+            "files": [{"filename": "README.md", "status": "modified", "additions": 1, "deletions": 0, "patch": "leak"}],
+            "commits": [{"sha": "deadbeef", "commit": {"message": "docs"}}]
+        }))
+        .unwrap();
+        assert_eq!(compare["ahead_by"], 1);
+        assert_eq!(compare["files"][0]["filename"], "README.md");
+        assert!(compare["files"][0].get("patch").is_none());
+        assert_eq!(compare["commits"].as_array().unwrap().len(), 1);
     }
 
     fn token_entry(service: &str) -> (Vault, [u8; 32], String) {
