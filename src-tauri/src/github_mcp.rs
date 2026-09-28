@@ -233,6 +233,7 @@ struct GithubWorkflowRunDto {
     conclusion: Option<String>,
     event: Option<String>,
     head_branch: Option<String>,
+    head_sha: Option<String>,
     html_url: Option<String>,
     created_at: Option<String>,
     updated_at: Option<String>,
@@ -2261,6 +2262,13 @@ fn workflow_run_dto(value: &Value) -> Option<Value> {
         conclusion: limited_string(value.get("conclusion")),
         event: limited_string(value.get("event")),
         head_branch: limited_string(value.get("head_branch")),
+        head_sha: value
+            .get("head_sha")
+            .and_then(Value::as_str)
+            .filter(|sha| {
+                !sha.is_empty() && sha.len() <= 64 && sha.chars().all(|c| c.is_ascii_hexdigit())
+            })
+            .map(str::to_string),
         html_url: limited_string(value.get("html_url")),
         created_at: limited_string(value.get("created_at")),
         updated_at: limited_string(value.get("updated_at")),
@@ -2815,6 +2823,23 @@ mod tests {
         .unwrap();
         assert!(!policy.enabled);
         assert!(!policy.api_write_enabled);
+    }
+
+    #[test]
+    fn workflow_run_dto_keeps_hex_head_sha_only() {
+        let dto = workflow_run_dto(&json!({
+            "id": 1,
+            "name": "release",
+            "status": "completed",
+            "conclusion": "success",
+            "head_branch": "master",
+            "head_sha": "abcdef1234567890",
+            "html_url": "https://github.com/a/b/actions/runs/1"
+        }))
+        .unwrap();
+        assert_eq!(dto["head_sha"], "abcdef1234567890");
+        let rejected = workflow_run_dto(&json!({"head_sha": "not a sha/../x"})).unwrap();
+        assert!(rejected.get("head_sha").unwrap().is_null());
     }
 
     #[test]
