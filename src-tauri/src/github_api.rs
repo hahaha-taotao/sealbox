@@ -347,7 +347,12 @@ fn pinned_url(
 }
 
 fn validate_path(path: &str) -> Result<(), String> {
-    if !path.starts_with('/') || path.contains("://") || path.contains("..") || path.contains('\\') || path.contains('@')
+    if !path.starts_with('/')
+        || path.contains("://")
+        || path.contains("..")
+        || path.contains('\\')
+        || path.contains('@')
+        || path.contains('#')
     {
         return Err("GitHub 路径不合法".into());
     }

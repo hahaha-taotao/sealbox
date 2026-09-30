@@ -961,6 +961,199 @@ pub fn api_tool_definitions() -> Vec<Value> {
                 &["repo", "git_ref"],
             ),
         ),
+        tool(
+            "github_release_generate_notes",
+            "根据 tag 生成建议的 Release 标题和正文，不会创建 Release。body 最多返回 64 KiB。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("tag_name", string_schema(1, MAX_RELEASE_TAG_CHARS as u64)),
+                    ("previous_tag_name", string_schema(1, MAX_RELEASE_TAG_CHARS as u64)),
+                    ("target_commitish", string_schema(1, 200)),
+                ],
+                &["repo", "tag_name"],
+            ),
+        ),
+        tool(
+            "github_run_artifacts",
+            "列出某次 Actions run 的产物：id、名称、字节数、是否过期。不返回下载地址。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("run_id", json!({"type":"integer","minimum":1,"maximum":9007199254740991u64})),
+                ],
+                &["repo", "run_id"],
+            ),
+        ),
+        tool(
+            "github_repo_variable_list",
+            "列出仓库 Actions 变量的名称、值和更新时间。变量是非机密配置。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                ],
+                &["repo"],
+            ),
+        ),
+        write_tool(
+            "github_release_publish",
+            "把草稿 Release 正式发布（draft=false）。可同时改名称、正文或 prerelease。每次都会弹出 Sealbox 桌面确认。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("id", json!({"type":"integer","minimum":1,"maximum":9007199254740991u64})),
+                    ("name", string_schema(1, 200)),
+                    ("body", string_schema(0, MAX_RELEASE_BODY_BYTES as u64)),
+                    ("prerelease", json!({"type":"boolean"})),
+                ],
+                &["repo", "id"],
+            ),
+        ),
+        write_tool(
+            "github_release_delete",
+            "删除一个 Release，不删除对应 tag。每次都会弹出 Sealbox 桌面确认。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("id", json!({"type":"integer","minimum":1,"maximum":9007199254740991u64})),
+                ],
+                &["repo", "id"],
+            ),
+        ),
+        write_tool(
+            "github_release_asset_upload",
+            "把本地文件上传为 Release 资产。文件名只允许字母、数字、点、下划线和连字符。每次都会弹出 Sealbox 桌面确认，确认框不含文件内容。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("id", json!({"type":"integer","minimum":1,"maximum":9007199254740991u64})),
+                    ("file_path", string_schema(1, 1024)),
+                    ("file_name", string_schema(1, 120)),
+                    ("content_type", string_schema(1, 200)),
+                ],
+                &["repo", "id", "file_path"],
+            ),
+        ),
+        write_tool(
+            "github_workflow_dispatch",
+            "手动触发 workflow_dispatch。workflow 是文件名或数字 id。每次都会弹出 Sealbox 桌面确认。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("workflow", string_schema(1, 200)),
+                    ("git_ref", string_schema(1, 200)),
+                    ("inputs", json!({"type":"object"})),
+                ],
+                &["repo", "workflow", "git_ref"],
+            ),
+        ),
+        write_tool(
+            "github_repository_dispatch",
+            "发送 repository_dispatch 事件。每次都会弹出 Sealbox 桌面确认，确认框不含 payload。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("event_type", string_schema(1, 100)),
+                    ("client_payload", json!({"type":"object"})),
+                ],
+                &["repo", "event_type"],
+            ),
+        ),
+        write_tool(
+            "github_run_rerun",
+            "重跑某次 GitHub Actions run。每次都会弹出 Sealbox 桌面确认。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("run_id", json!({"type":"integer","minimum":1,"maximum":9007199254740991u64})),
+                ],
+                &["repo", "run_id"],
+            ),
+        ),
+        write_tool(
+            "github_rerun_failed_jobs",
+            "只重跑某次 Actions run 里失败的 job。每次都会弹出 Sealbox 桌面确认。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("run_id", json!({"type":"integer","minimum":1,"maximum":9007199254740991u64})),
+                ],
+                &["repo", "run_id"],
+            ),
+        ),
+        write_tool(
+            "github_run_cancel",
+            "取消正在运行的 Actions run。每次都会弹出 Sealbox 桌面确认。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("run_id", json!({"type":"integer","minimum":1,"maximum":9007199254740991u64})),
+                ],
+                &["repo", "run_id"],
+            ),
+        ),
+        write_tool(
+            "github_repo_variable_set",
+            "创建或更新仓库 Actions 变量。已存在则更新，不存在则创建。每次都会弹出 Sealbox 桌面确认，确认框不含变量值。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("name", string_schema(1, 64)),
+                    ("value", string_schema(0, 4096)),
+                ],
+                &["repo", "name", "value"],
+            ),
+        ),
+        write_tool(
+            "github_repo_variable_delete",
+            "删除仓库 Actions 变量。每次都会弹出 Sealbox 桌面确认。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("name", string_schema(1, 64)),
+                ],
+                &["repo", "name"],
+            ),
+        ),
         write_tool(
             "github_create_release",
             "在仓库创建 Release。用户说「打一个 GitHub Release」时调用。默认 draft=true。每次都会弹出 Sealbox 桌面确认。",
@@ -1400,6 +1593,297 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
     };
     let (token, credential_label) = prepare(session, name, &args)?;
     let (status, result) = match name {
+        "github_release_generate_notes" => {
+            let repository = repository_args(&args)?;
+            let tag_name = release_tag_arg(&args)?;
+            let previous = optional_release_tag(&args, "previous_tag_name")?;
+            let target = optional_release_string(&args, "target_commitish", 200)?;
+            if let Some(value) = target.as_deref() {
+                reject_dot_dot(value, "target_commitish")?;
+            }
+            let mut request = Map::new();
+            request.insert("tag_name".into(), Value::String(tag_name));
+            if let Some(value) = previous {
+                request.insert("previous_tag_name".into(), Value::String(value));
+            }
+            if let Some(value) = target {
+                request.insert("target_commitish".into(), Value::String(value));
+            }
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).send(
+                &crate::github_api::Call {
+                    method: crate::github_api::Method::Post,
+                    path: format!("/repos/{repository}/releases/generate-notes"),
+                    query: Vec::new(),
+                    body: Some(crate::github_api::Body::Json(Value::Object(request))),
+                    ok: &[200],
+                    allow_missing_confirm: true,
+                },
+                None,
+            )?;
+            Ok((status, generate_notes_dto(&value)))
+        }
+        "github_release_publish" => {
+            let repository = repository_args(&args)?;
+            let id = positive_id(&args, "id")?;
+            let name = optional_release_string(&args, "name", 200)?;
+            let body = optional_release_body(&args)?;
+            let mut request = Map::new();
+            request.insert("draft".into(), Value::Bool(false));
+            if let Some(value) = name {
+                request.insert("name".into(), Value::String(value));
+            }
+            if let Some(value) = body {
+                request.insert("body".into(), Value::String(value));
+            }
+            if args.get("prerelease").is_some() {
+                request.insert("prerelease".into(), Value::Bool(bool_arg(&args, "prerelease", false)?));
+            }
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).send(
+                &crate::github_api::Call {
+                    method: crate::github_api::Method::Patch,
+                    path: format!("/repos/{repository}/releases/{id}"),
+                    query: Vec::new(),
+                    body: Some(crate::github_api::Body::Json(Value::Object(request))),
+                    ok: &[200],
+                    allow_missing_confirm: false,
+                },
+                Some(&crate::github_api::Confirm {
+                    title: "发布 GitHub Release".into(),
+                    prompt: "允许这次 GitHub 写操作？".into(),
+                    fields: vec![
+                        ("仓库".into(), repository),
+                        ("release id".into(), id.to_string()),
+                    ],
+                }),
+            )?;
+            let dto = release_dto(&value).ok_or_else(|| "GitHub 响应格式不正确".to_string())?;
+            Ok((status, dto))
+        }
+        "github_release_delete" => {
+            let repository = repository_args(&args)?;
+            let id = positive_id(&args, "id")?;
+            let (status, _value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).send(
+                &crate::github_api::Call {
+                    method: crate::github_api::Method::Delete,
+                    path: format!("/repos/{repository}/releases/{id}"),
+                    query: Vec::new(),
+                    body: None,
+                    ok: &[204],
+                    allow_missing_confirm: false,
+                },
+                Some(&crate::github_api::Confirm {
+                    title: "删除 GitHub Release".into(),
+                    prompt: "允许这次 GitHub 写操作？不会删除对应 tag。".into(),
+                    fields: vec![
+                        ("仓库".into(), repository),
+                        ("release id".into(), id.to_string()),
+                    ],
+                }),
+            )?;
+            Ok((status, json!({"deleted": true})))
+        }
+        "github_release_asset_upload" => {
+            let repository = repository_args(&args)?;
+            let id = positive_id(&args, "id")?;
+            let file_path = args
+                .get("file_path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "缺少参数 file_path".to_string())?;
+            let path = std::path::Path::new(file_path);
+            let file_name = match args.get("file_name").and_then(Value::as_str) {
+                Some(name) => asset_file_name(name)?,
+                None => path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| "无法从路径得到文件名".to_string())
+                    .and_then(asset_file_name)?,
+            };
+            let content_type = optional_content_type(&args)?;
+            let bytes = std::fs::metadata(path)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            let encoded = percent_encode(&file_name, false);
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).upload(
+                path,
+                &format!("/repos/{repository}/releases/{id}/assets?name={encoded}"),
+                &content_type,
+                &[201],
+                Some(&crate::github_api::Confirm {
+                    title: "上传 GitHub Release 资产".into(),
+                    prompt: "允许这次 GitHub 写操作？".into(),
+                    fields: vec![
+                        ("仓库".into(), repository),
+                        ("release id".into(), id.to_string()),
+                        ("文件名".into(), file_name),
+                        ("字节数".into(), bytes.to_string()),
+                    ],
+                }),
+            )?;
+            Ok((status, uploaded_asset_dto(&value)))
+        }
+        "github_workflow_dispatch" => {
+            let repository = repository_args(&args)?;
+            let workflow = workflow_selector(&args)?;
+            let git_ref = dispatch_ref(&args)?;
+            let inputs = dispatch_inputs(&args)?;
+            let mut request = Map::new();
+            request.insert("ref".into(), Value::String(git_ref.clone()));
+            if let Some(inputs) = inputs {
+                request.insert("inputs".into(), inputs);
+            }
+            let (status, _value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).send(
+                &crate::github_api::Call {
+                    method: crate::github_api::Method::Post,
+                    path: format!("/repos/{repository}/actions/workflows/{workflow}/dispatches"),
+                    query: Vec::new(),
+                    body: Some(crate::github_api::Body::Json(Value::Object(request))),
+                    ok: &[204],
+                    allow_missing_confirm: false,
+                },
+                Some(&crate::github_api::Confirm {
+                    title: "触发 GitHub workflow".into(),
+                    prompt: "允许这次 GitHub 写操作？".into(),
+                    fields: vec![
+                        ("仓库".into(), repository),
+                        ("workflow".into(), workflow),
+                        ("ref".into(), git_ref),
+                    ],
+                }),
+            )?;
+            Ok((status, json!({"dispatched": true})))
+        }
+        "github_repository_dispatch" => {
+            let repository = repository_args(&args)?;
+            let event_type = event_type_arg(&args)?;
+            let payload = client_payload(&args)?;
+            let mut request = Map::new();
+            request.insert("event_type".into(), Value::String(event_type.clone()));
+            if let Some(payload) = payload {
+                request.insert("client_payload".into(), payload);
+            }
+            let (status, _value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).send(
+                &crate::github_api::Call {
+                    method: crate::github_api::Method::Post,
+                    path: format!("/repos/{repository}/dispatches"),
+                    query: Vec::new(),
+                    body: Some(crate::github_api::Body::Json(Value::Object(request))),
+                    ok: &[204],
+                    allow_missing_confirm: false,
+                },
+                Some(&crate::github_api::Confirm {
+                    title: "发送 GitHub repository_dispatch".into(),
+                    prompt: "允许这次 GitHub 写操作？".into(),
+                    fields: vec![
+                        ("仓库".into(), repository),
+                        ("event_type".into(), event_type),
+                    ],
+                }),
+            )?;
+            Ok((status, json!({"dispatched": true})))
+        }
+        "github_run_rerun" => run_action(
+            &token,
+            &credential_label,
+            &args,
+            "rerun",
+            &[201, 204],
+            json!({"rerun": true}),
+            "重跑 GitHub Actions",
+        ),
+        "github_rerun_failed_jobs" => run_action(
+            &token,
+            &credential_label,
+            &args,
+            "rerun-failed-jobs",
+            &[201, 204],
+            json!({"rerun": true}),
+            "重跑失败的 GitHub Actions job",
+        ),
+        "github_run_cancel" => run_action(
+            &token,
+            &credential_label,
+            &args,
+            "cancel",
+            &[202, 204],
+            json!({"cancelled": true}),
+            "取消 GitHub Actions run",
+        ),
+        "github_repo_variable_set" => {
+            let repository = repository_args(&args)?;
+            let name = variable_name_arg(&args)?;
+            let value = variable_value_arg(&args)?;
+            let encoded = percent_encode(&name, false);
+            let github = crate::github_api::Github::open(token.clone(), credential_label.clone());
+            let (exists_status, _) = github.send(
+                &crate::github_api::Call {
+                    method: crate::github_api::Method::Get,
+                    path: format!("/repos/{repository}/actions/variables/{encoded}"),
+                    query: Vec::new(),
+                    body: None,
+                    ok: &[200, 404],
+                    allow_missing_confirm: true,
+                },
+                None,
+            )?;
+            let creating = exists_status == 404;
+            let confirm = crate::github_api::Confirm {
+                title: if creating {
+                    "创建 GitHub Actions 变量".into()
+                } else {
+                    "更新 GitHub Actions 变量".into()
+                },
+                prompt: "允许这次 GitHub 写操作？".into(),
+                fields: variable_confirm_fields(&repository, &name, &value),
+            };
+            let body = crate::github_api::Body::Json(json!({"name": name, "value": value}));
+            let (status, _) = if creating {
+                github.send(
+                    &crate::github_api::Call {
+                        method: crate::github_api::Method::Post,
+                        path: format!("/repos/{repository}/actions/variables"),
+                        query: Vec::new(),
+                        body: Some(body),
+                        ok: &[201],
+                        allow_missing_confirm: false,
+                    },
+                    Some(&confirm),
+                )?
+            } else {
+                github.send(
+                    &crate::github_api::Call {
+                        method: crate::github_api::Method::Patch,
+                        path: format!("/repos/{repository}/actions/variables/{encoded}"),
+                        query: Vec::new(),
+                        body: Some(body),
+                        ok: &[204],
+                        allow_missing_confirm: false,
+                    },
+                    Some(&confirm),
+                )?
+            };
+            Ok((status, json!({"name": name, "updated": true})))
+        }
+        "github_repo_variable_delete" => {
+            let repository = repository_args(&args)?;
+            let name = variable_name_arg(&args)?;
+            let encoded = percent_encode(&name, false);
+            let (status, _value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).send(
+                &crate::github_api::Call {
+                    method: crate::github_api::Method::Delete,
+                    path: format!("/repos/{repository}/actions/variables/{encoded}"),
+                    query: Vec::new(),
+                    body: None,
+                    ok: &[204],
+                    allow_missing_confirm: false,
+                },
+                Some(&crate::github_api::Confirm {
+                    title: "删除 GitHub Actions 变量".into(),
+                    prompt: "允许这次 GitHub 写操作？".into(),
+                    fields: variable_confirm_fields(&repository, &name, ""),
+                }),
+            )?;
+            Ok((status, json!({"deleted": true})))
+        }
         "github_release_create" => {
             let repository = repository_args(&args)?;
             let tag_name = release_tag_arg(&args)?;
@@ -2192,18 +2676,42 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
         }
         "github_release_get" => {
             let repository = repository_args(&args)?;
+            let by_tag = args.get("id").is_none() && args.get("tag_name").is_some();
             let endpoint = if args.get("id").is_some() {
                 let id = positive_id(&args, "id")?;
                 format!("/repos/{repository}/releases/{id}")
-            } else if args.get("tag_name").is_some() {
+            } else if by_tag {
                 let tag = compare_ref_arg(&args, "tag_name")?;
                 format!("/repos/{repository}/releases/tags/{tag}")
             } else {
                 return Err("缺少参数 id".into());
             };
-            request_json(&token, &endpoint, |value| {
+            match request_json(&token, &endpoint, |value| {
                 release_list_dto(value).ok_or_else(|| "GitHub 响应格式不正确".to_string())
-            })
+            }) {
+                Ok(result) => Ok(result),
+                Err(error) if by_tag && error.contains("HTTP 404") => {
+                    Err(format!("{error}；draft 请用 github_release_list 取 id"))
+                }
+                Err(error) => Err(error),
+            }
+        }
+        "github_run_artifacts" => {
+            let repository = repository_args(&args)?;
+            let run_id = positive_id(&args, "run_id")?;
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).get(
+                &format!("/repos/{repository}/actions/runs/{run_id}/artifacts"),
+                vec![("per_page".into(), MAX_PAGE_SIZE.to_string())],
+            )?;
+            Ok((status, artifacts_dto(&value)?))
+        }
+        "github_repo_variable_list" => {
+            let repository = repository_args(&args)?;
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).get(
+                &format!("/repos/{repository}/actions/variables"),
+                vec![("per_page".into(), MAX_PAGE_SIZE.to_string())],
+            )?;
+            Ok((status, variables_dto(&value)?))
         }
         "github_list_release_assets" => {
             let repository = repository_args(&args)?;
@@ -2253,7 +2761,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             request_json(
                 &token,
                 &format!("/repos/{repository}/actions/runs/{run_id}/jobs?per_page={MAX_PAGE_SIZE}"),
-                |value| object_list_dto(value, "jobs", MAX_PAGE_SIZE, workflow_job_dto),
+                workflow_jobs_dto,
             )
         }
         _ => return Err("未知 GitHub 工具".into()),
@@ -2833,6 +3341,275 @@ fn bool_arg(args: &Value, name: &str, default: bool) -> Result<bool, String> {
     value
         .as_bool()
         .ok_or_else(|| format!("参数 {name} 必须是布尔值"))
+}
+
+fn run_action(
+    token: &str,
+    credential_label: &str,
+    args: &Value,
+    suffix: &str,
+    ok: &'static [u16],
+    result: Value,
+    title: &str,
+) -> Result<(u16, Value), String> {
+    let repository = repository_args(args)?;
+    let run_id = positive_id(args, "run_id")?;
+    let (status, _value) = crate::github_api::Github::open(token, credential_label).send(
+        &crate::github_api::Call {
+            method: crate::github_api::Method::Post,
+            path: format!("/repos/{repository}/actions/runs/{run_id}/{suffix}"),
+            query: Vec::new(),
+            body: None,
+            ok,
+            allow_missing_confirm: false,
+        },
+        Some(&crate::github_api::Confirm {
+            title: title.into(),
+            prompt: "允许这次 GitHub 写操作？".into(),
+            fields: vec![
+                ("仓库".into(), repository),
+                ("run id".into(), run_id.to_string()),
+            ],
+        }),
+    )?;
+    Ok((status, result))
+}
+
+pub(crate) fn variable_confirm_fields(
+    repository: &str,
+    name: &str,
+    _value: &str,
+) -> Vec<(String, String)> {
+    vec![
+        ("仓库".into(), repository.to_string()),
+        ("变量名".into(), name.to_string()),
+    ]
+}
+
+pub(crate) fn asset_file_name(name: &str) -> Result<String, String> {
+    if (1..=120).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        Ok(name.to_string())
+    } else {
+        Err("文件名只允许字母、数字、点、下划线和连字符，长度 1–120".into())
+    }
+}
+
+fn optional_content_type(args: &Value) -> Result<String, String> {
+    let Some(value) = args.get("content_type") else {
+        return Ok("application/octet-stream".into());
+    };
+    let value = value
+        .as_str()
+        .ok_or_else(|| "参数 content_type 必须是字符串".to_string())?;
+    if value.is_empty() || value.len() > 200 || value.contains('\r') || value.contains('\n') {
+        return Err("参数 content_type 长度或格式不合法".into());
+    }
+    Ok(value.to_string())
+}
+
+fn optional_release_tag(args: &Value, name: &str) -> Result<Option<String>, String> {
+    if args.get(name).is_none() {
+        return Ok(None);
+    }
+    let wrapped = json!({ "tag_name": args.get(name).cloned().unwrap_or(Value::Null) });
+    release_tag_arg(&wrapped).map(Some)
+}
+
+fn reject_dot_dot(value: &str, name: &str) -> Result<(), String> {
+    if value.contains("..") {
+        Err(format!("参数 {name} 格式不合法"))
+    } else {
+        Ok(())
+    }
+}
+
+fn workflow_selector(args: &Value) -> Result<String, String> {
+    let workflow = required_text(args, "workflow", 200)?;
+    if workflow.contains("..") || workflow.contains('/') || workflow.contains('\\') {
+        return Err("参数 workflow 格式不合法".into());
+    }
+    Ok(workflow)
+}
+
+fn dispatch_ref(args: &Value) -> Result<String, String> {
+    let git_ref = args
+        .get("git_ref")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "缺少参数 git_ref".to_string())?;
+    if git_ref.is_empty()
+        || git_ref.chars().count() > 200
+        || git_ref.contains("..")
+        || git_ref.chars().any(char::is_control)
+    {
+        return Err("参数 git_ref 格式不合法".into());
+    }
+    Ok(git_ref.to_string())
+}
+
+fn dispatch_inputs(args: &Value) -> Result<Option<Value>, String> {
+    let Some(inputs) = args.get("inputs") else {
+        return Ok(None);
+    };
+    let object = inputs
+        .as_object()
+        .ok_or_else(|| "参数 inputs 必须是对象".to_string())?;
+    if object.len() > 10 {
+        return Err("参数 inputs 最多 10 个键".into());
+    }
+    let mut clean = Map::new();
+    for (key, value) in object {
+        let text = value
+            .as_str()
+            .ok_or_else(|| "参数 inputs 的值必须是字符串".to_string())?;
+        if text.chars().count() > 256 {
+            return Err("参数 inputs 的值最长 256".into());
+        }
+        clean.insert(key.clone(), Value::String(text.to_string()));
+    }
+    Ok(Some(Value::Object(clean)))
+}
+
+fn event_type_arg(args: &Value) -> Result<String, String> {
+    let event_type = required_text(args, "event_type", 100)?;
+    if event_type.len() > 100
+        || !event_type
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err("参数 event_type 格式不合法".into());
+    }
+    Ok(event_type)
+}
+
+fn client_payload(args: &Value) -> Result<Option<Value>, String> {
+    let Some(payload) = args.get("client_payload") else {
+        return Ok(None);
+    };
+    let object = payload
+        .as_object()
+        .ok_or_else(|| "参数 client_payload 必须是对象".to_string())?;
+    if object.len() > 10 {
+        return Err("参数 client_payload 最多 10 个键".into());
+    }
+    let encoded = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
+    if encoded.len() > 10 * 1024 {
+        return Err("参数 client_payload 超过 10 KiB".into());
+    }
+    Ok(Some(payload.clone()))
+}
+
+fn variable_name_arg(args: &Value) -> Result<String, String> {
+    let name = required_text(args, "name", 64)?;
+    let mut chars = name.chars();
+    let first_ok = chars
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_');
+    if !first_ok
+        || name.chars().count() > 64
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return Err("参数 name 格式不合法".into());
+    }
+    Ok(name)
+}
+
+fn variable_value_arg(args: &Value) -> Result<String, String> {
+    let value = args
+        .get("value")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "缺少参数 value".to_string())?;
+    if value.chars().count() > 4096 {
+        return Err("参数 value 最长 4096".into());
+    }
+    Ok(value.to_string())
+}
+
+fn generate_notes_dto(value: &Value) -> Value {
+    json!({
+        "name": limited_string(value.get("name")),
+        "body": limited_string_with_cap(value.get("body"), MAX_RELEASE_BODY_BYTES)
+    })
+}
+
+fn uploaded_asset_dto(value: &Value) -> Value {
+    json!({
+        "id": value.get("id").and_then(Value::as_i64),
+        "name": limited_string(value.get("name")),
+        "size": value.get("size").and_then(Value::as_i64),
+        "state": limited_string(value.get("state"))
+    })
+}
+
+fn artifacts_dto(value: &Value) -> Result<Value, String> {
+    let items = value
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "GitHub 响应格式不正确".to_string())?
+        .iter()
+        .take(MAX_PAGE_SIZE as usize)
+        .map(|item| {
+            json!({
+                "id": item.get("id").and_then(Value::as_i64),
+                "name": limited_string(item.get("name")),
+                "size_in_bytes": item.get("size_in_bytes").and_then(Value::as_i64),
+                "expired": item.get("expired").and_then(Value::as_bool)
+            })
+        })
+        .collect::<Vec<_>>();
+    let count = items.len();
+    Ok(json!({"artifacts": items, "count": count}))
+}
+
+fn variables_dto(value: &Value) -> Result<Value, String> {
+    let items = value
+        .get("variables")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "GitHub 响应格式不正确".to_string())?
+        .iter()
+        .take(MAX_PAGE_SIZE as usize)
+        .map(|item| {
+            json!({
+                "name": limited_string(item.get("name")),
+                "value": limited_string_with_cap(item.get("value"), 4096),
+                "updated_at": limited_string(item.get("updated_at"))
+            })
+        })
+        .collect::<Vec<_>>();
+    let count = items.len();
+    Ok(json!({"variables": items, "count": count}))
+}
+
+pub(crate) fn workflow_jobs_dto(value: &Value) -> Result<Value, String> {
+    let jobs = value
+        .get("jobs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "GitHub 响应格式不正确".to_string())?;
+    let items = jobs
+        .iter()
+        .filter_map(workflow_job_dto)
+        .take(MAX_PAGE_SIZE as usize)
+        .collect::<Vec<_>>();
+    let quota = !jobs.is_empty()
+        && jobs.iter().all(|job| {
+            job.get("conclusion").and_then(Value::as_str) == Some("failure")
+                && job
+                    .get("steps")
+                    .and_then(Value::as_array)
+                    .map(|steps| steps.is_empty())
+                    .unwrap_or(true)
+        });
+    let count = items.len();
+    let mut object = json!({"jobs": items, "count": count});
+    if quota {
+        object["quota_exhausted_suspect"] = Value::Bool(true);
+    }
+    Ok(object)
 }
 
 fn release_tag_arg(args: &Value) -> Result<String, String> {
@@ -3416,18 +4193,30 @@ fn workflow_summary_dto(value: &Value) -> Option<Value> {
 }
 
 fn workflow_job_dto(value: &Value) -> Option<Value> {
+    let failed = value.get("conclusion").and_then(Value::as_str) != Some("success");
     let steps = value
         .get("steps")
         .and_then(Value::as_array)
         .map(|items| {
             items
                 .iter()
+                .filter(|step| {
+                    !failed || step.get("conclusion").and_then(Value::as_str) != Some("success")
+                })
                 .take(50)
                 .map(|step| GithubWorkflowStepDto {
                     name: limited_string(step.get("name")),
-                    status: limited_string(step.get("status")),
+                    status: if failed {
+                        None
+                    } else {
+                        limited_string(step.get("status"))
+                    },
                     conclusion: limited_string(step.get("conclusion")),
-                    number: step.get("number").and_then(Value::as_i64),
+                    number: if failed {
+                        None
+                    } else {
+                        step.get("number").and_then(Value::as_i64)
+                    },
                 })
                 .collect()
         })
@@ -3590,6 +4379,89 @@ fn truncate(value: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use crate::session::Session;
+
+    fn find_tool(name: &str) -> Value {
+        api_tool_definitions()
+            .into_iter()
+            .find(|definition| definition["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing"))
+    }
+
+    #[test]
+    fn generate_notes_is_read_only_post() {
+        let def = find_tool("github_release_generate_notes");
+        assert_eq!(def["readOnly"], true);
+        assert_eq!(def["risk"], "low");
+    }
+
+    #[test]
+    fn failed_jobs_without_steps_mark_quota() {
+        let jobs = json!({"jobs":[{"conclusion":"failure","steps":[]}]});
+        let dto = workflow_jobs_dto(&jobs).unwrap();
+        assert_eq!(dto["quota_exhausted_suspect"], true);
+        let with_step = workflow_jobs_dto(&json!({
+            "jobs": [{"conclusion": "failure", "steps": [{"name": "build", "conclusion": "failure"}]}]
+        }))
+        .unwrap();
+        assert_ne!(with_step["quota_exhausted_suspect"], true);
+        let mixed = workflow_jobs_dto(&json!({
+            "jobs": [
+                {"conclusion": "failure", "steps": []},
+                {"conclusion": "success", "steps": []}
+            ]
+        }))
+        .unwrap();
+        assert_ne!(mixed["quota_exhausted_suspect"], true);
+    }
+
+    #[test]
+    fn asset_file_names_reject_traversal() {
+        assert!(asset_file_name("../evil").is_err());
+        assert_eq!(asset_file_name("app.zip").unwrap(), "app.zip");
+    }
+
+    #[test]
+    fn variable_confirm_fields_omit_value() {
+        let fields = variable_confirm_fields("octocat/hello-world", "DEPLOY_HOST", "super-secret-host");
+        let rendered = fields
+            .iter()
+            .map(|(label, value)| format!("{label}={value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("DEPLOY_HOST"));
+        assert!(rendered.contains("octocat/hello-world"));
+        assert!(!rendered.contains("super-secret-host"));
+    }
+
+    #[test]
+    fn release_and_actions_writes_hidden_until_api_write() {
+        let hidden = tool_names(&GithubMcpPolicy {
+            enabled: true,
+            api_write_enabled: false,
+            ..Default::default()
+        });
+        for name in [
+            "github_release_publish",
+            "github_release_delete",
+            "github_release_asset_upload",
+            "github_workflow_dispatch",
+            "github_repository_dispatch",
+            "github_run_rerun",
+            "github_rerun_failed_jobs",
+            "github_run_cancel",
+            "github_repo_variable_set",
+            "github_repo_variable_delete",
+        ] {
+            assert!(!hidden.iter().any(|item| item == name), "{name} leaked");
+        }
+        for name in [
+            "github_release_generate_notes",
+            "github_run_artifacts",
+            "github_repo_variable_list",
+        ] {
+            assert!(hidden.iter().any(|item| item == name), "{name} missing");
+        }
+    }
 
     #[test]
     fn repo_search_requires_q_and_is_low_risk() {
@@ -4036,8 +4908,8 @@ mod tests {
             .into_iter()
             .filter(|definition| definition["readOnly"] == true)
             .count();
-        // 22 original read-only tools, 5 new read tools, plus 13 read-only aliases.
-        assert_eq!(read_only, 40);
+        // 22 original read-only tools, 8 new read tools, plus 13 read-only aliases.
+        assert_eq!(read_only, 43);
     }
 
     #[test]
