@@ -12,7 +12,6 @@ const POLICY_KEY: &str = "github_mcp_policy";
 const API_BASE: &str = "https://api.github.com";
 const API_VERSION: &str = "2022-11-28";
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
-const MAX_REQUEST_BYTES: usize = 128 * 1024;
 const MAX_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_FILE_PUT_BYTES: usize = 48 * 1024;
 const MAX_DESCRIPTION_BYTES: usize = 2 * 1024;
@@ -2017,21 +2016,8 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let generate_release_notes = bool_arg(&args, "generate_release_notes", false)?;
             let make_latest =
                 enum_arg(&args, "make_latest", &["true", "false", "legacy"], "legacy")?;
-            let payload = github_confirm_payload(
-                "创建 GitHub Release",
-                "允许这次 GitHub 写操作？",
-                &[
-                    ("仓库", repository.clone()),
-                    ("标签", tag_name.clone()),
-                    ("草稿", if draft { "是".into() } else { "否".into() }),
-                    ("凭据", credential_label.clone()),
-                ],
-            );
-            if !crate::confirm::ask_payload(&payload) {
-                return Err("用户拒绝了这次 GitHub 写操作".into());
-            }
             let mut request = Map::new();
-            request.insert("tag_name".into(), Value::String(tag_name));
+            request.insert("tag_name".into(), Value::String(tag_name.clone()));
             if let Some(value) = target_commitish {
                 request.insert("target_commitish".into(), Value::String(value));
             }
@@ -2048,13 +2034,29 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                 Value::Bool(generate_release_notes),
             );
             request.insert("make_latest".into(), Value::String(make_latest));
-            let request = Value::Object(request);
-            post_json(
-                &token,
-                &format!("/repos/{repository}/releases"),
-                &request,
-                |value| release_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into()),
-            )
+            let path = format!("/repos/{repository}/releases");
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).send(
+                &crate::github_api::Call {
+                    method: crate::github_api::Method::Post,
+                    path,
+                    query: Vec::new(),
+                    body: Some(crate::github_api::Body::Json(Value::Object(request))),
+                    ok: &[201],
+                    allow_missing_confirm: false,
+                },
+                Some(&crate::github_api::Confirm {
+                    title: "创建 GitHub Release".into(),
+                    prompt: "允许这次 GitHub 写操作？".into(),
+                    fields: vec![
+                        ("仓库".into(), repository),
+                        ("标签".into(), tag_name),
+                        ("草稿".into(), if draft { "是".into() } else { "否".into() }),
+                        ("凭据".into(), credential_label),
+                    ],
+                }),
+            )?;
+            let dto = release_dto(&value).ok_or_else(|| "GitHub 响应格式不正确".to_string())?;
+            Ok((status, dto))
         }
         "github_issue_create" => {
             let repository = repository_args(&args)?;
@@ -2910,24 +2912,6 @@ fn prepare(session: &Session, name: &str, args: &Value) -> Result<(String, Strin
     validate_arguments(&definition["inputSchema"], args)?;
     let resolved = resolve_github_credential(session, args)?;
     Ok((resolved.token, resolved.title))
-}
-
-fn github_confirm_payload(
-    title: &str,
-    prompt: &str,
-    fields: &[(&str, String)],
-) -> crate::confirm::ConfirmPayload {
-    crate::confirm::ConfirmPayload {
-        title: title.to_string(),
-        prompt: prompt.to_string(),
-        fields: fields
-            .iter()
-            .map(|(label, value)| crate::confirm::ConfirmField {
-                label: (*label).to_string(),
-                value: value.clone(),
-            })
-            .collect(),
-    }
 }
 
 fn audit_context(args: &Value) -> GithubAuditContext {
@@ -4227,59 +4211,6 @@ fn request_json<T>(
         }
         Err(_) => return Err("GitHub 网络请求失败".into()),
     };
-    if truncated {
-        return Err("GitHub 响应超过安全大小限制".into());
-    }
-    let value: Value =
-        serde_json::from_slice(&body).map_err(|_| "GitHub 响应不是有效 JSON".to_string())?;
-    map(&value)
-        .map(|value| (status, value))
-        .map_err(|error| format!("GitHub 响应处理失败: {error}"))
-}
-
-fn post_json<T>(
-    token: &str,
-    path: &str,
-    request: &Value,
-    map: impl FnOnce(&Value) -> Result<T, String>,
-) -> Result<(u16, T), String> {
-    let target = parse_http_url(&format!("{API_BASE}{path}"), true)?;
-    if target.scheme != "https" || target.host != "api.github.com" || target.port != 443 {
-        return Err("GitHub API 目标不合法".into());
-    }
-    assert_public_target(&target)?;
-    let body = serde_json::to_vec(request).map_err(|_| "GitHub 请求体无效".to_string())?;
-    if body.len() > MAX_REQUEST_BYTES {
-        return Err("GitHub 请求体超过安全大小限制".into());
-    }
-    let agent = ureq::builder()
-        .redirects(0)
-        .timeout(Duration::from_secs(15))
-        .timeout_connect(Duration::from_secs(8))
-        .resolver(PublicResolver)
-        .user_agent(concat!("Sealbox/", env!("CARGO_PKG_VERSION")))
-        .build();
-    let response = agent
-        .post(&format!("{API_BASE}{path}"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("Accept", "application/vnd.github+json")
-        .set("Content-Type", "application/json")
-        .set("X-GitHub-Api-Version", API_VERSION)
-        .send_bytes(&body);
-    let (status, body, truncated) = match response {
-        Ok(response) => read_response(response),
-        Err(ureq::Error::Status(status, response)) => {
-            let (_, body, truncated) = read_response(response);
-            return Err(redact_text(
-                &github_error(status, &body, truncated),
-                &[token],
-            ));
-        }
-        Err(_) => return Err("GitHub 网络请求失败".into()),
-    };
-    if status != 201 {
-        return Err(format!("GitHub 写入返回异常状态 {status}"));
-    }
     if truncated {
         return Err("GitHub 响应超过安全大小限制".into());
     }
