@@ -14,6 +14,7 @@ const API_VERSION: &str = "2022-11-28";
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_REQUEST_BYTES: usize = 128 * 1024;
 const MAX_CONTENT_BYTES: usize = 64 * 1024;
+const MAX_FILE_PUT_BYTES: usize = 48 * 1024;
 const MAX_DESCRIPTION_BYTES: usize = 2 * 1024;
 const MAX_RELEASE_BODY_BYTES: usize = 64 * 1024;
 const MAX_RELEASE_TAG_CHARS: usize = 200;
@@ -897,6 +898,70 @@ pub fn api_tool_definitions() -> Vec<Value> {
             ),
         ),
         write_tool(
+            "github_file_put",
+            "创建或更新仓库文件（PUT /repos/{owner}/{repo}/contents/{path}）。content 为明文，最多 48 KiB，会编码成 Base64 再提交。新建不要传 sha；更新必须传 40 位 sha；空字符串会拒绝。每次都会弹出 Sealbox 桌面确认，确认框不含文件内容。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("path", string_schema(1, 500)),
+                    ("content", string_schema(0, MAX_FILE_PUT_BYTES as u64)),
+                    ("message", string_schema(1, 256)),
+                    ("sha", string_schema(40, 40)),
+                    ("branch", string_schema(1, 200)),
+                ],
+                &["repo", "path", "content", "message"],
+            ),
+        ),
+        write_tool(
+            "github_file_delete",
+            "删除仓库文件（DELETE /repos/{owner}/{repo}/contents/{path}）。必须提供当前文件的 40 位 sha。每次都会弹出 Sealbox 桌面确认，确认框不含文件内容。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("path", string_schema(1, 500)),
+                    ("message", string_schema(1, 256)),
+                    ("sha", string_schema(40, 40)),
+                    ("branch", string_schema(1, 200)),
+                ],
+                &["repo", "path", "message", "sha"],
+            ),
+        ),
+        write_tool(
+            "github_ref_create",
+            "创建 git ref（POST /repos/{owner}/{repo}/git/refs）。git_ref 为 heads/分支 或 tags/标签，也可带 refs/ 前缀。sha 必须是 40 位十六进制。每次都会弹出 Sealbox 桌面确认。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("git_ref", string_schema(1, 200)),
+                    ("sha", string_schema(40, 40)),
+                ],
+                &["repo", "git_ref", "sha"],
+            ),
+        ),
+        write_tool(
+            "github_ref_delete",
+            "删除 git ref（DELETE /repos/{owner}/{repo}/git/refs/{ref}）。git_ref 为 heads/分支 或 tags/标签。每次都会弹出 Sealbox 桌面确认。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("git_ref", string_schema(1, 200)),
+                ],
+                &["repo", "git_ref"],
+            ),
+        ),
+        write_tool(
             "github_create_release",
             "在仓库创建 Release。用户说「打一个 GitHub Release」时调用。默认 draft=true。每次都会弹出 Sealbox 桌面确认。",
             schema(
@@ -1580,6 +1645,152 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             )?;
             let dto = repository_dto(&value).ok_or_else(|| "GitHub 响应格式不正确".to_string())?;
             Ok((status, dto))
+        }
+        "github_file_put" => {
+            let repository = repository_args(&args)?;
+            let path = path_arg(&args, "path")?;
+            let request = file_put_body(&args)?;
+            let branch = request
+                .get("branch")
+                .and_then(Value::as_str)
+                .unwrap_or("默认")
+                .to_string();
+            let mode = if request.get("sha").is_some() {
+                "更新"
+            } else {
+                "新建"
+            };
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).send(
+                &crate::github_api::Call {
+                    method: crate::github_api::Method::Put,
+                    path: format!("/repos/{repository}/contents/{path}"),
+                    query: Vec::new(),
+                    body: Some(crate::github_api::Body::Json(request)),
+                    ok: &[200, 201],
+                    allow_missing_confirm: false,
+                },
+                Some(&crate::github_api::Confirm {
+                    title: "写入 GitHub 文件".into(),
+                    prompt: "允许这次 GitHub 写操作？".into(),
+                    fields: vec![
+                        ("仓库".into(), repository),
+                        ("路径".into(), path),
+                        ("分支".into(), branch),
+                        ("操作".into(), mode.into()),
+                    ],
+                }),
+            )?;
+            Ok((status, file_write_dto(&value)?))
+        }
+        "github_file_delete" => {
+            let repository = repository_args(&args)?;
+            let path = path_arg(&args, "path")?;
+            let request = file_delete_body(&args)?;
+            let branch = request
+                .get("branch")
+                .and_then(Value::as_str)
+                .unwrap_or("默认")
+                .to_string();
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).send(
+                &crate::github_api::Call {
+                    method: crate::github_api::Method::Delete,
+                    path: format!("/repos/{repository}/contents/{path}"),
+                    query: Vec::new(),
+                    body: Some(crate::github_api::Body::Json(request)),
+                    ok: &[200],
+                    allow_missing_confirm: false,
+                },
+                Some(&crate::github_api::Confirm {
+                    title: "删除 GitHub 文件".into(),
+                    prompt: "允许这次 GitHub 写操作？".into(),
+                    fields: vec![
+                        ("仓库".into(), repository),
+                        ("路径".into(), path.clone()),
+                        ("分支".into(), branch),
+                    ],
+                }),
+            )?;
+            let sha = value
+                .get("commit")
+                .and_then(|commit| commit.get("sha"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let mut result = json!({"deleted": true, "path": path});
+            if let Some(sha) = sha {
+                result["sha"] = Value::String(sha);
+            }
+            Ok((status, result))
+        }
+        "github_ref_create" => {
+            let repository = repository_args(&args)?;
+            let git_ref = args
+                .get("git_ref")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "缺少参数 git_ref".to_string())?;
+            let normalized = normalize_git_ref(git_ref)?;
+            let full_ref = format!("refs/{normalized}");
+            let sha = normalize_full_sha(
+                args.get("sha")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "缺少参数 sha".to_string())?,
+            )?;
+            let preview: String = sha.chars().take(12).collect();
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).send(
+                &crate::github_api::Call {
+                    method: crate::github_api::Method::Post,
+                    path: format!("/repos/{repository}/git/refs"),
+                    query: Vec::new(),
+                    body: Some(crate::github_api::Body::Json(
+                        json!({"ref": full_ref, "sha": sha}),
+                    )),
+                    ok: &[201],
+                    allow_missing_confirm: false,
+                },
+                Some(&crate::github_api::Confirm {
+                    title: "创建 GitHub ref".into(),
+                    prompt: "允许这次 GitHub 写操作？".into(),
+                    fields: vec![
+                        ("仓库".into(), repository),
+                        ("ref".into(), full_ref),
+                        ("sha".into(), preview),
+                    ],
+                }),
+            )?;
+            Ok((
+                status,
+                json!({
+                    "ref": limited_string(value.get("ref")),
+                    "sha": limited_string(value.get("object").and_then(|item| item.get("sha")))
+                }),
+            ))
+        }
+        "github_ref_delete" => {
+            let repository = repository_args(&args)?;
+            let git_ref = args
+                .get("git_ref")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "缺少参数 git_ref".to_string())?;
+            let normalized = normalize_git_ref(git_ref)?;
+            let encoded = percent_encode(&normalized, true);
+            let (status, _value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).send(
+                &crate::github_api::Call {
+                    method: crate::github_api::Method::Delete,
+                    path: format!("/repos/{repository}/git/refs/{encoded}"),
+                    query: Vec::new(),
+                    body: None,
+                    ok: &[204],
+                    allow_missing_confirm: false,
+                },
+                Some(&crate::github_api::Confirm {
+                    title: "删除 GitHub ref".into(),
+                    prompt: "允许这次 GitHub 写操作？".into(),
+                    fields: vec![
+                        ("仓库".into(), repository),
+                        ("ref".into(), format!("refs/{normalized}")),
+                    ],
+                }),
+            )?;
+            Ok((status, json!({"deleted": true, "ref": normalized})))
         }
         "github_repo_update" => {
             let repository = repository_args(&args)?;
@@ -2319,6 +2530,93 @@ fn optional_ref(args: &Value) -> Result<Option<String>, String> {
         return Err("ref 格式不合法".into());
     }
     Ok(Some(percent_encode(reference, false)))
+}
+
+pub(crate) fn normalize_full_sha(value: &str) -> Result<String, String> {
+    if value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(value.to_string())
+    } else {
+        Err("sha 必须是 40 位十六进制".into())
+    }
+}
+
+fn optional_branch(args: &Value) -> Result<Option<String>, String> {
+    let Some(value) = args.get("branch") else {
+        return Ok(None);
+    };
+    let branch = value
+        .as_str()
+        .ok_or_else(|| "参数 branch 必须是字符串".to_string())?;
+    if branch.is_empty()
+        || branch.len() > 200
+        || branch.contains("..")
+        || branch.contains('%')
+        || branch.contains('\\')
+        || branch.chars().any(char::is_control)
+    {
+        return Err("参数 branch 长度或格式不合法".into());
+    }
+    Ok(Some(branch.to_string()))
+}
+
+pub(crate) fn file_put_body(args: &Value) -> Result<Value, String> {
+    let sha = match args.get("sha") {
+        None => None,
+        Some(Value::String(sha)) if sha.is_empty() => {
+            return Err("sha 必须是 40 位十六进制".into());
+        }
+        Some(value) => {
+            let sha = value
+                .as_str()
+                .ok_or_else(|| "参数 sha 必须是字符串".to_string())?;
+            Some(normalize_full_sha(sha)?)
+        }
+    };
+    let content = args
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "缺少参数 content".to_string())?;
+    if content.len() > MAX_FILE_PUT_BYTES || content.contains('\0') {
+        return Err("参数 content 超过 48 KiB 或格式不合法".into());
+    }
+    let message = required_text(args, "message", 256)?;
+    let mut request = Map::new();
+    request.insert("message".into(), Value::String(message));
+    request.insert(
+        "content".into(),
+        Value::String(base64::engine::general_purpose::STANDARD.encode(content.as_bytes())),
+    );
+    if let Some(sha) = sha {
+        request.insert("sha".into(), Value::String(sha));
+    }
+    if let Some(branch) = optional_branch(args)? {
+        request.insert("branch".into(), Value::String(branch));
+    }
+    Ok(Value::Object(request))
+}
+
+fn file_delete_body(args: &Value) -> Result<Value, String> {
+    let message = required_text(args, "message", 256)?;
+    let sha = args
+        .get("sha")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "缺少参数 sha".to_string())?;
+    let mut request = Map::new();
+    request.insert("message".into(), Value::String(message));
+    request.insert("sha".into(), Value::String(normalize_full_sha(sha)?));
+    if let Some(branch) = optional_branch(args)? {
+        request.insert("branch".into(), Value::String(branch));
+    }
+    Ok(Value::Object(request))
+}
+
+fn file_write_dto(value: &Value) -> Result<Value, String> {
+    let content = value.get("content").unwrap_or(value);
+    Ok(json!({
+        "path": limited_string(content.get("path").or_else(|| value.get("path"))),
+        "sha": limited_string(content.get("sha").or_else(|| value.get("sha"))),
+        "html_url": limited_string(content.get("html_url").or_else(|| value.get("html_url"))),
+    }))
 }
 
 pub(crate) fn normalize_git_ref(value: &str) -> Result<String, String> {
@@ -3324,6 +3622,67 @@ mod tests {
     fn ref_get_strips_refs_prefix() {
         assert_eq!(normalize_git_ref("refs/heads/main").unwrap(), "heads/main");
         assert!(normalize_git_ref("heads/../main").is_err());
+    }
+
+    #[test]
+    fn file_put_requires_sha_when_updating() {
+        let error = file_put_body(&json!({"path":"README.md","content":"hi","sha":""})).unwrap_err();
+        assert!(error.contains("sha"));
+    }
+
+    #[test]
+    fn ref_create_rejects_short_sha() {
+        assert!(normalize_full_sha("abc").is_err());
+        assert_eq!(normalize_full_sha(&"a".repeat(40)).unwrap().len(), 40);
+    }
+
+    #[test]
+    fn file_put_body_encodes_content_and_omits_missing_sha() {
+        let body = file_put_body(&json!({"path":"README.md","content":"hi","message":"add readme"})).unwrap();
+        assert_eq!(body["content"], "aGk=");
+        assert!(body.get("sha").is_none());
+        let sha = "a".repeat(40);
+        let updating = file_put_body(&json!({
+            "path": "README.md",
+            "content": "hi",
+            "message": "update readme",
+            "sha": sha
+        }))
+        .unwrap();
+        assert_eq!(updating["sha"], sha);
+        let huge = "x".repeat(48 * 1024 + 1);
+        let error = file_put_body(&json!({"path":"README.md","content":huge,"message":"too big"})).unwrap_err();
+        assert!(error.contains("content") || error.contains("48") || error.contains("字节"), "{error}");
+    }
+
+    #[test]
+    fn file_and_ref_writes_hidden_until_api_write() {
+        let hidden = tool_names(&GithubMcpPolicy {
+            enabled: true,
+            api_write_enabled: false,
+            ..Default::default()
+        });
+        for name in [
+            "github_file_put",
+            "github_file_delete",
+            "github_ref_create",
+            "github_ref_delete",
+        ] {
+            assert!(!hidden.iter().any(|item| item == name), "{name} leaked");
+        }
+        let visible = tool_names(&GithubMcpPolicy {
+            enabled: true,
+            api_write_enabled: true,
+            ..Default::default()
+        });
+        for name in [
+            "github_file_put",
+            "github_file_delete",
+            "github_ref_create",
+            "github_ref_delete",
+        ] {
+            assert!(visible.iter().any(|item| item == name), "{name} missing");
+        }
     }
 
     #[test]
