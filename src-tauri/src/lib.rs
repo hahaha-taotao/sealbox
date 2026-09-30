@@ -10,6 +10,7 @@ pub mod db;
 pub mod extension_install;
 pub mod fill;
 pub mod git_workspace;
+pub mod github_api;
 pub mod github_mcp;
 pub mod hello;
 pub mod http_guard;
