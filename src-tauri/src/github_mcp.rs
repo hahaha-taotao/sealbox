@@ -398,12 +398,32 @@ pub fn api_tool_definitions() -> Vec<Value> {
                 &[
                     ("credential", credential_prop()),
                     ("credential_id", credential_id_prop()),
+                    ("type", json!({"type":"string","enum":["all","owner","public","private","member"],"description":"仓库范围，原样传给 GitHub type 参数"})),
                     ("visibility", json!({"type":"string","enum":["all","public","private"],"default":"all"})),
                     ("affiliation", json!({"type":"string","enum":["owner","collaborator","organization_member"],"default":"owner"})),
+                    ("sort", json!({"type":"string","enum":["created","updated","pushed","full_name"]})),
+                    ("direction", json!({"type":"string","enum":["asc","desc"]})),
+                    ("name_contains", string_schema(1, 200)),
                     ("page", json!({"type":"integer","minimum":1,"maximum":100,"default":1})),
                     ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":30})),
                 ],
                 &[],
+            ),
+        ),
+        tool(
+            "github_repo_search",
+            "按关键词搜索 GitHub 仓库（服务端搜索）。回答「有没有叫 X 的仓库」时调用。只返回仓库摘要，不含源码。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("q", string_schema(1, 256)),
+                    ("sort", json!({"type":"string","enum":["stars","forks","help-wanted-issues","updated"]})),
+                    ("order", json!({"type":"string","enum":["asc","desc"]})),
+                    ("page", json!({"type":"integer","minimum":1,"maximum":100,"default":1})),
+                    ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":30})),
+                ],
+                &["q"],
             ),
         ),
         tool(
@@ -444,10 +464,76 @@ pub fn api_tool_definitions() -> Vec<Value> {
                     ("repo", repo_prop()),
                     ("owner", string_schema(1, 100)),
                     ("state", json!({"type":"string","enum":["open","closed","all"],"default":"open"})),
+                    ("labels", string_schema(1, 400)),
+                    ("assignee", string_schema(1, 100)),
+                    ("creator", string_schema(1, 100)),
+                    ("since", string_schema(1, 40)),
+                    ("sort", json!({"type":"string","enum":["created","updated","comments"]})),
+                    ("direction", json!({"type":"string","enum":["asc","desc"]})),
                     ("page", json!({"type":"integer","minimum":1,"maximum":100,"default":1})),
                     ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":30})),
                 ],
                 &["repo"],
+            ),
+        ),
+        tool(
+            "github_commits_list",
+            "列出仓库提交：SHA、截断后的说明、作者登录名和链接。需要看某条分支最近提交时调用。不含 patch。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("sha", string_schema(1, 200)),
+                    ("page", json!({"type":"integer","minimum":1,"maximum":100,"default":1})),
+                    ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":30})),
+                ],
+                &["repo"],
+            ),
+        ),
+        tool(
+            "github_branches_list",
+            "列出仓库分支名、顶端 SHA 和是否受保护。不含提交内容。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("page", json!({"type":"integer","minimum":1,"maximum":100,"default":1})),
+                    ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":30})),
+                ],
+                &["repo"],
+            ),
+        ),
+        tool(
+            "github_ref_get",
+            "读取一个 git ref 指向的 commit SHA。git_ref 用 heads/main 或 tags/v1.0.0，也可带 refs/ 前缀。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("git_ref", string_schema(1, 200)),
+                ],
+                &["repo", "git_ref"],
+            ),
+        ),
+        tool(
+            "github_billing_actions",
+            "查询 GitHub Actions 用量。不传 year 和 month 时是本年至今，不是当月；要当月用量必须同时传 year 和 month。没有剩余分钟数字段。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("account", string_schema(1, 100)),
+                    ("is_org", json!({"type":"boolean","default":false})),
+                    ("year", json!({"type":"integer","minimum":2020,"maximum":2100})),
+                    ("month", json!({"type":"integer","minimum":1,"maximum":12})),
+                ],
+                &[],
             ),
         ),
         tool(
@@ -1355,21 +1441,83 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                 "owner",
             )?;
             let (page, per_page) = page_args(&args)?;
-            let path = format!(
-                "/user/repos?visibility={visibility}&affiliation={affiliation}&page={page}&per_page={per_page}"
-            );
-            request_json(&token, &path, |value| {
-                let repos = value
-                    .as_array()
-                    .ok_or_else(|| "GitHub 响应格式不正确".to_string())?;
-                let items: Vec<Value> = repos
-                    .iter()
-                    .filter_map(repository_dto)
-                    .take(per_page as usize)
-                    .collect();
-                let count = items.len();
-                Ok(json!({"repositories": items, "count": count}))
-            })
+            let name_contains = optional_query_text(&args, "name_contains", 200)?;
+            let mut query = vec![
+                ("visibility".to_string(), visibility),
+                ("affiliation".to_string(), affiliation),
+                ("page".to_string(), page.to_string()),
+                ("per_page".to_string(), per_page.to_string()),
+            ];
+            if let Some(kind) = optional_enum(
+                &args,
+                "type",
+                &["all", "owner", "public", "private", "member"],
+            )? {
+                query.push(("type".to_string(), kind));
+            }
+            if let Some(sort) =
+                optional_enum(&args, "sort", &["created", "updated", "pushed", "full_name"])?
+            {
+                query.push(("sort".to_string(), sort));
+            }
+            if let Some(direction) = optional_enum(&args, "direction", &["asc", "desc"])? {
+                query.push(("direction".to_string(), direction));
+            }
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone())
+                .get("/user/repos", query)?;
+            let repos = value
+                .as_array()
+                .ok_or_else(|| "GitHub 响应格式不正确".to_string())?;
+            let items: Vec<Value> = repos
+                .iter()
+                .filter_map(repository_dto)
+                .filter(|item| match name_contains.as_deref() {
+                    Some(needle) => item
+                        .get("full_name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| name.contains(needle)),
+                    None => true,
+                })
+                .take(per_page as usize)
+                .collect();
+            let count = items.len();
+            Ok((status, json!({"repositories": items, "count": count})))
+        }
+        "github_repo_search" => {
+            let query_text = required_text(&args, "q", 256)?;
+            let (page, per_page) = page_args(&args)?;
+            let mut query = vec![
+                ("q".to_string(), query_text),
+                ("page".to_string(), page.to_string()),
+                ("per_page".to_string(), per_page.to_string()),
+            ];
+            if let Some(sort) = optional_enum(
+                &args,
+                "sort",
+                &["stars", "forks", "help-wanted-issues", "updated"],
+            )? {
+                query.push(("sort".to_string(), sort));
+            }
+            if let Some(order) = optional_enum(&args, "order", &["asc", "desc"])? {
+                query.push(("order".to_string(), order));
+            }
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone())
+                .get("/search/repositories", query)?;
+            let items = value
+                .get("items")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "GitHub 响应格式不正确".to_string())?
+                .iter()
+                .filter_map(repository_dto)
+                .take(per_page as usize)
+                .collect::<Vec<_>>();
+            Ok((
+                status,
+                json!({
+                    "total_count": value.get("total_count").and_then(Value::as_i64),
+                    "items": items
+                }),
+            ))
         }
         "github_repo_get" => {
             let repository = repository_args(&args)?;
@@ -1392,11 +1540,120 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let repository = repository_args(&args)?;
             let state = enum_arg(&args, "state", &["open", "closed", "all"], "open")?;
             let (page, per_page) = page_args(&args)?;
-            let endpoint =
-                format!("/repos/{repository}/issues?state={state}&page={page}&per_page={per_page}");
-            request_json(&token, &endpoint, |value| {
-                list_dto(value, per_page, issue_dto)
-            })
+            let mut query = vec![
+                ("state".to_string(), state),
+                ("page".to_string(), page.to_string()),
+                ("per_page".to_string(), per_page.to_string()),
+            ];
+            for name in ["labels", "assignee", "creator", "since"] {
+                let max = match name {
+                    "labels" => 400,
+                    "since" => 40,
+                    _ => 100,
+                };
+                if let Some(value) = optional_query_text(&args, name, max)? {
+                    query.push((name.to_string(), value));
+                }
+            }
+            if let Some(sort) = optional_enum(&args, "sort", &["created", "updated", "comments"])? {
+                query.push(("sort".to_string(), sort));
+            }
+            if let Some(direction) = optional_enum(&args, "direction", &["asc", "desc"])? {
+                query.push(("direction".to_string(), direction));
+            }
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone())
+                .get(&format!("/repos/{repository}/issues"), query)?;
+            Ok((status, list_dto(&value, per_page, issue_dto)?))
+        }
+        "github_commits_list" => {
+            let repository = repository_args(&args)?;
+            let (page, per_page) = page_args(&args)?;
+            let mut query = vec![
+                ("page".to_string(), page.to_string()),
+                ("per_page".to_string(), per_page.to_string()),
+            ];
+            if let Some(sha) = optional_query_text(&args, "sha", 200)? {
+                query.push(("sha".to_string(), sha));
+            }
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone())
+                .get(&format!("/repos/{repository}/commits"), query)?;
+            let items = value
+                .as_array()
+                .ok_or_else(|| "GitHub 响应格式不正确".to_string())?
+                .iter()
+                .filter_map(commit_summary_dto)
+                .take(per_page as usize)
+                .collect::<Vec<_>>();
+            let count = items.len();
+            Ok((status, json!({"items": items, "count": count})))
+        }
+        "github_branches_list" => {
+            let repository = repository_args(&args)?;
+            let (page, per_page) = page_args(&args)?;
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone())
+                .get(
+                    &format!("/repos/{repository}/branches"),
+                    vec![
+                        ("page".to_string(), page.to_string()),
+                        ("per_page".to_string(), per_page.to_string()),
+                    ],
+                )?;
+            let items = value
+                .as_array()
+                .ok_or_else(|| "GitHub 响应格式不正确".to_string())?
+                .iter()
+                .filter_map(branch_dto)
+                .take(per_page as usize)
+                .collect::<Vec<_>>();
+            let count = items.len();
+            Ok((status, json!({"items": items, "count": count})))
+        }
+        "github_ref_get" => {
+            let repository = repository_args(&args)?;
+            let git_ref = args
+                .get("git_ref")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "缺少参数 git_ref".to_string())?;
+            let normalized = normalize_git_ref(git_ref)?;
+            let encoded = percent_encode(&normalized, true);
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone())
+                .get(
+                    &format!("/repos/{repository}/git/ref/{encoded}"),
+                    Vec::new(),
+                )?;
+            Ok((
+                status,
+                json!({
+                    "ref": limited_string(value.get("ref")),
+                    "sha": limited_string(value.get("object").and_then(|item| item.get("sha")))
+                }),
+            ))
+        }
+        "github_billing_actions" => {
+            let period = billing_query(&args)?;
+            let is_org = bool_arg(&args, "is_org", false)?;
+            let account = match optional_query_text(&args, "account", 100)? {
+                Some(account) => account,
+                None => {
+                    let (_, user) = crate::github_api::Github::open(token.clone(), credential_label.clone())
+                        .get("/user", Vec::new())?;
+                    user.get("login")
+                        .and_then(Value::as_str)
+                        .filter(|login| !login.is_empty())
+                        .ok_or_else(|| "GitHub 账号 login 不可用".to_string())?
+                        .to_string()
+                }
+            };
+            if !valid_segment(&account) {
+                return Err("参数 account 格式不合法".into());
+            }
+            let scope = if is_org { "orgs" } else { "users" };
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone())
+                .get(
+                    &format!("/{scope}/{account}/settings/billing/actions"),
+                    period,
+                )?;
+            Ok((status, billing_dto(&value, args.get("month").is_none())?))
         }
         "github_pulls_list" => {
             let repository = repository_args(&args)?;
@@ -1869,6 +2126,96 @@ fn optional_ref(args: &Value) -> Result<Option<String>, String> {
         return Err("ref 格式不合法".into());
     }
     Ok(Some(percent_encode(reference, false)))
+}
+
+pub(crate) fn normalize_git_ref(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    let reference = trimmed.strip_prefix("refs/").unwrap_or(trimmed);
+    if reference.is_empty()
+        || reference.len() > 200
+        || reference.contains("..")
+        || reference.contains('\\')
+        || reference.contains('@')
+        || reference.contains("://")
+        || reference.chars().any(char::is_control)
+        || reference
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == ".")
+    {
+        return Err("git_ref 格式不合法".into());
+    }
+    let kind = reference
+        .split_once('/')
+        .filter(|(_, name)| !name.is_empty())
+        .map(|(kind, _)| kind)
+        .ok_or_else(|| "git_ref 必须是 heads/分支 或 tags/标签".to_string())?;
+    if kind != "heads" && kind != "tags" {
+        return Err("git_ref 必须是 heads/分支 或 tags/标签".into());
+    }
+    Ok(reference.to_string())
+}
+
+pub(crate) fn billing_query(args: &Value) -> Result<Vec<(String, String)>, String> {
+    let year = args.get("year");
+    let month = args.get("month");
+    match (year, month) {
+        (None, None) => Ok(Vec::new()),
+        (Some(year), Some(month)) => {
+            let year = year
+                .as_u64()
+                .filter(|value| (2020..=2100).contains(value))
+                .ok_or_else(|| "参数 year 超出范围".to_string())?;
+            let month = month
+                .as_u64()
+                .filter(|value| (1..=12).contains(value))
+                .ok_or_else(|| "参数 month 超出范围".to_string())?;
+            Ok(vec![
+                ("year".to_string(), year.to_string()),
+                ("month".to_string(), month.to_string()),
+            ])
+        }
+        _ => Err("year 与 month 必须同时提供".into()),
+    }
+}
+
+fn optional_enum(args: &Value, name: &str, allowed: &[&str]) -> Result<Option<String>, String> {
+    if args.get(name).is_none() {
+        return Ok(None);
+    }
+    enum_arg(args, name, allowed, "").map(Some)
+}
+
+fn optional_query_text(args: &Value, name: &str, max: usize) -> Result<Option<String>, String> {
+    let Some(value) = args.get(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .ok_or_else(|| format!("参数 {name} 必须是字符串"))?;
+    if value.is_empty()
+        || value.chars().count() > max
+        || value.chars().any(|character| character == '\n' || character == '\r' || character == '\0')
+    {
+        return Err(format!("参数 {name} 长度或格式不合法"));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn billing_dto(value: &Value, year_to_date: bool) -> Result<Value, String> {
+    let mut object = Map::new();
+    for key in [
+        "total_minutes_used",
+        "total_paid_minutes_used",
+        "included_minutes",
+    ] {
+        if let Some(field) = value.get(key) {
+            object.insert(key.to_string(), field.clone());
+        }
+    }
+    if year_to_date {
+        object.insert("period".to_string(), Value::String("year_to_date".into()));
+    }
+    Ok(Value::Object(object))
 }
 
 fn percent_encode(value: &str, keep_slash: bool) -> String {
@@ -2358,6 +2705,29 @@ fn pull_file_dto(value: &Value) -> Option<Value> {
     .ok()
 }
 
+fn commit_summary_dto(value: &Value) -> Option<Value> {
+    let message = value
+        .get("commit")
+        .and_then(|item| item.get("message"))
+        .and_then(Value::as_str)
+        .map(|message| truncate(message, 200));
+    serde_json::to_value(GithubCommitDto {
+        sha: limited_string(value.get("sha")),
+        message,
+        author: limited_string(value.get("author").and_then(|item| item.get("login"))),
+        html_url: limited_string(value.get("html_url")),
+    })
+    .ok()
+}
+
+fn branch_dto(value: &Value) -> Option<Value> {
+    Some(json!({
+        "name": limited_string(value.get("name")),
+        "sha": limited_string(value.get("commit").and_then(|item| item.get("sha"))),
+        "protected": value.get("protected").and_then(Value::as_bool)
+    }))
+}
+
 fn commit_dto(value: &Value) -> Option<Value> {
     let commit = value.get("commit");
     serde_json::to_value(GithubCommitDto {
@@ -2615,6 +2985,62 @@ fn truncate(value: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use crate::session::Session;
+
+    #[test]
+    fn repo_search_requires_q_and_is_low_risk() {
+        let def = api_tool_definitions()
+            .into_iter()
+            .find(|t| t["name"] == "github_repo_search")
+            .unwrap();
+        assert_eq!(def["readOnly"], true);
+        assert_eq!(def["risk"], "low");
+        let error = validate_tool_arguments(&def["inputSchema"], &json!({})).unwrap_err();
+        assert!(error.contains("q"));
+    }
+
+    #[test]
+    fn billing_rejects_month_without_year() {
+        let error = billing_query(&json!({"month": 9})).unwrap_err();
+        assert!(error.contains("year"));
+    }
+
+    #[test]
+    fn billing_rejects_year_without_month_and_accepts_both() {
+        let error = billing_query(&json!({"year": 2026})).unwrap_err();
+        assert!(error.contains("year"), "{error}");
+        let params = billing_query(&json!({"year": 2026, "month": 9})).unwrap();
+        assert!(params.iter().any(|(key, value)| key == "year" && value == "2026"));
+        assert!(params.iter().any(|(key, value)| key == "month" && value == "9"));
+    }
+
+    #[test]
+    fn ref_get_strips_refs_prefix() {
+        assert_eq!(normalize_git_ref("refs/heads/main").unwrap(), "heads/main");
+        assert!(normalize_git_ref("heads/../main").is_err());
+    }
+
+    #[test]
+    fn new_read_tools_stay_visible_without_api_write() {
+        let definitions = tool_definitions_for_policy(&GithubMcpPolicy {
+            enabled: true,
+            api_write_enabled: false,
+            ..Default::default()
+        });
+        for name in [
+            "github_repo_search",
+            "github_commits_list",
+            "github_branches_list",
+            "github_ref_get",
+            "github_billing_actions",
+        ] {
+            let definition = definitions
+                .iter()
+                .find(|definition| definition["name"] == name)
+                .unwrap_or_else(|| panic!("{name} missing"));
+            assert_eq!(definition["readOnly"], true);
+            assert_eq!(definition["risk"], "low");
+        }
+    }
 
     #[test]
     fn alias_collapses_to_canonical_name() {
@@ -2881,8 +3307,8 @@ mod tests {
             .into_iter()
             .filter(|definition| definition["readOnly"] == true)
             .count();
-        // 22 original read-only tools plus 13 read-only aliases.
-        assert_eq!(read_only, 35);
+        // 22 original read-only tools, 5 new read tools, plus 13 read-only aliases.
+        assert_eq!(read_only, 40);
     }
 
     #[test]
