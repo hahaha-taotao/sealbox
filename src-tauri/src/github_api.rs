@@ -230,7 +230,10 @@ impl Github {
             allow_missing_confirm: true,
         };
         self.require_confirm(&call, confirm)?;
-        let temp = dest.with_extension("part");
+        let temp = part_path(dest);
+        if temp.exists() {
+            return Err("下载临时文件已存在".into());
+        }
         let saved = match stream_download(&self.token, &url, &temp, cap) {
             Ok(saved) => saved,
             Err(error) => {
@@ -405,11 +408,13 @@ fn exchange(
         Err(error) => return Err(redact_text(&format!("GitHub 请求失败: {error}"), &[token])),
     };
     let status = response.status();
-    let bytes = read_limited(response, MAX_JSON);
-    Ok(HttpReply {
-        status,
-        body: bytes,
-    })
+    match read_limited(response, MAX_JSON) {
+        Ok(bytes) => Ok(HttpReply {
+            status,
+            body: bytes,
+        }),
+        Err(error) => Err(error),
+    }
 }
 
 fn probe_exchange(
@@ -427,10 +432,8 @@ fn probe_exchange(
             authorization: format!("Bearer {token}"),
             body: body.map(|item| item.bytes.clone()).unwrap_or_default(),
         };
-        let reply = (probe.reply)(&captured);
-        if reply.is_ok() {
-            probe.calls.push(captured);
-        }
+        probe.calls.push(captured);
+        let reply = (probe.reply)(&probe.calls.last().expect("just pushed"));
         Some(reply)
     })
 }
@@ -445,11 +448,25 @@ fn method_name(method: Method) -> &'static str {
     }
 }
 
-fn read_limited(response: ureq::Response, max: usize) -> Vec<u8> {
-    let mut reader = response.into_reader().take(max as u64);
+fn read_capped(mut reader: impl Read, max: usize) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
-    let _ = reader.read_to_end(&mut body);
-    body
+    let mut buffer = [0u8; 8192];
+    loop {
+        let n = reader
+            .read(&mut buffer)
+            .map_err(|e| format!("无法读取 GitHub 响应: {e}"))?;
+        if n == 0 {
+            return Ok(body);
+        }
+        if body.len().saturating_add(n) > max {
+            return Err(format!("GitHub 响应超过安全大小限制 {max} 字节"));
+        }
+        body.extend_from_slice(&buffer[..n]);
+    }
+}
+
+fn read_limited(response: ureq::Response, max: usize) -> Result<Vec<u8>, String> {
+    read_capped(response.into_reader(), max)
 }
 
 fn parse_ok_json(status: u16, body: &[u8], token: &str) -> Result<(u16, Value), String> {
@@ -494,6 +511,7 @@ fn truncate_utf8(text: &str, max: usize) -> String {
     text[..end].to_string()
 }
 
+#[derive(Debug)]
 struct Streamed {
     bytes: u64,
     sha256: String,
@@ -535,71 +553,70 @@ fn stream_download(token: &str, url: &str, temp: &Path, cap: u64) -> Result<Stre
     };
     if response.status() != 200 {
         let status = response.status();
-        let body = read_limited(response, MAX_JSON);
+        let body = read_limited(response, MAX_JSON)?;
         return Err(http_error(status, &body, token));
     }
-    if let Some(parent) = temp.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("无法创建下载目录: {e}"))?;
-        }
-    }
-    let mut file = std::fs::File::create(temp).map_err(|e| format!("无法写入下载文件: {e}"))?;
-    let mut reader = response.into_reader();
-    let mut hasher = Sha256::new();
-    let mut written = 0u64;
-    let mut buffer = [0u8; 8192];
-    loop {
-        let n = reader
-            .read(&mut buffer)
-            .map_err(|e| format!("无法读取下载: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        let next = written.saturating_add(n as u64);
-        if next > cap {
-            return Err(format!("下载超过 {cap} 字节上限"));
-        }
-        file.write_all(&buffer[..n])
-            .map_err(|e| format!("无法写入下载文件: {e}"))?;
-        hasher.update(&buffer[..n]);
-        written = next;
-    }
-    file.flush()
-        .map_err(|e| format!("无法写入下载文件: {e}"))?;
-    Ok(Streamed {
-        bytes: written,
-        sha256: hex::encode(hasher.finalize()),
-    })
+    write_reader_capped(temp, response.into_reader(), cap)
+}
+
+fn part_path(dest: &Path) -> PathBuf {
+    let mut name = dest
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| "download".into());
+    name.push(".part");
+    dest.with_file_name(name)
 }
 
 fn write_capped(temp: &Path, body: &[u8], cap: u64) -> Result<Streamed, String> {
-    if body.len() as u64 > cap {
-        return Err(format!("下载超过 {cap} 字节上限"));
+    write_reader_capped(temp, std::io::Cursor::new(body), cap)
+}
+
+fn write_reader_capped(temp: &Path, mut reader: impl Read, cap: u64) -> Result<Streamed, String> {
+    if temp.exists() {
+        return Err("下载临时文件已存在".into());
     }
     if let Some(parent) = temp.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|e| format!("无法创建下载目录: {e}"))?;
         }
     }
-    let mut file = std::fs::File::create(temp).map_err(|e| format!("无法写入下载文件: {e}"))?;
-    let mut written = 0u64;
-    let mut hasher = Sha256::new();
-    for chunk in body.chunks(8192) {
-        let next = written.saturating_add(chunk.len() as u64);
-        if next > cap {
-            return Err(format!("下载超过 {cap} 字节上限"));
+    let mut file = match std::fs::File::create(temp) {
+        Ok(file) => file,
+        Err(error) => return Err(format!("无法写入下载文件: {error}")),
+    };
+    let outcome = (|| {
+        let mut hasher = Sha256::new();
+        let mut written = 0u64;
+        let mut buffer = [0u8; 8192];
+        loop {
+            let n = reader
+                .read(&mut buffer)
+                .map_err(|e| format!("无法读取下载: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            let next = written.saturating_add(n as u64);
+            if next > cap {
+                return Err(format!("下载超过 {cap} 字节上限"));
+            }
+            file.write_all(&buffer[..n])
+                .map_err(|e| format!("无法写入下载文件: {e}"))?;
+            hasher.update(&buffer[..n]);
+            written = next;
         }
-        file.write_all(chunk)
+        file.flush()
             .map_err(|e| format!("无法写入下载文件: {e}"))?;
-        hasher.update(chunk);
-        written = next;
+        Ok(Streamed {
+            bytes: written,
+            sha256: hex::encode(hasher.finalize()),
+        })
+    })();
+    if outcome.is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(temp);
     }
-    file.flush()
-        .map_err(|e| format!("无法写入下载文件: {e}"))?;
-    Ok(Streamed {
-        bytes: written,
-        sha256: hex::encode(hasher.finalize()),
-    })
+    outcome
 }
 
 #[cfg(test)]
@@ -790,8 +807,46 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("超过"), "{error}");
         assert!(!dest.exists());
-        assert!(!dest.with_extension("part").exists());
+        assert!(!part_path(&dest).exists());
         assert_eq!(probe.calls().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn response_over_cap_is_not_parsed() {
+        let over = MAX_JSON + 1;
+        let reader = std::io::Cursor::new(vec![b'{'; over]);
+        let error = read_capped(reader, MAX_JSON).unwrap_err();
+        assert!(error.contains("超过"), "{error}");
+
+        let exact = read_capped(std::io::Cursor::new(vec![b'x'; MAX_JSON]), MAX_JSON).unwrap();
+        assert_eq!(exact.len(), MAX_JSON);
+    }
+
+    #[test]
+    fn chunked_download_over_cap_removes_part_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "sealbox-gh-part-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("logs.zip");
+        let temp = part_path(&dest);
+        let body = vec![b'a'; 20_000];
+        let error = write_capped(&temp, &body, 100).unwrap_err();
+        assert!(error.contains("超过"), "{error}");
+        assert!(!temp.exists(), "part file must be removed after the cap error");
+        assert!(!dest.exists());
+
+        let occupied = part_path(&dir.join("logs.tar"));
+        std::fs::write(&occupied, b"keep").unwrap();
+        let error = write_capped(&occupied, b"short", 100).unwrap_err();
+        assert!(error.contains("已存在"), "{error}");
+        assert_eq!(std::fs::read(&occupied).unwrap(), b"keep");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
