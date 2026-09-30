@@ -1,7 +1,7 @@
 # GitHub MCP 扩展路线
 
 日期：2026-09-20  
-状态：本文件是历史台账。当前范围以 [`docs/superpowers/specs/2026-09-30-github-mcp-sigil-refactor-design.md`](2026-09-30-github-mcp-sigil-refactor-design.md) 为准。
+状态：本文件是历史台账。当前范围以 [`docs/superpowers/specs/2026-09-30-github-mcp-sigil-refactor-design.md`](2026-09-30-github-mcp-sigil-refactor-design.md) 为准。当前版本的入口口径见根目录 `README.md`。
 
 ## 当前能力
 
