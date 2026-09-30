@@ -829,6 +829,74 @@ pub fn api_tool_definitions() -> Vec<Value> {
             ),
         ),
         write_tool(
+            "github_issue_update",
+            "更新已有 Issue 的状态、标题、正文或标签。只发送调用方提供的字段。每次都会弹出 Sealbox 桌面确认。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("number", json!({"type":"integer","minimum":1,"maximum":1000000000})),
+                    ("state", json!({"type":"string","enum":["open","closed"]})),
+                    ("title", string_schema(1, 256)),
+                    ("body", string_schema(0, MAX_RELEASE_BODY_BYTES as u64)),
+                    ("labels", json!({"type":"string","minLength":1,"maxLength":400,"description":"逗号分隔的标签名"})),
+                ],
+                &["repo", "number"],
+            ),
+        ),
+        write_tool(
+            "github_pr_merge",
+            "合并一个 Pull Request。merge_method 只能是 merge、squash 或 rebase，默认 merge。每次都会弹出 Sealbox 桌面确认。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("number", json!({"type":"integer","minimum":1,"maximum":1000000000})),
+                    ("merge_method", json!({"type":"string","enum":["merge","squash","rebase"],"default":"merge"})),
+                ],
+                &["repo", "number"],
+            ),
+        ),
+        write_tool(
+            "github_repo_create",
+            "在当前账号下创建私有仓库。拒绝 private=false。每次都会弹出 Sealbox 桌面确认。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("name", string_schema(1, 100)),
+                    ("description", string_schema(0, 2048)),
+                    ("private", json!({"type":"boolean"})),
+                ],
+                &["name"],
+            ),
+        ),
+        write_tool(
+            "github_repo_update",
+            "更新仓库设置。只发送调用方提供的字段。拒绝把仓库改为公开。每次都会弹出 Sealbox 桌面确认。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("description", string_schema(0, 2048)),
+                    ("homepage", string_schema(0, 2048)),
+                    ("default_branch", string_schema(1, 200)),
+                    ("private", json!({"type":"boolean"})),
+                    ("has_issues", json!({"type":"boolean"})),
+                    ("has_wiki", json!({"type":"boolean"})),
+                    ("has_projects", json!({"type":"boolean"})),
+                    ("archived", json!({"type":"boolean"})),
+                ],
+                &["repo"],
+            ),
+        ),
+        write_tool(
             "github_create_release",
             "在仓库创建 Release。用户说「打一个 GitHub Release」时调用。默认 draft=true。每次都会弹出 Sealbox 桌面确认。",
             schema(
@@ -1322,20 +1390,8 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let title = required_text(&args, "title", 256)?;
             let body = optional_release_body(&args)?;
             let labels = optional_csv(&args, "labels")?;
-            let payload = github_confirm_payload(
-                "创建 GitHub Issue",
-                "允许这次 GitHub 写操作？",
-                &[
-                    ("仓库", repository.clone()),
-                    ("标题", title.clone()),
-                    ("凭据", credential_label.clone()),
-                ],
-            );
-            if !crate::confirm::ask_payload(&payload) {
-                return Err("用户拒绝了这次 GitHub 写操作".into());
-            }
             let mut request = Map::new();
-            request.insert("title".into(), Value::String(title));
+            request.insert("title".into(), Value::String(title.clone()));
             if let Some(value) = body {
                 request.insert("body".into(), Value::String(value));
             }
@@ -1345,40 +1401,58 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                     Value::Array(labels.into_iter().map(Value::String).collect()),
                 );
             }
-            post_json(
-                &token,
-                &format!("/repos/{repository}/issues"),
-                &Value::Object(request),
-                |value| issue_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into()),
-            )
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).send(
+                &crate::github_api::Call {
+                    method: crate::github_api::Method::Post,
+                    path: format!("/repos/{repository}/issues"),
+                    query: Vec::new(),
+                    body: Some(crate::github_api::Body::Json(Value::Object(request))),
+                    ok: &[201],
+                    allow_missing_confirm: false,
+                },
+                Some(&crate::github_api::Confirm {
+                    title: "创建 GitHub Issue".into(),
+                    prompt: "允许这次 GitHub 写操作？".into(),
+                    fields: vec![
+                        ("仓库".into(), repository),
+                        ("标题".into(), title),
+                        ("凭据".into(), credential_label.clone()),
+                    ],
+                }),
+            )?;
+            let dto = issue_dto(&value).ok_or_else(|| "GitHub 响应格式不正确".to_string())?;
+            Ok((status, dto))
         }
         "github_issue_comment" => {
             let repository = repository_args(&args)?;
             let number = issue_number(&args)?;
             let body = required_text(&args, "body", MAX_RELEASE_BODY_BYTES)?;
-            let payload = github_confirm_payload(
-                "评论 GitHub Issue/PR",
-                "允许这次 GitHub 写操作？",
-                &[
-                    ("仓库", format!("{repository}#{number}")),
-                    ("凭据", credential_label.clone()),
-                ],
-            );
-            if !crate::confirm::ask_payload(&payload) {
-                return Err("用户拒绝了这次 GitHub 写操作".into());
-            }
-            post_json(
-                &token,
-                &format!("/repos/{repository}/issues/{number}/comments"),
-                &json!({"body": body}),
-                |value| {
-                    Ok(json!({
-                        "id": value.get("id").and_then(Value::as_i64),
-                        "html_url": limited_string(value.get("html_url")),
-                        "user": limited_string(value.get("user").and_then(|item| item.get("login"))),
-                    }))
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).send(
+                &crate::github_api::Call {
+                    method: crate::github_api::Method::Post,
+                    path: format!("/repos/{repository}/issues/{number}/comments"),
+                    query: Vec::new(),
+                    body: Some(crate::github_api::Body::Json(json!({"body": body}))),
+                    ok: &[201],
+                    allow_missing_confirm: false,
                 },
-            )
+                Some(&crate::github_api::Confirm {
+                    title: "评论 GitHub Issue/PR".into(),
+                    prompt: "允许这次 GitHub 写操作？".into(),
+                    fields: vec![
+                        ("仓库".into(), format!("{repository}#{number}")),
+                        ("凭据".into(), credential_label.clone()),
+                    ],
+                }),
+            )?;
+            Ok((
+                status,
+                json!({
+                    "id": value.get("id").and_then(Value::as_i64),
+                    "html_url": limited_string(value.get("html_url")),
+                    "user": limited_string(value.get("user").and_then(|item| item.get("login"))),
+                }),
+            ))
         }
         "github_pr_create" => {
             let repository = repository_args(&args)?;
@@ -1387,34 +1461,153 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let base = required_text(&args, "base", 200)?;
             let body = optional_release_body(&args)?;
             let draft = bool_arg(&args, "draft", true)?;
-            let payload = github_confirm_payload(
-                "创建 GitHub Pull Request",
-                "允许这次 GitHub 写操作？",
-                &[
-                    ("仓库", repository.clone()),
-                    ("分支", format!("{head} → {base}")),
-                    ("标题", title.clone()),
-                    ("草稿", if draft { "是".into() } else { "否".into() }),
-                    ("凭据", credential_label.clone()),
-                ],
-            );
-            if !crate::confirm::ask_payload(&payload) {
-                return Err("用户拒绝了这次 GitHub 写操作".into());
-            }
             let mut request = Map::new();
-            request.insert("title".into(), Value::String(title));
-            request.insert("head".into(), Value::String(head));
-            request.insert("base".into(), Value::String(base));
+            request.insert("title".into(), Value::String(title.clone()));
+            request.insert("head".into(), Value::String(head.clone()));
+            request.insert("base".into(), Value::String(base.clone()));
             request.insert("draft".into(), Value::Bool(draft));
             if let Some(value) = body {
                 request.insert("body".into(), Value::String(value));
             }
-            post_json(
-                &token,
-                &format!("/repos/{repository}/pulls"),
-                &Value::Object(request),
-                |value| pull_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into()),
-            )
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).send(
+                &crate::github_api::Call {
+                    method: crate::github_api::Method::Post,
+                    path: format!("/repos/{repository}/pulls"),
+                    query: Vec::new(),
+                    body: Some(crate::github_api::Body::Json(Value::Object(request))),
+                    ok: &[201],
+                    allow_missing_confirm: false,
+                },
+                Some(&crate::github_api::Confirm {
+                    title: "创建 GitHub Pull Request".into(),
+                    prompt: "允许这次 GitHub 写操作？".into(),
+                    fields: vec![
+                        ("仓库".into(), repository),
+                        ("分支".into(), format!("{head} → {base}")),
+                        ("标题".into(), title),
+                        (
+                            "草稿".into(),
+                            if draft { "是".into() } else { "否".into() },
+                        ),
+                        ("凭据".into(), credential_label.clone()),
+                    ],
+                }),
+            )?;
+            let dto = pull_dto(&value).ok_or_else(|| "GitHub 响应格式不正确".to_string())?;
+            Ok((status, dto))
+        }
+        "github_issue_update" => {
+            let repository = repository_args(&args)?;
+            let number = issue_number(&args)?;
+            let request = issue_update_body(&args)?;
+            let mut fields = vec![
+                ("仓库".into(), repository.clone()),
+                ("编号".into(), number.to_string()),
+            ];
+            if let Some(state) = request.get("state").and_then(Value::as_str) {
+                fields.push(("state".into(), state.to_string()));
+            } else if let Some(title) = request.get("title").and_then(Value::as_str) {
+                fields.push(("title".into(), title.to_string()));
+            } else {
+                fields.push(("正文".into(), "已提供".into()));
+            }
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).send(
+                &crate::github_api::Call {
+                    method: crate::github_api::Method::Patch,
+                    path: format!("/repos/{repository}/issues/{number}"),
+                    query: Vec::new(),
+                    body: Some(crate::github_api::Body::Json(request)),
+                    ok: &[200],
+                    allow_missing_confirm: false,
+                },
+                Some(&crate::github_api::Confirm {
+                    title: "更新 GitHub Issue".into(),
+                    prompt: "允许这次 GitHub 写操作？".into(),
+                    fields,
+                }),
+            )?;
+            let dto = issue_dto(&value).ok_or_else(|| "GitHub 响应格式不正确".to_string())?;
+            Ok((status, dto))
+        }
+        "github_pr_merge" => {
+            let repository = repository_args(&args)?;
+            let number = issue_number(&args)?;
+            let merge_method = merge_method_arg(&args)?;
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).send(
+                &crate::github_api::Call {
+                    method: crate::github_api::Method::Put,
+                    path: format!("/repos/{repository}/pulls/{number}/merge"),
+                    query: Vec::new(),
+                    body: Some(crate::github_api::Body::Json(
+                        json!({"merge_method": merge_method}),
+                    )),
+                    ok: &[200],
+                    allow_missing_confirm: false,
+                },
+                Some(&crate::github_api::Confirm {
+                    title: "合并 GitHub Pull Request".into(),
+                    prompt: "允许这次 GitHub 写操作？".into(),
+                    fields: vec![
+                        ("仓库".into(), repository),
+                        ("编号".into(), number.to_string()),
+                        ("方式".into(), merge_method),
+                    ],
+                }),
+            )?;
+            Ok((status, merge_dto(&value)?))
+        }
+        "github_repo_create" => {
+            let request = repo_create_body(&args)?;
+            let name = request
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).send(
+                &crate::github_api::Call {
+                    method: crate::github_api::Method::Post,
+                    path: "/user/repos".into(),
+                    query: Vec::new(),
+                    body: Some(crate::github_api::Body::Json(request)),
+                    ok: &[201],
+                    allow_missing_confirm: false,
+                },
+                Some(&crate::github_api::Confirm {
+                    title: "创建 GitHub 仓库".into(),
+                    prompt: "允许这次 GitHub 写操作？".into(),
+                    fields: vec![("仓库名".into(), name)],
+                }),
+            )?;
+            let dto = repository_dto(&value).ok_or_else(|| "GitHub 响应格式不正确".to_string())?;
+            Ok((status, dto))
+        }
+        "github_repo_update" => {
+            let repository = repository_args(&args)?;
+            let request = repo_update_body(&args)?;
+            let changed = request
+                .as_object()
+                .map(|object| object.keys().cloned().collect::<Vec<_>>().join(", "))
+                .unwrap_or_default();
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).send(
+                &crate::github_api::Call {
+                    method: crate::github_api::Method::Patch,
+                    path: format!("/repos/{repository}"),
+                    query: Vec::new(),
+                    body: Some(crate::github_api::Body::Json(request)),
+                    ok: &[200],
+                    allow_missing_confirm: false,
+                },
+                Some(&crate::github_api::Confirm {
+                    title: "更新 GitHub 仓库".into(),
+                    prompt: "允许这次 GitHub 写操作？".into(),
+                    fields: vec![
+                        ("仓库".into(), repository),
+                        ("字段".into(), changed),
+                    ],
+                }),
+            )?;
+            let dto = repository_dto(&value).ok_or_else(|| "GitHub 响应格式不正确".to_string())?;
+            Ok((status, dto))
         }
         "github_user_info" => {
             let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone())
@@ -2376,6 +2569,120 @@ fn optional_release_string(args: &Value, name: &str, max: usize) -> Result<Optio
     Ok(Some(value.to_string()))
 }
 
+pub(crate) fn issue_update_body(args: &Value) -> Result<Value, String> {
+    let mut request = Map::new();
+    if args.get("state").is_some() {
+        let state = args
+            .get("state")
+            .and_then(Value::as_str)
+            .filter(|value| matches!(*value, "open" | "closed"))
+            .ok_or_else(|| "参数 state 取值不合法".to_string())?;
+        request.insert("state".into(), Value::String(state.to_string()));
+    }
+    if args.get("title").is_some() {
+        request.insert(
+            "title".into(),
+            Value::String(required_text(args, "title", 256)?),
+        );
+    }
+    if let Some(body) = optional_release_body(args)? {
+        request.insert("body".into(), Value::String(body));
+    }
+    if args.get("labels").is_some() {
+        let labels = optional_csv(args, "labels")?;
+        request.insert(
+            "labels".into(),
+            Value::Array(labels.into_iter().map(Value::String).collect()),
+        );
+    }
+    if request.is_empty() {
+        return Err("缺少要更新的 Issue 字段".into());
+    }
+    Ok(Value::Object(request))
+}
+
+pub(crate) fn merge_method_arg(args: &Value) -> Result<String, String> {
+    let method = args
+        .get("merge_method")
+        .and_then(Value::as_str)
+        .unwrap_or("merge");
+    if !matches!(method, "merge" | "squash" | "rebase") {
+        return Err("参数 merge_method 取值不合法".into());
+    }
+    Ok(method.to_string())
+}
+
+fn merge_dto(value: &Value) -> Result<Value, String> {
+    Ok(json!({
+        "sha": limited_string(value.get("sha")),
+        "merged": value.get("merged").and_then(Value::as_bool),
+        "message": limited_string(value.get("message")),
+    }))
+}
+
+pub(crate) fn repo_create_body(args: &Value) -> Result<Value, String> {
+    if args.get("private") == Some(&Value::Bool(false)) {
+        return Err("仓库必须是私有的，拒绝创建公开仓库".into());
+    }
+    let name = required_text(args, "name", 100)?;
+    let mut request = Map::new();
+    request.insert("name".into(), Value::String(name));
+    request.insert("private".into(), Value::Bool(true));
+    if let Some(description) = optional_plain_text(args, "description", 2048)? {
+        request.insert("description".into(), Value::String(description));
+    }
+    Ok(Value::Object(request))
+}
+
+pub(crate) fn repo_update_body(args: &Value) -> Result<Value, String> {
+    if args.get("private") == Some(&Value::Bool(false)) {
+        return Err("仓库必须保持私有，拒绝改为公开".into());
+    }
+    let mut request = Map::new();
+    if args.get("description").is_some() {
+        let description = optional_plain_text(args, "description", 2048)?;
+        request.insert(
+            "description".into(),
+            Value::String(description.unwrap_or_default()),
+        );
+    }
+    if args.get("homepage").is_some() {
+        let homepage = optional_plain_text(args, "homepage", 2048)?;
+        request.insert(
+            "homepage".into(),
+            Value::String(homepage.unwrap_or_default()),
+        );
+    }
+    if args.get("default_branch").is_some() {
+        request.insert(
+            "default_branch".into(),
+            Value::String(required_text(args, "default_branch", 200)?),
+        );
+    }
+    for name in ["private", "has_issues", "has_wiki", "has_projects", "archived"] {
+        if args.get(name).is_some() {
+            request.insert(name.into(), Value::Bool(bool_arg(args, name, false)?));
+        }
+    }
+    if request.is_empty() {
+        return Err("缺少要更新的仓库字段".into());
+    }
+    Ok(Value::Object(request))
+}
+
+fn optional_plain_text(args: &Value, name: &str, max: usize) -> Result<Option<String>, String> {
+    let Some(value) = args.get(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .ok_or_else(|| format!("参数 {name} 必须是字符串"))?;
+    if value.chars().count() > max || value.contains('\0') {
+        return Err(format!("参数 {name} 长度或格式不合法"));
+    }
+    Ok(Some(value.to_string()))
+}
+
 fn optional_release_body(args: &Value) -> Result<Option<String>, String> {
     let Some(value) = args.get("body") else {
         return Ok(None);
@@ -3040,6 +3347,69 @@ mod tests {
             assert_eq!(definition["readOnly"], true);
             assert_eq!(definition["risk"], "low");
         }
+    }
+
+    #[test]
+    fn repo_create_refuses_public() {
+        let error = repo_create_body(&json!({"name":"box","private":false})).unwrap_err();
+        assert!(error.contains("私有"));
+    }
+
+    #[test]
+    fn repo_create_body_forces_private_and_omits_description() {
+        let body = repo_create_body(&json!({"name":"box"})).unwrap();
+        assert_eq!(body, json!({"name":"box","private":true}));
+        let explicit = repo_create_body(&json!({"name":"box","private":true,"description":"notes"})).unwrap();
+        assert_eq!(explicit["private"], true);
+        assert_eq!(explicit["name"], "box");
+        assert_eq!(explicit["description"], "notes");
+    }
+
+    #[test]
+    fn repo_update_rejects_public_and_empty() {
+        let public = repo_update_body(&json!({"private":false})).unwrap_err();
+        assert!(public.contains("私有") || public.contains("公开"), "{public}");
+        assert!(repo_update_body(&json!({})).is_err());
+    }
+
+    #[test]
+    fn issue_update_rejects_bad_state_and_empty_patch() {
+        let state = issue_update_body(&json!({"state":"done"})).unwrap_err();
+        assert!(state.contains("state") || state.contains("取值"), "{state}");
+        assert!(issue_update_body(&json!({})).is_err());
+        let body = issue_update_body(&json!({"title":"fix","state":"closed"})).unwrap();
+        assert_eq!(body, json!({"title":"fix","state":"closed"}));
+    }
+
+    #[test]
+    fn issue_update_hidden_until_api_write() {
+        let names = tool_names(&GithubMcpPolicy {
+            enabled: true,
+            api_write_enabled: false,
+            ..Default::default()
+        });
+        assert!(!names.iter().any(|name| name == "github_issue_update"));
+        let names = tool_names(&GithubMcpPolicy {
+            enabled: true,
+            api_write_enabled: true,
+            ..Default::default()
+        });
+        assert!(names.iter().any(|name| name == "github_issue_update"));
+        assert!(names.iter().any(|name| name == "github_pr_merge"));
+        assert!(names.iter().any(|name| name == "github_repo_create"));
+        assert!(names.iter().any(|name| name == "github_repo_update"));
+    }
+
+    fn tool_names(policy: &GithubMcpPolicy) -> Vec<String> {
+        tool_definitions_for_policy(policy)
+            .into_iter()
+            .filter_map(|definition| {
+                definition
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
     }
 
     #[test]
