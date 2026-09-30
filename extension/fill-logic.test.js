@@ -30,6 +30,21 @@ test("choiceCaptions keeps truncated notes off the primary line", () => {
   );
 });
 
+test("choiceCaptions distinguishes same-identity duplicates without changing unique labels", () => {
+  assert.deepEqual(
+    fill.choiceCaptions([
+      { title: "GitHub 工作号", username: "octocat", notes: "", duplicate_count: 2, duplicate_index: 1, use_count: 4 },
+      { title: "GitHub 个人号", username: "octocat", notes: "备用", duplicate_count: 2, duplicate_index: 2, use_count: 1 },
+      { title: "GitLab", username: "hubot", notes: "机器人" },
+    ]),
+    [
+      { primary: "octocat · GitH…", note: "重复 1/2 · 使用 4 次" },
+      { primary: "octocat · GitH…", note: "备用 · 重复 2/2 · 使用 1 次" },
+      { primary: "hubot · GitLab", note: "机器人" },
+    ],
+  );
+});
+
 test("choiceLabel appends a truncated note after the username", () => {
   assert.equal(
     fill.choiceLabel({

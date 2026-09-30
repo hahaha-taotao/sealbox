@@ -49,6 +49,7 @@ pub fn run() {
             commands::lock_vault,
             commands::list_entries,
             commands::list_counts,
+            commands::find_website_duplicates,
             commands::create_entry,
             commands::update_entry,
             commands::delete_entries,

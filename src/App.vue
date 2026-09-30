@@ -36,6 +36,7 @@ import {
   type SecretPayload,
   type Status,
   type UpsertEntry,
+  type WebsiteDuplicate,
   type ZoomkeyCandidates,
   type ZoomkeyMcpPolicy,
 } from "./lib/tauri";
@@ -67,6 +68,8 @@ const filter = reactive<ListFilter>({
 });
 const showForm = ref(false);
 const editing = ref<EntryDto | null>(null);
+const websiteDuplicates = ref<WebsiteDuplicate[]>([]);
+const saveBusy = ref(false);
 const form = reactive({
   kind: "website" as EntryKind,
   title: "",
@@ -967,18 +970,41 @@ function isKindSelected(kind: EntryKind) {
   return selectedKindIds.value.includes(kind);
 }
 
+function clearWebsiteDuplicateState() {
+  websiteDuplicates.value = [];
+}
+function editWebsiteDuplicate(entry: WebsiteDuplicate) {
+  openEdit(entry);
+}
+async function continueWithWebsiteDuplicate() {
+  try {
+    const duplicates = await api.findWebsiteDuplicates(form.url, form.account, editing.value?.id ?? null);
+    if (!duplicates.length) {
+      clearWebsiteDuplicateState();
+      await saveEntry();
+      return;
+    }
+    websiteDuplicates.value = duplicates;
+    await saveEntry(true);
+  } catch (e) {
+    showToast(String(e));
+  }
+}
 function closeForm() {
   showForm.value = false;
   editing.value = null;
+  clearWebsiteDuplicateState();
   resetFormFields();
 }
 function openCreate() {
   editing.value = null;
+  clearWebsiteDuplicateState();
   resetFormFields();
   showForm.value = true;
 }
 async function openEdit(row: EntryDto) {
   resetGenerator();
+  clearWebsiteDuplicateState();
   editing.value = row;
   const notes = await api.notes(row.id);
   if (row.kind === "client_cert") {
@@ -1125,12 +1151,29 @@ async function pickClientCertFile(kind: "cert" | "key") {
   }
 }
 
-async function saveEntry() {
+async function saveEntry(allowWebsiteDuplicate = false) {
+  if (saveBusy.value) return;
+  saveBusy.value = true;
+  if (form.kind === "website" && !allowWebsiteDuplicate) {
+    try {
+      const duplicates = await api.findWebsiteDuplicates(form.url, form.account, editing.value?.id ?? null);
+      if (duplicates.length) {
+        websiteDuplicates.value = duplicates;
+        saveBusy.value = false;
+        return;
+      }
+    } catch (e) {
+      showToast(String(e));
+      saveBusy.value = false;
+      return;
+    }
+  }
   if (form.kind === "client_cert") {
     const hasCertPath = Boolean(form.cert_path);
     const hasKeyPath = Boolean(form.key_path);
     if (hasCertPath !== hasKeyPath || (!editing.value && (!hasCertPath || !hasKeyPath))) {
       showToast("请选择客户端证书和私钥文件，或都不选择");
+      saveBusy.value = false;
       return;
     }
     certImportBusy.value = true;
@@ -1170,6 +1213,7 @@ async function saveEntry() {
       showToast(String(e));
     } finally {
       certImportBusy.value = false;
+      saveBusy.value = false;
     }
     return;
   }
@@ -1189,10 +1233,20 @@ async function saveEntry() {
     notes: form.notes || null,
     secret: buildSecret(),
   };
-  await api.create(input);
-  closeForm();
-  showToast("已保存");
-  await refreshVault();
+  try {
+    await api.create(input, allowWebsiteDuplicate);
+    closeForm();
+    showToast("已保存");
+    await refreshVault();
+  } catch (e) {
+    const message = String(e);
+    if (form.kind === "website" && message.includes("已有同站同账号")) {
+      websiteDuplicates.value = await api.findWebsiteDuplicates(form.url, form.account, editing.value?.id ?? null).catch(() => []);
+    }
+    showToast(message);
+  } finally {
+    saveBusy.value = false;
+  }
 }
 
 async function copy(id: string, field = "secret") {
@@ -2654,8 +2708,23 @@ onMounted(async () => {
           </select>
         </div>
         <div class="field"><label>键名</label><input v-model="form.title" /></div>
-        <div class="field" v-if="form.kind !== 'ssh' && form.kind !== 'mailbox' && form.kind !== 'mail_auth' && form.kind !== 'client_cert'"><label>{{ form.kind === 'server' || form.kind === 'database' ? '用户名' : '账号' }}</label><input v-model="form.account" /></div>
-        <div class="field" v-if="form.kind === 'website'"><label>网址</label><input v-model="form.url" /></div>
+        <div class="field" v-if="form.kind !== 'ssh' && form.kind !== 'mailbox' && form.kind !== 'mail_auth' && form.kind !== 'client_cert'"><label>{{ form.kind === 'server' || form.kind === 'database' ? '用户名' : '账号' }}</label><input v-model="form.account" @input="form.kind === 'website' && clearWebsiteDuplicateState()" /></div>
+        <div class="field" v-if="form.kind === 'website'"><label>网址</label><input v-model="form.url" @input="clearWebsiteDuplicateState" /></div>
+        <div v-if="form.kind === 'website' && websiteDuplicates.length" class="duplicate-warning">
+          <strong>已有 {{ websiteDuplicates.length }} 条同站同账号</strong>
+          <p class="crumb">不会自动覆盖。请选择已有条目，或明确确认仍然新建。</p>
+          <div v-for="entry in websiteDuplicates" :key="entry.id" class="duplicate-row">
+            <div>
+              <strong>{{ entry.title || '未命名' }}</strong>
+              <span class="duplicate-meta">{{ entry.url || '—' }} · 更新于 {{ fmtTime(entry.updated_at) }} · 使用 {{ entry.use_count }} 次</span>
+            </div>
+            <button class="btn" type="button" @click="editWebsiteDuplicate(entry)">编辑</button>
+          </div>
+          <div class="duplicate-actions">
+            <button class="btn" type="button" @click="clearWebsiteDuplicateState">取消</button>
+            <button class="btn danger" type="button" @click="continueWithWebsiteDuplicate">仍然新建</button>
+          </div>
+        </div>
         <div class="field" v-if="form.kind === 'website' || form.kind === 'mailbox' || form.kind === 'server' || form.kind === 'database'">
           <label>密码</label>
           <div class="secret-row generator-row">
@@ -2781,8 +2850,8 @@ onMounted(async () => {
         <div class="field"><label>过期日期（可空）</label><input v-model="form.expires_at" type="date" /></div>
         <div class="field"><label>备注</label><textarea v-model="form.notes" rows="3" /></div>
         <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
-          <button class="btn" @click="closeForm">取消</button>
-          <button class="btn primary" @click="saveEntry">保存</button>
+          <button class="btn" type="button" @click="closeForm">取消</button>
+          <button class="btn primary" type="button" :disabled="saveBusy" @click="saveEntry()">{{ saveBusy ? '保存中…' : '保存' }}</button>
         </div>
       </div>
     </div>

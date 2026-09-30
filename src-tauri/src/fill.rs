@@ -3,6 +3,7 @@ use crate::session::Session;
 use crate::vault::{EntryKind, ListFilter, SecretPayload, SortBy, UpsertEntry};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use uuid::Uuid;
 
@@ -15,6 +16,10 @@ pub struct FillMatch {
     pub notes: Option<String>,
     pub score: i32,
     pub has_totp: bool,
+    pub use_count: i64,
+    pub updated_at: String,
+    pub duplicate_count: usize,
+    pub duplicate_index: usize,
 }
 
 #[derive(Serialize)]
@@ -27,12 +32,19 @@ pub struct FillSecret {
     pub totp_period_remaining: Option<u8>,
 }
 
+pub type WebsiteIdentityKey = (String, String, u16, String);
+
 pub fn host_of(url: &str) -> Option<String> {
     origin_of(url).map(|(_scheme, host, _port)| host)
 }
 
+pub(crate) fn website_identity_key(url: &str, username: &str) -> Option<WebsiteIdentityKey> {
+    let (scheme, host, port) = origin_of(url)?;
+    Some((scheme, host, port, username.trim().to_string()))
+}
+
 /// Scheme, host without leading www, and explicit or default port.
-fn origin_of(url: &str) -> Option<(String, String, u16)> {
+pub(crate) fn origin_of(url: &str) -> Option<(String, String, u16)> {
     let u = url.trim();
     if u.is_empty() {
         return None;
@@ -146,20 +158,58 @@ pub fn match_websites(session: &Mutex<Session>, page_url: &str) -> Result<Vec<Fi
         };
         let score = score_url(page_url, stored);
         if score > 0 {
+            let username = e.account.clone().unwrap_or_default();
+            let identity = website_identity_key(stored, &username);
             let notes = vault.get_notes(&dek, &e.id).ok().flatten();
-            out.push(FillMatch {
-                id: e.id,
-                title: e.title,
-                username: e.account.unwrap_or_default(),
-                url: e.url,
-                notes,
-                score,
-                has_totp: e.has_totp,
-            });
+            out.push((e, identity, notes, score, username));
         }
     }
-    out.sort_by(|a, b| b.score.cmp(&a.score));
-    Ok(out)
+    let mut counts = HashMap::new();
+    for (_, identity, _, _, _) in &out {
+        if let Some(identity) = identity {
+            *counts.entry(identity.clone()).or_insert(0usize) += 1;
+        }
+    }
+    let mut matches = Vec::new();
+    for (e, identity, notes, score, username) in out {
+        let duplicate_count = identity
+            .as_ref()
+            .and_then(|key| counts.get(key).copied())
+            .unwrap_or(1);
+        matches.push(FillMatch {
+            id: e.id,
+            title: e.title,
+            username,
+            url: e.url,
+            notes,
+            score,
+            has_totp: e.has_totp,
+            use_count: e.use_count,
+            updated_at: e.updated_at,
+            duplicate_count,
+            duplicate_index: 0,
+        });
+    }
+    matches.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| b.use_count.cmp(&a.use_count))
+    });
+    let mut indexes = HashMap::new();
+    for item in &mut matches {
+        let Some(identity) = item
+            .url
+            .as_deref()
+            .and_then(|url| website_identity_key(url, &item.username))
+        else {
+            item.duplicate_index = 1;
+            continue;
+        };
+        let next = indexes.entry(identity).or_insert(0usize);
+        *next += 1;
+        item.duplicate_index = *next;
+    }
+    Ok(matches)
 }
 
 pub fn reveal_for_fill(
@@ -278,7 +328,12 @@ pub fn save_from_browser_with_notes(
         let Some(stored) = e.url.as_deref() else {
             continue;
         };
-        if score_url(url, stored) > 0 && e.account.as_deref() == Some(username) {
+        let Some(identity) = website_identity_key(url, username) else {
+            continue;
+        };
+        if website_identity_key(stored, e.account.as_deref().unwrap_or("")).as_ref()
+            == Some(&identity)
+        {
             reuse_id = Some(e.id.clone());
             folder_id = e.folder_id;
             tags = e.tags;
@@ -358,8 +413,15 @@ pub fn classify_save(
             id: None,
         });
     }
+    let identity = website_identity_key(url, username);
     let matches = match_websites(session, url)?;
-    let Some(hit) = matches.into_iter().find(|m| m.username == username) else {
+    let Some(hit) = matches.into_iter().find(|m| {
+        identity.as_ref()
+            == m.url
+                .as_deref()
+                .and_then(|stored| website_identity_key(stored, &m.username))
+                .as_ref()
+    }) else {
         return Ok(FillClassify {
             action: "save".into(),
             id: None,
@@ -739,6 +801,26 @@ mod tests {
     }
 
     #[test]
+    fn website_identity_key_normalizes_origin_and_account() {
+        assert_eq!(
+            website_identity_key("https://www.Example.com/login?next=1", " alice "),
+            website_identity_key("https://example.com/dashboard", "alice"),
+        );
+        assert_ne!(
+            website_identity_key("http://example.com", "alice"),
+            website_identity_key("https://example.com", "alice"),
+        );
+        assert_ne!(
+            website_identity_key("https://example.com:8443", "alice"),
+            website_identity_key("https://example.com", "alice"),
+        );
+        assert_ne!(
+            website_identity_key("https://example.com", "alice"),
+            website_identity_key("https://example.com", "bob"),
+        );
+    }
+
+    #[test]
     fn match_and_save() {
         let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
         vault
@@ -774,6 +856,9 @@ mod tests {
         let other = match_websites(&mutex, "https://csm.hhughg.com:8280/").unwrap();
         assert!(other.is_empty());
         assert_eq!(hits[0].username, "octocat");
+        assert_eq!(hits[0].duplicate_count, 1);
+        assert_eq!(hits[0].duplicate_index, 1);
+        assert!(hits[0].updated_at.contains('T'));
         let sec = reveal_for_fill(&mutex, &hits[0].id, "https://github.com/login").unwrap();
         assert_eq!(sec.password, "gh-pass");
         assert!(reveal_for_fill(&mutex, &hits[0].id, "").is_err());
@@ -813,6 +898,39 @@ mod tests {
                 .password,
             "new-login-pass"
         );
+        {
+            let s = mutex.lock().unwrap();
+            let dek = *s.dek().unwrap();
+            let vault = s.vault().unwrap();
+            let original = vault.get_secret(&dek, &login_id).unwrap();
+            vault
+                .upsert_entry_with_duplicate_policy(
+                    &dek,
+                    UpsertEntry {
+                        id: None,
+                        kind: EntryKind::Website,
+                        title: "客服备份".into(),
+                        account: Some("18698459937".into()),
+                        url: Some("https://www.csm.hhughg.com:8280/other".into()),
+                        folder_id: None,
+                        tags: vec![],
+                        pinned: false,
+                        expires_at: None,
+                        notes: Some("历史重复".into()),
+                        secret: original,
+                    },
+                    true,
+                )
+                .unwrap();
+        }
+        let duplicate_hits = match_websites(&mutex, "https://csm.hhughg.com:8280/#").unwrap();
+        assert_eq!(duplicate_hits.len(), 2);
+        assert!(duplicate_hits.iter().all(|m| m.duplicate_count == 2));
+        assert_ne!(
+            duplicate_hits[0].duplicate_index,
+            duplicate_hits[1].duplicate_index
+        );
+
         let other_host = save_from_browser(
             &mutex,
             "IAM",

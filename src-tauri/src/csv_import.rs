@@ -1,3 +1,4 @@
+use crate::fill::website_identity_key;
 use crate::vault::{EntryKind, ListFilter, SecretPayload, SortBy, UpsertEntry, Vault, VaultError};
 use serde::Serialize;
 use std::fs;
@@ -334,41 +335,7 @@ fn valid_login_url(url: &str) -> bool {
 }
 
 fn origin_of(url: &str) -> Option<(String, String, u16)> {
-    let url = url.trim();
-    let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
-        ("https", rest)
-    } else if let Some(rest) = url.strip_prefix("http://") {
-        ("http", rest)
-    } else if url.contains("://") {
-        return None;
-    } else {
-        ("https", url)
-    };
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()?
-        .split('@')
-        .next_back()?
-        .trim();
-    if authority.is_empty() {
-        return None;
-    }
-    let default_port = if scheme == "http" { 80 } else { 443 };
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) if !host.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()) => {
-            (host, port.parse().ok()?)
-        }
-        _ => (authority, default_port),
-    };
-    let host = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .trim_start_matches("www.")
-        .to_ascii_lowercase();
-    if host.is_empty() || host == "localhost" || !host.contains('.') {
-        return None;
-    }
-    Some((scheme.into(), host, port))
+    crate::fill::origin_of(url)
 }
 
 fn parse_valid_rows(parsed: &ParsedCsv) -> (Vec<CsvRow>, usize) {
@@ -411,7 +378,7 @@ pub fn parse_preview(bytes: &[u8]) -> Result<CsvImportPreview, String> {
 }
 
 fn host_of(url: &str) -> Option<String> {
-    origin_of(url).map(|(_, host, _)| host)
+    crate::fill::host_of(url)
 }
 
 pub fn preview_file(
@@ -470,12 +437,14 @@ fn find_duplicate<'a>(
     entries: &'a [crate::vault::EntryDto],
     row: &CsvRow,
 ) -> Option<&'a crate::vault::EntryDto> {
-    let source = origin_of(&row.url)?;
+    let identity = website_identity_key(&row.url, &row.username)?;
     entries.iter().find(|entry| {
-        let Some(existing_origin) = entry.url.as_deref().and_then(origin_of) else {
-            return false;
-        };
-        existing_origin == source && entry.account.as_deref().unwrap_or("") == row.username
+        entry
+            .url
+            .as_deref()
+            .and_then(|url| website_identity_key(url, entry.account.as_deref().unwrap_or("")))
+            .as_ref()
+            == Some(&identity)
     })
 }
 
@@ -659,6 +628,18 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn duplicate_matching_shares_origin_normalization_with_browser_fill() {
+        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        let csv = b"title,url,username,password\nGitHub,https://WWW.example.com/login,alice,new\n";
+        commit_rows(&vault, &dek, csv, false).unwrap();
+        let second = b"title,url,username,password\nGitHub,https://example.com:443/dashboard, alice ,newer\n";
+        let result = commit_rows(&vault, &dek, second, false).unwrap();
+        assert_eq!(result.inserted, 0);
+        assert_eq!(result.skipped_existing, 1);
+        assert_eq!(website_entries(&vault).unwrap().len(), 1);
     }
 
     #[test]

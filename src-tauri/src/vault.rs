@@ -57,6 +57,8 @@ pub enum VaultError {
     TagAlreadyExists,
     #[error("标签不存在")]
     TagNotFound,
+    #[error("已有同站同账号条目，请选择“仍然新建”后重试")]
+    DuplicateWebsite,
     #[error("来源和目标不能相同")]
     SameOrganizationTarget,
 }
@@ -431,10 +433,15 @@ impl Vault {
         Ok(())
     }
 
-    pub fn upsert_entry(
+    pub fn upsert_entry(&self, dek: &[u8; 32], input: UpsertEntry) -> Result<EntryDto, VaultError> {
+        self.upsert_entry_with_duplicate_policy(dek, input, true)
+    }
+
+    pub fn upsert_entry_with_duplicate_policy(
         &self,
         dek: &[u8; 32],
         mut input: UpsertEntry,
+        allow_duplicate: bool,
     ) -> Result<EntryDto, VaultError> {
         if input.kind != input.secret.kind() {
             return Err(VaultError::KindMismatch);
@@ -463,6 +470,20 @@ impl Vault {
             if raw.is_empty() {
                 if let SecretPayload::Website { totp_secret, .. } = &mut input.secret {
                     *totp_secret = None;
+                }
+            }
+        }
+        if !allow_duplicate {
+            if let SecretPayload::Website { url, username, .. } = &input.secret {
+                let candidate_url = url.as_deref().or(input.url.as_deref());
+                let candidate_username = username.as_deref().or(input.account.as_deref());
+                if let (Some(url), Some(username)) = (candidate_url, candidate_username) {
+                    if !self
+                        .find_website_duplicates(url, username, input.id.as_deref())?
+                        .is_empty()
+                    {
+                        return Err(VaultError::DuplicateWebsite);
+                    }
                 }
             }
         }
@@ -642,6 +663,40 @@ impl Vault {
             &format!("{} {}", input.kind.as_str(), input.title),
         )?;
         self.get_dto(&id)
+    }
+
+    pub fn find_website_duplicates(
+        &self,
+        url: &str,
+        username: &str,
+        exclude_id: Option<&str>,
+    ) -> Result<Vec<EntryDto>, VaultError> {
+        let Some(key) = crate::fill::website_identity_key(url, username) else {
+            return Ok(Vec::new());
+        };
+        let entries = self.list_entries(&ListFilter {
+            kind: Some(EntryKind::Website),
+            kinds: vec![EntryKind::Website],
+            sort: SortBy::Updated,
+            ..Default::default()
+        })?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| exclude_id != Some(entry.id.as_str()))
+            .filter(|entry| {
+                entry
+                    .url
+                    .as_deref()
+                    .and_then(|stored| {
+                        crate::fill::website_identity_key(
+                            stored,
+                            entry.account.as_deref().unwrap_or(""),
+                        )
+                    })
+                    .as_ref()
+                    == Some(&key)
+            })
+            .collect())
     }
 
     pub fn get_secret(&self, dek: &[u8; 32], id: &str) -> Result<SecretPayload, VaultError> {

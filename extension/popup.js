@@ -172,11 +172,18 @@ async function refresh() {
       row.className = "match";
       const label = document.createElement("span");
       const strong = document.createElement("strong");
-      strong.textContent = item.username || "未填账号";
+      const duplicate = Number(item.duplicate_count) > 1
+        ? ` · 重复 ${Number(item.duplicate_index) || 1}/${Number(item.duplicate_count)}`
+        : "";
+      strong.textContent = `${item.username || "未填账号"}${duplicate}`;
       const small = document.createElement("small");
       const note = String(item.notes || "").replace(/\s+/g, " ").trim();
+      const title = String(item.title || "").trim();
       const noteChars = [...note];
-      small.textContent = noteChars.length > 8 ? `${noteChars.slice(0, 6).join("")}…` : note;
+      const noteText = noteChars.length > 8 ? `${noteChars.slice(0, 6).join("")}…` : note;
+      small.textContent = [title, noteText, Number(item.duplicate_count) > 1 ? `使用 ${Number(item.use_count) || 0} 次` : ""]
+        .filter(Boolean)
+        .join(" · ");
       label.appendChild(strong);
       if (small.textContent) {
         label.appendChild(document.createElement("br"));

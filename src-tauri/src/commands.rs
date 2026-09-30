@@ -341,7 +341,27 @@ pub fn list_counts(state: State<AppState>, filter: ListFilter) -> Result<Counts,
 }
 
 #[tauri::command]
-pub fn create_entry(state: State<AppState>, mut input: UpsertEntry) -> Result<EntryDto, String> {
+pub fn find_website_duplicates(
+    state: State<AppState>,
+    url: String,
+    username: String,
+    exclude_id: Option<String>,
+) -> Result<Vec<EntryDto>, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    session
+        .vault()
+        .map_err(map_err)?
+        .find_website_duplicates(&url, &username, exclude_id.as_deref())
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn create_entry(
+    state: State<AppState>,
+    mut input: UpsertEntry,
+    allow_duplicate: Option<bool>,
+) -> Result<EntryDto, String> {
     if let SecretPayload::Ssh {
         private_key,
         public_fingerprint,
@@ -358,13 +378,17 @@ pub fn create_entry(state: State<AppState>, mut input: UpsertEntry) -> Result<En
     session
         .vault()
         .map_err(map_err)?
-        .upsert_entry(&dek, input)
+        .upsert_entry_with_duplicate_policy(&dek, input, allow_duplicate.unwrap_or(false))
         .map_err(map_err)
 }
 
 #[tauri::command]
-pub fn update_entry(state: State<AppState>, input: UpsertEntry) -> Result<EntryDto, String> {
-    create_entry(state, input)
+pub fn update_entry(
+    state: State<AppState>,
+    input: UpsertEntry,
+    allow_duplicate: Option<bool>,
+) -> Result<EntryDto, String> {
+    create_entry(state, input, allow_duplicate)
 }
 
 #[tauri::command]

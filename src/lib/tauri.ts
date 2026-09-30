@@ -27,6 +27,8 @@ export interface EntryDto {
   fingerprint: string | null;
 }
 
+export type WebsiteDuplicate = EntryDto;
+
 export interface ClientCertInfo {
   id: string;
   title: string;
@@ -290,7 +292,10 @@ export const api = {
   lock: () => invoke("lock_vault"),
   list: (filter: ListFilter) => invoke<EntryDto[]>("list_entries", { filter }),
   counts: (filter: ListFilter) => invoke<Counts>("list_counts", { filter }),
-  create: (input: UpsertEntry) => invoke<EntryDto>("create_entry", { input }),
+  findWebsiteDuplicates: (url: string, username: string, excludeId?: string | null) =>
+    invoke<WebsiteDuplicate[]>("find_website_duplicates", { url, username, excludeId: excludeId ?? null }),
+  create: (input: UpsertEntry, allowDuplicate = false) =>
+    invoke<EntryDto>("create_entry", { input, allowDuplicate }),
   remove: (ids: string[]) => invoke<number>("delete_entries", { ids }),
   restore: (ids: string[]) => invoke<number>("restore_entries", { ids }),
   emptyTrash: () => invoke<number>("empty_trash"),

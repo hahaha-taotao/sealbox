@@ -88,6 +88,62 @@ fn empty_sqlite_leftover_is_not_initialized_and_can_be_replaced() {
 }
 
 #[test]
+fn website_duplicates_use_normalized_origin_and_ignore_trash_or_self() {
+    let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+    let first = vault
+        .upsert_entry(&dek, sample_website("first", None))
+        .unwrap();
+
+    let duplicates = vault
+        .find_website_duplicates("https://WWW.jira.example.com/login", " alice ", None)
+        .unwrap();
+    assert_eq!(
+        duplicates
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![first.id.as_str()]
+    );
+    assert!(vault
+        .find_website_duplicates(
+            "https://jira.example.com/dashboard",
+            "alice",
+            Some(&first.id),
+        )
+        .unwrap()
+        .is_empty());
+    assert!(vault
+        .find_website_duplicates("http://jira.example.com/dashboard", "alice", None)
+        .unwrap()
+        .is_empty());
+
+    assert!(matches!(
+        vault.upsert_entry_with_duplicate_policy(&dek, sample_website("second", None), false),
+        Err(VaultError::DuplicateWebsite)
+    ));
+    let second = vault
+        .upsert_entry_with_duplicate_policy(&dek, sample_website("second", None), true)
+        .unwrap();
+    assert_ne!(first.id, second.id);
+    assert_eq!(
+        vault
+            .find_website_duplicates("https://jira.example.com", "alice", None)
+            .unwrap()
+            .len(),
+        2
+    );
+
+    vault.soft_delete(&[first.id.clone()]).unwrap();
+    assert_eq!(
+        vault
+            .find_website_duplicates("https://jira.example.com", "alice", None)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn list_dto_has_no_password_and_search_skips_notes() {
     let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
     vault

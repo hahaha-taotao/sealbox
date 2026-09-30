@@ -42,7 +42,10 @@ const Fill = globalThis.SealboxFill || {
   choiceCaptions: (matches) =>
     (matches || []).map((m) => ({
       primary: String(m.username || "").trim() || "未填账号",
-      note: String(m.notes || "").replace(/\s+/g, " ").trim(),
+      note: [
+        String(m.notes || "").replace(/\s+/g, " ").trim(),
+        Number(m.duplicate_count) > 1 ? `重复 ${Number(m.duplicate_index) || 1}/${Number(m.duplicate_count)}` : "",
+      ].filter(Boolean).join(" · "),
     })),
   addHostLine: (text) => text || "",
   fillTokenFromStores: ({ sessionToken, localToken } = {}) => {
@@ -1059,6 +1062,10 @@ async function showOverlayOnTab(tab) {
       username: m.username,
       notes: m.notes || "",
       has_totp: Boolean(m.has_totp),
+      duplicate_count: Number(m.duplicate_count) || 1,
+      duplicate_index: Number(m.duplicate_index) || 1,
+      use_count: Number(m.use_count) || 0,
+      updated_at: m.updated_at || "",
       badge: m.has_totp ? "验证码" : "",
       primary,
       note,

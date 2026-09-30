@@ -109,11 +109,24 @@
   function choiceCaptions(matches) {
     const list = matches || [];
     const titles = new Set(list.map((m) => String(m.title || "").trim()).filter(Boolean));
-    const hideTitle = titles.size <= 1;
-    return list.map((m) => ({
-      primary: choicePrimary({ title: m.title, username: m.username, hideTitle }),
-      note: abbreviateNote(m.notes),
-    }));
+    const duplicateCount = (m) => Math.max(1, Number(m?.duplicate_count) || 1);
+    const hideTitle = titles.size <= 1 && !list.some((m) => duplicateCount(m) > 1);
+    return list.map((m) => {
+      const duplicate = duplicateCount(m);
+      const primary = choicePrimary({
+        title: m.title,
+        username: m.username,
+        hideTitle: hideTitle && duplicate <= 1,
+      });
+      const note = abbreviateNote(m.notes);
+      const duplicateText = duplicate > 1
+        ? `重复 ${Number(m.duplicate_index) || 1}/${duplicate} · 使用 ${Number(m.use_count) || 0} 次`
+        : "";
+      return {
+        primary,
+        note: [note, duplicateText].filter(Boolean).join(" · "),
+      };
+    });
   }
 
   function addHostLine(text, hostOrUrl) {

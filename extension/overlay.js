@@ -23,7 +23,11 @@ function render(matches) {
     primary.textContent = m.primary || m.username || m.title || "未填账号";
     primary.style.cssText = "display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
     b.appendChild(primary);
-    const note = String(m.note || m.notes || "").replace(/\s+/g, " ").trim();
+    const rawNote = String(m.note || m.notes || "").replace(/\s+/g, " ").trim();
+    const duplicate = Number(m.duplicate_count) > 1
+      ? `重复 ${Number(m.duplicate_index) || 1}/${Number(m.duplicate_count)}`
+      : "";
+    const note = rawNote.includes("重复 ") ? rawNote : [rawNote, duplicate].filter(Boolean).join(" · ");
     if (note) {
       const noteEl = document.createElement("span");
       const chars = [...note];
