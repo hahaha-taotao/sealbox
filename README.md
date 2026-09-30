@@ -4,7 +4,7 @@
 
 A local credential vault for Windows. Unlock with a master password (optional Windows Hello). Website logins, API tokens, SSH keys, mailboxes, servers, and databases stay encrypted on disk. Copied secrets are cleared from the clipboard on a timer. Encrypted `.svbak` backups can be exported and imported. An optional localhost MCP lets Cursor / Claude Code use credentials without seeing plaintext. A Chrome / Edge extension can fill or save website logins.
 
-当前版本 Current version: **v0.2.4** (`0.2.4`)
+当前版本 Current version: **v0.3.0** (`0.3.0`)
 
 ## 在线更新 Online updates
 
@@ -30,7 +30,7 @@ A local credential vault for Windows. Unlock with a master password (optional Wi
 
 ## 安装 Install
 
-Windows x64 使用 NSIS 安装包 `Sealbox_0.2.4_x64-setup.exe`。向导会让你选择：
+Windows x64 使用 NSIS 安装包 `Sealbox_0.3.0_x64-setup.exe`。向导会让你选择：
 
 1. 安装范围：当前用户，或所有用户（后者需要管理员权限）
 2. **安装盘符与目录**，例如 `D:\Sealbox`；默认在当前用户下是 `%LOCALAPPDATA%\Sealbox`，在所有用户下是 `C:\Program Files\Sealbox`
@@ -70,7 +70,7 @@ npm run tauri build
 | 剪贴板 Clipboard | 复制条目秘密、MCP / 填表 Token 和 MCP 配置后约 20 秒，若仍是那条内容则清空；锁定会立刻清掉本应用写入的秘密 |
 | 锁定 Lock | 空闲超时、标题栏或托盘锁定都会丢掉 DEK、清已复制秘密、关掉编辑框和明文显示 |
 | 备份 Backup | `.svbak` 用导出密码加密；Windows Hello 解不开备份文件 |
-| 网络 Network | MCP / 填表只监听 `127.0.0.1`，默认端口 `17891`。GitHub 读取工具只访问 `https://api.github.com:443`，固定 GET；Release 写入使用独立、受控的 POST，统一拒绝重定向和内网目标 |
+| 网络 Network | MCP / 填表只监听 `127.0.0.1`，默认端口 `17891`。GitHub 工具只访问 `https://api.github.com:443`，Release 资产上传只访问 `https://uploads.github.com:443`，统一拒绝重定向和内网目标 |
 | 插件 Extension | 登录页右下角弹出填充条；一站点多账号可点选。`Alt+Shift+F` 也可打开选择器。填充条在 closed Shadow DOM 中，只响应真实用户点击，账号做掩码。提交后询问保存/更新，明文只暂存在 `chrome.storage.session`。扩展仅申请 `127.0.0.1` 主机权限；填表 Token 只放 session，启动时清掉 local 残留 |
 
 ## 环境 Requirements
@@ -83,12 +83,12 @@ npm run tauri build
 
 ## 发布 Release
 
-发布只接受形如 `v0.2.4` 的 Git tag。`.github/workflows/release.yml` 在 Windows runner 上依次执行 `npm ci`、版本一致性校验、Rust 测试、前端构建和扩展测试，全部通过后由 `tauri-apps/tauri-action` 构建并发布 NSIS 安装包、`latest.json` 和对应的 `.sig` updater 签名文件。
+发布只接受形如 `v0.3.0` 的 Git tag。`.github/workflows/release.yml` 在 Windows runner 上依次执行 `npm ci`、版本一致性校验、Rust 测试、前端构建和扩展测试，全部通过后由 `tauri-apps/tauri-action` 构建并发布 NSIS 安装包、`latest.json` 和对应的 `.sig` updater 签名文件。
 
 版本号必须同时匹配以下文件：`package.json`、`package-lock.json`（根版本和 `packages[""].version`）、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json`、`extension/manifest.json`。本地可在打 tag 前运行：
 
 ```bash
-node scripts/check-version.mjs v0.2.4
+node scripts/check-version.mjs v0.3.0
 ```
 
 GitHub Actions 只从 Secrets 注入签名材料，不会把私钥写入仓库或工作区。请在仓库 Settings → Secrets and variables → Actions 中配置：
