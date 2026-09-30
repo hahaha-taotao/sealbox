@@ -350,8 +350,31 @@ struct GithubReleaseDto {
     published_at: Option<String>,
 }
 
+pub fn canonical_tool_name(name: &str) -> &str {
+    match name {
+        "github_get_authenticated_user" => "github_user_info",
+        "github_list_repositories" => "github_repo_list",
+        "github_get_repository" => "github_repo_get",
+        "github_get_file" => "github_file_get",
+        "github_list_issues" => "github_issues_list",
+        "github_list_pull_requests" => "github_pulls_list",
+        "github_create_issue" => "github_issue_create",
+        "github_create_issue_comment" => "github_issue_comment",
+        "github_create_pull_request" => "github_pr_create",
+        "github_create_release" => "github_release_create",
+        "github_list_releases" => "github_release_list",
+        "github_get_release" => "github_release_get",
+        "github_list_tags" => "github_tags_list",
+        "github_list_workflows" => "github_workflow_list",
+        "github_list_workflow_runs" => "github_runs_list",
+        "github_get_workflow_run" => "github_run_get",
+        "github_list_workflow_jobs" => "github_run_jobs",
+        other => other,
+    }
+}
+
 pub fn api_tool_definitions() -> Vec<Value> {
-    vec![
+    with_legacy_aliases(vec![
         tool(
             "github_list_credentials",
             "列出本地活动 GitHub Token 的标题、账号和是否为默认凭据。回答「我有哪些 GitHub Token / 该用哪条凭据」时调用。日常读写不必先调这个：可直接传标题，或省略后使用默认 Token。永不返回 Token 明文。",
@@ -740,7 +763,26 @@ pub fn api_tool_definitions() -> Vec<Value> {
                 &["repo", "tag_name"],
             ),
         ),
-    ]
+    ])
+}
+
+fn with_legacy_aliases(definitions: Vec<Value>) -> Vec<Value> {
+    let mut tools = Vec::with_capacity(definitions.len() * 2);
+    for definition in definitions {
+        let name = definition
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let canonical = canonical_tool_name(&name);
+        if canonical != name {
+            let mut alias = definition.clone();
+            alias["name"] = Value::String(canonical.to_string());
+            tools.push(alias);
+        }
+        tools.push(definition);
+    }
+    tools
 }
 
 pub fn tool_definitions() -> Vec<Value> {
@@ -1132,9 +1174,14 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             .map(|text| (200, text))
             .map_err(|e| e.to_string());
     }
+    let name = if name.starts_with("github_git_") {
+        name
+    } else {
+        canonical_tool_name(name)
+    };
     let (token, credential_label) = prepare(session, name, &args)?;
     let (status, result) = match name {
-        "github_create_release" => {
+        "github_release_create" => {
             let repository = repository_args(&args)?;
             let tag_name = release_tag_arg(&args)?;
             let target_commitish = optional_release_string(&args, "target_commitish", 200)?;
@@ -1184,7 +1231,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                 |value| release_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into()),
             )
         }
-        "github_create_issue" => {
+        "github_issue_create" => {
             let repository = repository_args(&args)?;
             let title = required_text(&args, "title", 256)?;
             let body = optional_release_body(&args)?;
@@ -1219,7 +1266,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                 |value| issue_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into()),
             )
         }
-        "github_create_issue_comment" => {
+        "github_issue_comment" => {
             let repository = repository_args(&args)?;
             let number = issue_number(&args)?;
             let body = required_text(&args, "body", MAX_RELEASE_BODY_BYTES)?;
@@ -1247,7 +1294,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                 },
             )
         }
-        "github_create_pull_request" => {
+        "github_pr_create" => {
             let repository = repository_args(&args)?;
             let title = required_text(&args, "title", 256)?;
             let head = required_text(&args, "head", 200)?;
@@ -1283,8 +1330,10 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                 |value| pull_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into()),
             )
         }
-        "github_get_authenticated_user" => request_json(&token, "/user", |value| {
-            serde_json::to_value(GithubUserDto {
+        "github_user_info" => {
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone())
+                .get("/user", Vec::new())?;
+            let dto = serde_json::to_value(GithubUserDto {
                 id: value.get("id").and_then(Value::as_i64),
                 login: limited_string(value.get("login")),
                 name: limited_string(value.get("name")),
@@ -1294,9 +1343,10 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                 public_repos: value.get("public_repos").and_then(Value::as_i64),
                 private_repos: value.get("total_private_repos").and_then(Value::as_i64),
             })
-            .map_err(|e| e.to_string())
-        }),
-        "github_list_repositories" => {
+            .map_err(|e| e.to_string())?;
+            Ok((status, dto))
+        }
+        "github_repo_list" => {
             let visibility = enum_arg(&args, "visibility", &["all", "public", "private"], "all")?;
             let affiliation = enum_arg(
                 &args,
@@ -1321,13 +1371,13 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                 Ok(json!({"repositories": items, "count": count}))
             })
         }
-        "github_get_repository" => {
+        "github_repo_get" => {
             let repository = repository_args(&args)?;
             request_json(&token, &format!("/repos/{repository}"), |value| {
                 repository_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into())
             })
         }
-        "github_get_file" => {
+        "github_file_get" => {
             let repository = repository_args(&args)?;
             let path = path_arg(&args, "path")?;
             let reference = optional_ref(&args)?;
@@ -1338,7 +1388,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             };
             request_json(&token, &endpoint, file_dto)
         }
-        "github_list_issues" => {
+        "github_issues_list" => {
             let repository = repository_args(&args)?;
             let state = enum_arg(&args, "state", &["open", "closed", "all"], "open")?;
             let (page, per_page) = page_args(&args)?;
@@ -1348,7 +1398,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                 list_dto(value, per_page, issue_dto)
             })
         }
-        "github_list_pull_requests" => {
+        "github_pulls_list" => {
             let repository = repository_args(&args)?;
             let state = enum_arg(&args, "state", &["open", "closed", "all"], "open")?;
             let (page, per_page) = page_args(&args)?;
@@ -1367,7 +1417,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                 |value| pull_dto(value).ok_or_else(|| "GitHub 响应格式不正确".into()),
             )
         }
-        "github_list_workflow_runs" => {
+        "github_runs_list" => {
             let repository = repository_args(&args)?;
             let (page, per_page) = page_args_with_default(&args, 20)?;
             let mut endpoint =
@@ -1471,7 +1521,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                 combined_status_dto,
             )
         }
-        "github_list_releases" => {
+        "github_release_list" => {
             let repository = repository_args(&args)?;
             let (page, per_page) = page_args(&args)?;
             let endpoint = format!("/repos/{repository}/releases?page={page}&per_page={per_page}");
@@ -1479,7 +1529,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                 list_dto(value, per_page, release_list_dto)
             })
         }
-        "github_get_release" => {
+        "github_release_get" => {
             let repository = repository_args(&args)?;
             let endpoint = if args.get("id").is_some() {
                 let id = positive_id(&args, "id")?;
@@ -1503,7 +1553,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                 |value| list_dto(value, MAX_PAGE_SIZE, release_asset_dto),
             )
         }
-        "github_list_tags" => {
+        "github_tags_list" => {
             let repository = repository_args(&args)?;
             let (page, per_page) = page_args(&args)?;
             let endpoint = format!("/repos/{repository}/tags?page={page}&per_page={per_page}");
@@ -1518,7 +1568,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             let endpoint = compare_endpoint(&repository, &base, &head)?;
             request_json(&token, &endpoint, compare_dto)
         }
-        "github_list_workflows" => {
+        "github_workflow_list" => {
             let repository = repository_args(&args)?;
             let (page, per_page) = page_args(&args)?;
             let endpoint =
@@ -1527,7 +1577,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                 object_list_dto(value, "workflows", per_page, workflow_summary_dto)
             })
         }
-        "github_get_workflow_run" => {
+        "github_run_get" => {
             let repository = repository_args(&args)?;
             let run_id = positive_id(&args, "run_id")?;
             request_json(
@@ -1536,7 +1586,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
                 |value| workflow_run_dto(value).ok_or_else(|| "GitHub 响应格式不正确".to_string()),
             )
         }
-        "github_list_workflow_jobs" => {
+        "github_run_jobs" => {
             let repository = repository_args(&args)?;
             let run_id = positive_id(&args, "run_id")?;
             request_json(
@@ -2567,6 +2617,15 @@ mod tests {
     use crate::session::Session;
 
     #[test]
+    fn alias_collapses_to_canonical_name() {
+        assert_eq!(canonical_tool_name("github_list_repositories"), "github_repo_list");
+        assert_eq!(canonical_tool_name("github_repo_list"), "github_repo_list");
+        assert_eq!(canonical_tool_name("github_create_issue"), "github_issue_create");
+        assert_eq!(canonical_tool_name("github_get_file"), "github_file_get");
+        assert_eq!(canonical_tool_name("github_git_status"), "github_git_status");
+    }
+
+    #[test]
     fn default_policy_is_disabled() {
         let policy = GithubMcpPolicy::default();
         assert!(!policy.enabled);
@@ -2822,7 +2881,27 @@ mod tests {
             .into_iter()
             .filter(|definition| definition["readOnly"] == true)
             .count();
-        assert_eq!(read_only, 22);
+        // 22 original read-only tools plus 13 read-only aliases.
+        assert_eq!(read_only, 35);
+    }
+
+    #[test]
+    fn user_info_alias_shares_schema_with_legacy_name() {
+        let definitions = api_tool_definitions();
+        let legacy = definitions
+            .iter()
+            .find(|definition| definition["name"] == "github_get_authenticated_user")
+            .expect("legacy user tool");
+        let canonical = definitions
+            .iter()
+            .find(|definition| definition["name"] == "github_user_info")
+            .expect("canonical user tool");
+        assert_eq!(legacy["readOnly"], canonical["readOnly"]);
+        assert_eq!(legacy["risk"], canonical["risk"]);
+        assert_eq!(legacy["description"], canonical["description"]);
+        assert_eq!(legacy["inputSchema"], canonical["inputSchema"]);
+        assert!(is_github_api_tool("github_get_authenticated_user"));
+        assert!(is_github_api_tool("github_user_info"));
     }
 
     #[test]
