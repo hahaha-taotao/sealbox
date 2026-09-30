@@ -797,8 +797,46 @@ mod tests {
         assert!(!names.iter().any(|name| name.starts_with("github_")));
     }
 
+    fn github_tool_names(policy_json: &str) -> Vec<String> {
+        let (vault, dek) =
+            crate::vault::Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        vault
+            .set_secret_setting(&dek, "github_mcp_policy", policy_json)
+            .unwrap();
+        let mut session = Session::default();
+        session.set_unlocked(vault, dek);
+        let listed = tools_list(&Mutex::new(session));
+        listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .filter(|name| name.starts_with("github_"))
+            .map(str::to_string)
+            .collect()
+    }
+
     #[test]
     fn enabled_github_tools_are_exposed_as_a_single_capability() {
+        let reads_only = github_tool_names(r#"{"enabled":true,"api_write_enabled":false}"#);
+        for name in [
+            "github_repo_search",
+            "github_list_repositories",
+            "github_git_status",
+        ] {
+            assert!(reads_only.iter().any(|tool| tool == name), "missing {name}");
+        }
+        for name in [
+            "github_issue_update",
+            "github_repo_secret_set",
+            "github_download_run_logs",
+        ] {
+            assert!(
+                !reads_only.iter().any(|tool| tool == name),
+                "{name} must stay hidden until API writes are enabled"
+            );
+        }
+
         let (vault, dek) =
             crate::vault::Vault::create_in_memory("correct horse battery staple extra").unwrap();
         vault
@@ -817,8 +855,15 @@ mod tests {
             .iter()
             .filter_map(|tool| tool["name"].as_str())
             .filter(|name| name.starts_with("github_"))
+            .map(str::to_string)
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 37);
+        for name in [
+            "github_issue_update",
+            "github_repo_secret_set",
+            "github_download_run_logs",
+        ] {
+            assert!(names.iter().any(|tool| tool == name), "missing {name}");
+        }
         let listed_tools = listed["tools"].as_array().unwrap();
         let status = listed_tools
             .iter()
@@ -831,19 +876,19 @@ mod tests {
             .unwrap();
         assert_eq!(push["annotations"]["readOnlyHint"], false);
         assert_eq!(push["annotations"]["destructiveHint"], true);
-        assert!(names.contains(&"github_list_credentials"));
-        assert!(names.contains(&"github_get_file"));
-        assert!(names.contains(&"github_git_status"));
-        assert!(names.contains(&"github_git_clone"));
-        assert!(names.contains(&"github_git_workspace_register"));
-        assert!(names.contains(&"github_create_release"));
-        assert!(names.contains(&"github_create_pull_request"));
-        assert!(names.contains(&"github_list_workflow_runs"));
-        assert!(names.contains(&"github_list_pull_request_files"));
-        assert!(names.contains(&"github_get_pull_request_status"));
-        assert!(names.contains(&"github_compare_commits"));
-        assert!(names.contains(&"github_list_workflow_jobs"));
-        assert!(!names.contains(&"github_git_list"));
+        assert!(names.iter().any(|name| name == "github_list_credentials"));
+        assert!(names.iter().any(|name| name == "github_get_file"));
+        assert!(names.iter().any(|name| name == "github_git_status"));
+        assert!(names.iter().any(|name| name == "github_git_clone"));
+        assert!(names.iter().any(|name| name == "github_git_workspace_register"));
+        assert!(names.iter().any(|name| name == "github_create_release"));
+        assert!(names.iter().any(|name| name == "github_create_pull_request"));
+        assert!(names.iter().any(|name| name == "github_list_workflow_runs"));
+        assert!(names.iter().any(|name| name == "github_list_pull_request_files"));
+        assert!(names.iter().any(|name| name == "github_get_pull_request_status"));
+        assert!(names.iter().any(|name| name == "github_compare_commits"));
+        assert!(names.iter().any(|name| name == "github_list_workflow_jobs"));
+        assert!(!names.iter().any(|name| name == "github_git_list"));
     }
 
     #[test]
@@ -887,30 +932,38 @@ mod tests {
 
     #[test]
     fn enabled_github_tools_are_exposed_as_single_toggle() {
-        let (vault, dek) =
-            crate::vault::Vault::create_in_memory("correct horse battery staple extra").unwrap();
-        vault
-            .set_secret_setting(
-                &dek,
-                "github_mcp_policy",
-                r#"{"enabled":true,"api_write_enabled":true}"#,
-            )
-            .unwrap();
-        let mut session = Session::default();
-        session.set_unlocked(vault, dek);
-        let listed = tools_list(&Mutex::new(session));
-        let github_names = listed["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|tool| tool["name"].as_str())
-            .filter(|name| name.starts_with("github_"))
-            .collect::<Vec<_>>();
-        assert_eq!(github_names.len(), 37);
-        assert!(github_names.contains(&"github_list_credentials"));
-        assert!(github_names.contains(&"github_git_push"));
-        assert!(github_names.contains(&"github_create_release"));
-        assert!(github_names.contains(&"github_git_workspace_list"));
+        let reads_only = github_tool_names(r#"{"enabled":true,"api_write_enabled":false}"#);
+        for name in [
+            "github_repo_search",
+            "github_list_repositories",
+            "github_git_status",
+        ] {
+            assert!(reads_only.iter().any(|tool| tool == name), "missing {name}");
+        }
+        for name in [
+            "github_issue_update",
+            "github_repo_secret_set",
+            "github_download_run_logs",
+        ] {
+            assert!(
+                !reads_only.iter().any(|tool| tool == name),
+                "{name} must stay hidden until API writes are enabled"
+            );
+        }
+
+        let with_writes = github_tool_names(r#"{"enabled":true,"api_write_enabled":true}"#);
+        for name in [
+            "github_issue_update",
+            "github_repo_secret_set",
+            "github_download_run_logs",
+            "github_list_credentials",
+            "github_git_push",
+            "github_create_release",
+            "github_git_workspace_list",
+        ] {
+            assert!(with_writes.iter().any(|tool| tool == name), "missing {name}");
+        }
+        assert!(with_writes.len() > reads_only.len());
     }
 
     #[test]

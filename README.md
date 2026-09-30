@@ -55,7 +55,7 @@ npm run tauri build
 - **速查 Quick search** — 默认全局热键 `Ctrl+Shift+Space`，回车复制主秘密
 - **安全习惯 Hygiene** — 空闲自动锁定、审计日志（不记明文）、回收站、置顶、标签、文件夹
 - **备份与导入 Backup & import** — 加密 `.svbak` 导出 / 导入（默认合并，覆盖需确认）；可从 Chrome / Edge、Bitwarden、1Password 导出的 UTF-8 CSV 导入网站账号，默认跳过已有同站同账号
-- **MCP** — 本机 `127.0.0.1` 服务；GitHub MCP 提供只读 API、本地 git 和工作区短名；Issue / PR / Release 写入另有独立开关，且每次弹出桌面确认。模型可用 Token 标题或默认凭据，不必先抄 UUID
+- **MCP** — 本机 `127.0.0.1` 服务；GitHub MCP 提供只读 API、本地 git 和工作区短名；Issue、PR、Release、文件、ref、Actions 和 secret 写入另有独立开关，且每次弹出桌面确认。模型可用 Token 标题或默认凭据，不必先抄 UUID
 - **客户端证书 Client cert** — 保险库里可以导入 mTLS 用的客户端证书与私钥（PEM），由 Rust 侧限长、解析并校验证书/私钥匹配后加密保存，随金库一起备份；列表和速查不会显示或复制私钥，锁定时会清理 TLS 运行时缓存
 - **助手 Assistant** — 位于「插件」下方的 OpenAI 兼容对话页；可测试本机 MCP 连通性，并让模型调用当前暴露的 GitHub 只读工具
 - **插件 Plugin** — Chrome / Edge 从客户端安装后按当前网址填充或一键登记；在侧栏「插件」页配对
@@ -120,18 +120,22 @@ On first launch, set a master password (at least 10 characters). Closing the win
 默认工具 Tools:
 
 - `github_list_credentials` — 列出活动 GitHub Token 的标题、账号和是否为默认凭据，不含 Token
-- `github_get_authenticated_user` — 当前 Token 对应账号
-- `github_list_repositories` / `github_get_repository` / `github_get_file` — 仓库与文件
+- `github_get_authenticated_user`（别名 `github_user_info`）— 当前 Token 对应账号
+- `github_list_repositories` / `github_repo_search` / `github_get_repository` / `github_get_file` — 仓库搜索、仓库元数据与单个文本文件
+- `github_commits_list` / `github_branches_list` / `github_ref_get` / `github_compare_commits` / `github_list_tags` — 提交、分支、ref、对比和 tag；不含 patch
+- `github_billing_actions` — Actions 用量。不传 year 和 month 时是本年至今；没有剩余分钟数
 - `github_list_issues` / `github_list_pull_requests` / `github_get_pull_request` — Issue / PR，含 head/base、draft、mergeable、assignees
 - `github_list_pull_request_files` / `github_list_pull_request_commits` / `github_list_pull_request_reviews` / `github_list_pull_request_comments` / `github_get_pull_request_status` — PR 文件、提交、review、行内评论和 combined status；不含 patch 全文和日志
-- `github_list_releases` / `github_get_release` / `github_list_release_assets` / `github_list_tags` / `github_compare_commits` — Release 元数据、资产清单、tag 和 commit 对比；不下载资产
-- `github_list_workflows` / `github_list_workflow_runs` / `github_get_workflow_run` / `github_list_workflow_jobs` — Actions workflow、运行、单次 run 和 jobs；不含日志和 artifacts
+- `github_list_releases` / `github_get_release` / `github_list_release_assets` / `github_release_generate_notes` — Release 元数据、资产清单和建议的 release notes；不下载资产
+- `github_list_workflows` / `github_list_workflow_runs` / `github_get_workflow_run` / `github_list_workflow_jobs` / `github_run_artifacts` — Actions workflow、运行、单次 run、jobs 和产物清单；不返回下载地址或日志正文
+- `github_repo_variable_list` / `github_repo_secret_list` — Actions 变量（含值）和 secret 名称；不返回 secret 值
 - `github_git_workspace_list` / `github_git_workspace_register` — 把本机仓库登记成短名，之后传 `workspace="sealbox"`
 - `github_git_status` / `github_git_diff` / `github_git_log` / `github_git_branches` — 本地只读 git，返回 JSON（含 branch、commits），并进入 MCP `structuredContent`
 - `github_git_stage` / `github_git_commit` / `github_git_push` / `github_git_pull` / `github_git_clone` — 日常写入。`github_git_stage` 用 `files` 一次传入多个相对路径，只弹一次确认；`file` 仍可用，`all=true` 才是 `git add -A`。push 可指定 `remote`（默认 origin）、`branch`、`tag`（只推该标签）、`tags`、`force_with_lease`，并区分「已推送 / 远端已是最新」
-- `github_create_issue` / `github_create_issue_comment` / `github_create_pull_request` / `github_create_release` — GitHub 写操作，需单独启用 API 写入，且每次弹出桌面确认
+- API 写入（需单独打开 `api_write_enabled`，每次弹出桌面确认）：`github_create_issue` / `github_issue_update` / `github_create_issue_comment`；`github_create_pull_request`（默认草稿）/ `github_pr_merge`；`github_repo_create`（只建私有仓）/ `github_repo_update`（拒绝改为公开）；`github_file_put` / `github_file_delete`；`github_ref_create` / `github_ref_delete`；`github_create_release`（默认草稿）/ `github_release_publish` / `github_release_delete` / `github_release_asset_upload`；`github_workflow_dispatch` / `github_repository_dispatch` / `github_run_rerun` / `github_rerun_failed_jobs` / `github_run_cancel`；`github_repo_variable_set` / `github_repo_variable_delete`；`github_repo_secret_set`
+- 中风险下载（同样受 API 写入开关和桌面确认约束）：`github_download_release_asset` / `github_download_artifact` / `github_download_run_logs` — 写到本地绝对路径，返回 path、bytes、sha256，不含文件内容
 
-GitHub MCP 默认停用。启用后开放只读 API 和 `github_git_*`。凭据可传标题（`credential="agentos"`），也可省略后使用 MCP 页默认 Token；金库里只有一条 GitHub Token 时自动选用。仓库推荐 `repo="owner/repo"`。git 可先登记工作区短名，不必每次传绝对路径。`tools/list` 带 MCP 标准 `annotations.readOnlyHint` / `destructiveHint`。GitHub API 写入由 `api_write_enabled` 控制；打开后会出现 Issue / 评论 / Draft PR / Release，但每一次仍要桌面确认。侧栏助手只调用只读低风险工具。
+GitHub MCP 默认停用。启用后开放只读 API 和 `github_git_*`。凭据可传标题（`credential="agentos"`），也可省略后使用 MCP 页默认 Token；金库里只有一条 GitHub Token 时自动选用。仓库推荐 `repo="owner/repo"`。git 可先登记工作区短名，不必每次传绝对路径。`tools/list` 带 MCP 标准 `annotations.readOnlyHint` / `destructiveHint`。GitHub API 写入由 `api_write_enabled` 控制；打开后会出现 Issue、PR（含合并）、私有仓库、文件、ref、Release、Actions 调度、变量、secret，以及 CI 产物下载，但每一次仍要桌面确认。不提供删仓库、分支保护、协作者、deploy key、Actions 总开关或 workflow 默认 Token 权限。侧栏助手只调用只读低风险工具。Token 不会返回给模型，也不接受任意 URL、请求头、方法或原始请求体。
 
 停用时这些工具都不会出现在 `tools/list`，直接调用也会被拒绝。模型收到的是结构化字段或截断后的 git 输出，不包含 Token、请求头、Release body 或完整远端响应。金库锁定时工具会失败。后续接口规划见 [`docs/superpowers/specs/2026-09-20-github-mcp-roadmap.md`](docs/superpowers/specs/2026-09-20-github-mcp-roadmap.md)。MCP Token 可在页面轮换。
 
@@ -143,7 +147,7 @@ GitHub MCP 默认停用。启用后开放只读 API 和 `github_git_*`。凭据�
 
 The Assistant page is below Plugin in the sidebar. It uses an OpenAI Chat Completions-compatible endpoint, stores the API key encrypted in the vault, probes the real local MCP HTTP endpoint, and automatically follows the single GitHub MCP enable/disable switch. The first version is non-streaming and does not support external MCP servers or stdio/SSE transports.
 
-GitHub MCP is disabled by default. When enabled, the assistant discovers the low-risk read-only GitHub and local-git tools; write tools such as commit, push, PR and Release stay behind desktop confirmation and are not offered to the assistant. GitHub API reads remain fixed GET calls to `https://api.github.com:443`; the separate API-write switch exposes allowlisted Issue / PR / Release POSTs and never accepts arbitrary URLs, headers, bodies, or methods.
+GitHub MCP is disabled by default. When enabled, the assistant discovers the low-risk read-only GitHub and local-git tools; write tools such as commit, push, issues, pull requests, releases, file and ref edits, Actions controls, variables, and secrets stay behind desktop confirmation and are not offered to the assistant. GitHub API reads remain fixed calls to `https://api.github.com:443`; the separate API-write switch exposes the allowlisted writes above, plus medium-risk downloads of release assets, artifacts, and run logs. It never accepts arbitrary URLs, headers, bodies, or methods, and it does not delete repositories or manage branch protection, collaborators, deploy keys, the Actions enable switch, or default workflow token permissions.
 
 ## 插件 Plugin（Chrome / Edge）
 

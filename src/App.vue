@@ -2185,7 +2185,7 @@ onMounted(async () => {
           <div class="mcp-card">
             <h3>GitHub MCP</h3>
             <p class="crumb">
-              启用后开放 GitHub 只读 API、本地 git，以及可单独打开的 Issue / PR / Release 写入。
+              启用后开放 GitHub 只读 API、本地 git，以及可单独打开的 Issue、PR、Release、文件、Actions 和 secret 写入。
               模型可用 Token 标题或默认凭据，不必先抄 UUID；仓库传 owner/repo；已登记工作区可用短名代替绝对路径。
               每一次写操作都会弹出 Sealbox 桌面确认。Token 不会返回给模型。
             </p>
@@ -2232,7 +2232,7 @@ onMounted(async () => {
               </div>
             </template>
             <p class="crumb">
-              GitHub API 写入包含创建 Issue、评论、Draft PR 和 Release；每次仍需桌面确认。
+              GitHub API 写入包含 Issue、PR、Release、文件、ref、Actions 变量和 secret，以及 CI 产物下载。每次仍需桌面确认。不提供删仓库、分支保护、协作者和 deploy key。
               GitHub Token 在 GitHub 侧的实际权限仍由 GitHub 返回结果决定；Sealbox 不把 Token、请求头或任意请求体返回给模型。
             </p>
           </div>
