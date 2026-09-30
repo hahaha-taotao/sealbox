@@ -217,6 +217,25 @@ impl Github {
         cap: u64,
         confirm: Option<&Confirm>,
     ) -> Result<Saved, String> {
+        self.download_with_accept(
+            path,
+            query,
+            dest,
+            cap,
+            confirm,
+            "application/vnd.github+json",
+        )
+    }
+
+    pub fn download_with_accept(
+        &self,
+        path: &str,
+        query: Vec<(String, String)>,
+        dest: &Path,
+        cap: u64,
+        confirm: Option<&Confirm>,
+        accept: &str,
+    ) -> Result<Saved, String> {
         if dest.exists() {
             return Err("目标文件已存在".into());
         }
@@ -234,7 +253,7 @@ impl Github {
         if temp.exists() {
             return Err("下载临时文件已存在".into());
         }
-        let saved = match stream_download(&self.token, &url, &temp, cap) {
+        let saved = match stream_download(&self.token, &url, &temp, cap, accept) {
             Ok(saved) => saved,
             Err(error) => {
                 let _ = std::fs::remove_file(&temp);
@@ -522,7 +541,13 @@ struct Streamed {
     sha256: String,
 }
 
-fn stream_download(token: &str, url: &str, temp: &Path, cap: u64) -> Result<Streamed, String> {
+fn stream_download(
+    token: &str,
+    url: &str,
+    temp: &Path,
+    cap: u64,
+    accept: &str,
+) -> Result<Streamed, String> {
     if let Some(reply) = probe_exchange(token, Method::Get, url, None) {
         let reply = reply?;
         if reply.status != 200 {
@@ -548,7 +573,7 @@ fn stream_download(token: &str, url: &str, temp: &Path, cap: u64) -> Result<Stre
     let response = agent
         .request("GET", url)
         .set("Authorization", &format!("Bearer {token}"))
-        .set("Accept", "application/vnd.github+json")
+        .set("Accept", accept)
         .set("X-GitHub-Api-Version", "2022-11-28")
         .call();
     let response = match response {

@@ -1154,6 +1154,81 @@ pub fn api_tool_definitions() -> Vec<Value> {
                 &["repo", "name"],
             ),
         ),
+        medium_tool(
+            "github_download_release_asset",
+            "下载 GitHub Release 资产到本地绝对路径。确认框只含仓库、资产 id 和目标路径，不含文件内容。返回 path、bytes、sha256。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("asset_id", json!({"type":"integer","minimum":1,"maximum":9007199254740991u64})),
+                    ("dest_path", string_schema(1, 1024)),
+                ],
+                &["repo", "asset_id", "dest_path"],
+            ),
+        ),
+        medium_tool(
+            "github_download_artifact",
+            "下载某次 Actions artifact 的 zip 到本地绝对路径。确认框只含仓库、artifact id 和目标路径，不含文件内容。返回 path、bytes、sha256。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("artifact_id", json!({"type":"integer","minimum":1,"maximum":9007199254740991u64})),
+                    ("dest_path", string_schema(1, 1024)),
+                ],
+                &["repo", "artifact_id", "dest_path"],
+            ),
+        ),
+        medium_tool(
+            "github_download_run_logs",
+            "下载某次 Actions run 的日志 zip 到本地绝对路径。确认框只含仓库、run id 和目标路径，不含日志正文。返回 path、bytes、sha256。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("run_id", json!({"type":"integer","minimum":1,"maximum":9007199254740991u64})),
+                    ("dest_path", string_schema(1, 1024)),
+                ],
+                &["repo", "run_id", "dest_path"],
+            ),
+        ),
+        tool(
+            "github_repo_secret_list",
+            "列出仓库 Actions secret 的名称和更新时间。不返回 secret 值。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                ],
+                &["repo"],
+            ),
+        ),
+        write_tool(
+            "github_repo_secret_set",
+            "创建或更新仓库 Actions secret。value、value_from_file、value_credential_name 必须且只能填一个。value 为明文，不推荐。确认框不含 secret 值。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("name", string_schema(1, 64)),
+                    ("value", string_schema(0, MAX_CONTENT_BYTES as u64)),
+                    ("value_from_file", string_schema(1, 1024)),
+                    ("value_credential_name", string_schema(1, 100)),
+                ],
+                &["repo", "name"],
+            ),
+        ),
         write_tool(
             "github_create_release",
             "在仓库创建 Release。用户说「打一个 GitHub Release」时调用。默认 draft=true。每次都会弹出 Sealbox 桌面确认。",
@@ -1255,6 +1330,17 @@ fn write_tool(name: &str, description: &str, input_schema: Value) -> Value {
         "inputSchema": input_schema,
         "readOnly": false,
         "risk": "high",
+        "annotations": annotations(false, true)
+    })
+}
+
+fn medium_tool(name: &str, description: &str, input_schema: Value) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": input_schema,
+        "readOnly": false,
+        "risk": "medium",
         "annotations": annotations(false, true)
     })
 }
@@ -1863,6 +1949,42 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             };
             Ok((status, json!({"name": name, "updated": true})))
         }
+        "github_download_release_asset" => download_github(
+            &token,
+            &credential_label,
+            &args,
+            "asset_id",
+            |repository, id| format!("/repos/{repository}/releases/assets/{id}"),
+            256 * 1024 * 1024u64,
+            "下载 GitHub Release 资产",
+        ),
+        "github_download_artifact" => download_github(
+            &token,
+            &credential_label,
+            &args,
+            "artifact_id",
+            |repository, id| format!("/repos/{repository}/actions/artifacts/{id}/zip"),
+            256 * 1024 * 1024u64,
+            "下载 GitHub Actions artifact",
+        ),
+        "github_download_run_logs" => download_github(
+            &token,
+            &credential_label,
+            &args,
+            "run_id",
+            |repository, id| format!("/repos/{repository}/actions/runs/{id}/logs"),
+            64 * 1024 * 1024u64,
+            "下载 GitHub Actions 日志",
+        ),
+        "github_repo_secret_list" => {
+            let repository = repository_args(&args)?;
+            let (status, value) = crate::github_api::Github::open(token.clone(), credential_label.clone()).get(
+                &format!("/repos/{repository}/actions/secrets"),
+                vec![("per_page".into(), MAX_PAGE_SIZE.to_string())],
+            )?;
+            Ok((status, secrets_dto(&value)?))
+        }
+        "github_repo_secret_set" => set_repo_secret(&session, &token, &credential_label, &args),
         "github_repo_variable_delete" => {
             let repository = repository_args(&args)?;
             let name = variable_name_arg(&args)?;
@@ -3502,6 +3624,299 @@ fn client_payload(args: &Value) -> Result<Option<Value>, String> {
     Ok(Some(payload.clone()))
 }
 
+const SECRET_VALUE_CAP: usize = 64 * 1024;
+
+fn download_github(
+    token: &str,
+    credential_label: &str,
+    args: &Value,
+    id_name: &str,
+    path_for: impl FnOnce(&str, u64) -> String,
+    cap: u64,
+    title: &str,
+) -> Result<(u16, Value), String> {
+    let repository = repository_args(args)?;
+    let id = positive_id(args, id_name)?;
+    let dest = dest_path_arg(args)?;
+    check_dest_path(&dest)?;
+    let saved = crate::github_api::Github::open(token.to_string(), credential_label.to_string())
+        .download_with_accept(
+            &path_for(&repository, id),
+            Vec::new(),
+            std::path::Path::new(&dest),
+            cap,
+            Some(&crate::github_api::Confirm {
+                title: title.to_string(),
+                prompt: "允许把 GitHub 文件保存到本地？".into(),
+                fields: vec![
+                    ("仓库".into(), repository),
+                    (id_name.to_string(), id.to_string()),
+                    ("目标路径".into(), dest.clone()),
+                ],
+            }),
+            "application/octet-stream",
+        )?;
+    Ok((
+        200,
+        json!({
+            "path": saved.path.display().to_string(),
+            "bytes": saved.bytes,
+            "sha256": saved.sha256
+        }),
+    ))
+}
+
+pub(crate) fn check_dest_path(raw: &str) -> Result<(), String> {
+    let path = std::path::Path::new(raw);
+    if !path.is_absolute() {
+        return Err("目标路径必须是绝对路径".into());
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| "目标路径的父目录不存在".to_string())?;
+    if !parent.is_dir() {
+        return Err("目标路径的父目录不存在".into());
+    }
+    if path.exists() {
+        return Err("目标文件已存在".into());
+    }
+    Ok(())
+}
+
+fn dest_path_arg(args: &Value) -> Result<String, String> {
+    args.get("dest_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "缺少参数 dest_path".to_string())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SecretSource {
+    Value,
+    File(String),
+    Credential(String),
+}
+
+pub(crate) fn secret_source(args: &Value) -> Result<SecretSource, String> {
+    let present = |name: &str| {
+        args.get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let value = present("value");
+    let file = present("value_from_file");
+    let credential = present("value_credential_name");
+    let count = [value.is_some(), file.is_some(), credential.is_some()]
+        .into_iter()
+        .filter(|set| *set)
+        .count();
+    if count != 1 {
+        return Err("secret 必须且只能指定一个来源".into());
+    }
+    if value.is_some() {
+        return Ok(SecretSource::Value);
+    }
+    if let Some(path) = file {
+        return Ok(SecretSource::File(path));
+    }
+    Ok(SecretSource::Credential(credential.expect("count checked")))
+}
+
+fn secret_plaintext(session: &Session, args: &Value) -> Result<(Vec<u8>, String), String> {
+    match secret_source(args)? {
+        SecretSource::Value => {
+            let value = args
+                .get("value")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "缺少参数 value".to_string())?;
+            if value.len() > SECRET_VALUE_CAP {
+                return Err("secret 超过 64 KiB".into());
+            }
+            Ok((value.as_bytes().to_vec(), "直接输入".into()))
+        }
+        SecretSource::File(path) => {
+            let bytes = read_secret_file(&path)?;
+            let name = std::path::Path::new(&path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("文件")
+                .to_string();
+            Ok((bytes, name))
+        }
+        SecretSource::Credential(requested) => {
+            let (bytes, title) = secret_from_credential(session, &requested)?;
+            Ok((bytes, title))
+        }
+    }
+}
+
+fn read_secret_file(raw: &str) -> Result<Vec<u8>, String> {
+    let path = std::path::Path::new(raw);
+    if !path.is_absolute() {
+        return Err("secret 文件必须是绝对路径".into());
+    }
+    let meta = std::fs::metadata(path).map_err(|_| "无法读取 secret 文件".to_string())?;
+    if !meta.is_file() {
+        return Err("secret 文件必须是普通文件".into());
+    }
+    if meta.len() > SECRET_VALUE_CAP as u64 {
+        return Err("secret 超过 64 KiB".into());
+    }
+    let bytes = std::fs::read(path).map_err(|_| "无法读取 secret 文件".to_string())?;
+    if bytes.len() > SECRET_VALUE_CAP {
+        return Err("secret 超过 64 KiB".into());
+    }
+    Ok(bytes)
+}
+
+fn secret_from_credential(session: &Session, requested: &str) -> Result<(Vec<u8>, String), String> {
+    let vault = session.vault().map_err(|e| e.to_string())?;
+    let dek = session.dek().map_err(|e| e.to_string())?;
+    let entries = vault
+        .list_entries(&crate::vault::ListFilter::default())
+        .map_err(|e| e.to_string())?;
+    let metas = entries
+        .iter()
+        .map(|entry| GithubCredentialMeta {
+            id: entry.id.clone(),
+            title: entry.title.clone(),
+            account: entry.account.clone(),
+            is_default: false,
+        })
+        .collect::<Vec<_>>();
+    let selected = match_credential(&metas, requested)?;
+    let payload = vault
+        .get_active_secret(dek, &selected.id)
+        .map_err(|_| "凭据不存在或已在回收站".to_string())?;
+    let secret = match payload {
+        SecretPayload::ApiToken { token, .. } => token,
+        SecretPayload::Website { password, .. } => password,
+        _ => return Err("凭据类型不能作为 Actions secret".into()),
+    };
+    if secret.len() > SECRET_VALUE_CAP {
+        return Err("secret 超过 64 KiB".into());
+    }
+    Ok((secret.into_bytes(), selected.title.clone()))
+}
+
+fn set_repo_secret(
+    session: &Session,
+    token: &str,
+    credential_label: &str,
+    args: &Value,
+) -> Result<(u16, Value), String> {
+    let repository = repository_args(args)?;
+    let name = variable_name_arg(args)?;
+    let (plaintext, source_label) = secret_plaintext(session, args)?;
+    let github = crate::github_api::Github::open(token.to_string(), credential_label.to_string());
+    let (_status, key_value) = github.send(
+        &crate::github_api::Call {
+            method: crate::github_api::Method::Get,
+            path: format!("/repos/{repository}/actions/secrets/public-key"),
+            query: Vec::new(),
+            body: None,
+            ok: &[200],
+            allow_missing_confirm: true,
+        },
+        None,
+    )?;
+    let key_id = key_value
+        .get("key_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .ok_or_else(|| "GitHub public key 响应格式不正确".to_string())?
+        .to_string();
+    let key_b64 = key_value
+        .get("key")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "GitHub public key 响应格式不正确".to_string())?;
+    let public_key = base64::engine::general_purpose::STANDARD
+        .decode(key_b64)
+        .map_err(|_| "GitHub public key 无法解码".to_string())?;
+    let encrypted = seal_secret(&plaintext, &public_key)?;
+    let encoded_name = percent_encode(&name, false);
+    let (status, _) = github.send(
+        &crate::github_api::Call {
+            method: crate::github_api::Method::Put,
+            path: format!("/repos/{repository}/actions/secrets/{encoded_name}"),
+            query: Vec::new(),
+            body: Some(crate::github_api::Body::Json(json!({
+                "encrypted_value": encrypted,
+                "key_id": key_id
+            }))),
+            ok: &[201, 204],
+            allow_missing_confirm: false,
+        },
+        Some(&crate::github_api::Confirm {
+            title: "设置 GitHub Actions secret".into(),
+            prompt: "允许这次 GitHub 写操作？确认框不含 secret 值。".into(),
+            fields: vec![
+                ("仓库".into(), repository),
+                ("secret 名".into(), name.clone()),
+                ("来源".into(), source_label),
+            ],
+        }),
+    )?;
+    Ok((status, json!({"name": name, "updated": true})))
+}
+
+pub(crate) fn seal_secret(plaintext: &[u8], public_key_bytes: &[u8]) -> Result<String, String> {
+    use crypto_box::PublicKey;
+    let key_bytes: [u8; 32] = public_key_bytes
+        .try_into()
+        .map_err(|_| "GitHub public key 长度不正确".to_string())?;
+    let public_key = PublicKey::from(key_bytes);
+    let sealed = public_key
+        .seal(&mut rand::thread_rng(), plaintext)
+        .map_err(|_| "无法加密 secret".to_string())?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(sealed))
+}
+
+#[cfg(test)]
+fn test_secret_key() -> crypto_box::SecretKey {
+    crypto_box::SecretKey::from([7u8; 32])
+}
+
+#[cfg(test)]
+fn test_public_key() -> [u8; 32] {
+    *crypto_box::PublicKey::from(&test_secret_key()).as_bytes()
+}
+
+#[cfg(test)]
+fn open_seal_for_test(encrypted: &str, secret_key: &crypto_box::SecretKey) -> Result<Vec<u8>, String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encrypted)
+        .map_err(|_| "无法解码 sealed box".to_string())?;
+    secret_key
+        .unseal(&bytes)
+        .map_err(|_| "无法解密 sealed box".to_string())
+}
+
+fn secrets_dto(value: &Value) -> Result<Value, String> {
+    let items = value
+        .get("secrets")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "GitHub 响应格式不正确".to_string())?
+        .iter()
+        .take(MAX_PAGE_SIZE as usize)
+        .map(secret_list_item)
+        .collect::<Vec<_>>();
+    let count = items.len();
+    Ok(json!({"secrets": items, "count": count}))
+}
+
+fn secret_list_item(item: &Value) -> Value {
+    json!({
+        "name": limited_string(item.get("name")),
+        "updated_at": limited_string(item.get("updated_at"))
+    })
+}
+
 fn variable_name_arg(args: &Value) -> Result<String, String> {
     let name = required_text(args, "name", 64)?;
     let mut chars = name.chars();
@@ -4388,6 +4803,58 @@ mod tests {
     }
 
     #[test]
+    fn download_rejects_relative_dest() {
+        let error = check_dest_path("logs.zip").unwrap_err();
+        assert!(error.contains("绝对路径"));
+    }
+
+    #[test]
+    fn secret_set_rejects_two_sources() {
+        let error = secret_source(&json!({
+            "value": "plain",
+            "value_from_file": "C:/keys/app.key"
+        }))
+        .unwrap_err();
+        assert!(error.contains("一个来源"));
+    }
+
+    #[test]
+    fn sealed_box_round_trip_hides_plaintext() {
+        let secret = b"super-secret";
+        let encrypted = seal_secret(secret, &test_public_key()).unwrap();
+        assert!(!encrypted.contains("super-secret"));
+        let opened = open_seal_for_test(&encrypted, &test_secret_key()).unwrap();
+        assert_eq!(opened, secret);
+    }
+
+    #[test]
+    fn secret_source_rejects_none_and_accepts_value() {
+        let none = secret_source(&json!({})).unwrap_err();
+        assert!(none.contains("一个来源"), "{none}");
+        let three = secret_source(&json!({
+            "value": "plain",
+            "value_from_file": "C:/keys/app.key",
+            "value_credential_name": "ci"
+        }))
+        .unwrap_err();
+        assert!(three.contains("一个来源"), "{three}");
+        assert_eq!(secret_source(&json!({"value": "plain"})).unwrap(), SecretSource::Value);
+    }
+
+    #[test]
+    fn secret_list_item_drops_extra_fields() {
+        let item = secret_list_item(&json!({
+            "name": "DEPLOY_KEY",
+            "updated_at": "2026-09-01T00:00:00Z",
+            "created_at": "2026-01-01T00:00:00Z",
+            "value": "super-secret"
+        }));
+        assert_eq!(item, json!({"name": "DEPLOY_KEY", "updated_at": "2026-09-01T00:00:00Z"}));
+        assert!(item.get("value").is_none());
+        assert!(item.get("created_at").is_none());
+    }
+
+    #[test]
     fn generate_notes_is_read_only_post() {
         let def = find_tool("github_release_generate_notes");
         assert_eq!(def["readOnly"], true);
@@ -4629,6 +5096,45 @@ mod tests {
         assert!(names.iter().any(|name| name == "github_pr_merge"));
         assert!(names.iter().any(|name| name == "github_repo_create"));
         assert!(names.iter().any(|name| name == "github_repo_update"));
+    }
+
+    #[test]
+    fn download_tools_are_medium_and_need_api_write() {
+        let hidden = tool_names(&GithubMcpPolicy {
+            enabled: true,
+            api_write_enabled: false,
+            ..Default::default()
+        });
+        let visible = tool_names(&GithubMcpPolicy {
+            enabled: true,
+            api_write_enabled: true,
+            ..Default::default()
+        });
+        for name in [
+            "github_download_release_asset",
+            "github_download_artifact",
+            "github_download_run_logs",
+        ] {
+            let def = find_tool(name);
+            assert_eq!(def["readOnly"], false);
+            assert_eq!(def["risk"], "medium");
+            assert_eq!(def["annotations"]["destructiveHint"], true);
+            assert!(!hidden.iter().any(|item| item == name), "{name} leaked");
+            assert!(visible.iter().any(|item| item == name), "{name} missing");
+        }
+    }
+
+    #[test]
+    fn secret_list_is_low_risk_without_api_write() {
+        let def = find_tool("github_repo_secret_list");
+        assert_eq!(def["readOnly"], true);
+        assert_eq!(def["risk"], "low");
+        let names = tool_names(&GithubMcpPolicy {
+            enabled: true,
+            api_write_enabled: false,
+            ..Default::default()
+        });
+        assert!(names.iter().any(|name| name == "github_repo_secret_list"));
     }
 
     fn tool_names(policy: &GithubMcpPolicy) -> Vec<String> {
@@ -4908,8 +5414,8 @@ mod tests {
             .into_iter()
             .filter(|definition| definition["readOnly"] == true)
             .count();
-        // 22 original read-only tools, 8 new read tools, plus 13 read-only aliases.
-        assert_eq!(read_only, 43);
+        // 22 original read-only tools, 9 new read tools, plus 13 read-only aliases.
+        assert_eq!(read_only, 44);
     }
 
     #[test]

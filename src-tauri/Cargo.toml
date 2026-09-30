@@ -37,8 +37,9 @@ regex = "1"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
-md-5 = "0.10"
-tauri-plugin-updater = "2"
+	md-5 = "0.10"
+	tauri-plugin-updater = "2"
+	crypto_box = { version = "0.9", features = ["seal"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"

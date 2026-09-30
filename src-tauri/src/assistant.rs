@@ -767,6 +767,20 @@ mod tests {
     }
 
     #[test]
+    fn safe_tools_exclude_medium_github_downloads() {
+        let value = json!({
+            "tools": [
+                {"name":"github_get_file","description":"file","inputSchema":{},"readOnly":true,"risk":"low"},
+                {"name":"github_download_release_asset","description":"download","inputSchema":{},"readOnly":false,"risk":"medium","annotations":{"destructiveHint":true}}
+            ]
+        });
+        let tools = safe_tool_definitions(&value);
+        let names: Vec<&str> = tools.iter().map(|tool| tool.summary.name.as_str()).collect();
+        assert_eq!(names, vec!["github_get_file"]);
+        assert!(!names.contains(&"github_download_release_asset"));
+    }
+
+    #[test]
     fn invalid_model_response_is_reported_without_panic() {
         let response = json!({"choices": []});
         assert!(response
