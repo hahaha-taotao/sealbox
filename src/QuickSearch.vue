@@ -148,10 +148,16 @@ onMounted(async () => {
     password.value = "";
     await refresh();
   });
+  const unUnlock = await listen("vault-unlocked", async () => {
+    if (status.value?.unlocked) return;
+    password.value = "";
+    await refresh();
+  });
   onUnmounted(() => {
     window.removeEventListener("keydown", onKey);
     un();
     unLock();
+    unUnlock();
   });
 });
 </script>

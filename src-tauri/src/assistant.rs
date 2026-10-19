@@ -740,10 +740,10 @@ mod tests {
     fn safe_tools_exclude_legacy_and_high_risk_tools() {
         let value = json!({
             "tools": [
-                {"name":"github_get_file","description":"file","inputSchema":{},"readOnly":true,"risk":"low"},
+                {"name":"github_file_get","description":"file","inputSchema":{},"readOnly":true,"risk":"low"},
                 {"name":"github_git_status","description":"git status","inputSchema":{},"readOnly":true,"risk":"low"},
                 {"name":"github_git_push","description":"git push","inputSchema":{},"readOnly":false,"risk":"high"},
-                {"name":"github_create_release","description":"create release","inputSchema":{},"readOnly":false,"risk":"high"},
+                {"name":"github_release_create","description":"create release","inputSchema":{},"readOnly":false,"risk":"high"},
                 {"name":"zoomkey_jira_nav","description":"jira","inputSchema":{},"readOnly":true,"risk":"low"},
                 {"name":"zoomkey_crm_query","description":"crm","inputSchema":{},"readOnly":true,"risk":"low"},
                 {"name":"list_credentials","description":"legacy","inputSchema":{},"readOnly":true,"risk":"medium"},
@@ -758,7 +758,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "github_get_file",
+                "github_file_get",
                 "github_git_status",
                 "zoomkey_jira_nav",
                 "zoomkey_crm_query"
@@ -770,13 +770,13 @@ mod tests {
     fn safe_tools_exclude_medium_github_downloads() {
         let value = json!({
             "tools": [
-                {"name":"github_get_file","description":"file","inputSchema":{},"readOnly":true,"risk":"low"},
+                {"name":"github_file_get","description":"file","inputSchema":{},"readOnly":true,"risk":"low"},
                 {"name":"github_download_release_asset","description":"download","inputSchema":{},"readOnly":false,"risk":"medium","annotations":{"destructiveHint":true}}
             ]
         });
         let tools = safe_tool_definitions(&value);
         let names: Vec<&str> = tools.iter().map(|tool| tool.summary.name.as_str()).collect();
-        assert_eq!(names, vec!["github_get_file"]);
+        assert_eq!(names, vec!["github_file_get"]);
         assert!(!names.contains(&"github_download_release_asset"));
     }
 

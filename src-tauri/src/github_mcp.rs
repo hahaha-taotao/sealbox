@@ -1,14 +1,13 @@
 use crate::http_guard::{assert_public_target, parse_http_url, sha256_hex, PublicResolver};
 use crate::redact::redact_text;
 use crate::session::Session;
-use crate::vault::{SecretPayload, Vault};
+use crate::vault::SecretPayload;
 use base64::Engine;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 use std::io::Read;
 use std::time::Duration;
 
-const POLICY_KEY: &str = "github_mcp_policy";
 const API_BASE: &str = "https://api.github.com";
 const API_VERSION: &str = "2022-11-28";
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
@@ -69,50 +68,11 @@ impl From<&str> for GithubCallError {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct GithubWorkspace {
-    pub name: String,
-    pub path: String,
-    pub default_credential_id: Option<String>,
-}
-
-impl Default for GithubWorkspace {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            path: String::new(),
-            default_credential_id: None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct GithubMcpPolicy {
-    pub enabled: bool,
-    pub api_write_enabled: bool,
-    pub default_credential_id: Option<String>,
-    pub workspaces: Vec<GithubWorkspace>,
-}
-
-impl Default for GithubMcpPolicy {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            api_write_enabled: false,
-            default_credential_id: None,
-            workspaces: Vec::new(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize)]
 pub struct GithubCredentialMeta {
     pub id: String,
     pub title: String,
     pub account: Option<String>,
-    pub is_default: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -127,7 +87,7 @@ fn credential_prop() -> Value {
         "type": "string",
         "minLength": 1,
         "maxLength": 100,
-        "description": "GitHub Token 的标题、账号或 ID。可省略：使用 MCP 页的默认 Token；若金库里只有一个 GitHub Token 则自动选用。"
+        "description": "GitHub Token 的标题、账号或 ID。金库里只有一个 GitHub Token 时可省略。"
     })
 }
 
@@ -350,6 +310,7 @@ struct GithubReleaseDto {
     published_at: Option<String>,
 }
 
+/// 旧工具名不再单独注册。已经接到旧名的客户端仍落到同一实现。
 pub fn canonical_tool_name(name: &str) -> &str {
     match name {
         "github_get_authenticated_user" => "github_user_info",
@@ -374,14 +335,14 @@ pub fn canonical_tool_name(name: &str) -> &str {
 }
 
 pub fn api_tool_definitions() -> Vec<Value> {
-    with_legacy_aliases(vec![
+    vec![
         tool(
             "github_list_credentials",
-            "列出本地活动 GitHub Token 的标题、账号和是否为默认凭据。回答「我有哪些 GitHub Token / 该用哪条凭据」时调用。日常读写不必先调这个：可直接传标题，或省略后使用默认 Token。永不返回 Token 明文。",
+            "列出本地活动 GitHub Token 的标题和账号。回答「我有哪些 GitHub Token / 该用哪条凭据」时调用。金库里只有一条时可省略 credential。永不返回 Token 明文。",
             schema(&[], &[]),
         ),
         tool(
-            "github_get_authenticated_user",
+            "github_user_info",
             "读取当前 GitHub 账号的 login、姓名、公开/私有仓库数。回答「我是谁 / 这个 Token 属于哪个账号」时调用。",
             schema(
                 &[
@@ -392,7 +353,7 @@ pub fn api_tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
-            "github_list_repositories",
+            "github_repo_list",
             "列出当前 Token 可见的仓库（full_name、默认分支、私有与否）。回答「我有多少 GitHub 仓库 / 列出我的仓库」时调用。默认只看自己拥有的仓库。",
             schema(
                 &[
@@ -427,7 +388,7 @@ pub fn api_tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
-            "github_get_repository",
+            "github_repo_get",
             "读取单个仓库的元数据：默认分支、是否私有、描述、更新时间。需要确认某个 owner/repo 是否存在或默认分支是什么时调用。",
             schema(
                 &[
@@ -440,7 +401,7 @@ pub fn api_tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
-            "github_get_file",
+            "github_file_get",
             "读取 GitHub 仓库里的单个文本文件（README、工作流 YAML 等）。需要看远端文件内容而不是本地工作区时调用。目录会报错。",
             schema(
                 &[
@@ -455,7 +416,7 @@ pub fn api_tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
-            "github_list_issues",
+            "github_issues_list",
             "列出仓库 Issue（不含 PR）：编号、标题、状态、标签、指派人、评论数。回答「这个仓库有哪些未关闭 Issue」时调用。",
             schema(
                 &[
@@ -537,7 +498,7 @@ pub fn api_tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
-            "github_list_pull_requests",
+            "github_pulls_list",
             "列出仓库 Pull Request：编号、标题、draft、head/base、mergeable、指派人和 requested reviewers。回答「有哪些未合并 PR / 这个 PR 能不能合」时调用。",
             schema(
                 &[
@@ -567,7 +528,7 @@ pub fn api_tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
-            "github_list_workflow_runs",
+            "github_runs_list",
             "列出仓库最近的 GitHub Actions 运行：status、conclusion、head_branch、html_url。轮询 CI / 发布流水线状态时调用。",
             schema(
                 &[
@@ -663,7 +624,7 @@ pub fn api_tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
-            "github_list_releases",
+            "github_release_list",
             "列出仓库 Release：tag、名称、是否草稿、是否预发布、html_url。不含 body 全文，也不含资产文件。",
             schema(
                 &[
@@ -678,7 +639,7 @@ pub fn api_tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
-            "github_get_release",
+            "github_release_get",
             "读取单个 Release 的元数据。传 id 或 tag_name 之一。不含 body，不含资产二进制。",
             schema(
                 &[
@@ -707,7 +668,7 @@ pub fn api_tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
-            "github_list_tags",
+            "github_tags_list",
             "列出仓库 tag 名和对应 commit SHA。",
             schema(
                 &[
@@ -737,7 +698,7 @@ pub fn api_tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
-            "github_list_workflows",
+            "github_workflow_list",
             "列出仓库 Actions workflow：id、name、path、state。不含 workflow 文件内容。",
             schema(
                 &[
@@ -752,7 +713,7 @@ pub fn api_tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
-            "github_get_workflow_run",
+            "github_run_get",
             "读取单次 workflow run：status、conclusion、head_sha、head_branch、html_url。不含日志。",
             schema(
                 &[
@@ -766,7 +727,7 @@ pub fn api_tool_definitions() -> Vec<Value> {
             ),
         ),
         tool(
-            "github_list_workflow_jobs",
+            "github_run_jobs",
             "列出某次 run 的 jobs：name、status、conclusion，以及各 step 的名称和结论。不含日志。",
             schema(
                 &[
@@ -780,7 +741,7 @@ pub fn api_tool_definitions() -> Vec<Value> {
             ),
         ),
         write_tool(
-            "github_create_issue",
+            "github_issue_create",
             "在仓库创建 Issue。用户说「帮我开一个 bug / 功能单」时调用。每次都会弹出 Sealbox 桌面确认。",
             schema(
                 &[
@@ -796,7 +757,7 @@ pub fn api_tool_definitions() -> Vec<Value> {
             ),
         ),
         write_tool(
-            "github_create_issue_comment",
+            "github_issue_comment",
             "在已有 Issue 或 PR 下追加一条评论。需要回复 Issue/PR 时调用。每次都会弹出 Sealbox 桌面确认。",
             schema(
                 &[
@@ -811,7 +772,7 @@ pub fn api_tool_definitions() -> Vec<Value> {
             ),
         ),
         write_tool(
-            "github_create_pull_request",
+            "github_pr_create",
             "从 head 分支向 base 开 PR。用户说「帮我提 PR」时调用。默认 draft=true。每次都会弹出 Sealbox 桌面确认。",
             schema(
                 &[
@@ -1229,7 +1190,7 @@ pub fn api_tool_definitions() -> Vec<Value> {
             ),
         ),
         write_tool(
-            "github_create_release",
+            "github_release_create",
             "在仓库创建 Release。用户说「打一个 GitHub Release」时调用。默认 draft=true。每次都会弹出 Sealbox 桌面确认。",
             schema(
                 &[
@@ -1249,26 +1210,7 @@ pub fn api_tool_definitions() -> Vec<Value> {
                 &["repo", "tag_name"],
             ),
         ),
-    ])
-}
-
-fn with_legacy_aliases(definitions: Vec<Value>) -> Vec<Value> {
-    let mut tools = Vec::with_capacity(definitions.len() * 2);
-    for definition in definitions {
-        let name = definition
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let canonical = canonical_tool_name(&name);
-        if canonical != name {
-            let mut alias = definition.clone();
-            alias["name"] = Value::String(canonical.to_string());
-            tools.push(alias);
-        }
-        tools.push(definition);
-    }
-    tools
+    ]
 }
 
 pub fn tool_definitions() -> Vec<Value> {
@@ -1277,12 +1219,8 @@ pub fn tool_definitions() -> Vec<Value> {
     tools
 }
 
-pub fn tool_definitions_for_policy(policy: &GithubMcpPolicy) -> Vec<Value> {
-    let mut tools = crate::git_workspace::tool_definitions();
-    tools.extend(api_tool_definitions().into_iter().filter(|definition| {
-        definition["readOnly"].as_bool().unwrap_or(false) || policy.api_write_enabled
-    }));
-    tools
+pub fn tool_definitions_for_mcp() -> Vec<Value> {
+    tool_definitions()
 }
 
 fn string_schema(minimum: u64, maximum: u64) -> Value {
@@ -1345,97 +1283,14 @@ fn medium_tool(name: &str, description: &str, input_schema: Value) -> Value {
 }
 
 pub fn is_github_api_tool(name: &str) -> bool {
+    let canonical = canonical_tool_name(name);
     api_tool_definitions()
         .iter()
-        .any(|definition| definition.get("name").and_then(Value::as_str) == Some(name))
+        .any(|definition| definition.get("name").and_then(Value::as_str) == Some(canonical))
 }
 
 pub fn is_github_tool(name: &str) -> bool {
     is_github_api_tool(name) || crate::git_workspace::is_git_tool(name)
-}
-
-pub fn load_policy(vault: &Vault, dek: &[u8; 32]) -> GithubMcpPolicy {
-    let Some(raw) = vault.get_secret_setting(dek, POLICY_KEY).ok().flatten() else {
-        return GithubMcpPolicy::default();
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
-        return GithubMcpPolicy::default();
-    };
-    if value.get("scopes").is_some() || value.get("allowed_repositories").is_some() {
-        return GithubMcpPolicy::default();
-    }
-    let mut value = value;
-    if value.get("default_credential_id").is_none() {
-        if let Some(legacy) = value.get("credential_id").cloned() {
-            if let Some(object) = value.as_object_mut() {
-                object.insert("default_credential_id".into(), legacy);
-            }
-        }
-    }
-    normalize_policy(serde_json::from_value(value).unwrap_or_default()).unwrap_or_default()
-}
-
-pub fn save_policy(vault: &Vault, dek: &[u8; 32], policy: &GithubMcpPolicy) -> Result<(), String> {
-    let normalized = normalize_policy(policy.clone())?;
-    let raw = serde_json::to_string(&normalized).map_err(|e| e.to_string())?;
-    vault
-        .set_secret_setting(dek, POLICY_KEY, &raw)
-        .map_err(|e| e.to_string())
-}
-
-pub fn normalize_policy(policy: GithubMcpPolicy) -> Result<GithubMcpPolicy, String> {
-    let mut names = std::collections::HashSet::new();
-    let mut workspaces = Vec::new();
-    for workspace in policy.workspaces {
-        let name = normalize_workspace_name(&workspace.name)?;
-        if !names.insert(name.clone()) {
-            return Err(format!("工作区短名重复：{name}"));
-        }
-        let path = workspace.path.trim().to_string();
-        if path.is_empty() {
-            return Err(format!("工作区 {name} 缺少绝对路径"));
-        }
-        let path_buf = std::path::PathBuf::from(&path);
-        if !path_buf.is_absolute() {
-            return Err(format!("工作区 {name} 的 path 必须是绝对路径"));
-        }
-        let default_credential_id = workspace
-            .default_credential_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        workspaces.push(GithubWorkspace {
-            name,
-            path,
-            default_credential_id,
-        });
-    }
-    let default_credential_id = policy
-        .default_credential_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    Ok(GithubMcpPolicy {
-        enabled: policy.enabled,
-        api_write_enabled: policy.enabled && policy.api_write_enabled,
-        default_credential_id,
-        workspaces,
-    })
-}
-
-pub fn normalize_workspace_name(raw: &str) -> Result<String, String> {
-    let name = raw.trim();
-    if name.is_empty()
-        || name.len() > 64
-        || !name
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
-    {
-        return Err("工作区短名只能是字母、数字、下划线或连字符".into());
-    }
-    Ok(name.to_string())
 }
 
 pub fn list_credentials(session: &Session) -> Result<Vec<GithubCredentialMeta>, String> {
@@ -1460,20 +1315,7 @@ pub fn list_credentials(session: &Session) -> Result<Vec<GithubCredentialMeta>, 
                 id: entry.id,
                 title: entry.title,
                 account,
-                is_default: false,
             });
-        }
-    }
-    if let Ok(policy) = session
-        .vault()
-        .and_then(|vault| session.dek().map(|dek| load_policy(vault, dek)))
-    {
-        if let Some(default_id) = policy.default_credential_id.as_deref() {
-            for item in &mut out {
-                item.is_default = item.id == default_id;
-            }
-        } else if out.len() == 1 {
-            out[0].is_default = true;
         }
     }
     Ok(out)
@@ -1497,16 +1339,8 @@ pub fn resolve_github_credential(
                 .into(),
         );
     }
-    let vault = session.vault().map_err(|e| e.to_string())?;
-    let dek = session.dek().map_err(|e| e.to_string())?;
-    let policy = load_policy(vault, dek);
     let selected = if let Some(requested) = requested {
         match_credential(&credentials, requested)?
-    } else if let Some(default_id) = policy.default_credential_id.as_deref() {
-        credentials
-            .iter()
-            .find(|item| item.id == default_id)
-            .ok_or_else(|| "MCP 页选择的默认 GitHub Token 已不存在，请重新选择".to_string())?
     } else if credentials.len() == 1 {
         &credentials[0]
     } else {
@@ -1522,7 +1356,7 @@ pub fn resolve_github_credential(
             .collect::<Vec<_>>()
             .join("、");
         return Err(format!(
-            "有多条 GitHub Token，请传 credential=标题，或在 Sealbox MCP 页选定默认 Token。可选：{titles}"
+            "有多条 GitHub Token，请传 credential=标题。可选：{titles}"
         ));
     };
     token_from_id(session, &selected.id).map(|token| ResolvedGithubCredential {
@@ -1568,7 +1402,7 @@ fn match_credential<'a>(
     match matches.as_slice() {
         [only] => Ok(*only),
         [] => Err(format!(
-            "找不到 GitHub Token「{requested}」。先调 github_list_credentials，或在 MCP 页选定默认 Token。"
+            "找不到 GitHub Token「{requested}」。先调 github_list_credentials 看标题。"
         )),
         many => {
             let titles = many
@@ -1632,7 +1466,7 @@ pub fn call_tool_detailed(
         }
         Err(raw) => {
             let (status, parsed_reason, message) = parse_call_error(&raw);
-            let reason = if raw == "GitHub MCP 能力未启用" {
+            let reason = if raw == "MCP 未启用。请先在 Sealbox 的 MCP 页面打开。" {
                 "disabled"
             } else if raw.contains("用户拒绝") {
                 "denied"
@@ -1662,8 +1496,8 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
         validate_arguments(&definition["inputSchema"], &args)?;
         let vault = session.vault().map_err(|e| e.to_string())?;
         let dek = session.dek().map_err(|e| e.to_string())?;
-        if !load_policy(vault, dek).enabled {
-            return Err("GitHub MCP 能力未启用".into());
+        if !crate::zoomkey::mcp_enabled(vault, dek) {
+            return Err("MCP 未启用。请先在 Sealbox 的 MCP 页面打开。".into());
         }
         let credentials = list_credentials(session)?;
         session.touch();
@@ -2902,12 +2736,8 @@ fn prepare(session: &Session, name: &str, args: &Value) -> Result<(String, Strin
         .ok_or_else(|| "未知 GitHub 工具".to_string())?;
     let vault = session.vault().map_err(|e| e.to_string())?;
     let dek = session.dek().map_err(|e| e.to_string())?;
-    let policy = load_policy(vault, dek);
-    if !policy.enabled {
-        return Err("GitHub MCP 能力未启用".into());
-    }
-    if !definition["readOnly"].as_bool().unwrap_or(false) && !policy.api_write_enabled {
-        return Err("GitHub API 写入能力未启用".into());
+    if !crate::zoomkey::mcp_enabled(vault, dek) {
+        return Err("MCP 未启用。请先在 Sealbox 的 MCP 页面打开。".into());
     }
     validate_arguments(&definition["inputSchema"], args)?;
     let resolved = resolve_github_credential(session, args)?;
@@ -3770,7 +3600,6 @@ fn secret_from_credential(session: &Session, requested: &str) -> Result<(Vec<u8>
             id: entry.id.clone(),
             title: entry.title.clone(),
             account: entry.account.clone(),
-            is_default: false,
         })
         .collect::<Vec<_>>();
     let selected = match_credential(&metas, requested)?;
@@ -4725,6 +4554,7 @@ fn truncate(value: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use crate::session::Session;
+    use crate::vault::Vault;
 
     fn find_tool(name: &str) -> Value {
         api_tool_definitions()
@@ -4832,32 +4662,16 @@ mod tests {
     }
 
     #[test]
-    fn release_and_actions_writes_hidden_until_api_write() {
-        let hidden = tool_names(&GithubMcpPolicy {
-            enabled: true,
-            api_write_enabled: false,
-            ..Default::default()
-        });
+    fn all_write_tools_are_registered_for_shared_mcp() {
+        let definitions = tool_definitions_for_mcp();
         for name in [
             "github_release_publish",
-            "github_release_delete",
-            "github_release_asset_upload",
-            "github_workflow_dispatch",
-            "github_repository_dispatch",
-            "github_run_rerun",
-            "github_rerun_failed_jobs",
-            "github_run_cancel",
-            "github_repo_variable_set",
-            "github_repo_variable_delete",
+            "github_file_put",
+            "github_issue_update",
+            "github_download_run_logs",
+            "github_git_push",
         ] {
-            assert!(!hidden.iter().any(|item| item == name), "{name} leaked");
-        }
-        for name in [
-            "github_release_generate_notes",
-            "github_run_artifacts",
-            "github_repo_variable_list",
-        ] {
-            assert!(hidden.iter().any(|item| item == name), "{name} missing");
+            assert!(definitions.iter().any(|definition| definition["name"] == name), "{name} missing");
         }
     }
 
@@ -4926,55 +4740,18 @@ mod tests {
     }
 
     #[test]
-    fn file_and_ref_writes_hidden_until_api_write() {
-        let hidden = tool_names(&GithubMcpPolicy {
-            enabled: true,
-            api_write_enabled: false,
-            ..Default::default()
-        });
-        for name in [
-            "github_file_put",
-            "github_file_delete",
-            "github_ref_create",
-            "github_ref_delete",
-        ] {
-            assert!(!hidden.iter().any(|item| item == name), "{name} leaked");
-        }
-        let visible = tool_names(&GithubMcpPolicy {
-            enabled: true,
-            api_write_enabled: true,
-            ..Default::default()
-        });
-        for name in [
-            "github_file_put",
-            "github_file_delete",
-            "github_ref_create",
-            "github_ref_delete",
-        ] {
-            assert!(visible.iter().any(|item| item == name), "{name} missing");
+    fn file_and_ref_tools_are_registered_for_shared_mcp() {
+        let definitions = tool_definitions_for_mcp();
+        for name in ["github_file_put", "github_file_delete", "github_ref_create", "github_ref_delete"] {
+            assert!(definitions.iter().any(|definition| definition["name"] == name), "{name} missing");
         }
     }
 
     #[test]
-    fn new_read_tools_stay_visible_without_api_write() {
-        let definitions = tool_definitions_for_policy(&GithubMcpPolicy {
-            enabled: true,
-            api_write_enabled: false,
-            ..Default::default()
-        });
-        for name in [
-            "github_repo_search",
-            "github_commits_list",
-            "github_branches_list",
-            "github_ref_get",
-            "github_billing_actions",
-        ] {
-            let definition = definitions
-                .iter()
-                .find(|definition| definition["name"] == name)
-                .unwrap_or_else(|| panic!("{name} missing"));
-            assert_eq!(definition["readOnly"], true);
-            assert_eq!(definition["risk"], "low");
+    fn new_read_tools_are_registered_for_shared_mcp() {
+        let definitions = tool_definitions_for_mcp();
+        for name in ["github_repo_search", "github_commits_list", "github_branches_list", "github_ref_get", "github_billing_actions"] {
+            assert!(definitions.iter().any(|definition| definition["name"] == name), "{name} missing");
         }
     }
 
@@ -5011,103 +4788,48 @@ mod tests {
     }
 
     #[test]
-    fn issue_update_hidden_until_api_write() {
-        let names = tool_names(&GithubMcpPolicy {
-            enabled: true,
-            api_write_enabled: false,
-            ..Default::default()
-        });
-        assert!(!names.iter().any(|name| name == "github_issue_update"));
-        let names = tool_names(&GithubMcpPolicy {
-            enabled: true,
-            api_write_enabled: true,
-            ..Default::default()
-        });
-        assert!(names.iter().any(|name| name == "github_issue_update"));
-        assert!(names.iter().any(|name| name == "github_pr_merge"));
-        assert!(names.iter().any(|name| name == "github_repo_create"));
-        assert!(names.iter().any(|name| name == "github_repo_update"));
-    }
-
-    #[test]
-    fn download_tools_are_medium_and_need_api_write() {
-        let hidden = tool_names(&GithubMcpPolicy {
-            enabled: true,
-            api_write_enabled: false,
-            ..Default::default()
-        });
-        let visible = tool_names(&GithubMcpPolicy {
-            enabled: true,
-            api_write_enabled: true,
-            ..Default::default()
-        });
-        for name in [
-            "github_download_release_asset",
-            "github_download_artifact",
-            "github_download_run_logs",
-        ] {
-            let def = find_tool(name);
-            assert_eq!(def["readOnly"], false);
-            assert_eq!(def["risk"], "medium");
-            assert_eq!(def["annotations"]["destructiveHint"], true);
-            assert!(!hidden.iter().any(|item| item == name), "{name} leaked");
-            assert!(visible.iter().any(|item| item == name), "{name} missing");
+    fn issue_update_tool_is_registered_for_shared_mcp() {
+        let definitions = tool_definitions_for_mcp();
+        for name in ["github_issue_update", "github_pr_merge", "github_repo_create", "github_repo_update"] {
+            assert!(definitions.iter().any(|definition| definition["name"] == name), "{name} missing");
         }
     }
 
     #[test]
-    fn secret_list_is_low_risk_without_api_write() {
+    fn download_tools_are_medium_risk() {
+        for name in ["github_download_release_asset", "github_download_artifact", "github_download_run_logs"] {
+            let def = find_tool(name);
+            assert_eq!(def["readOnly"], false);
+            assert_eq!(def["risk"], "medium");
+            assert_eq!(def["annotations"]["destructiveHint"], true);
+        }
+    }
+
+    #[test]
+    fn secret_list_is_low_risk() {
         let def = find_tool("github_repo_secret_list");
         assert_eq!(def["readOnly"], true);
         assert_eq!(def["risk"], "low");
-        let names = tool_names(&GithubMcpPolicy {
-            enabled: true,
-            api_write_enabled: false,
-            ..Default::default()
-        });
-        assert!(names.iter().any(|name| name == "github_repo_secret_list"));
-    }
-
-    fn tool_names(policy: &GithubMcpPolicy) -> Vec<String> {
-        tool_definitions_for_policy(policy)
-            .into_iter()
-            .filter_map(|definition| {
-                definition
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .collect()
     }
 
     #[test]
     fn alias_collapses_to_canonical_name() {
-        assert_eq!(canonical_tool_name("github_list_repositories"), "github_repo_list");
         assert_eq!(canonical_tool_name("github_repo_list"), "github_repo_list");
-        assert_eq!(canonical_tool_name("github_create_issue"), "github_issue_create");
-        assert_eq!(canonical_tool_name("github_get_file"), "github_file_get");
+        assert_eq!(canonical_tool_name("github_repo_list"), "github_repo_list");
+        assert_eq!(canonical_tool_name("github_issue_create"), "github_issue_create");
+        assert_eq!(canonical_tool_name("github_file_get"), "github_file_get");
         assert_eq!(canonical_tool_name("github_git_status"), "github_git_status");
     }
 
     #[test]
-    fn default_policy_is_disabled() {
-        let policy = GithubMcpPolicy::default();
-        assert!(!policy.enabled);
-        assert!(!policy.api_write_enabled);
+    fn canonical_names_are_used_for_dispatch() {
+        assert_eq!(canonical_tool_name("github_get_authenticated_user"), "github_user_info");
+        assert_eq!(canonical_tool_name("github_create_release"), "github_release_create");
+        assert!(is_github_api_tool("github_user_info"));
+        assert!(is_github_api_tool("github_get_authenticated_user"));
     }
 
-    #[test]
-    fn legacy_policy_fields_migrate_to_disabled() {
-        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
-        vault
-            .set_secret_setting(
-                &dek,
-                "github_mcp_policy",
-                r#"{"enabled":true,"scopes":["user"],"allowed_repositories":["octocat/repo"]}"#,
-            )
-            .unwrap();
-        assert!(!load_policy(&vault, &dek).enabled);
-    }
+
 
     #[test]
     fn repository_and_path_reject_traversal() {
@@ -5145,7 +4867,7 @@ mod tests {
     fn release_tool_is_high_risk_and_closed() {
         let definition = api_tool_definitions()
             .into_iter()
-            .find(|definition| definition["name"] == "github_create_release")
+            .find(|definition| definition["name"] == "github_release_create")
             .expect("release tool must be registered");
         assert_eq!(definition["readOnly"], false);
         assert_eq!(definition["risk"], "high");
@@ -5160,56 +4882,37 @@ mod tests {
     }
 
     #[test]
-    fn write_tools_require_the_separate_policy_switch() {
-        let read_only = tool_definitions_for_policy(&GithubMcpPolicy {
-            enabled: true,
-            api_write_enabled: false,
-            ..Default::default()
-        });
-        assert!(!read_only
-            .iter()
-            .any(|definition| definition["name"] == "github_create_release"));
-        let with_write = tool_definitions_for_policy(&GithubMcpPolicy {
-            enabled: true,
-            api_write_enabled: true,
-            ..Default::default()
-        });
-        assert!(with_write
-            .iter()
-            .any(|definition| definition["name"] == "github_create_release"));
-        assert!(with_write
-            .iter()
-            .any(|definition| definition["name"] == "github_create_pull_request"));
-        assert!(with_write
-            .iter()
-            .any(|definition| definition["name"] == "github_create_issue"));
+    fn all_write_tools_are_visible_without_a_github_policy() {
+        let definitions = tool_definitions_for_mcp();
+        assert!(definitions.iter().any(|definition| definition["name"] == "github_release_create"));
+        assert!(definitions.iter().any(|definition| definition["name"] == "github_issue_create"));
     }
 
     #[test]
     fn read_only_tools_have_closed_schemas() {
         let expected = [
             "github_list_credentials",
-            "github_get_authenticated_user",
-            "github_list_repositories",
-            "github_get_repository",
-            "github_get_file",
-            "github_list_issues",
-            "github_list_pull_requests",
+            "github_user_info",
+            "github_repo_list",
+            "github_repo_get",
+            "github_file_get",
+            "github_issues_list",
+            "github_pulls_list",
             "github_get_pull_request",
-            "github_list_workflow_runs",
+            "github_runs_list",
             "github_list_pull_request_files",
             "github_list_pull_request_commits",
             "github_list_pull_request_reviews",
             "github_list_pull_request_comments",
             "github_get_pull_request_status",
-            "github_list_releases",
-            "github_get_release",
+            "github_release_list",
+            "github_release_get",
             "github_list_release_assets",
-            "github_list_tags",
+            "github_tags_list",
             "github_compare_commits",
-            "github_list_workflows",
-            "github_get_workflow_run",
-            "github_list_workflow_jobs",
+            "github_workflow_list",
+            "github_run_get",
+            "github_run_jobs",
         ];
         let definitions = tool_definitions();
         for name in expected {
@@ -5237,24 +4940,24 @@ mod tests {
         let cases = [
             ("github_list_credentials", json!({})),
             (
-                "github_get_authenticated_user",
+                "github_user_info",
                 json!({"credential_id":"id"}),
             ),
-            ("github_list_repositories", json!({"credential_id":"id"})),
+            ("github_repo_list", json!({"credential_id":"id"})),
             (
-                "github_get_repository",
+                "github_repo_get",
                 json!({"credential_id":"id","owner":"octocat","repo":"hello-world"}),
             ),
             (
-                "github_get_file",
+                "github_file_get",
                 json!({"credential_id":"id","owner":"octocat","repo":"hello-world","path":"README.md"}),
             ),
             (
-                "github_list_issues",
+                "github_issues_list",
                 json!({"credential_id":"id","owner":"octocat","repo":"hello-world"}),
             ),
             (
-                "github_list_pull_requests",
+                "github_pulls_list",
                 json!({"credential_id":"id","owner":"octocat","repo":"hello-world"}),
             ),
             (
@@ -5266,11 +4969,11 @@ mod tests {
                 json!({"repo":"octocat/hello-world","number":1}),
             ),
             (
-                "github_list_releases",
+                "github_release_list",
                 json!({"repo":"octocat/hello-world"}),
             ),
             (
-                "github_get_release",
+                "github_release_get",
                 json!({"repo":"octocat/hello-world","tag_name":"v1.0.0"}),
             ),
             (
@@ -5278,11 +4981,11 @@ mod tests {
                 json!({"repo":"octocat/hello-world","base":"main","head":"feature"}),
             ),
             (
-                "github_get_workflow_run",
+                "github_run_get",
                 json!({"repo":"octocat/hello-world","run_id":1}),
             ),
             (
-                "github_list_workflow_jobs",
+                "github_run_jobs",
                 json!({"repo":"octocat/hello-world","run_id":1}),
             ),
         ];
@@ -5292,7 +4995,7 @@ mod tests {
         }
         let release_error = call_tool(
             &mut session,
-            "github_create_release",
+            "github_release_create",
             json!({
                 "credential_id":"id",
                 "owner":"octocat",
@@ -5312,20 +5015,16 @@ mod tests {
     }
 
     #[test]
-    fn new_readonly_tools_stay_visible_without_api_write() {
-        let definitions = tool_definitions_for_policy(&GithubMcpPolicy {
-            enabled: true,
-            api_write_enabled: false,
-            ..Default::default()
-        });
+    fn new_readonly_tools_stay_visible_for_shared_mcp() {
+        let definitions = tool_definitions_for_mcp();
         for name in [
             "github_list_pull_request_files",
             "github_get_pull_request_status",
-            "github_list_releases",
-            "github_get_release",
+            "github_release_list",
+            "github_release_get",
             "github_list_release_assets",
             "github_compare_commits",
-            "github_list_workflow_jobs",
+            "github_run_jobs",
         ] {
             assert!(
                 definitions
@@ -5345,27 +5044,16 @@ mod tests {
             .into_iter()
             .filter(|definition| definition["readOnly"] == true)
             .count();
-        // 22 original read-only tools, 9 new read tools, plus 13 read-only aliases.
-        assert_eq!(read_only, 44);
+        // Read-only GitHub tools are each registered once; legacy names are not listed.
+        assert_eq!(read_only, 31);
     }
 
     #[test]
-    fn user_info_alias_shares_schema_with_legacy_name() {
+    fn canonical_user_tool_is_registered_once() {
         let definitions = api_tool_definitions();
-        let legacy = definitions
-            .iter()
-            .find(|definition| definition["name"] == "github_get_authenticated_user")
-            .expect("legacy user tool");
-        let canonical = definitions
-            .iter()
-            .find(|definition| definition["name"] == "github_user_info")
-            .expect("canonical user tool");
-        assert_eq!(legacy["readOnly"], canonical["readOnly"]);
-        assert_eq!(legacy["risk"], canonical["risk"]);
-        assert_eq!(legacy["description"], canonical["description"]);
-        assert_eq!(legacy["inputSchema"], canonical["inputSchema"]);
-        assert!(is_github_api_tool("github_get_authenticated_user"));
-        assert!(is_github_api_tool("github_user_info"));
+        let count = definitions.iter().filter(|definition| definition["name"] == "github_user_info").count();
+        assert_eq!(count, 1);
+        assert!(!definitions.iter().any(|definition| definition["name"] == "github_get_authenticated_user"));
     }
 
     #[test]
@@ -5378,17 +5066,7 @@ mod tests {
         assert_eq!(bool_arg(&json!({}), "draft", true).unwrap(), true);
     }
 
-    #[test]
-    fn policy_disables_api_writes_without_disabling_git() {
-        let policy = normalize_policy(GithubMcpPolicy {
-            enabled: false,
-            api_write_enabled: true,
-            ..Default::default()
-        })
-        .unwrap();
-        assert!(!policy.enabled);
-        assert!(!policy.api_write_enabled);
-    }
+
 
     #[test]
     fn workflow_run_dto_keeps_hex_head_sha_only() {
@@ -5493,6 +5171,18 @@ mod tests {
         assert_eq!(compare["commits"].as_array().unwrap().len(), 1);
     }
 
+    fn enable_mcp(vault: &Vault, dek: &[u8; 32]) {
+        crate::zoomkey::save_policy(
+            vault,
+            dek,
+            &crate::zoomkey::ZoomkeyMcpPolicy {
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
     fn token_entry(service: &str) -> (Vault, [u8; 32], String) {
         let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
         let entry = vault
@@ -5521,41 +5211,14 @@ mod tests {
     }
 
     #[test]
-    fn enabled_policy_requires_no_preselected_token() {
-        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
-        save_policy(
-            &vault,
-            &dek,
-            &GithubMcpPolicy {
-                enabled: true,
-                api_write_enabled: false,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let policy = load_policy(&vault, &dek);
-        assert!(policy.enabled);
-        assert!(!policy.api_write_enabled);
-    }
-
-    #[test]
     fn active_token_is_selected_by_tool_argument() {
         let (vault, dek, id) = token_entry("github");
-        save_policy(
-            &vault,
-            &dek,
-            &GithubMcpPolicy {
-                enabled: true,
-                api_write_enabled: false,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        enable_mcp(&vault, &dek);
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
         let (token, _) = prepare(
             &session,
-            "github_get_repository",
+            "github_repo_get",
             &json!({"credential_id":id,"owner":"octocat","repo":"other"}),
         )
         .unwrap();
@@ -5565,26 +5228,17 @@ mod tests {
     #[test]
     fn credential_can_be_matched_by_title_or_omitted_when_unique() {
         let (vault, dek, _) = token_entry("github");
-        save_policy(
-            &vault,
-            &dek,
-            &GithubMcpPolicy {
-                enabled: true,
-                api_write_enabled: false,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        enable_mcp(&vault, &dek);
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
         let by_title = prepare(
             &session,
-            "github_get_authenticated_user",
+            "github_user_info",
             &json!({"credential":"github"}),
         )
         .unwrap();
         assert_eq!(by_title.0, "ghp_test_token_value");
-        let implicit = prepare(&session, "github_get_authenticated_user", &json!({})).unwrap();
+        let implicit = prepare(&session, "github_user_info", &json!({})).unwrap();
         assert_eq!(implicit.0, "ghp_test_token_value");
     }
 
@@ -5607,43 +5261,24 @@ mod tests {
     #[test]
     fn credential_discovery_returns_metadata_without_token() {
         let (vault, dek, _) = token_entry("github");
-        save_policy(
-            &vault,
-            &dek,
-            &GithubMcpPolicy {
-                enabled: true,
-                api_write_enabled: false,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        enable_mcp(&vault, &dek);
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
         let text = call_tool(&mut session, "github_list_credentials", json!({})).unwrap();
         assert!(text.contains("github"));
-        assert!(text.contains("is_default"));
         assert!(!text.contains("ghp_test_token_value"));
     }
 
     #[test]
     fn write_is_denied_when_desktop_confirm_rejects() {
         let (vault, dek, id) = token_entry("github");
-        save_policy(
-            &vault,
-            &dek,
-            &GithubMcpPolicy {
-                enabled: true,
-                api_write_enabled: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+        enable_mcp(&vault, &dek);
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
         let error = crate::confirm::with_auto(Some(false), || {
             call_tool(
                 &mut session,
-                "github_create_issue",
+                "github_issue_create",
                 json!({
                     "credential_id": id,
                     "repo": "octocat/hello-world",

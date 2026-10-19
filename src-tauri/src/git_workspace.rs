@@ -1,10 +1,9 @@
 //! 本地仓库上的 `github_git_*` 工具。
 //!
-//! 与 `github_mcp` 共用 `GithubMcpPolicy.enabled`。可先注册工作区短名，
-//! 之后用 workspace="sealbox" 代替绝对路径；push / pull / clone 用一次性
-//! askpass 注入金库 Token，不改 remote URL。
+//! 是否可用看 MCP 页的总开关。仓库一律传本机绝对路径。
+//! push / pull / clone 用一次性 askpass 注入金库 Token，不改 remote URL。
 
-use crate::github_mcp::{self, GithubMcpPolicy, GithubWorkspace};
+use crate::github_mcp;
 use crate::redact::redact_text;
 use crate::session::Session;
 use serde_json::{json, Map, Value};
@@ -20,21 +19,12 @@ const DEFAULT_LOG: u64 = 20;
 const MAX_PATH: u64 = 500;
 const ELLIPSIS: &str = "…";
 
-fn workspace_prop() -> Value {
-    json!({
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 64,
-        "description": "已登记的工作区短名，例如 sealbox。登记后不必再传绝对路径。"
-    })
-}
-
 fn path_prop() -> Value {
     json!({
         "type": "string",
         "minLength": 1,
         "maxLength": MAX_PATH,
-        "description": "本机绝对路径。已登记工作区时改传 workspace。"
+        "description": "本机 git 仓库的绝对路径。"
     })
 }
 
@@ -43,7 +33,7 @@ fn credential_prop() -> Value {
         "type": "string",
         "minLength": 1,
         "maxLength": 100,
-        "description": "GitHub Token 的标题、账号或 ID。可省略：使用工作区默认凭据、MCP 页默认 Token，或金库里唯一的 GitHub Token。"
+        "description": "GitHub Token 的标题、账号或 ID。金库里只有一个 GitHub Token 时可省略。"
     })
 }
 
@@ -56,36 +46,12 @@ fn credential_id_prop() -> Value {
     })
 }
 
-fn location_props() -> Vec<(&'static str, Value)> {
-    vec![("workspace", workspace_prop()), ("path", path_prop())]
-}
-
 pub fn tool_definitions() -> Vec<Value> {
     vec![
         tool(
-            "github_git_workspace_list",
-            "列出已登记的本地 git 工作区短名和绝对路径。之后可用 workspace=\"sealbox\" 代替每次传绝对路径。",
-            schema(&[], &[]),
-            true,
-        ),
-        tool(
-            "github_git_workspace_register",
-            "把本机 git 仓库登记成短名。用户说「把这个仓库登记为 sealbox」或后续不想再传绝对路径时调用。每次弹出桌面确认。",
-            schema(
-                &[
-                    ("name", json!({"type":"string","minLength":1,"maxLength":64,"description":"短名，例如 sealbox"})),
-                    ("path", path_prop()),
-                    ("credential", credential_prop()),
-                    ("credential_id", credential_id_prop()),
-                ],
-                &["name", "path"],
-            ),
-            false,
-        ),
-        tool(
             "github_git_status",
-            "查看本地仓库当前分支和 porcelain 状态。开始改代码前、提交前确认工作区是否干净时调用。传 workspace 或 path。",
-            schema(&location_props(), &[]),
+            "查看本地仓库当前分支和 porcelain 状态。开始改代码前、提交前确认仓库是否干净时调用。传本机绝对路径。",
+            schema(&[("path", path_prop())], &["path"]),
             true,
         ),
         tool(
@@ -93,13 +59,12 @@ pub fn tool_definitions() -> Vec<Value> {
             "查看本地 diff。默认返回 --stat 摘要；需要看具体改动时设 stat_only=false。staged=true 看暂存区。提交说明或 code review 前调用。",
             schema(
                 &[
-                    ("workspace", workspace_prop()),
                     ("path", path_prop()),
                     ("staged", json!({"type":"boolean","default":false})),
                     ("stat_only", json!({"type":"boolean","default":true})),
                     ("file", string_schema(1, 500)),
                 ],
-                &[],
+                &["path"],
             ),
             true,
         ),
@@ -108,18 +73,17 @@ pub fn tool_definitions() -> Vec<Value> {
             "查看最近提交。默认 20 条，最多 100。写 Release notes、确认 HEAD 或对比远端前调用。",
             schema(
                 &[
-                    ("workspace", workspace_prop()),
                     ("path", path_prop()),
                     ("limit", json!({"type":"integer","minimum":1,"maximum":100,"default":20})),
                 ],
-                &[],
+                &["path"],
             ),
             true,
         ),
         tool(
             "github_git_branches",
             "列出本地分支，当前分支带标记。准备 push、开 PR 或确认是否在正确分支时调用。",
-            schema(&location_props(), &[]),
+            schema(&[("path", path_prop())], &["path"]),
             true,
         ),
         tool(
@@ -127,7 +91,6 @@ pub fn tool_definitions() -> Vec<Value> {
             "把仓库内相对路径加入暂存区。files 一次传入多个路径，只弹一次桌面确认；file 仍可用。all=true 才等价 git add -A。准备提交时调用。",
             schema(
                 &[
-                    ("workspace", workspace_prop()),
                     ("path", path_prop()),
                     ("file", string_schema(1, 500)),
                     (
@@ -141,7 +104,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     ),
                     ("all", json!({"type":"boolean","default":false})),
                 ],
-                &[],
+                &["path"],
             ),
             false,
         ),
@@ -150,11 +113,10 @@ pub fn tool_definitions() -> Vec<Value> {
             "提交已暂存改动。message 必填。不改正文作者、不做 amend。每次弹出桌面确认。",
             schema(
                 &[
-                    ("workspace", workspace_prop()),
                     ("path", path_prop()),
                     ("message", string_schema(1, 2000)),
                 ],
-                &["message"],
+                &["path", "message"],
             ),
             false,
         ),
@@ -163,7 +125,6 @@ pub fn tool_definitions() -> Vec<Value> {
             "推送到 GitHub 远程。默认 remote=origin。可指定 branch、tag（只推该标签）、tags=true（连同所有标签）、force_with_lease=true（先 ls-remote 再 --force-with-lease）。发布、同步远端时调用。返回 pushed / up_to_date。每次弹出桌面确认。",
             schema(
                 &[
-                    ("workspace", workspace_prop()),
                     ("path", path_prop()),
                     ("credential", credential_prop()),
                     ("credential_id", credential_id_prop()),
@@ -173,7 +134,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     ("tags", json!({"type":"boolean","default":false,"description":"同时推送全部标签"})),
                     ("force_with_lease", json!({"type":"boolean","default":false})),
                 ],
-                &[],
+                &["path"],
             ),
             false,
         ),
@@ -182,20 +143,19 @@ pub fn tool_definitions() -> Vec<Value> {
             "从 GitHub 远程快进拉取。默认 remote=origin、当前分支。工作区有未提交改动时拒绝。无 rebase、无 force。同步远端更新时调用。每次弹出桌面确认。",
             schema(
                 &[
-                    ("workspace", workspace_prop()),
                     ("path", path_prop()),
                     ("credential", credential_prop()),
                     ("credential_id", credential_id_prop()),
                     ("remote", json!({"type":"string","minLength":1,"maxLength":64,"description":"远程名，默认 origin。必须是 https://github.com"})),
                     ("branch", string_schema(1, 200)),
                 ],
-                &[],
+                &["path"],
             ),
             false,
         ),
         tool(
             "github_git_clone",
-            "把 github.com/{owner}/{repo} 克隆到已存在的绝对父目录。可选 name 作为目录名，并可同时登记为工作区短名。每次弹出桌面确认。",
+            "把 github.com/{owner}/{repo} 克隆到已存在的绝对父目录。可选 name 作为目录名。每次弹出桌面确认。",
             schema(
                 &[
                     ("path", path_prop()),
@@ -204,7 +164,6 @@ pub fn tool_definitions() -> Vec<Value> {
                     ("repo", json!({"type":"string","minLength":1,"maxLength":201,"description":"owner/repo，例如 hahaha-taotao/sealbox"})),
                     ("owner", string_schema(1, 100)),
                     ("name", string_schema(1, 100)),
-                    ("workspace", json!({"type":"string","minLength":1,"maxLength":64,"description":"克隆成功后登记的短名"})),
                 ],
                 &["path", "repo"],
             ),
@@ -255,13 +214,11 @@ pub fn prepare_tool(
     crate::github_mcp::validate_tool_arguments(&definition["inputSchema"], &args)?;
     let vault = session.vault().map_err(|e| e.to_string())?;
     let dek = session.dek().map_err(|e| e.to_string())?;
-    if !crate::github_mcp::load_policy(vault, dek).enabled {
-        return Err("GitHub MCP 能力未启用".into());
+    if !crate::zoomkey::mcp_enabled(vault, dek) {
+        return Err("MCP 未启用。请先在 Sealbox 的 MCP 页面打开。".into());
     }
     let secrets = git_secrets(session, &args);
     let prepared = match name {
-        "github_git_workspace_list" => PreparedGitOp::Immediate(list_workspaces(session)?),
-        "github_git_workspace_register" => prepare_register_workspace(session, &args)?,
         "github_git_status" => PreparedGitOp::Immediate(status(session, &args)?),
         "github_git_diff" => PreparedGitOp::Immediate(diff(session, &args)?),
         "github_git_log" => PreparedGitOp::Immediate(log(session, &args)?),
@@ -340,72 +297,6 @@ fn display_path(path: &Path) -> String {
         return rest.replace('/', "\\");
     }
     raw.into_owned()
-}
-
-fn list_workspaces(session: &Session) -> Result<String, String> {
-    let policy = current_policy(session)?;
-    let items: Vec<Value> = policy
-        .workspaces
-        .iter()
-        .map(|workspace| {
-            json!({
-                "name": workspace.name,
-                "path": display_path(Path::new(&workspace.path)),
-                "has_default_credential": workspace.default_credential_id.is_some(),
-            })
-        })
-        .collect();
-    serde_json::to_string_pretty(&json!({
-        "workspaces": items,
-        "count": items.len(),
-    }))
-    .map_err(|e| e.to_string())
-}
-
-fn prepare_register_workspace(session: &Session, args: &Value) -> Result<PreparedGitOp, String> {
-    let name = github_mcp::normalize_workspace_name(
-        args.get("name")
-            .and_then(Value::as_str)
-            .ok_or("缺少参数 name")?,
-    )?;
-    let path = absolute_path(args)?;
-    let root = repo_root_from_path(&path)?;
-    let credential_id = if args.get("credential").is_some() || args.get("credential_id").is_some() {
-        Some(github_mcp::resolve_github_credential(session, args)?.id)
-    } else {
-        None
-    };
-    let payload = git_confirm_payload(
-        "登记 git 工作区",
-        "允许把这个本地仓库登记为短名？之后可用短名代替绝对路径。",
-        &[("短名", name.clone()), ("路径", display_path(&root))],
-    );
-    let display = display_path(&root);
-    Ok(PreparedGitOp::Pending {
-        payload,
-        deny: "用户拒绝了这次 git 写操作".into(),
-        exec: Box::new(move |session| {
-            let mut policy = current_policy(session)?;
-            if let Some(existing) = policy
-                .workspaces
-                .iter_mut()
-                .find(|workspace| workspace.name == name)
-            {
-                existing.path = display.clone();
-                if credential_id.is_some() {
-                    existing.default_credential_id = credential_id.clone();
-                }
-            } else {
-                policy.workspaces.push(GithubWorkspace {
-                    name: name.clone(),
-                    path: display.clone(),
-                    default_credential_id: credential_id,
-                });
-            }
-            save_current_policy(session, &policy)?;
-            Ok(format!("已登记工作区 {name} -> {display}"))
-        }),
-    })
 }
 
 fn status(session: &Session, args: &Value) -> Result<String, String> {
@@ -688,15 +579,6 @@ fn prepare_clone(session: &Session, args: &Value) -> Result<PreparedGitOp, Strin
         return Err(format!("目标目录已存在：{}", display_path(&dest)));
     }
     let token = github_token(session, args)?;
-    let workspace = args
-        .get("workspace")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let credential_id = if workspace.is_some() {
-        Some(github_mcp::resolve_github_credential(session, args)?.id)
-    } else {
-        None
-    };
     let payload = git_confirm_payload(
         "克隆 GitHub 仓库",
         "允许这次本地 git 写操作？",
@@ -708,20 +590,9 @@ fn prepare_clone(session: &Session, args: &Value) -> Result<PreparedGitOp, Strin
     Ok(PreparedGitOp::Pending {
         payload,
         deny: "用户拒绝了这次 git 写操作".into(),
-        exec: Box::new(move |session| {
+        exec: Box::new(move |_session| {
             let url = format!("https://github.com/{owner}/{repo}.git");
             git_with_token(&parent, &["clone", &url, &dir_name], &token)?;
-            if let Some(workspace) = workspace {
-                let name = github_mcp::normalize_workspace_name(&workspace)?;
-                let mut policy = current_policy(session)?;
-                policy.workspaces.retain(|item| item.name != name);
-                policy.workspaces.push(GithubWorkspace {
-                    name,
-                    path: display_path(&dest),
-                    default_credential_id: credential_id,
-                });
-                save_current_policy(session, &policy)?;
-            }
             Ok(format!("已克隆到 {}", display_path(&dest)))
         }),
     })
@@ -739,21 +610,9 @@ fn clone_repo_name(args: &Value) -> Result<String, String> {
     Err("缺少仓库。请传 repo=\"owner/repo\"".into())
 }
 
-fn repo_root(session: &Session, args: &Value) -> Result<PathBuf, String> {
-    if let Some(name) = args.get("workspace").and_then(Value::as_str) {
-        let name = github_mcp::normalize_workspace_name(name)?;
-        let policy = current_policy(session)?;
-        let workspace = policy
-            .workspaces
-            .iter()
-            .find(|item| item.name == name)
-            .ok_or_else(|| {
-                format!("未登记工作区「{name}」。先调 github_git_workspace_register，或传 path 绝对路径。")
-            })?;
-        return repo_root_from_path(&PathBuf::from(&workspace.path));
-    }
+fn repo_root(_session: &Session, args: &Value) -> Result<PathBuf, String> {
     if args.get("path").and_then(Value::as_str).is_none() {
-        return Err("请传 workspace 短名，或 path 绝对路径".into());
+        return Err("请传 path 绝对路径".into());
     }
     let path = absolute_path(args)?;
     repo_root_from_path(&path)
@@ -772,18 +631,6 @@ fn repo_root_from_path(path: &Path) -> Result<PathBuf, String> {
         return Err("该目录不是 git 仓库".into());
     }
     Ok(canonical)
-}
-
-fn current_policy(session: &Session) -> Result<GithubMcpPolicy, String> {
-    let vault = session.vault().map_err(|e| e.to_string())?;
-    let dek = session.dek().map_err(|e| e.to_string())?;
-    Ok(github_mcp::load_policy(vault, dek))
-}
-
-fn save_current_policy(session: &Session, policy: &GithubMcpPolicy) -> Result<(), String> {
-    let vault = session.vault().map_err(|e| e.to_string())?;
-    let dek = session.dek().map_err(|e| e.to_string())?;
-    github_mcp::save_policy(vault, dek, policy)
 }
 
 fn requested_branch(args: &Value) -> Result<Option<String>, String> {
@@ -915,6 +762,7 @@ fn working_tree_dirty(root: &Path) -> Result<bool, String> {
     Ok(!text.trim().is_empty())
 }
 
+#[cfg(test)]
 fn require_github_https_origin(root: &Path) -> Result<(), String> {
     require_github_https_remote(root, "origin")
 }
@@ -1068,26 +916,7 @@ fn parse_branches(raw: &str) -> Value {
 }
 
 fn github_token(session: &Session, args: &Value) -> Result<Zeroizing<String>, String> {
-    let mut lookup = args.clone();
-    if lookup.get("credential").is_none() && lookup.get("credential_id").is_none() {
-        if let Some(name) = args.get("workspace").and_then(Value::as_str) {
-            if let Ok(name) = github_mcp::normalize_workspace_name(name) {
-                if let Ok(policy) = current_policy(session) {
-                    if let Some(id) = policy
-                        .workspaces
-                        .iter()
-                        .find(|item| item.name == name)
-                        .and_then(|item| item.default_credential_id.clone())
-                    {
-                        if let Some(object) = lookup.as_object_mut() {
-                            object.insert("credential_id".into(), Value::String(id));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let resolved = github_mcp::resolve_github_credential(session, &lookup)?;
+    let resolved = github_mcp::resolve_github_credential(session, args)?;
     Ok(Zeroizing::new(resolved.token))
 }
 
@@ -1241,7 +1070,6 @@ fn tool(name: &str, description: &str, input_schema: Value, read_only: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::github_mcp::GithubMcpPolicy;
     use crate::session::Session;
     use crate::vault::{EntryKind, SecretPayload, UpsertEntry, Vault};
 
@@ -1321,12 +1149,11 @@ mod tests {
                 },
             )
             .unwrap();
-        crate::github_mcp::save_policy(
+        crate::zoomkey::save_policy(
             &vault,
             &dek,
-            &GithubMcpPolicy {
+            &crate::zoomkey::ZoomkeyMcpPolicy {
                 enabled: true,
-                api_write_enabled: false,
                 ..Default::default()
             },
         )
@@ -1459,28 +1286,19 @@ mod tests {
         assert!(!tool_definitions()
             .iter()
             .any(|tool| tool["name"] == "github_git_list"));
-        assert!(tool_definitions()
+        assert!(!tool_definitions()
             .iter()
             .any(|tool| tool["name"] == "github_git_workspace_register"));
     }
 
     #[test]
-    fn workspace_short_name_resolves_path() {
+    fn status_requires_absolute_path() {
         let repo = temp_git_repo();
         let mut session = enabled_session();
-        let path = repo.to_string_lossy().into_owned();
-        let registered = call_tool_text(
-            &mut session,
-            "github_git_workspace_register",
-            json!({ "name": "sealbox", "path": path }),
-        )
-        .unwrap();
-        assert!(registered.contains("sealbox"), "{registered}");
-        assert!(!registered.contains(r#"\\?\"#), "{registered}");
         let status = call_tool_text(
             &mut session,
             "github_git_status",
-            json!({ "workspace": "sealbox" }),
+            json!({ "path": repo.to_string_lossy() }),
         )
         .unwrap();
         let status_json: Value = serde_json::from_str(&status).unwrap();

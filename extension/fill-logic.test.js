@@ -338,42 +338,47 @@ test("pickReadFields prefers the frame that actually has login values", () => {
   assert.equal(merged.password, "secret");
 });
 
-test("fillTokenFromStores prefers session and drops any local leftover", () => {
+test("fillTokenFromStores keeps the local token and migrates a session leftover", () => {
   assert.deepEqual(fill.fillTokenFromStores({ sessionToken: "s", localToken: "l" }), {
-    token: "s",
-    writeSession: false,
-    removeLocal: true,
+    token: "l",
+    writeLocal: false,
+    removeSession: true,
   });
   assert.deepEqual(fill.fillTokenFromStores({ sessionToken: "", localToken: "l" }), {
     token: "l",
-    writeSession: true,
-    removeLocal: true,
+    writeLocal: false,
+    removeSession: false,
   });
   assert.deepEqual(fill.fillTokenFromStores({ sessionToken: "s", localToken: "" }), {
     token: "s",
-    writeSession: false,
-    removeLocal: false,
+    writeLocal: true,
+    removeSession: true,
   });
   assert.deepEqual(fill.fillTokenFromStores({}), {
     token: "",
-    writeSession: false,
-    removeLocal: false,
+    writeLocal: false,
+    removeSession: false,
   });
 });
 
-test("fillTokenWritePlan never persists the token to local storage", () => {
+test("fillTokenWritePlan persists the token locally and drops the session copy", () => {
   assert.deepEqual(fill.fillTokenWritePlan("fill_abc"), {
     token: "fill_abc",
-    writeSession: true,
-    removeLocal: true,
+    writeLocal: true,
+    removeSession: true,
+  });
+  assert.deepEqual(fill.fillTokenWritePlan(""), {
+    token: "",
+    writeLocal: true,
+    removeSession: true,
   });
 });
 
-test("background.js never writes fillToken to chrome.storage.local", async () => {
+test("background.js persists fillToken in chrome.storage.local", async () => {
   const { readFile } = await import("node:fs/promises");
   const src = await readFile(new URL("./background.js", import.meta.url), "utf8");
-  assert.equal(/storage\.local\.set\(\s*\{[^}]*fillToken/.test(src), false);
-  assert.match(src, /storage\.local\.remove\(\s*(?:\[\s*"fillToken"|"fillToken")/);
+  assert.match(src, /storage\.local\.set\(\s*\{[^}]*fillToken/);
+  assert.match(src, /storage\.session\.remove\(\s*(?:\[\s*"fillToken"|"fillToken")/);
 });
 
 test("isOtpField matches 2FA fields and rejects password or username fields", () => {

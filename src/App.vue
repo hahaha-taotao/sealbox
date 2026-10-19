@@ -28,8 +28,6 @@ import {
   type EntryKind,
   type ExtensionInstallStatus,
   type FolderDto,
-  type GithubCredentialOption,
-  type GithubMcpPolicy,
   type ListFilter,
   type McpStatus,
   type McpToolInfo,
@@ -379,15 +377,6 @@ const revealedFillToken = ref("");
 const revealedMcpToken = ref("");
 const revealedMcpSnippet = ref("");
 const mcpTools = ref<McpToolInfo[]>([]);
-const emptyGithubPolicy = (): GithubMcpPolicy => ({
-  enabled: false,
-  api_write_enabled: false,
-  default_credential_id: null,
-  workspaces: [],
-});
-const githubPolicy = ref<GithubMcpPolicy>(emptyGithubPolicy());
-const githubCredentials = ref<GithubCredentialOption[]>([]);
-const githubPolicyBusy = ref(false);
 const zoomkeyPolicy = ref<ZoomkeyMcpPolicy | null>(null);
 const zoomkeyCandidates = ref<ZoomkeyCandidates>({
   jira_credentials: [],
@@ -420,17 +409,6 @@ async function refreshMcp() {
   hideBridgeTokens();
   mcp.value = await api.mcpStatus();
   try {
-    githubPolicy.value = coerceGithubPolicy(await api.githubMcpPolicyGet());
-    try {
-      githubCredentials.value = await api.githubMcpCredentials();
-    } catch {
-      githubCredentials.value = [];
-    }
-  } catch {
-    githubPolicy.value = emptyGithubPolicy();
-    githubCredentials.value = [];
-  }
-  try {
     zoomkeyPolicy.value = await api.zoomkeyPolicyGet();
     zoomkeyCandidates.value = await api.zoomkeyCandidates();
   } catch {
@@ -451,7 +429,7 @@ async function saveZoomkeyPolicy(opts: { toggling?: boolean } = {}) {
   }
   if (zoomkeyPolicy.value.enabled && (opts.toggling || !previousEnabled)) {
     const ok = confirm(
-      "开启后，Sealbox 允许向白名单内的内网主机发起请求（携带金库里的客户端证书）。\n" +
+      "开启后，Sealbox 会同时开放 GitHub 和 ZoomKey MCP 工具；ZoomKey 只会向白名单内的内网主机发起请求（携带金库里的客户端证书）。\n" +
         "请确认白名单里只有你信任的公司内网域名。配齐凭据的端点会自动出现在工具列表。继续？",
     );
     if (!ok) {
@@ -464,7 +442,7 @@ async function saveZoomkeyPolicy(opts: { toggling?: boolean } = {}) {
     zoomkeyPolicy.value = await api.zoomkeyPolicySet(zoomkeyPolicy.value);
     mcpTools.value = await api.mcpTools();
     if (opts.toggling) {
-      showToast(zoomkeyPolicy.value.enabled ? "ZoomKey MCP 已启用" : "ZoomKey MCP 已停用");
+      showToast(zoomkeyPolicy.value.enabled ? "MCP 已启用" : "MCP 已停用");
     } else {
       showToast("ZoomKey 策略已保存");
     }
@@ -510,98 +488,6 @@ async function pickCaBundlePath(endpoint: "jira" | "crm") {
   } catch (e) {
     showToast(`打开文件选择框失败：${String(e)}`);
   }
-}
-
-async function saveGithubPolicy() {
-  if (githubPolicyBusy.value) return;
-  const previous = { ...githubPolicy.value };
-  const next = { ...githubPolicy.value, enabled: !previous.enabled, api_write_enabled: previous.enabled ? previous.api_write_enabled : false };
-  if (!previous.enabled) {
-    const ok = confirm(
-      "开启后，Cursor / Claude Code 可以使用 GitHub API 和本地 git。写操作（commit / push / 开 PR / 建 Issue / 发 Release）每次都会弹出 Sealbox 桌面确认。Token 不会返回给模型。继续？",
-    );
-    if (!ok) return;
-  }
-  githubPolicyBusy.value = true;
-  githubPolicy.value = next;
-  try {
-    githubPolicy.value = coerceGithubPolicy(await api.githubMcpPolicySet(normalizeGithubPolicyForSave(next)));
-    mcp.value = await api.mcpStatus();
-    mcpTools.value = await api.mcpTools();
-    showToast(githubPolicy.value.enabled ? "GitHub MCP 已启用" : "GitHub MCP 已停用");
-  } catch (e) {
-    githubPolicy.value = previous;
-    showToast(String(e));
-  } finally {
-    githubPolicyBusy.value = false;
-  }
-}
-
-async function toggleGithubApiWrite() {
-  if (githubPolicyBusy.value || !githubPolicy.value.enabled) return;
-  const nextEnabled = !githubPolicy.value.api_write_enabled;
-  if (nextEnabled) {
-    const ok = confirm(
-      "这会允许外部 MCP 客户端创建 Issue、评论、Draft PR 和 Release。每一次写操作仍会弹出 Sealbox 桌面确认。请确认 Token 具备目标仓库的写权限。继续？",
-    );
-    if (!ok) return;
-  }
-  const previous = { ...githubPolicy.value };
-  githubPolicyBusy.value = true;
-  githubPolicy.value = { ...previous, api_write_enabled: nextEnabled };
-  try {
-    githubPolicy.value = coerceGithubPolicy(
-      await api.githubMcpPolicySet(normalizeGithubPolicyForSave(githubPolicy.value)),
-    );
-    mcpTools.value = await api.mcpTools();
-    showToast(nextEnabled ? "GitHub API 写入已启用" : "GitHub API 写入已停用");
-  } catch (e) {
-    githubPolicy.value = previous;
-    showToast(String(e));
-  } finally {
-    githubPolicyBusy.value = false;
-  }
-}
-
-function coerceGithubPolicy(policy: GithubMcpPolicy): GithubMcpPolicy {
-  return {
-    ...policy,
-    default_credential_id: policy.default_credential_id || "",
-    workspaces: policy.workspaces ?? [],
-  };
-}
-
-function normalizeGithubPolicyForSave(policy: GithubMcpPolicy): GithubMcpPolicy {
-  const defaultId = policy.default_credential_id?.trim() || null;
-  return {
-    ...policy,
-    default_credential_id: defaultId,
-    workspaces: (policy.workspaces ?? []).map((workspace) => ({
-      ...workspace,
-      default_credential_id: workspace.default_credential_id?.trim() || null,
-    })),
-  };
-}
-
-async function saveGithubPolicyDetails() {
-  if (githubPolicyBusy.value || !githubPolicy.value.enabled) return;
-  githubPolicyBusy.value = true;
-  try {
-    githubPolicy.value = coerceGithubPolicy(
-      await api.githubMcpPolicySet(normalizeGithubPolicyForSave(githubPolicy.value)),
-    );
-    mcpTools.value = await api.mcpTools();
-    showToast("GitHub MCP 设置已保存");
-  } catch (e) {
-    showToast(String(e));
-    await refreshMcp();
-  } finally {
-    githubPolicyBusy.value = false;
-  }
-}
-
-function removeGithubWorkspace(name: string) {
-  githubPolicy.value.workspaces = githubPolicy.value.workspaces.filter((item) => item.name !== name);
 }
 
 async function rotateMcp() {
@@ -1758,12 +1644,18 @@ onMounted(async () => {
     if (!event.payload) hideVisibleSecrets();
   });
   const unLock = await listen("lock-now", () => doLock());
+  const unUnlock = await listen("vault-unlocked", async () => {
+    if (status.value?.unlocked) return;
+    await refreshStatus();
+    if (status.value?.unlocked) await refreshVault();
+  });
   onUnmounted(() => {
     applyLockedUi();
     window.removeEventListener("keydown", onKey);
     document.removeEventListener("visibilitychange", onVisibility);
     unFocus();
     unLock();
+    unUnlock();
     stopPairingTimer();
   });
 });
@@ -2162,9 +2054,20 @@ onMounted(async () => {
             <div class="mcp-status">
               <span class="mcp-dot" :class="{ on: mcp?.running }" />
               <span>{{ mcp?.running ? "运行中" : "已停止" }} · {{ mcp?.port || "—" }}</span>
+              <button
+                class="btn primary"
+                type="button"
+                :disabled="zoomkeyBusy || !zoomkeyPolicy"
+                @click="toggleZoomkeyEnabled"
+              >
+                {{ zoomkeyBusy ? "保存中…" : (zoomkeyPolicy?.enabled ? "停用 MCP" : "启用 MCP") }}
+              </button>
               <button class="btn" type="button" @click="rotateMcp">轮换 MCP Token</button>
             </div>
           </div>
+          <p class="crumb">
+            这一个开关同时控制 GitHub 和 ZoomKey 工具。关闭后模型看不到任何工具；打开后，GitHub 只读和本地 git 立即可用。
+          </p>
           <div class="mcp-card">
             <h3>Cursor / Claude Code</h3>
             <p class="crumb">金库锁定时工具会失败并提示先解锁。</p>
@@ -2183,60 +2086,6 @@ onMounted(async () => {
             <button class="btn" type="button" :disabled="!mcp?.has_token" @click="copyMcpSnippet">复制配置</button>
           </div>
           <div class="mcp-card">
-            <h3>GitHub MCP</h3>
-            <p class="crumb">
-              启用后开放 GitHub 只读 API、本地 git，以及可单独打开的 Issue、PR、Release、文件、Actions 和 secret 写入。
-              模型可用 Token 标题或默认凭据，不必先抄 UUID；仓库传 owner/repo；已登记工作区可用短名代替绝对路径。
-              每一次写操作都会弹出 Sealbox 桌面确认。Token 不会返回给模型。
-            </p>
-            <div class="mcp-actions">
-              <button class="btn primary" type="button" :disabled="githubPolicyBusy" @click="saveGithubPolicy">
-                {{ githubPolicyBusy ? "保存中…" : (githubPolicy.enabled ? "停用 GitHub MCP" : "启用 GitHub MCP") }}
-              </button>
-              <button
-                class="btn"
-                type="button"
-                :disabled="githubPolicyBusy || !githubPolicy.enabled"
-                @click="toggleGithubApiWrite"
-              >
-                {{ githubPolicy.api_write_enabled ? "停用 GitHub API 写入" : "启用 GitHub API 写入" }}
-              </button>
-            </div>
-            <template v-if="githubPolicy.enabled">
-              <div class="field">
-                <label>默认 GitHub Token</label>
-                <select v-model="githubPolicy.default_credential_id">
-                  <option value="">未选择（金库里只有一条时自动用）</option>
-                  <option v-for="c in githubCredentials" :key="c.id" :value="c.id">
-                    {{ c.title }}{{ c.account ? ` · ${c.account}` : "" }}
-                  </option>
-                </select>
-                <p class="crumb" v-if="!githubCredentials.length">
-                  还没有 GitHub API Token。请在保险库新建一条：服务填 github。
-                </p>
-              </div>
-              <div class="field" v-if="githubPolicy.workspaces.length">
-                <label>已登记工作区</label>
-                <div class="tool-list">
-                  <div class="tool-item" v-for="ws in githubPolicy.workspaces" :key="ws.name">
-                    <div class="tool-heading">
-                      <code class="tool-name">{{ ws.name }}</code>
-                      <button class="btn" type="button" @click="removeGithubWorkspace(ws.name)">移除</button>
-                    </div>
-                    <p class="crumb">{{ ws.path }}</p>
-                  </div>
-                </div>
-              </div>
-              <div class="mcp-actions">
-                <button class="btn" type="button" :disabled="githubPolicyBusy" @click="saveGithubPolicyDetails">保存默认 Token / 工作区</button>
-              </div>
-            </template>
-            <p class="crumb">
-              GitHub API 写入包含 Issue、PR、Release、文件、ref、Actions 变量和 secret，以及 CI 产物下载。每次仍需桌面确认。不提供删仓库、分支保护、协作者和 deploy key。
-              GitHub Token 在 GitHub 侧的实际权限仍由 GitHub 返回结果决定；Sealbox 不把 Token、请求头或任意请求体返回给模型。
-            </p>
-          </div>
-          <div class="mcp-card">
             <h3>ZoomKey JIRA / CRM</h3>
             <p class="crumb">
               把众齐内网的 JIRA 与 CRM 查询能力开放给本机 MCP 客户端。两个站点都在 172.16.x.x 内网且强制双向 TLS；
@@ -2247,11 +2096,6 @@ onMounted(async () => {
                 启用后 Sealbox 只对下方白名单里的主机名放行，解析结果会被钉住再使用；
                 回环、链路本地与云元数据地址（169.254.169.254 / 100.100.100.200）永远拒绝。
                 配齐凭据、客户端证书和 CA bundle 的端点会自动出现在工具列表。
-              </div>
-              <div class="mcp-actions">
-                <button class="btn primary" type="button" :disabled="zoomkeyBusy" @click="toggleZoomkeyEnabled">
-                  {{ zoomkeyBusy ? "保存中…" : (zoomkeyPolicy.enabled ? "停用 ZoomKey MCP" : "启用 ZoomKey MCP") }}
-                </button>
               </div>
               <div class="field">
                 <label>允许的主机名（每行一个，精确匹配）</label>

@@ -147,6 +147,11 @@ fn crm_url_origin(url: &str) -> Option<String> {
     Some(format!("{scheme}://{hostport}"))
 }
 
+/// MCP 页上的唯一总开关。GitHub 和 ZoomKey 工具都看这一项。
+pub fn mcp_enabled(vault: &Vault, dek: &[u8; 32]) -> bool {
+    load_policy(vault, dek).enabled
+}
+
 pub fn load_policy(vault: &Vault, dek: &[u8; 32]) -> ZoomkeyMcpPolicy {
     let Some(raw) = vault.get_secret_setting(dek, POLICY_KEY).ok().flatten() else {
         return ZoomkeyMcpPolicy::default();

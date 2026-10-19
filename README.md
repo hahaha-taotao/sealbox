@@ -4,11 +4,11 @@
 
 A local credential vault for Windows. Unlock with a master password (optional Windows Hello). Website logins, API tokens, SSH keys, mailboxes, servers, and databases stay encrypted on disk. Copied secrets are cleared from the clipboard on a timer. Encrypted `.svbak` backups can be exported and imported. An optional localhost MCP lets Cursor / Claude Code use credentials without seeing plaintext. A Chrome / Edge extension can fill or save website logins.
 
-当前版本 Current version: **v0.3.0** (`0.3.0`)
+当前版本 Current version: **v0.4.1** (`0.4.1`)
 
 ### 当前范围口径 Scope of this release
 
-当前实现以 `v0.2.4` 的代码和本文档为准。`docs/superpowers/specs/2026-09-11-local-credential-vault-design.md` 是 9 月 11 日的初始基线；后续 9 月 17 日、18 日、20 日和 24 日的规格对冲突部分作了增量修订，尤其是 Chrome / Edge 填充、TOTP、CSV 导入、本地 Git 和受控 GitHub MCP。9 月 28 日的 QR 入库与页面 OTP 候选仍是待审阅提案，不属于当前版本。
+当前实现以 `v0.4.1` 的代码和本文档为准。`docs/superpowers/specs/2026-09-11-local-credential-vault-design.md` 是 9 月 11 日的初始基线；后续 9 月 17 日、18 日、20 日和 24 日的规格对冲突部分作了增量修订，尤其是 Chrome / Edge 填充、TOTP、CSV 导入、本地 Git 和受控 GitHub MCP。9 月 28 日的 QR 入库与页面 OTP 候选仍是待审阅提案，不属于当前版本。
 
 The `v0.2.4` code and this README define the current shipped scope. The September 11 design is the original baseline; later dated specifications supersede conflicting parts, including Chrome / Edge fill, TOTP, CSV import, local Git, and guarded GitHub MCP. The September 28 QR-enrollment and page-OTP proposals are not shipped.
 
@@ -36,7 +36,7 @@ The `v0.2.4` code and this README define the current shipped scope. The Septembe
 
 ## 安装 Install
 
-Windows x64 使用 NSIS 安装包 `Sealbox_0.3.0_x64-setup.exe`。向导会让你选择：
+Windows x64 使用 NSIS 安装包 `Sealbox_0.4.1_x64-setup.exe`。向导会让你选择：
 
 1. 安装范围：当前用户，或所有用户（后者需要管理员权限）
 2. **安装盘符与目录**，例如 `D:\Sealbox`；默认在当前用户下是 `%LOCALAPPDATA%\Sealbox`，在所有用户下是 `C:\Program Files\Sealbox`
@@ -85,7 +85,7 @@ npm run tauri build
 | 锁定 Lock | 空闲超时、标题栏或托盘锁定都会丢掉 DEK、清已复制秘密、关掉编辑框和明文显示 |
 | 备份 Backup | `.svbak` 用导出密码加密；Windows Hello 解不开备份文件 |
 | 网络 Network | MCP / 填表 API 只监听 `127.0.0.1`，默认端口 `17891`。GitHub 工具只访问 `https://api.github.com:443`，Release 资产上传只访问 `https://uploads.github.com:443`，统一拒绝重定向和内网目标。ZoomKey 仅访问精确白名单内网主机，使用 mTLS、固定路径和只读工具策略 |
-| 插件 Extension | 登录页右下角弹出填充条；一站点多账号可点选。`Alt+Shift+F` 也可打开选择器。填充条在 open Shadow DOM 中，只响应真实用户点击。提交后询问保存/更新，明文只暂存在 `chrome.storage.session`。扩展为检测和填充当前网页而申请 `http://*/*` 与 `https://*/*` 页面权限，Sealbox API 本身仍仅访问 `127.0.0.1`；填表 Token 只放 session，启动时清掉 local 残留 |
+| 插件 Extension | 登录页右下角弹出填充条；一站点多账号可点选。`Alt+Shift+F` 也可打开选择器。填充条在 open Shadow DOM 中，只响应真实用户点击。提交后询问保存/更新，明文只暂存在 `chrome.storage.session`。扩展为检测和填充当前网页而申请 `http://*/*` 与 `https://*/*` 页面权限，Sealbox API 本身仍仅访问 `127.0.0.1`；填表 Token 写入 `chrome.storage.local`，关掉浏览器仍有效，只有轮换后才需要重新配对 |
 
 ## 环境 Requirements
 
@@ -97,12 +97,12 @@ npm run tauri build
 
 ## 发布 Release
 
-发布只接受形如 `v0.3.0` 的 Git tag。`.github/workflows/release.yml` 在 Windows runner 上依次执行 `npm ci`、版本一致性校验、Rust 测试、前端构建和扩展测试，全部通过后由 `tauri-apps/tauri-action` 构建并发布 NSIS 安装包、`latest.json` 和对应的 `.sig` updater 签名文件。
+发布只接受形如 `v0.4.1` 的 Git tag。`.github/workflows/release.yml` 在 Windows runner 上依次执行 `npm ci`、版本一致性校验、Rust 测试、前端构建和扩展测试，全部通过后由 `tauri-apps/tauri-action` 构建并发布 NSIS 安装包、`latest.json` 和对应的 `.sig` updater 签名文件。
 
 版本号必须同时匹配以下文件：`package.json`、`package-lock.json`（根版本和 `packages[""].version`）、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json`、`extension/manifest.json`。本地可在打 tag 前运行：
 
 ```bash
-node scripts/check-version.mjs v0.3.0
+node scripts/check-version.mjs v0.4.1
 ```
 
 GitHub Actions 只从 Secrets 注入签名材料，不会把私钥写入仓库或工作区。请在仓库 Settings → Secrets and variables → Actions 中配置：
@@ -174,8 +174,8 @@ After the app starts, fill APIs listen on `127.0.0.1:17891`. Install and pairing
 3. 解锁后点 **配对**，60 秒内把一次性配对码填进扩展 / Unlock, click **Pair**, then enter the one-time code in the extension within 60 seconds.
 4. 打开登录页：检测到密码框后右下角会出现匹配账号，点选填充；也可按 `Alt+Shift+F`。卡片优先显示账号，过长标题会缩略；有备注时在账号后显示前几个字。含 TOTP 的条目会在登录页或下一页验证码框填入当前 6 位码，扩展拿不到 TOTP 密钥。打开插件弹窗时，「登记当前站点」会读当前页已填的账号密码，并可填写备注。登录提交后，若该站点还没有这个账号会询问保存；已有同一账号且密码变了会询问更新；密码没变则不弹。 / Open a login page: after a password field is detected, a bottom-right overlay lists matching accounts. `Alt+Shift+F` also opens the chooser. Buttons show the username first, abbreviate long titles, and append a short note when present. Entries with TOTP fill the current six-digit code on the login page or the following verification-code page; the extension never receives the TOTP secret. Opening the popup copies the page’s current username and password into the save form, with an optional note. After submit, Sealbox asks to save a new login, or update when the same account’s password changed. Unchanged passwords are not prompted.
 
-金库锁定时无法填充或登记。配对码一次性有效；填表 Token 只存在 `chrome.storage.session`（关浏览器即失效），不写入 `chrome.storage.local`；升级后会把旧的 local 残留清掉。与 MCP Token 分开，可单独轮换。读取明文和写入条目都会按当前页面网址复核。提交后采集的账号密码只暂存在会话存储，确认保存才写入金库，拒绝或超时会清掉。填充选择器在 open Shadow DOM 里，只响应真实用户点击。扩展需要访问当前网页以检测和填充登录字段，因此声明 `http://*/*` 与 `https://*/*` 页面权限；Sealbox 本地接口仍只访问 `127.0.0.1`。可在弹窗里配置站点排除列表。
-Fill and save require an unlocked vault. Pairing codes are one-shot. The fill token lives only in session storage (cleared when the browser quits) and is never written to `chrome.storage.local`; leftover local copies are deleted on upgrade. It is separate from the MCP token. Secret reveal and save are bound to the current page URL. Captured logins stay in session storage until you confirm save, then they are cleared. The chooser uses an open Shadow DOM and requires a real user gesture. The extension needs `http://*/*` and `https://*/*` page access to detect and fill login fields; Sealbox's local API remains limited to `127.0.0.1`. Sites can be excluded in the popup.
+金库锁定时无法填充或登记。配对码一次性有效；填表 Token 写入 `chrome.storage.local`，关掉浏览器后仍然有效，旧的 session 副本会在启动时迁过来并删掉。与 MCP Token 分开，可单独轮换；轮换后扩展会清掉失效 Token 并要求重新配对。读取明文和写入条目都会按当前页面网址复核。提交后采集的账号密码只暂存在会话存储，确认保存才写入金库，拒绝或超时会清掉。填充选择器在 open Shadow DOM 里，只响应真实用户点击。扩展需要访问当前网页以检测和填充登录字段，因此声明 `http://*/*` 与 `https://*/*` 页面权限；Sealbox 本地接口仍只访问 `127.0.0.1`。可在弹窗里配置站点排除列表。
+Fill and save require an unlocked vault. Pairing codes are one-shot. The fill token is stored in `chrome.storage.local` and survives closing the browser; a leftover session copy is migrated and deleted on startup. It is separate from the MCP token and can be rotated on its own. After rotation the extension drops the rejected token and asks to pair again. Secret reveal and save are bound to the current page URL. Captured logins stay in session storage until you confirm save, then they are cleared. The chooser uses an open Shadow DOM and requires a real user gesture. The extension needs `http://*/*` and `https://*/*` page access to detect and fill login fields; Sealbox's local API remains limited to `127.0.0.1`. Sites can be excluded in the popup.
 
 匹配规则：按协议、主机和端口匹配（与 Chrome 网页登录相同），路径只用来排序，不挡同站账号。
 Matches require the same scheme, host, and port as Chrome web logins. Path only ranks results.

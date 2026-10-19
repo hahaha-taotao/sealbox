@@ -141,26 +141,6 @@ export interface ExtensionInstallStatus {
   edge: { available: boolean };
 }
 
-export interface GithubWorkspace {
-  name: string;
-  path: string;
-  default_credential_id: string | null;
-}
-
-export interface GithubMcpPolicy {
-  enabled: boolean;
-  api_write_enabled: boolean;
-  default_credential_id: string | null;
-  workspaces: GithubWorkspace[];
-}
-
-export interface GithubCredentialOption {
-  id: string;
-  title: string;
-  account: string | null;
-  is_default: boolean;
-}
-
 export interface ZoomkeyEndpointPolicy {
   base_url: string;
   credential_id: string;
@@ -375,9 +355,6 @@ export const api = {
   extensionOpenBrowser: (browser: "chrome" | "edge") =>
     invoke<string>("extension_open_browser", { browser }),
   mcpTools: () => invoke<McpToolInfo[]>("mcp_tools"),
-  githubMcpPolicyGet: () => invoke<GithubMcpPolicy>("github_mcp_policy_get"),
-  githubMcpPolicySet: (policy: GithubMcpPolicy) => invoke<GithubMcpPolicy>("github_mcp_policy_set", { policy }),
-  githubMcpCredentials: () => invoke<GithubCredentialOption[]>("github_mcp_credentials"),
   zoomkeyPolicyGet: () => invoke<ZoomkeyMcpPolicy>("zoomkey_policy_get"),
   zoomkeyPolicySet: (policy: ZoomkeyMcpPolicy) => invoke<ZoomkeyMcpPolicy>("zoomkey_policy_set", { policy }),
   zoomkeyCandidates: () => invoke<ZoomkeyCandidates>("zoomkey_candidates"),

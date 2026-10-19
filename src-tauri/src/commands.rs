@@ -1,7 +1,6 @@
 use crate::assistant;
 use crate::backup::{export_envelope, import_envelope};
 use crate::clipboard;
-use crate::github_mcp::{self, GithubCredentialMeta, GithubMcpPolicy};
 use crate::hello;
 use crate::lock::{idle_lock_if_needed, lock_everything, lock_session, recover_lock};
 use crate::mcp::{self, McpState};
@@ -202,6 +201,7 @@ pub fn setup_vault(app: AppHandle, state: State<AppState>, password: String) -> 
     drop(session);
     hydrate_bridge_tokens(&state);
     let _ = mcp::start(&state.mcp, state.session.clone());
+    notify_vault_unlocked(&app);
     Ok(())
 }
 
@@ -223,6 +223,7 @@ pub fn unlock_vault(
             drop(session);
             hydrate_bridge_tokens(&state);
             let _ = mcp::start(&state.mcp, state.session.clone());
+            notify_vault_unlocked(&app);
             Ok(())
         }
         Err(e) => {
@@ -246,7 +247,13 @@ pub fn unlock_hello(app: AppHandle, state: State<AppState>) -> Result<(), String
     lock_session(&state.session).set_unlocked(vault, dek);
     hydrate_bridge_tokens(&state);
     let _ = mcp::start(&state.mcp, state.session.clone());
+    notify_vault_unlocked(&app);
     Ok(())
+}
+
+fn notify_vault_unlocked(app: &AppHandle) {
+    let _ = app.emit_to("main", "vault-unlocked", ());
+    let _ = app.emit_to("quick", "vault-unlocked", ());
 }
 
 fn persist_tokens(state: &AppState) {
@@ -927,6 +934,8 @@ pub fn import_backup(
         let vault = Vault::open(db.to_str().unwrap()).map_err(map_err)?;
         let n = import_envelope(&vault, &dek, &bytes, &password, overwrite).map_err(map_err)?;
         session.set_unlocked(vault, dek);
+        drop(session);
+        notify_vault_unlocked(&app);
         return Ok(n);
     }
     session.require_unlocked().map_err(map_err)?;
@@ -1293,48 +1302,6 @@ pub fn copy_extension_path(app: AppHandle, state: State<AppState>) -> Result<(),
 #[tauri::command]
 pub fn mcp_tools(state: State<AppState>) -> Vec<mcp::ToolInfo> {
     mcp::tool_catalog(&state.session)
-}
-
-#[tauri::command]
-pub fn github_mcp_policy_get(state: State<AppState>) -> Result<GithubMcpPolicy, String> {
-    let mut session = lock_session(&state.session);
-    session.require_unlocked().map_err(map_err)?;
-    let vault = session.vault().map_err(map_err)?;
-    let dek = session.dek().map_err(map_err)?;
-    Ok(github_mcp::load_policy(vault, dek))
-}
-
-#[tauri::command]
-pub fn github_mcp_policy_set(
-    state: State<AppState>,
-    policy: GithubMcpPolicy,
-) -> Result<GithubMcpPolicy, String> {
-    let mut session = lock_session(&state.session);
-    session.require_unlocked().map_err(map_err)?;
-    let normalized = github_mcp::normalize_policy(policy)?;
-    let dek = *session.dek().map_err(map_err)?;
-    let vault = session.vault().map_err(map_err)?;
-    github_mcp::save_policy(vault, &dek, &normalized)?;
-    let detail = format!(
-        "enabled={} api_write_enabled={} default={} workspaces={}",
-        normalized.enabled,
-        normalized.api_write_enabled,
-        if normalized.default_credential_id.is_some() {
-            "set"
-        } else {
-            "-"
-        },
-        normalized.workspaces.len()
-    );
-    let _ = vault.audit("mcp_github_policy", None, &detail);
-    Ok(normalized)
-}
-
-#[tauri::command]
-pub fn github_mcp_credentials(state: State<AppState>) -> Result<Vec<GithubCredentialMeta>, String> {
-    let mut session = lock_session(&state.session);
-    session.require_unlocked().map_err(map_err)?;
-    github_mcp::list_credentials(&session)
 }
 
 #[tauri::command]

@@ -17,15 +17,16 @@
 | 1 | 范围 | 发版 + CI。对齐 Sigil 的仓库、文件、Issue、PR、Release、ref、Actions、变量和 secret |
 | 2 | 不做 | 删仓库、分支保护、协作者、deploy key、Actions 总开关、workflow 默认权限 |
 | 3 | 模块 | 新增内部客户端 `Github`。分发器仍按工具名调用 `get` / `send` / `download` / `upload` |
-| 4 | 名字 | 保留现有工具名，同时注册 Sigil 同义名。同义名走同一实现 |
-| 5 | 本地 git | `github_git_*` 留在 `git_workspace.rs`，不改行为 |
-| 6 | 开关 | 继续用 `GithubMcpPolicy.enabled` 与 `api_write_enabled`，默认都关 |
-| 7 | 确认 | 每个写操作逐次桌面确认。确认框不含 Token、secret 明文或文件正文 |
-| 8 | 落盘 | 日志、artifact、release asset 只写到调用方给出的绝对路径，结果只含路径、字节数和 sha256 |
+| 4 | 名字 | 每个 GitHub 能力只注册一套规范名；旧名只在调用分发前映射到规范名，不再重复出现在 `tools/list` |
+| 5 | 本地 git | `github_git_*` 留在 `git_workspace.rs`；移除工作区登记/短名，所有仓库参数使用本机绝对路径 |
+| 6 | 开关 | GitHub 与 ZoomKey 共用 MCP 页的唯一总开关（沿用 ZoomKey 策略里的 `enabled`）；GitHub 不再有独立策略、默认账号、默认 Token 或写入开关 |
+| 7 | 凭据 | GitHub Token 由调用方传 `credential`/`credential_id`；金库只有一条 GitHub Token 时可省略，多个时必须明确指定 |
+| 8 | 确认 | 每个写操作逐次桌面确认。确认框不含 Token、secret 明文或文件正文 |
+| 9 | 落盘 | 日志、artifact、release asset 只写到调用方给出的绝对路径，结果只含路径、字节数和 sha256 |
 
 ## 3. 模块
 
-对外接缝不变：`tool_definitions_for_policy`、`call_tool`、`call_tool_detailed`、`load_policy`、`resolve_github_credential`。MCP 和 Tauri 命令继续调这些函数。
+对外接缝保持最小化：`tool_definitions_for_mcp`、`call_tool`、`call_tool_detailed`、`resolve_github_credential`。MCP 路由通过 ZoomKey 策略中的总开关统一决定 GitHub 和 ZoomKey 工具是否暴露；GitHub 不再提供独立策略 Tauri 命令。
 
 新增 `src-tauri/src/github_api.rs`，只负责一次已经过策略检查的 GitHub 调用。
 
@@ -68,11 +69,11 @@ impl Github {
 
 ## 4. 工具
 
-规范名采用 Sigil 的名字。括号里是继续可用的旧名。
+规范名采用 Sigil 的名字。旧名仅在调用分发时映射到规范名，不会作为重复条目出现在 `tools/list`。
 
 ### 4.1 只读，`risk: low`
 
-这些工具在 GitHub MCP 开启后就出现，不需要写开关。
+MCP 总开关打开后，这些工具与写工具一起出现；是否写入由每次桌面确认保护，不再有 GitHub 专用写入开关。
 
 | 工具 | GitHub 路径 | 说明 |
 |---|---|---|
@@ -101,13 +102,13 @@ impl Github {
 
 保留现有 PR 上下文工具，不改名也不改参数：`github_get_pull_request`、`github_list_pull_request_files`、`github_list_pull_request_commits`、`github_list_pull_request_reviews`、`github_list_pull_request_comments`、`github_get_pull_request_status`、`github_compare_commits`、`github_list_release_assets`。
 
-`github_list_credentials` 继续只返回 id、标题、账号和是否默认，不含 Token。
+`github_list_credentials` 只返回 id、标题和账号，不含 Token，也不再计算或保存默认凭据。
 
 分页统一：`page` 从 1 起，`per_page` 默认 30、最大 50。列表响应保留 `truncated: true` 当 GitHub 返回被大小上限截断时。
 
 ### 4.2 写入，`risk: high`
 
-这些工具只在 `enabled` 和 `api_write_enabled` 都打开时出现。每次调用弹确认。
+这些工具在 MCP 总开关打开后出现。每次调用仍弹出桌面确认；GitHub 不再有独立的 `enabled` 或 `api_write_enabled` 策略字段。
 
 | 工具 | 方法与路径 | 确认框展示 |
 |---|---|---|
@@ -143,7 +144,7 @@ impl Github {
 
 ### 4.3 落盘，`risk: medium`
 
-这些工具在写开关打开时才出现。内置助手不自动调用。它们是 GET，但仍弹确认，因为会把可能含构建信息的内容写到磁盘。
+这些工具在 MCP 总开关打开时出现。内置助手不自动调用。它们是 GET，但仍弹确认，因为会把可能含构建信息的内容写到磁盘。
 
 | 工具 | 来源 | 上限 |
 |---|---|---|
@@ -163,7 +164,7 @@ impl Github {
 
 ## 6. 界面与文档
 
-MCP 页不新增开关。写开关的说明改为「允许创建和修改 Issue、PR、Release、文件、ref、Actions 变量和 secret，并下载 CI 产物。每次操作都会确认。」
+MCP 页只保留一个总开关，统一控制 GitHub 与 ZoomKey 工具是否可用；ZoomKey 的站点、凭据、证书和 CA bundle 配置保持不变。GitHub 不再展示单独开关、默认账号、默认 Token 或工作区配置。写操作和下载仍逐次桌面确认。
 
 更新 `docs/superpowers/specs/2026-09-20-github-mcp-roadmap.md` 的当前能力，把本规格已实现的项目从「未承诺」挪走。README 的 GitHub MCP 小节同步工具数量和仍不做的边界。
 
@@ -177,14 +178,14 @@ MCP 页不新增开关。写开关的说明改为「允许创建和修改 Issue�
 - 下载超过上限时删除临时文件，目标路径不存在
 - secret 请求体是加密后的 `encrypted_value`，确认记录和返回 JSON 都不含明文
 
-工具测试覆盖：旧名和新名命中同一规范名；写开关关闭时写工具不在 `tools/list`；`private=false`、缺 sha 的文件更新、相对 `dest_path`、secret 来源冲突都被拒绝。
+工具测试覆盖：旧名和新名命中同一规范名且只列出一份；总开关关闭时所有 GitHub 工具不在 `tools/list`，打开后读写和下载工具一起出现；`private=false`、缺 sha 的文件更新、相对 `dest_path`、secret 来源冲突都被拒绝。
 
 现有 GitHub、git workspace、MCP 测试保持通过。
 
 ## 8. 成功标准
 
-1. 开启 GitHub MCP 后，模型能搜索仓库、列出分支和提交、查看失败 job 的 step。
-2. 打开写开关后，模型能创建或更新 Issue、合并 PR、发布草稿 Release、上传一个本地文件作为 asset、重跑失败 job。
+1. 打开 MCP 总开关后，模型能使用 GitHub 和已配置的 ZoomKey 工具；GitHub 能搜索仓库、列出分支和提交、查看失败 job 的 step。
+2. MCP 总开关打开后，GitHub 写工具和下载工具可被调用，但每次写入或落盘操作都必须通过桌面确认。
 3. 每一次写操作都能被桌面确认取消，取消后 GitHub 收不到请求。
 4. 下载日志和 artifact 后，模型只看到路径、大小和 sha256。
 5. 设置 Actions secret 时，模型看不到明文，确认框只显示来源。

@@ -337,17 +337,17 @@
     const session = String(sessionToken || "");
     const local = String(localToken || "");
     return {
-      token: session || local,
-      writeSession: Boolean(!session && local),
-      removeLocal: Boolean(local),
+      token: local || session,
+      writeLocal: Boolean(!local && session),
+      removeSession: Boolean(session),
     };
   }
 
   function fillTokenWritePlan(fillToken) {
     return {
       token: String(fillToken || ""),
-      writeSession: true,
-      removeLocal: true,
+      writeLocal: true,
+      removeSession: true,
     };
   }
 

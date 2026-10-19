@@ -52,15 +52,15 @@ const Fill = globalThis.SealboxFill || {
     const session = String(sessionToken || "");
     const local = String(localToken || "");
     return {
-      token: session || local,
-      writeSession: Boolean(!session && local),
-      removeLocal: Boolean(local),
+      token: local || session,
+      writeLocal: Boolean(!local && session),
+      removeSession: Boolean(session),
     };
   },
   fillTokenWritePlan: (fillToken) => ({
     token: String(fillToken || ""),
-    writeSession: true,
-    removeLocal: true,
+    writeLocal: true,
+    removeSession: true,
   }),
 };
 const DEFAULT_PORT = 17891;
@@ -80,26 +80,15 @@ async function readStoredFillToken(area) {
 }
 
 async function applyFillTokenPlan(plan) {
-  if (plan.writeSession) {
-    try {
-      if (plan.token) await chrome.storage.session.set({ fillToken: plan.token });
-      else await chrome.storage.session.remove(["fillToken"]);
-    } catch (e) {
-      if (plan.removeLocal) {
-        try {
-          await chrome.storage.local.remove(["fillToken"]);
-        } catch (_) {
-          /* ignore */
-        }
-      }
-      throw e;
-    }
+  if (plan.writeLocal) {
+    if (plan.token) await chrome.storage.local.set({ fillToken: plan.token });
+    else await chrome.storage.local.remove(["fillToken"]);
   }
-  if (plan.removeLocal) {
+  if (plan.removeSession) {
     try {
-      await chrome.storage.local.remove(["fillToken"]);
+      await chrome.storage.session.remove(["fillToken"]);
     } catch (_) {
-      /* ignore */
+      /* session storage unavailable */
     }
   }
 }
@@ -125,13 +114,13 @@ async function stored() {
   return { port: await getPort(), fillToken: await getFillToken() };
 }
 
-function migrateFillTokenToSession() {
+function migrateFillTokenToLocal() {
   getFillToken().catch(() => {});
 }
 
-chrome.runtime.onStartup.addListener(migrateFillTokenToSession);
+chrome.runtime.onStartup.addListener(migrateFillTokenToLocal);
 chrome.runtime.onInstalled.addListener(() => {
-  migrateFillTokenToSession();
+  migrateFillTokenToLocal();
   chrome.storage.local.remove("showFloatingBar").catch(() => {});
 });
 
@@ -152,7 +141,7 @@ async function fetchLocal(path, { body, token, timeoutMs } = {}) {
     return { port, res, data };
   } catch (e) {
     if (e?.name === "AbortError") {
-      throw new Error("连接 Sealbox 超时。请确认应用已启动，并在「插件」页重新点配对。");
+      throw new Error("连接 Sealbox 超时。请确认应用已启动");
     }
     throw new Error("无法连接 Sealbox，请确认应用已启动");
   } finally {
@@ -189,6 +178,7 @@ async function api(path, body) {
   }
   const { res, data } = await fetchLocal(path, { body, token: fillToken });
   if (res.status === 401) {
+    await setFillToken("");
     await sessionRemove(["pendingTotp"]);
     throw new Error("填表 Token 已失效，请重新配对");
   }

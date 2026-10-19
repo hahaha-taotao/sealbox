@@ -1,10 +1,12 @@
 # 本地凭据金库 — 第一版设计
 
 日期：2026-09-11  
-状态：已批准  
+状态：已批准的初始基线；当前范围以 v0.2.4 修订说明为准<br>
 产品名：Sealbox（印盒）  
 应用 id：`com.sealbox.app`  
 对标参考：Sigil 掌玺（https://sigil.ruoyi.plus/），仅借鉴「本地金库」思路与界面视觉，不复制其云端 AI/MCP 形态；本项目只提供本机、受控的 GitHub MCP（只读 API + 已登记本地仓库的 git）。
+
+> **后续实现修订（截至 v0.2.4）**：本文是 2026-09-11 的初始范围基线，不是当前版本的完整功能清单。后续规格与实现已经修订了与本文冲突的部分：Chrome / Edge 扩展、按当前网址的填充与保存、TOTP 填充、CSV 导入、文件夹和标签维护、ZoomKey 只读 MCP、受控本地 Git，以及四个受桌面确认保护的 GitHub API 写入（Issue、评论、Draft PR、Draft Release）均已落地。本文中“第一版不做浏览器填充”和“仅受控 Release 写入”等表述仅描述当日基线，阅读当前范围时应以 README 和后续规格为准。2026-09-28 的 QR TOTP 入库与页面 OTP 候选仍是待审阅提案，未计入当前版本。
 
 ## 1. 产品定位
 
@@ -23,16 +25,18 @@
 | 条目类型 | 网站账号、API Token、SSH/证书 |
 | 存储 | 只存本机；支持加密备份导出/导入 |
 | 解锁 | 主密码为根；Windows Hello 为第二把钥匙 |
-| 使用方式 | 应用内复制 + 全局快捷键速查；不做浏览器填充 |
+| 使用方式 | **9 月 11 日基线**：应用内复制 + 全局快捷键速查；当时不做浏览器填充。当前版本已由后续 Chrome / Edge 扩展规格和实现补充受限的填充、保存与 TOTP 填充 |
 | 技术 | Tauri 2 + Vue 3 界面 + Rust 金库核心 |
 | 界面 | 借 Sigil 保险库的视觉（白底、图标栏、分类侧栏、表格、类型色标、圆角按钮），不借其功能清单 |
 
 ## 3. 范围
 
-### 3.1 第一版要做
+### 3.1 9 月 11 日基线第一版要做
+
+以下条目是当日基线；当前 v0.2.4 已在其上扩展了邮箱、服务器、数据库、客户端证书、浏览器填充 / 保存、CSV 导入、ZoomKey 和受控 GitHub MCP。本文后续章节中未另行标注的“第一版”均指这份历史基线，而不是当前发布范围。
 
 - 首次设主密码、日常主密码或 Windows Hello 解锁、手动锁定、空闲自动锁定
-- 三类条目的增删改查、搜索、文件夹、标签、置顶
+- 三类条目的增删改查、搜索、文件夹、标签、置顶（9 月 11 日基线；当前实现已扩展为八类条目）
 - 列表展示元数据；显示明文有超时；复制主秘密 / 账号；剪贴板 20 秒后清空
 - 网站账号可选 TOTP（本地生成 6 位码）
 - 新建网站密码时可本机生成密码
@@ -44,13 +48,15 @@
 - 首页概览：条数、最近使用、即将过期
 - 设置：超时、热键、Hello 开关、剪贴板秒数、备份入口
 
-### 3.2 第一版明确不做
+### 3.2 9 月 11 日基线明确不做
+
+以下清单记录当日基线；标注“已由后续版本修订”的项目不代表当前 v0.2.4 的禁用项。
 
 - macOS / Linux
 - 云同步、多用户、账号系统
-- 浏览器自动填充、向其他窗口注入按键
+- **[已由后续版本修订]** 浏览器自动填充、向其他窗口注入按键；当前仅由 Chrome / Edge 扩展在用户触发、站点 origin 校验和 session 约束下填充，不提供任意键盘模拟或静默注入
 - GitHub Contents / Git Data 写 API、通用 HTTP 默认暴露、模型触发的秘密复制
-- GitHub MCP：默认停用；启用后开放固定的 api.github.com GET 工具，以及 Agent 传入绝对路径的 `github_git_*`（见 `2026-09-18-git-workspace-mcp-design.md`）。GitHub API 写入仅在独立开关打开后提供受控的 `github_create_release`，不做任意写 API、force / SSH / 相对路径逃逸
+- GitHub MCP：默认停用；启用后开放固定的 api.github.com GET 工具，以及 Agent 传入绝对路径的 `github_git_*`（见 `2026-09-18-git-workspace-mcp-design.md`）。当前已实现的 GitHub API 写入是独立开关保护的 `github_create_issue`、`github_create_issue_comment`、`github_create_pull_request` 和 `github_create_release`，每次均需桌面确认；不做任意写 API、force / SSH / 相对路径逃逸。发布资产、tag、workflow 控制、PR 合并、Contents / Git Data、分支保护、Secrets 和 Webhooks 仍未承诺
 - 文件加密盘、加密分享包、邮件、MQTT、对象存储、内置浏览器
 - Bitwarden 导入、扫描导入、Have I Been Pwned、试用倒计时
 - Token 额度刷新、分页（本地全量列表 + 搜索即可）
@@ -59,13 +65,13 @@
 
 ### 3.3 后续能力预留
 
-Rust 核心暴露内部 `VaultService`：按筛选列出元数据、按 id 解密一次、写审计。当前本机 MCP 用 `GithubMcpPolicy.enabled` 控制 GitHub API/本地 `github_git_*` 总能力，并用独立的 `api_write_enabled` 控制受控 GitHub Release 写入。API 读取固定 GET `https://api.github.com`；Release 创建只接受白名单 POST 字段；git 工具在 Agent 给出的绝对路径上跑本机 `git`，Token 经 askpass 注入且不回给模型。详见 `2026-09-18-git-workspace-mcp-design.md` 和 `2026-09-20-github-mcp-roadmap.md`。
+Rust 核心暴露内部 `VaultService`：按筛选列出元数据、按 id 解密一次、写审计。当前本机 MCP 用 `GithubMcpPolicy.enabled` 控制 GitHub API/本地 `github_git_*` 总能力，并用独立的 `api_write_enabled` 控制四个受控 GitHub API 写入（Issue、评论、Draft PR、Draft Release）。API 读取固定 GET `https://api.github.com`；这些写入只接受白名单字段并逐次桌面确认；git 工具在 Agent 给出的绝对路径上跑本机 `git`，Token 经 askpass 注入且不回给模型。详见 `2026-09-18-git-workspace-mcp-design.md` 和 `2026-09-20-github-mcp-roadmap.md`。
 
 ## 4. 成功标准
 
 第一版算做成，当且仅当：
 
-1. 设主密码后可创建三类条目，重启后须解锁才能看见列表。
+1. **9 月 11 日基线验收**：设主密码后可创建三类条目，重启后须解锁才能看见列表；当前实现已扩展为八类条目。
 2. 列表、搜索、审计、日志里没有密码 / Token / 私钥全文。
 3. 复制后约 20 秒，若剪贴板仍是那条秘密则被清空。
 4. 空闲超时或点锁定后，复制和显示都必须重新解锁。
@@ -95,11 +101,11 @@ Rust 核心
   127.0.0.1 MCP HTTP（不向模型返回凭据明文）
 ```
 
-三条硬边界：
+三条硬边界（在后续扩展实现中仍适用）：
 
 1. 明文只在 Rust 里短暂出现。前端默认看不到完整秘密；「显示」或「复制」才请求一次。
 2. 磁盘无明文。SQLite 存元数据与 AES-256-GCM 密文；数据密钥用主密码派生钥包装，另有一份包装进 Credential Manager 供 Hello。
-3. MCP 只在本机 loopback 提供固定的只读查询和明确受控的 Release 写入；凭据明文只在 Rust 请求构造期间短暂存在，不进入模型结果。
+3. MCP 只在本机 loopback 提供固定的只读查询和明确受控的 GitHub Issue / 评论 / Draft PR / Draft Release 写入；凭据明文只在 Rust 请求构造期间短暂存在，不进入模型结果。
 
 关主窗口 ≠ 退出。托盘仍在，热键才可用。退出或锁定：丢掉内存中的数据密钥、清我们放入的剪贴板。
 
@@ -316,9 +322,9 @@ Windows Hello **不是**第二套 KDF。它是「已登录的 Windows 用户 + �
 
 仅本机：长度、大小写、数字、符号。插入当前密码框，未保存前不入库。
 
-### 10.4 禁止
+### 10.4 当前安全边界
 
-自动填充网页、模拟键盘把秘密打进其他程序、把秘密写到临时文件、把备份默默传到网络。
+9 月 11 日基线禁止自动填充网页和模拟键盘把秘密打进其他程序。当前实现的 Chrome / Edge 扩展只在用户触发、当前页面 origin 通过复核、金库已解锁且配对有效时填充；分步 TOTP 只在 session TTL 内暂存当前验证码。仍然禁止任意键盘模拟、静默注入、把秘密写到临时文件，以及把备份默默传到网络。
 
 ## 11. 备份
 
@@ -377,11 +383,12 @@ Windows Hello **不是**第二套 KDF。它是「已登录的 Windows 用户 + �
 
 ## 14. 安全属性（实现时不可破）
 
-1. 前端、审计、日志、备份文件（无口令时）、SQLite 文件本身，都得不到秘密明文。
-2. 显示和复制是唯一把明文送到 UI/剪贴板的出口，且有超时。
+1. 前端、审计、日志、备份文件（无口令时）、SQLite 文件本身，都得不到秘密明文；当前编辑普通条目时的解密表单属于现有实现行为，不应误读为 MCP 或列表输出会返回秘密。
+2. 显示、复制和经 origin 复核的浏览器填充是受控明文出口，且有超时或 session 生命周期约束。
 3. 同一把 DEK；Hello 只是 Credential Manager + 本人确认，不是第二套库。
 4. 备份只用主密码加密，与 Hello 无关；Hello 不能解开 `.svbak`。
-5. 本机 MCP/填表服务仅监听 `127.0.0.1`；GitHub 读取工具固定访问 `api.github.com`，Release 写入只允许白名单 POST，ZoomKey 按独立内网策略和 mTLS 访问；不得上传金库数据或凭据明文。
+5. 本机 MCP/填表服务仅监听 `127.0.0.1`；GitHub 读取工具固定访问 `api.github.com`，Issue / 评论 / Draft PR / Draft Release 只允许白名单 POST；ZoomKey 按独立内网策略和 mTLS 访问；不得上传金库数据或凭据明文。
+6. 路线图中的发布资产、tag、workflow 控制、PR 合并、Contents / Git Data、分支保护、Secrets 和 Webhooks 不是当前承诺；必须有单独规格、确认和测试后才可进入范围。
 
 ## 15. 实现顺序
 
