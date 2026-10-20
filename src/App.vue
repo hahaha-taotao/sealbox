@@ -2516,7 +2516,7 @@ onMounted(async () => {
                   <label>剪贴板清空（秒）</label>
                   <input type="number" min="5" max="120" v-model.number="settingsClip" />
                 </div>
-                <div class="field settings-span">
+                <div class="field">
                   <label>全局热键</label>
                   <input v-model="settingsHotkey" placeholder="Ctrl+Shift+Space" />
                 </div>

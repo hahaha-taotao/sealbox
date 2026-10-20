@@ -4,11 +4,11 @@
 
 A local credential vault for Windows. Unlock with a master password. Website logins, API tokens, SSH keys, mailboxes, servers, and databases stay encrypted on disk. Copied secrets are cleared from the clipboard on a timer. Encrypted `.svbak` backups can be exported and imported. An optional localhost MCP lets Cursor / Claude Code use credentials without seeing plaintext. A Chrome / Edge extension can fill or save website logins.
 
-当前版本 Current version: **v0.6.0** (`0.6.0`)
+当前版本 Current version: **v0.6.1** (`0.6.1`)
 
 ### 当前范围口径 Scope of this release
 
-当前实现以 `v0.6.0` 的代码和本文档为准。`docs/superpowers/specs/2026-09-11-local-credential-vault-design.md` 是 9 月 11 日的初始基线；后续 9 月 17 日、18 日、20 日和 24 日的规格对冲突部分作了增量修订，尤其是 Chrome / Edge 填充、TOTP、CSV 导入、本地 Git 和受控 GitHub MCP。9 月 28 日的 QR 入库与页面 OTP 候选仍是待审阅提案，不属于当前版本。
+当前实现以 `v0.6.1` 的代码和本文档为准。`docs/superpowers/specs/2026-09-11-local-credential-vault-design.md` 是 9 月 11 日的初始基线；后续 9 月 17 日、18 日、20 日和 24 日的规格对冲突部分作了增量修订，尤其是 Chrome / Edge 填充、TOTP、CSV 导入、本地 Git 和受控 GitHub MCP。9 月 28 日的 QR 入库与页面 OTP 候选仍是待审阅提案，不属于当前版本。
 
 The `v0.2.4` code and this README define the current shipped scope. The September 11 design is the original baseline; later dated specifications supersede conflicting parts, including Chrome / Edge fill, TOTP, CSV import, local Git, and guarded GitHub MCP. The September 28 QR-enrollment and page-OTP proposals are not shipped.
 
@@ -36,7 +36,7 @@ The `v0.2.4` code and this README define the current shipped scope. The Septembe
 
 ## 安装 Install
 
-Windows x64 使用 NSIS 安装包 `Sealbox_0.6.0_x64-setup.exe`。向导会让你选择：
+Windows x64 使用 NSIS 安装包 `Sealbox_0.6.1_x64-setup.exe`。向导会让你选择：
 
 1. 安装范围：当前用户，或所有用户（后者需要管理员权限）
 2. **安装盘符与目录**，例如 `D:\Sealbox`；默认在当前用户下是 `%LOCALAPPDATA%\Sealbox`，在所有用户下是 `C:\Program Files\Sealbox`
