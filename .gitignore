@@ -11,8 +11,14 @@ node_modules
 dist
 dist-ssr
 *.local
-src-tauri/target
-target
+src-tauri/target/**
+!src-tauri/target/release/
+src-tauri/target/release/**
+!src-tauri/target/release/bundle/
+src-tauri/target/release/bundle/**
+!src-tauri/target/release/bundle/nsis/
+src-tauri/target/release/bundle/nsis/**
+!src-tauri/target/release/bundle/nsis/Sealbox_0.6.0_x64-setup.exe
 .superpowers/brainstorm/*/state
 .worktrees
 *.svbak

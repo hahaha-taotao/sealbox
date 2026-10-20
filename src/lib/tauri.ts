@@ -29,6 +29,40 @@ export interface EntryDto {
 
 export type WebsiteDuplicate = EntryDto;
 
+export type SyncKind = "webdav" | "s3";
+
+export interface SyncView {
+  configured: boolean;
+  kind: SyncKind | null;
+  endpoint: string;
+  username: string;
+  bucket: string;
+  region: string;
+  prefix: string;
+  has_secret: boolean;
+  device_id: string;
+  last_sync_at: string | null;
+  last_result: string | null;
+}
+
+export interface SyncSaveInput {
+  kind: SyncKind;
+  endpoint: string;
+  username: string;
+  secret?: string | null;
+  bucket?: string | null;
+  region?: string | null;
+  prefix?: string | null;
+}
+
+export interface SyncReport {
+  pulled: number;
+  pushed: number;
+  unchanged: number;
+  conflicts: string[];
+  remote_missing: boolean;
+}
+
 export interface ClientCertInfo {
   id: string;
   title: string;
@@ -117,8 +151,6 @@ export interface Counts {
 export interface Status {
   initialized: boolean;
   unlocked: boolean;
-  hello_enabled: boolean;
-  hello_available: boolean;
   counts: Counts | null;
 }
 
@@ -268,7 +300,6 @@ export const api = {
   status: () => invoke<Status>("get_status"),
   setup: (password: string) => invoke("setup_vault", { password }),
   unlock: (password: string) => invoke("unlock_vault", { password }),
-  unlockHello: () => invoke("unlock_hello"),
   lock: () => invoke("lock_vault"),
   list: (filter: ListFilter) => invoke<EntryDto[]>("list_entries", { filter }),
   counts: (filter: ListFilter) => invoke<Counts>("list_counts", { filter }),
@@ -329,7 +360,10 @@ export const api = {
   settingsGet: () => invoke<{ idle_secs: number; clipboard_secs: number; hotkey: string }>("settings_get"),
   settingsSet: (settings: { idle_secs: number; clipboard_secs: number; hotkey: string }) =>
     invoke("settings_set", { settings }),
-  setHello: (enabled: boolean) => invoke("set_hello_enabled", { enabled }),
+  syncStatus: () => invoke<SyncView>("sync_status"),
+  syncSave: (input: SyncSaveInput) => invoke<SyncView>("sync_save", { input }),
+  syncClear: () => invoke("sync_clear"),
+  syncNow: () => invoke<SyncReport>("sync_now"),
   changeMaster: (oldPassword: string, newPassword: string) =>
     invoke("change_master", { oldPassword, newPassword }),
   window: (action: string) => invoke("window_control", { action }),

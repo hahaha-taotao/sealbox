@@ -1,14 +1,14 @@
 # Sealbox 印盒
 
-本地凭据金库。主密码（可选 Windows Hello）解锁；网站账号、API Token、SSH、邮箱、服务器和数据库凭据加密存放；复制后定时清空剪贴板；支持 `.svbak` 加密备份。可选本机 MCP，让 Cursor / Claude Code 使用凭据但看不到明文。也提供 Chrome / Edge 填表扩展。
+本地凭据金库。主密码解锁；网站账号、API Token、SSH、邮箱、服务器和数据库凭据加密存放；复制后定时清空剪贴板；支持 `.svbak` 加密备份。可选本机 MCP，让 Cursor / Claude Code 使用凭据但看不到明文。也提供 Chrome / Edge 填表扩展。
 
-A local credential vault for Windows. Unlock with a master password (optional Windows Hello). Website logins, API tokens, SSH keys, mailboxes, servers, and databases stay encrypted on disk. Copied secrets are cleared from the clipboard on a timer. Encrypted `.svbak` backups can be exported and imported. An optional localhost MCP lets Cursor / Claude Code use credentials without seeing plaintext. A Chrome / Edge extension can fill or save website logins.
+A local credential vault for Windows. Unlock with a master password. Website logins, API tokens, SSH keys, mailboxes, servers, and databases stay encrypted on disk. Copied secrets are cleared from the clipboard on a timer. Encrypted `.svbak` backups can be exported and imported. An optional localhost MCP lets Cursor / Claude Code use credentials without seeing plaintext. A Chrome / Edge extension can fill or save website logins.
 
-当前版本 Current version: **v0.5.0** (`0.5.0`)
+当前版本 Current version: **v0.6.0** (`0.6.0`)
 
 ### 当前范围口径 Scope of this release
 
-当前实现以 `v0.5.0` 的代码和本文档为准。`docs/superpowers/specs/2026-09-11-local-credential-vault-design.md` 是 9 月 11 日的初始基线；后续 9 月 17 日、18 日、20 日和 24 日的规格对冲突部分作了增量修订，尤其是 Chrome / Edge 填充、TOTP、CSV 导入、本地 Git 和受控 GitHub MCP。9 月 28 日的 QR 入库与页面 OTP 候选仍是待审阅提案，不属于当前版本。
+当前实现以 `v0.6.0` 的代码和本文档为准。`docs/superpowers/specs/2026-09-11-local-credential-vault-design.md` 是 9 月 11 日的初始基线；后续 9 月 17 日、18 日、20 日和 24 日的规格对冲突部分作了增量修订，尤其是 Chrome / Edge 填充、TOTP、CSV 导入、本地 Git 和受控 GitHub MCP。9 月 28 日的 QR 入库与页面 OTP 候选仍是待审阅提案，不属于当前版本。
 
 The `v0.2.4` code and this README define the current shipped scope. The September 11 design is the original baseline; later dated specifications supersede conflicting parts, including Chrome / Edge fill, TOTP, CSV import, local Git, and guarded GitHub MCP. The September 28 QR-enrollment and page-OTP proposals are not shipped.
 
@@ -27,8 +27,8 @@ The `v0.2.4` code and this README define the current shipped scope. The Septembe
 
 安装程序只替换应用文件，不会删除或搬移金库。金库路径是 `%APPDATA%\\com.sealbox.app\\vault.db`；升级前仍建议先导出 `.svbak` 加密备份。
 
-> 数据只存本机，不做云同步。
-> Secrets stay on this machine. There is no cloud sync.
+> 可选 WebDAV / S3 同步。远端只保存用同步密钥加密的快照，不保存明文，也解不开主密码。
+> Optional WebDAV / S3 sync stores an encrypted snapshot. The remote never sees plaintext and cannot unlock the master password.
 
 > 当前工作区的在线更新实现已经支持签名下载、进度展示和安装确认；v0.1.4 及更早安装包仍需按上面的步骤手动升级一次。请只从本项目的 GitHub Releases 下载，并核对版本号与签名元数据。
 
@@ -36,7 +36,7 @@ The `v0.2.4` code and this README define the current shipped scope. The Septembe
 
 ## 安装 Install
 
-Windows x64 使用 NSIS 安装包 `Sealbox_0.5.0_x64-setup.exe`。向导会让你选择：
+Windows x64 使用 NSIS 安装包 `Sealbox_0.6.0_x64-setup.exe`。向导会让你选择：
 
 1. 安装范围：当前用户，或所有用户（后者需要管理员权限）
 2. **安装盘符与目录**，例如 `D:\Sealbox`；默认在当前用户下是 `%LOCALAPPDATA%\Sealbox`，在所有用户下是 `C:\Program Files\Sealbox`
@@ -57,7 +57,7 @@ npm run tauri build
 ## 功能 Features
 
 - **保险库 Vault** — 网站账号、API Token、SSH、邮箱、邮箱授权码、服务器、数据库、客户端证书
-- **解锁 Unlock** — 主密码为根；可选 Windows Hello 作为第二把钥匙
+- **解锁 Unlock** — 主密码为根
 - **速查 Quick search** — 默认全局热键 `Ctrl+Shift+Space`，回车复制主秘密
 - **安全习惯 Hygiene** — 空闲自动锁定、审计日志（不记明文）、回收站、置顶、标签、单层文件夹；文件夹可重命名、删除（条目变为未归类）或合并，标签可重命名、删除或合并
 - **备份与导入 Backup & import** — 加密 `.svbak` 导出 / 导入（默认合并，覆盖需确认）；可从 Chrome / Edge、Bitwarden、1Password 导出的 UTF-8 CSV 导入网站账号，默认跳过已有同站同账号
@@ -70,7 +70,7 @@ npm run tauri build
 
 ### 当前明确不做 Current non-goals
 
-- 不做云同步、多用户、账号系统、定时云备份或备份上传；金库和 `.svbak` 留在本机。
+- 不做多用户、账号系统或定时自动上传。可选的 WebDAV / S3 同步只上传加密快照，不上传明文金库或 `.svbak`。
 - 不做 Firefox / Safari / Brave 适配、浏览器商店上架、`.crx`、注册表强制安装或静默加载；当前扩展只支持 Chrome / Edge 的本机加载流程。
 - 不读 Chrome `Login Data` 或其他浏览器凭据数据库，不使用 DPAPI，不做 Passkey、HIBP、扫描导入或 QR 入库；2026-09-28 的 QR TOTP 与页面 OTP 候选仍是待审阅提案。
 - 不提供任意 HTTP、任意 URL / 方法 / 请求头 / 原始请求体；不把 Token、主密码、备份、Authorization header 或完整远端响应交给模型。
@@ -83,7 +83,7 @@ npm run tauri build
 | 列表 List | 列表、搜索、审计、MCP 都不返回密码 / Token / 私钥 |
 | 剪贴板 Clipboard | 复制条目秘密、MCP / 填表 Token 和 MCP 配置后约 20 秒，若仍是那条内容则清空；锁定会立刻清掉本应用写入的秘密 |
 | 锁定 Lock | 空闲超时、标题栏或托盘锁定都会丢掉 DEK、清已复制秘密、关掉编辑框和明文显示 |
-| 备份 Backup | `.svbak` 用导出密码加密；Windows Hello 解不开备份文件 |
+| 备份 Backup | `.svbak` 用导出密码加密 |
 | 网络 Network | MCP / 填表 API 只监听 `127.0.0.1`，默认端口 `17891`。GitHub 工具只访问 `https://api.github.com:443`，Release 资产上传只访问 `https://uploads.github.com:443`，统一拒绝重定向和内网目标。ZoomKey 仅访问精确白名单内网主机，使用 mTLS、固定路径和只读工具策略 |
 | 插件 Extension | 登录页右下角弹出填充条；一站点多账号可点选。`Alt+Shift+F` 也可打开选择器。填充条在 open Shadow DOM 中，只响应真实用户点击。提交后询问保存/更新，明文只暂存在 `chrome.storage.session`。扩展为检测和填充当前网页而申请 `http://*/*` 与 `https://*/*` 页面权限，Sealbox API 本身仍仅访问 `127.0.0.1`；填表 Token 写入 `chrome.storage.local`，关掉浏览器仍有效，只有轮换后才需要重新配对 |
 
@@ -97,12 +97,12 @@ npm run tauri build
 
 ## 发布 Release
 
-发布只接受形如 `v0.5.0` 的 Git tag。`.github/workflows/release.yml` 在 Windows runner 上依次执行 `npm ci`、版本一致性校验、Rust 测试、前端构建和扩展测试，全部通过后由 `tauri-apps/tauri-action` 构建并发布 NSIS 安装包、`latest.json` 和对应的 `.sig` updater 签名文件。
+发布只接受形如 `v0.6.0` 的 Git tag。`.github/workflows/release.yml` 在 Windows runner 上依次执行 `npm ci`、版本一致性校验、Rust 测试、前端构建和扩展测试，全部通过后由 `tauri-apps/tauri-action` 构建并发布 NSIS 安装包、`latest.json` 和对应的 `.sig` updater 签名文件。
 
 版本号必须同时匹配以下文件：`package.json`、`package-lock.json`（根版本和 `packages[""].version`）、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json`、`extension/manifest.json`。本地可在打 tag 前运行：
 
 ```bash
-node scripts/check-version.mjs v0.5.0
+node scripts/check-version.mjs v0.6.0
 ```
 
 GitHub Actions 只从 Secrets 注入签名材料，不会把私钥写入仓库或工作区。请在仓库 Settings → Secrets and variables → Actions 中配置：

@@ -48,8 +48,6 @@ fn migrate(conn: &Connection) -> Result<(), DbError> {
           kdf_t INTEGER NOT NULL,
           kdf_p INTEGER NOT NULL,
           wrapped_data_key BLOB NOT NULL,
-          hello_enabled INTEGER NOT NULL DEFAULT 0,
-          wrapped_dek_hello BLOB,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
@@ -99,5 +97,33 @@ fn migrate(conn: &Connection) -> Result<(), DbError> {
         );
         "#,
     )?;
+    drop_hello_columns(conn)?;
+    Ok(())
+}
+
+/// Existing vaults may still carry the removed Windows Hello wrap.
+/// SQLite before 3.35 cannot DROP COLUMN; those files keep the unused columns.
+fn drop_hello_columns(conn: &Connection) -> Result<(), DbError> {
+    let mut stmt = conn.prepare("PRAGMA table_info(vault_meta)")?;
+    let names: Vec<String> = stmt
+        .query_map([], |row| row.get(1))?
+        .filter_map(|name| name.ok())
+        .collect();
+    if !names.iter().any(|name| name == "hello_enabled")
+        && !names.iter().any(|name| name == "wrapped_dek_hello")
+    {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE vault_meta SET hello_enabled = 0, wrapped_dek_hello = NULL WHERE id = 1",
+        [],
+    )?;
+    let dropped = conn.execute_batch(
+        "ALTER TABLE vault_meta DROP COLUMN wrapped_dek_hello;
+         ALTER TABLE vault_meta DROP COLUMN hello_enabled;",
+    );
+    if dropped.is_err() {
+        return Ok(());
+    }
     Ok(())
 }

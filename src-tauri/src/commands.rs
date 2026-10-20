@@ -1,10 +1,10 @@
 use crate::assistant;
 use crate::backup::{export_envelope, import_envelope};
 use crate::clipboard;
-use crate::hello;
 use crate::lock::{idle_lock_if_needed, lock_everything, lock_session, recover_lock};
 use crate::mcp::{self, McpState};
 use crate::session::Session;
+use crate::sync::{self, SyncConfig, SyncKind, SyncReport, SyncView};
 use crate::totp::{generate_passphrase, generate_password_with_options, ssh_fingerprint, totp_now};
 use crate::vault::{
     AuditEvent, Counts, EntryDto, FolderDto, ListFilter, SecretPayload, UpsertEntry, Vault,
@@ -67,13 +67,6 @@ fn require_existing_vault(path: &Path) -> Result<Vault, String> {
         return Err(crate::vault::VaultError::NotInitialized.to_string());
     }
     Vault::open(path).map_err(map_err)
-}
-
-fn peek_hello_enabled(path: &Path) -> bool {
-    Vault::open(path.to_str().unwrap_or_default())
-        .ok()
-        .and_then(|v| v.hello_enabled().ok())
-        .unwrap_or(false)
 }
 
 fn bind_open_vault(session: &mut Session, path: &Path) {
@@ -168,8 +161,6 @@ fn load_bridge_tokens(state: &AppState, session: &Session) {
 pub struct Status {
     pub initialized: bool,
     pub unlocked: bool,
-    pub hello_enabled: bool,
-    pub hello_available: bool,
     pub counts: Option<Counts>,
 }
 
@@ -186,17 +177,6 @@ pub fn get_status(app: AppHandle, state: State<AppState>) -> Result<Status, Stri
     if initialized && unlocked {
         bind_open_vault(&mut session, &path);
     }
-    let hello_enabled = if !initialized {
-        false
-    } else if unlocked {
-        session
-            .vault()
-            .ok()
-            .and_then(|v| v.hello_enabled().ok())
-            .unwrap_or(false)
-    } else {
-        peek_hello_enabled(&path)
-    };
     if initialized && unlocked {
         load_bridge_tokens(&state, &session);
     }
@@ -211,8 +191,6 @@ pub fn get_status(app: AppHandle, state: State<AppState>) -> Result<Status, Stri
     Ok(Status {
         initialized,
         unlocked,
-        hello_enabled,
-        hello_available: hello::hello_available(),
         counts,
     })
 }
@@ -284,27 +262,6 @@ pub fn unlock_vault(
             Err(e.to_string())
         }
     }
-}
-
-#[tauri::command]
-pub fn unlock_hello(app: AppHandle, state: State<AppState>) -> Result<(), String> {
-    if !hello::prompt_hello()? {
-        return Err("Windows Hello 未通过".into());
-    }
-    let key = hello::load_hello_key()?;
-    let path = vault_path(&app)?;
-    let vault = require_existing_vault(&path)?;
-    let dek = vault.unlock_with_hello_key(&key).map_err(map_err)?;
-    let _ = vault.audit("unlock_hello", None, "ok");
-    {
-        let mut session = lock_session(&state.session);
-        session.set_unlocked(vault, dek);
-        apply_vault_settings(&mut session);
-    }
-    hydrate_bridge_tokens(&state);
-    let _ = mcp::start(&state.mcp, state.session.clone());
-    notify_vault_unlocked(&app);
-    Ok(())
 }
 
 fn notify_vault_unlocked(app: &AppHandle) {
@@ -1134,17 +1091,59 @@ fn parse_hotkey(s: &str) -> Result<tauri_plugin_global_shortcut::Shortcut, Strin
     Ok(Shortcut::new(Some(mods), code))
 }
 
+#[derive(Deserialize)]
+pub struct SyncSaveInput {
+    pub kind: SyncKind,
+    pub endpoint: String,
+    pub username: String,
+    pub secret: Option<String>,
+    pub bucket: Option<String>,
+    pub region: Option<String>,
+    pub prefix: Option<String>,
+}
+
 #[tauri::command]
-pub fn set_hello_enabled(state: State<AppState>, enabled: bool) -> Result<(), String> {
+pub fn sync_status(state: State<AppState>) -> Result<SyncView, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    sync::view(session.vault().map_err(map_err)?).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn sync_save(state: State<AppState>, input: SyncSaveInput) -> Result<SyncView, String> {
     let mut session = lock_session(&state.session);
     session.require_unlocked().map_err(map_err)?;
     let dek = *session.dek().map_err(map_err)?;
     let vault = session.vault().map_err(map_err)?;
-    if enabled {
-        hello::enable_hello(vault, &dek)
-    } else {
-        hello::disable_hello(vault, &dek)
-    }
+    sync::save_config(
+        vault,
+        &dek,
+        SyncConfig {
+            kind: input.kind,
+            endpoint: input.endpoint,
+            username: input.username,
+            bucket: input.bucket.unwrap_or_default(),
+            region: input.region.unwrap_or_default(),
+            prefix: input.prefix.unwrap_or_default(),
+        },
+        input.secret.as_deref(),
+    )?;
+    sync::view(vault).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn sync_clear(state: State<AppState>) -> Result<(), String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    sync::clear_config(session.vault().map_err(map_err)?).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn sync_now(state: State<AppState>) -> Result<SyncReport, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let dek = *session.dek().map_err(map_err)?;
+    sync::sync_now(session.vault().map_err(map_err)?, &dek)
 }
 
 #[tauri::command]
@@ -1160,9 +1159,6 @@ pub fn change_master(
     vault
         .change_master_password(&dek, &old_password, &new_password)
         .map_err(map_err)?;
-    if vault.hello_enabled().unwrap_or(false) {
-        hello::enable_hello(vault, &dek)?;
-    }
     Ok(())
 }
 
@@ -1659,19 +1655,6 @@ mod tests {
         assert_eq!(stored.idle_secs, 60);
         assert_eq!(stored.clipboard_secs, 5);
         assert_eq!(stored.hotkey, Settings::default().hotkey);
-    }
-
-    #[test]
-    fn peek_hello_enabled_does_not_need_session() {
-        let (path, dek) = temp_vault_path();
-        let vault = Vault::open(path.to_str().unwrap()).unwrap();
-        vault.set_hello(&dek, Some(&[7u8; 32])).unwrap();
-        let mut session = Session::default();
-        session.set_unlocked(vault, dek);
-        session.lock();
-        assert!(peek_hello_enabled(&path));
-        assert!(session.vault().is_err());
-        assert!(!session.is_unlocked());
     }
 
     fn sample_site() -> UpsertEntry {

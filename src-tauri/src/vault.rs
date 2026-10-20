@@ -330,8 +330,8 @@ impl Vault {
         conn.execute(
             "INSERT INTO vault_meta (
                 id, schema_version, kdf_salt, kdf_m, kdf_t, kdf_p,
-                wrapped_data_key, hello_enabled, wrapped_dek_hello, created_at, updated_at
-            ) VALUES (1, 1, ?1, ?2, ?3, ?4, ?5, 0, NULL, ?6, ?6)",
+                wrapped_data_key, created_at, updated_at
+            ) VALUES (1, 1, ?1, ?2, ?3, ?4, ?5, ?6, ?6)",
             params![
                 params_kdf.salt.as_slice(),
                 params_kdf.m_cost as i64,
@@ -1292,49 +1292,6 @@ impl Vault {
         Ok(())
     }
 
-    pub fn hello_enabled(&self) -> Result<bool, VaultError> {
-        let v: i64 =
-            self.conn
-                .query_row("SELECT hello_enabled FROM vault_meta WHERE id=1", [], |r| {
-                    r.get(0)
-                })?;
-        Ok(v != 0)
-    }
-
-    pub fn set_hello(
-        &self,
-        dek: &[u8; 32],
-        hello_key: Option<&[u8; 32]>,
-    ) -> Result<(), VaultError> {
-        match hello_key {
-            Some(key) => {
-                let wrapped = wrap_key(key, dek)?.to_bytes();
-                self.conn.execute(
-                    "UPDATE vault_meta SET hello_enabled=1, wrapped_dek_hello=?1, updated_at=?2 WHERE id=1",
-                    params![wrapped, now_rfc3339()],
-                )?;
-            }
-            None => {
-                self.conn.execute(
-                    "UPDATE vault_meta SET hello_enabled=0, wrapped_dek_hello=NULL, updated_at=?1 WHERE id=1",
-                    params![now_rfc3339()],
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    pub fn unlock_with_hello_key(&self, hello_key: &[u8; 32]) -> Result<[u8; 32], VaultError> {
-        let blob: Option<Vec<u8>> = self.conn.query_row(
-            "SELECT wrapped_dek_hello FROM vault_meta WHERE id=1 AND hello_enabled=1",
-            [],
-            |r| r.get(0),
-        )?;
-        let blob = blob.ok_or(VaultError::BadPassword)?;
-        let enc = Encrypted::from_bytes(&blob)?;
-        unwrap_key(hello_key, &enc).map_err(|_| VaultError::BadPassword)
-    }
-
     pub fn snapshot_for_backup(&self) -> Result<BackupSnapshot, VaultError> {
         let folders = self.list_folders()?;
         let tags = self.list_tags()?;
@@ -1790,6 +1747,94 @@ impl Vault {
         self.conn
             .execute("DELETE FROM settings WHERE key=?1", params![key])?;
         Ok(())
+    }
+
+    pub fn delete_setting(&self, key: &str) -> Result<(), VaultError> {
+        self.conn
+            .execute("DELETE FROM settings WHERE key=?1", params![key])?;
+        Ok(())
+    }
+
+    /// Replace folders, tags and entries with a snapshot whose secret blobs
+    /// are already encrypted with this vault's DEK. Settings and audit stay.
+    pub fn replace_snapshot_same_key(
+        &self,
+        dek: &[u8; 32],
+        snapshot: &BackupSnapshot,
+    ) -> Result<(), VaultError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            self.conn.execute("DELETE FROM entry_tags", [])?;
+            self.conn.execute("DELETE FROM entries", [])?;
+            self.conn.execute("DELETE FROM folders", [])?;
+            self.conn.execute("DELETE FROM tags", [])?;
+            for folder in &snapshot.folders {
+                let name = normalize_name(&folder.name, true)?;
+                self.conn.execute(
+                    "INSERT INTO folders (id, name, parent_id) VALUES (?1,?2,NULL)",
+                    params![&folder.id, &name],
+                )?;
+            }
+            for entry in &snapshot.entries {
+                let enc = Encrypted::from_bytes(&entry.secret_blob)?;
+                decrypt(dek, &enc)?;
+                if let Some(notes) = &entry.notes_blob {
+                    decrypt(dek, &Encrypted::from_bytes(notes)?)?;
+                }
+                let folder_id = entry.folder_id.as_ref().filter(|id| {
+                    snapshot.folders.iter().any(|folder| folder.id == **id)
+                });
+                self.conn.execute(
+                    "INSERT INTO entries (
+                        id, kind, title, account, url, folder_id, pinned, expires_at,
+                        use_count, last_used_at, created_at, updated_at, deleted_at,
+                        has_totp, fingerprint, secret_blob, notes_blob
+                    ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                    params![
+                        &entry.id,
+                        &entry.kind,
+                        &entry.title,
+                        &entry.account,
+                        &entry.url,
+                        folder_id,
+                        entry.pinned as i64,
+                        &entry.expires_at,
+                        entry.use_count,
+                        &entry.last_used_at,
+                        &entry.created_at,
+                        &entry.updated_at,
+                        &entry.deleted_at,
+                        entry.has_totp as i64,
+                        &entry.fingerprint,
+                        &entry.secret_blob,
+                        &entry.notes_blob,
+                    ],
+                )?;
+                for tag in normalize_tag_names(&entry.tags) {
+                    let tag_id = self.ensure_tag(&tag)?;
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?1,?2)",
+                        params![&entry.id, &tag_id],
+                    )?;
+                }
+            }
+            self.audit(
+                "sync_apply",
+                None,
+                &format!("entries={}", snapshot.entries.len()),
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
     }
 }
 

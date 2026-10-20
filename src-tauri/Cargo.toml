@@ -1,6 +1,6 @@
 [package]
 name = "sealbox"
-version = "0.5.0"
+version = "0.6.0"
 description = "Sealbox 印盒 — local credential vault"
 authors = ["you"]
 edition = "2021"
@@ -28,10 +28,10 @@ base64 = "0.22"
 rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 arboard = "3"
-keyring = "3"
 totp-rs = { version = "5", default-features = false, features = ["otpauth"] }
 regex = "1"
 ureq = { version = "2", default-features = false, features = ["tls"] }
@@ -44,7 +44,6 @@ rustls-pemfile = "2"
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
 windows = { version = "0.58", features = [
-  "Security_Credentials_UI",
   "Foundation",
   "Win32_Foundation",
   "Win32_System_Com",

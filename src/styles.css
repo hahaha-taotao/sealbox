@@ -194,13 +194,6 @@ button { cursor: pointer; }
 .update-progress-head strong { color: var(--brand); font-weight: 600; }
 .update-progress-track { height: 8px; overflow: hidden; border-radius: 999px; background: #e7e9f5; }
 .update-progress-track span { display: block; height: 100%; border-radius: inherit; background: var(--brand); transition: width .2s ease; }
-.hello-status {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 0 0 14px;
-  color: var(--text);
-}
 .mcp-head {
   display: flex;
   align-items: flex-start;

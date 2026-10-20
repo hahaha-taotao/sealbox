@@ -12,13 +12,13 @@ pub mod fill;
 pub mod git_workspace;
 pub mod github_api;
 pub mod github_mcp;
-pub mod hello;
 pub mod http_guard;
 pub mod lock;
 pub mod mcp;
 pub mod passphrase_words;
 pub mod redact;
 pub mod session;
+pub mod sync;
 pub mod totp;
 pub mod vault;
 pub mod zoomkey;
@@ -46,7 +46,6 @@ pub fn run() {
             commands::home_overview,
             commands::setup_vault,
             commands::unlock_vault,
-            commands::unlock_hello,
             commands::lock_vault,
             commands::list_entries,
             commands::list_counts,
@@ -82,7 +81,10 @@ pub fn run() {
             commands::import_csv_commit,
             commands::settings_get,
             commands::settings_set,
-            commands::set_hello_enabled,
+            commands::sync_status,
+            commands::sync_save,
+            commands::sync_clear,
+            commands::sync_now,
             commands::change_master,
             commands::mcp_status,
             commands::mcp_start,

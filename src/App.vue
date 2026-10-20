@@ -33,6 +33,9 @@ import {
   type McpToolInfo,
   type SecretPayload,
   type Status,
+  type SyncKind,
+  type SyncReport,
+  type SyncView,
   type UpsertEntry,
   type WebsiteDuplicate,
   type ZoomkeyCandidates,
@@ -340,15 +343,6 @@ async function doUnlock() {
     await refreshVault();
   } catch {
     error.value = "主密码不正确";
-  }
-}
-async function doHello() {
-  try {
-    await api.unlockHello();
-    await refreshStatus();
-    await refreshVault();
-  } catch (e) {
-    error.value = String(e);
   }
 }
 async function openAudit() {
@@ -812,6 +806,7 @@ function goPage(next: Page) {
   page.value = next;
   if (next === "settings" && status.value?.unlocked) {
     loadSettings().catch(() => undefined);
+    loadSync().catch(() => undefined);
   }
 }
 function goBack() {
@@ -1312,6 +1307,78 @@ const settingsHotkey = ref("Ctrl+Shift+Space");
 const oldMaster = ref("");
 const newMaster = ref("");
 const newMaster2 = ref("");
+const syncKind = ref<SyncKind>("webdav");
+const syncEndpoint = ref("");
+const syncUsername = ref("");
+const syncSecret = ref("");
+const syncBucket = ref("");
+const syncRegion = ref("us-east-1");
+const syncPrefix = ref("");
+const syncView = ref<SyncView | null>(null);
+const syncBusy = ref(false);
+const syncReport = ref<SyncReport | null>(null);
+
+async function loadSync() {
+  syncView.value = await api.syncStatus();
+  if (!syncView.value.configured) return;
+  syncKind.value = syncView.value.kind ?? "webdav";
+  syncEndpoint.value = syncView.value.endpoint;
+  syncUsername.value = syncView.value.username;
+  syncBucket.value = syncView.value.bucket;
+  syncRegion.value = syncView.value.region || "us-east-1";
+  syncPrefix.value = syncView.value.prefix;
+}
+
+async function saveSync() {
+  syncBusy.value = true;
+  try {
+    syncView.value = await api.syncSave({
+      kind: syncKind.value,
+      endpoint: syncEndpoint.value,
+      username: syncUsername.value,
+      secret: syncSecret.value || null,
+      bucket: syncBucket.value || null,
+      region: syncRegion.value || null,
+      prefix: syncPrefix.value || null,
+    });
+    syncSecret.value = "";
+    showToast("同步配置已保存");
+  } catch (e) {
+    showToast(String(e));
+  } finally {
+    syncBusy.value = false;
+  }
+}
+
+async function runSync() {
+  syncBusy.value = true;
+  syncReport.value = null;
+  try {
+    const report = await api.syncNow();
+    syncReport.value = report;
+    await loadSync();
+    await refreshVault();
+    const conflict = report.conflicts.length ? `，冲突 ${report.conflicts.length} 条已保留本地` : "";
+    showToast(`已同步：拉取 ${report.pulled}，推送 ${report.pushed}${conflict}`);
+  } catch (e) {
+    showToast(String(e));
+  } finally {
+    syncBusy.value = false;
+  }
+}
+
+async function clearSync() {
+  if (!confirm("清除这台设备上的同步配置和同步密钥？远端文件不会删除。")) return;
+  try {
+    await api.syncClear();
+    syncView.value = null;
+    syncSecret.value = "";
+    syncReport.value = null;
+    showToast("已清除同步配置");
+  } catch (e) {
+    showToast(String(e));
+  }
+}
 const appVersion = ref(String(packageJson.version));
 const update = shallowRef<AvailableUpdate | null>(null);
 const updateMetadata = ref<UpdaterMetadata | null>(null);
@@ -1706,13 +1773,10 @@ onMounted(async () => {
     <div class="body" v-else-if="!status.unlocked">
       <div class="unlock">
         <h1>解锁印盒</h1>
-        <p>输入主密码，或使用 Windows Hello。</p>
+        <p>输入主密码。</p>
         <p v-if="error" class="error">{{ error }}</p>
         <input v-model="password" type="password" placeholder="主密码" @keyup.enter="doUnlock" />
-        <button class="btn primary" style="width:100%;margin-bottom:8px" @click="doUnlock">解锁</button>
-        <button class="btn" style="width:100%" v-if="status.hello_enabled && status.hello_available" @click="doHello">
-          Windows Hello
-        </button>
+        <button class="btn primary" style="width:100%" @click="doUnlock">解锁</button>
       </div>
     </div>
 
@@ -2459,19 +2523,51 @@ onMounted(async () => {
               </div>
               <button class="btn primary" type="button" @click="saveSettings">保存</button>
             </div>
-            <div class="mcp-card">
-              <h3>Windows Hello</h3>
-              <p class="crumb">用本机生物识别作为第二把钥匙。备份文件仍只能用主密码解开。</p>
-              <p class="hello-status">
-                <span class="mcp-dot" :class="{ on: status.hello_enabled }" />
-                <span v-if="!status.hello_available">当前设备不可用</span>
-                <span v-else-if="status.hello_enabled">已开启</span>
-                <span v-else>未开启</span>
-              </p>
-              <div class="mcp-actions">
-                <button class="btn primary" type="button" :disabled="!status.hello_available" @click="api.setHello(true).then(() => { showToast('已开启'); refreshStatus(); })">开启</button>
-                <button class="btn" type="button" @click="api.setHello(false).then(() => { showToast('已关闭'); refreshStatus(); })">关闭</button>
+          </div>
+          <div class="mcp-card settings-master">
+            <h3>数据同步</h3>
+            <p class="crumb">支持 WebDAV 和 S3。上传的是用同步密钥再加密的快照，服务器看不到明文，也解不开主密码。同一条在两边同时改过且时间相同，会保留本机版本并记为冲突。</p>
+            <div class="settings-fields">
+              <div class="field">
+                <label>类型</label>
+                <select v-model="syncKind">
+                  <option value="webdav">WebDAV</option>
+                  <option value="s3">S3</option>
+                </select>
               </div>
+              <div class="field">
+                <label>{{ syncKind === 'webdav' ? 'WebDAV 地址' : 'S3 Endpoint' }}</label>
+                <input v-model="syncEndpoint" placeholder="https://" />
+              </div>
+              <div class="field">
+                <label>{{ syncKind === 'webdav' ? '用户名' : 'Access Key' }}</label>
+                <input v-model="syncUsername" autocomplete="off" />
+              </div>
+              <div class="field">
+                <label>{{ syncKind === 'webdav' ? '密码或应用密码' : 'Secret Key' }}</label>
+                <input v-model="syncSecret" type="password" autocomplete="new-password" :placeholder="syncView?.has_secret ? '已保存，留空则不修改' : '至少 8 位'" />
+              </div>
+              <template v-if="syncKind === 's3'">
+                <div class="field">
+                  <label>Bucket</label>
+                  <input v-model="syncBucket" />
+                </div>
+                <div class="field">
+                  <label>Region</label>
+                  <input v-model="syncRegion" placeholder="us-east-1" />
+                </div>
+              </template>
+              <div class="field settings-span">
+                <label>路径前缀（可选）</label>
+                <input v-model="syncPrefix" placeholder="留空则使用 sealbox/vault.sboxsync" />
+              </div>
+            </div>
+            <p v-if="syncView?.last_sync_at" class="crumb">上次同步 {{ fmtTime(syncView.last_sync_at) }}<span v-if="syncView.last_result"> · {{ syncView.last_result }}</span></p>
+            <p v-if="syncReport?.conflicts.length" class="error">冲突保留了本地版本：{{ syncReport.conflicts.join('、') }}</p>
+            <div class="mcp-actions">
+              <button class="btn primary" type="button" :disabled="syncBusy" @click="saveSync">保存配置</button>
+              <button class="btn" type="button" :disabled="syncBusy || !syncView?.configured" @click="runSync">{{ syncBusy ? '同步中…' : '立即同步' }}</button>
+              <button class="btn" type="button" :disabled="syncBusy || !syncView?.configured" @click="clearSync">清除配置</button>
             </div>
           </div>
           <div class="mcp-card settings-master">
