@@ -179,7 +179,9 @@ pub fn get_status(app: AppHandle, state: State<AppState>) -> Result<Status, Stri
     *recover_lock(&state.db_path) = Some(path.clone());
     let initialized = Vault::is_initialized(path.to_str().unwrap_or_default());
     let mut session = lock_session(&state.session);
-    idle_lock_if_needed(&mut session, &state.mcp);
+    // Status is polled by the window, including the call that paints settings
+    // right after unlock. Idle lock stays on the security clock; this read must
+    // not treat a just-unlocked vault as already idle.
     let unlocked = session.is_unlocked();
     if initialized && unlocked {
         bind_open_vault(&mut session, &path);
@@ -1051,7 +1053,10 @@ impl Default for Settings {
 
 #[tauri::command]
 pub fn settings_get(state: State<AppState>) -> Settings {
-    let s = lock_session(&state.session);
+    let mut s = lock_session(&state.session);
+    if s.is_unlocked() {
+        apply_vault_settings(&mut s);
+    }
     Settings {
         idle_secs: s.idle_secs,
         clipboard_secs: s.clipboard_secs,
@@ -1597,7 +1602,7 @@ mod tests {
         let vault = Vault::open(path.to_str().unwrap()).unwrap();
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
-        session.idle_secs = 3 * 60;
+        session.idle_secs = 60 * 60;
         session.clipboard_secs = 45;
         session.hotkey = "Ctrl+Alt+K".into();
         persist_session_settings(&session).unwrap();
@@ -1605,7 +1610,7 @@ mod tests {
 
         let reopened = Vault::open(path.to_str().unwrap()).unwrap();
         let stored = settings_from_vault(&reopened);
-        assert_eq!(stored.idle_secs, 180);
+        assert_eq!(stored.idle_secs, 3600);
         assert_eq!(stored.clipboard_secs, 45);
         assert_eq!(stored.hotkey, "Ctrl+Alt+K");
         assert_eq!(persisted_hotkey(&path).as_deref(), Some("Ctrl+Alt+K"));
@@ -1613,8 +1618,20 @@ mod tests {
         let mut restarted = Session::default();
         assert_eq!(restarted.idle_secs, 15 * 60);
         restarted.set_unlocked(reopened, dek);
+        // Unlock refreshes activity. The window then sits while the user types
+        // the password and opens settings; status used to idle-lock against the
+        // 15 minute default before the stored timeout was applied.
+        restarted.age_last_active(std::time::Duration::from_secs(16 * 60));
+        assert!(restarted.maybe_idle_lock());
+        assert!(!restarted.is_unlocked());
+
+        let again = Vault::open(path.to_str().unwrap()).unwrap();
+        restarted.set_unlocked(again, dek);
+        restarted.age_last_active(std::time::Duration::from_secs(16 * 60));
         apply_vault_settings(&mut restarted);
-        assert_eq!(restarted.idle_secs, 180);
+        assert!(!restarted.maybe_idle_lock());
+        assert!(restarted.is_unlocked());
+        assert_eq!(restarted.idle_secs, 3600);
         assert_eq!(restarted.clipboard_secs, 45);
         assert_eq!(restarted.hotkey, "Ctrl+Alt+K");
     }

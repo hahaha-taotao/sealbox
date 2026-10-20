@@ -810,6 +810,9 @@ function goPage(next: Page) {
   history.value.push(next);
   historyIndex.value = history.value.length - 1;
   page.value = next;
+  if (next === "settings" && status.value?.unlocked) {
+    loadSettings().catch(() => undefined);
+  }
 }
 function goBack() {
   if (historyIndex.value <= 0) return;
@@ -1421,7 +1424,7 @@ async function lockForUpdate() {
 
 async function loadSettings() {
   const s = await api.settingsGet();
-  settingsIdle.value = Math.round(s.idle_secs / 60);
+  settingsIdle.value = Math.max(1, Math.round(s.idle_secs / 60));
   settingsClip.value = s.clipboard_secs;
   settingsHotkey.value = s.hotkey;
 }
@@ -1649,7 +1652,10 @@ onMounted(async () => {
   const unUnlock = await listen("vault-unlocked", async () => {
     if (status.value?.unlocked) return;
     await refreshStatus();
-    if (status.value?.unlocked) await refreshVault();
+    if (status.value?.unlocked) {
+      await refreshVault();
+      await loadSettings();
+    }
   });
   onUnmounted(() => {
     applyLockedUi();
