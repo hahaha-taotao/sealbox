@@ -17,6 +17,11 @@ target
 .worktrees
 *.svbak
 
+# Local agent notes and design drafts
+.workbuddy-ai/
+.zcode/
+docs/
+
 # Local debug leftovers
 tmp-*.png
 NUL
