@@ -1,6 +1,6 @@
 [package]
 name = "sealbox"
-version = "0.4.3"
+version = "0.5.0"
 description = "Sealbox 印盒 — local credential vault"
 authors = ["you"]
 edition = "2021"

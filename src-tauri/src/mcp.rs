@@ -816,16 +816,14 @@ mod tests {
 
         let enabled = github_tool_names(true);
         for name in [
-            "github_repo_search",
             "github_repo_list",
-            "github_git_status",
-            "github_issue_update",
-            "github_repo_secret_set",
-            "github_download_run_logs",
-            "github_release_create",
-            "github_pr_create",
-            "github_runs_list",
-            "github_run_jobs",
+            "github_repo_get",
+            "github_git",
+            "github_issue",
+            "github_pr",
+            "github_release",
+            "github_list_credentials",
+            "github_user_info",
         ] {
             assert!(enabled.iter().any(|tool| tool == name), "missing {name}");
         }
@@ -884,16 +882,12 @@ mod tests {
         assert!(github_tool_names(false).is_empty());
         let enabled = github_tool_names(true);
         for name in [
-            "github_repo_search",
             "github_repo_list",
-            "github_git_status",
-            "github_issue_update",
-            "github_repo_secret_set",
-            "github_download_run_logs",
+            "github_git",
+            "github_issue",
             "github_list_credentials",
-            "github_git_push",
-            "github_release_create",
-            "github_git_log",
+            "github_release",
+            "github_pr",
         ] {
             assert!(enabled.iter().any(|tool| tool == name), "missing {name}");
         }

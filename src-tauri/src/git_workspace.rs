@@ -46,134 +46,90 @@ fn credential_id_prop() -> Value {
     })
 }
 
+const GIT_ACTIONS: &[&str] = &[
+    "status",
+    "diff",
+    "log",
+    "branches",
+    "fetch",
+    "pull",
+    "commit",
+    "push",
+    "clone",
+];
+
+fn action_prop() -> Value {
+    json!({
+        "type": "string",
+        "enum": GIT_ACTIONS,
+        "description": "status/diff/log/branches 只读；fetch 只更新远端跟踪；pull 快进当前分支；commit 可带 files 或 all，暂存和提交一次确认；push 推分支或标签；clone 把 owner/repo 克隆到 path 指定的已存在父目录。"
+    })
+}
+
 pub fn tool_definitions() -> Vec<Value> {
-    vec![
-        tool(
-            "github_git_status",
-            "查看本地仓库当前分支和 porcelain 状态。开始改代码前、提交前确认仓库是否干净时调用。传本机绝对路径。",
-            schema(&[("path", path_prop())], &["path"]),
-            true,
+    vec![tool(
+        "github_git",
+        "本机仓库的常用 git。action 取 status、diff、log、branches、fetch、pull、commit、push、clone。除 clone 外 path 是仓库绝对路径；clone 的 path 是已存在的父目录。写动作每次弹出一次桌面确认。",
+        schema(
+            &[
+                ("action", action_prop()),
+                ("path", path_prop()),
+                ("credential", credential_prop()),
+                ("credential_id", credential_id_prop()),
+                ("staged", json!({"type":"boolean","default":false,"description":"仅 diff：看暂存区"})),
+                ("stat_only", json!({"type":"boolean","default":true,"description":"仅 diff：只返回 --stat。false 才返回 patch"})),
+                ("file", string_schema(1, 500)),
+                (
+                    "files",
+                    json!({
+                        "type": "array",
+                        "maxItems": 100,
+                        "items": string_schema(1, 500),
+                        "description": "仅 commit：提交前先暂存这些仓库内相对路径。与 all 互斥。"
+                    }),
+                ),
+                ("all", json!({"type":"boolean","default":false,"description":"仅 commit：先 git add -A 再提交。与 file/files 互斥。"})),
+                ("message", string_schema(1, 2000)),
+                ("limit", json!({"type":"integer","minimum":1,"maximum":100,"default":20,"description":"仅 log"})),
+                ("remote", json!({"type":"string","minLength":1,"maxLength":64,"description":"fetch/pull/push 的远程名，默认 origin。必须是 https://github.com"})),
+                ("branch", string_schema(1, 200)),
+                ("tag", json!({"type":"string","minLength":1,"maxLength":200,"description":"仅 push：只推这个标签。与 branch / tags 互斥"})),
+                ("tags", json!({"type":"boolean","default":false,"description":"仅 push：推送分支时带上全部标签"})),
+                ("force_with_lease", json!({"type":"boolean","default":false,"description":"仅 push：先 ls-remote 再 --force-with-lease。不推标签时不能用"})),
+                ("repo", json!({"type":"string","minLength":1,"maxLength":201,"description":"仅 clone：owner/repo"})),
+                ("owner", string_schema(1, 100)),
+                ("name", string_schema(1, 100)),
+            ],
+            &["action", "path"],
         ),
-        tool(
-            "github_git_diff",
-            "查看本地 diff。默认返回 --stat 摘要；需要看具体改动时设 stat_only=false。staged=true 看暂存区。提交说明或 code review 前调用。",
-            schema(
-                &[
-                    ("path", path_prop()),
-                    ("staged", json!({"type":"boolean","default":false})),
-                    ("stat_only", json!({"type":"boolean","default":true})),
-                    ("file", string_schema(1, 500)),
-                ],
-                &["path"],
-            ),
-            true,
-        ),
-        tool(
-            "github_git_log",
-            "查看最近提交。默认 20 条，最多 100。写 Release notes、确认 HEAD 或对比远端前调用。",
-            schema(
-                &[
-                    ("path", path_prop()),
-                    ("limit", json!({"type":"integer","minimum":1,"maximum":100,"default":20})),
-                ],
-                &["path"],
-            ),
-            true,
-        ),
-        tool(
-            "github_git_branches",
-            "列出本地分支，当前分支带标记。准备 push、开 PR 或确认是否在正确分支时调用。",
-            schema(&[("path", path_prop())], &["path"]),
-            true,
-        ),
-        tool(
-            "github_git_stage",
-            "把仓库内相对路径加入暂存区。files 一次传入多个路径，只弹一次桌面确认；file 仍可用。all=true 才等价 git add -A。准备提交时调用。",
-            schema(
-                &[
-                    ("path", path_prop()),
-                    ("file", string_schema(1, 500)),
-                    (
-                        "files",
-                        json!({
-                            "type": "array",
-                            "maxItems": 100,
-                            "items": string_schema(1, 500),
-                            "description": "一次暂存的仓库内相对路径。与 file 可同时使用，确认框只弹一次。"
-                        }),
-                    ),
-                    ("all", json!({"type":"boolean","default":false})),
-                ],
-                &["path"],
-            ),
-            false,
-        ),
-        tool(
-            "github_git_commit",
-            "提交已暂存改动。message 必填。不改正文作者、不做 amend。每次弹出桌面确认。",
-            schema(
-                &[
-                    ("path", path_prop()),
-                    ("message", string_schema(1, 2000)),
-                ],
-                &["path", "message"],
-            ),
-            false,
-        ),
-        tool(
-            "github_git_push",
-            "推送到 GitHub 远程。默认 remote=origin。可指定 branch、tag（只推该标签）、tags=true（连同所有标签）、force_with_lease=true（先 ls-remote 再 --force-with-lease）。发布、同步远端时调用。返回 pushed / up_to_date。每次弹出桌面确认。",
-            schema(
-                &[
-                    ("path", path_prop()),
-                    ("credential", credential_prop()),
-                    ("credential_id", credential_id_prop()),
-                    ("remote", json!({"type":"string","minLength":1,"maxLength":64,"description":"远程名，默认 origin。必须是 https://github.com"})),
-                    ("branch", string_schema(1, 200)),
-                    ("tag", json!({"type":"string","minLength":1,"maxLength":200,"description":"只推这个标签，例如 v0.1.7。与 branch / tags=true 互斥"})),
-                    ("tags", json!({"type":"boolean","default":false,"description":"同时推送全部标签"})),
-                    ("force_with_lease", json!({"type":"boolean","default":false})),
-                ],
-                &["path"],
-            ),
-            false,
-        ),
-        tool(
-            "github_git_pull",
-            "从 GitHub 远程快进拉取。默认 remote=origin、当前分支。工作区有未提交改动时拒绝。无 rebase、无 force。同步远端更新时调用。每次弹出桌面确认。",
-            schema(
-                &[
-                    ("path", path_prop()),
-                    ("credential", credential_prop()),
-                    ("credential_id", credential_id_prop()),
-                    ("remote", json!({"type":"string","minLength":1,"maxLength":64,"description":"远程名，默认 origin。必须是 https://github.com"})),
-                    ("branch", string_schema(1, 200)),
-                ],
-                &["path"],
-            ),
-            false,
-        ),
-        tool(
-            "github_git_clone",
-            "把 github.com/{owner}/{repo} 克隆到已存在的绝对父目录。可选 name 作为目录名。每次弹出桌面确认。",
-            schema(
-                &[
-                    ("path", path_prop()),
-                    ("credential", credential_prop()),
-                    ("credential_id", credential_id_prop()),
-                    ("repo", json!({"type":"string","minLength":1,"maxLength":201,"description":"owner/repo，例如 hahaha-taotao/sealbox"})),
-                    ("owner", string_schema(1, 100)),
-                    ("name", string_schema(1, 100)),
-                ],
-                &["path", "repo"],
-            ),
-            false,
-        ),
-    ]
+        false,
+    )]
+}
+
+/// 旧的细工具名映射到 github_git 的 action。未知名原样返回。
+fn legacy_git_action(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "github_git_status" => "status",
+        "github_git_diff" => "diff",
+        "github_git_log" => "log",
+        "github_git_branches" => "branches",
+        "github_git_pull" => "pull",
+        "github_git_commit" | "github_git_stage" => "commit",
+        "github_git_push" => "push",
+        "github_git_clone" => "clone",
+        _ => return None,
+    })
+}
+
+fn definition_named<'a>(definitions: &'a [Value], name: &str) -> Result<&'a Value, String> {
+    definitions
+        .iter()
+        .find(|definition| definition.get("name").and_then(Value::as_str) == Some(name))
+        .ok_or_else(|| "未知 GitHub git 工具".to_string())
 }
 
 pub fn is_git_tool(name: &str) -> bool {
-    name.starts_with("github_git_")
+    name == "github_git" || name.starts_with("github_git_")
 }
 
 pub fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<String, String> {
@@ -207,28 +163,37 @@ pub fn prepare_tool(
     name: &str,
     args: Value,
 ) -> Result<PreparedGitOp, String> {
-    let definition = tool_definitions()
-        .into_iter()
-        .find(|definition| definition.get("name").and_then(Value::as_str) == Some(name))
-        .ok_or_else(|| "未知 GitHub git 工具".to_string())?;
-    crate::github_mcp::validate_tool_arguments(&definition["inputSchema"], &args)?;
+    let definitions = tool_definitions();
+    let definition = definition_named(&definitions, "github_git")?;
+    let (action, args) = if name == "github_git" {
+        crate::github_mcp::validate_tool_arguments(&definition["inputSchema"], &args)?;
+        let action = args
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        (action, args)
+    } else {
+        let action = legacy_git_action(name).ok_or_else(|| "未知 GitHub git 工具".to_string())?;
+        (action.to_string(), args)
+    };
     let vault = session.vault().map_err(|e| e.to_string())?;
     let dek = session.dek().map_err(|e| e.to_string())?;
     if !crate::zoomkey::mcp_enabled(vault, dek) {
         return Err("MCP 未启用。请先在 Sealbox 的 MCP 页面打开。".into());
     }
     let secrets = git_secrets(session, &args);
-    let prepared = match name {
-        "github_git_status" => PreparedGitOp::Immediate(status(session, &args)?),
-        "github_git_diff" => PreparedGitOp::Immediate(diff(session, &args)?),
-        "github_git_log" => PreparedGitOp::Immediate(log(session, &args)?),
-        "github_git_branches" => PreparedGitOp::Immediate(branches(session, &args)?),
-        "github_git_stage" => prepare_stage(session, &args)?,
-        "github_git_commit" => prepare_commit(session, &args)?,
-        "github_git_push" => prepare_push(session, &args)?,
-        "github_git_pull" => prepare_pull(session, &args)?,
-        "github_git_clone" => prepare_clone(session, &args)?,
-        _ => return Err("未知 GitHub git 工具".into()),
+    let prepared = match action.as_str() {
+        "status" => PreparedGitOp::Immediate(status(session, &args)?),
+        "diff" => PreparedGitOp::Immediate(diff(session, &args)?),
+        "log" => PreparedGitOp::Immediate(log(session, &args)?),
+        "branches" => PreparedGitOp::Immediate(branches(session, &args)?),
+        "fetch" => prepare_fetch(session, &args)?,
+        "commit" => prepare_commit(session, &args)?,
+        "push" => prepare_push(session, &args)?,
+        "pull" => prepare_pull(session, &args)?,
+        "clone" => prepare_clone(session, &args)?,
+        _ => return Err("未知的 github_git action".into()),
     };
     session.touch();
     Ok(redact_prepared(prepared, secrets))
@@ -364,40 +329,6 @@ fn branches(session: &Session, args: &Value) -> Result<String, String> {
     Ok(json_text(parse_branches(&raw)))
 }
 
-fn prepare_stage(session: &Session, args: &Value) -> Result<PreparedGitOp, String> {
-    let root = repo_root(session, args)?;
-    let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
-    let files = stage_paths(args)?;
-    if all && !files.is_empty() {
-        return Err("all=true 时不要再传 file 或 files".into());
-    }
-    let operation = if all {
-        "git add -A".to_string()
-    } else if files.is_empty() {
-        return Err("请提供 file、files，或设 all=true".into());
-    } else {
-        format!("git add -- {}", files.join(" "))
-    };
-    let payload = git_confirm_payload(
-        "暂存本地改动",
-        "允许这次本地 git 写操作？",
-        &[("仓库", display_path(&root)), ("操作", operation)],
-    );
-    Ok(PreparedGitOp::Pending {
-        payload,
-        deny: "用户拒绝了这次 git 写操作".into(),
-        exec: Box::new(move |_session| {
-            if all {
-                return git_output(&root, &["add", "-A"], None);
-            }
-            let mut cmd = vec!["add".to_string(), "--".to_string()];
-            cmd.extend(files);
-            let args = cmd.iter().map(String::as_str).collect::<Vec<_>>();
-            git_output(&root, &args, None)
-        }),
-    })
-}
-
 fn stage_paths(args: &Value) -> Result<Vec<String>, String> {
     let mut files = Vec::new();
     if let Some(file) = optional_rel_path(args, "file")? {
@@ -431,15 +362,62 @@ fn prepare_commit(session: &Session, args: &Value) -> Result<PreparedGitOp, Stri
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "缺少提交说明".to_string())?
         .to_string();
+    let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+    let files = stage_paths(args)?;
+    if all && !files.is_empty() {
+        return Err("all=true 时不要再传 file 或 files".into());
+    }
+    let stage = if all {
+        "git add -A".to_string()
+    } else if files.is_empty() {
+        "使用已暂存内容".to_string()
+    } else {
+        format!("git add -- {}", files.join(" "))
+    };
     let payload = git_confirm_payload(
         "创建 git 提交",
         "允许这次本地 git 写操作？",
-        &[("仓库", display_path(&root)), ("说明", message.clone())],
+        &[
+            ("仓库", display_path(&root)),
+            ("暂存", stage),
+            ("说明", message.clone()),
+        ],
     );
     Ok(PreparedGitOp::Pending {
         payload,
         deny: "用户拒绝了这次 git 写操作".into(),
-        exec: Box::new(move |_session| git_output(&root, &["commit", "-m", &message], None)),
+        exec: Box::new(move |_session| {
+            if all {
+                git_output(&root, &["add", "-A"], None)?;
+            } else if !files.is_empty() {
+                let mut cmd = vec!["add".to_string(), "--".to_string()];
+                cmd.extend(files);
+                let add_args = cmd.iter().map(String::as_str).collect::<Vec<_>>();
+                git_output(&root, &add_args, None)?;
+            }
+            git_output(&root, &["commit", "-m", &message], None)
+        }),
+    })
+}
+
+fn prepare_fetch(session: &Session, args: &Value) -> Result<PreparedGitOp, String> {
+    let root = repo_root(session, args)?;
+    let remote = remote_name(args)?;
+    require_github_https_remote(&root, &remote)?;
+    let token = github_token(session, args)?;
+    let payload = git_confirm_payload(
+        "抓取 GitHub 远端",
+        "允许这次本地 git 写操作？",
+        &[
+            ("仓库", display_path(&root)),
+            ("远程", remote.clone()),
+            ("说明", "只更新远端跟踪，不改工作区".into()),
+        ],
+    );
+    Ok(PreparedGitOp::Pending {
+        payload,
+        deny: "用户拒绝了这次 git 写操作".into(),
+        exec: Box::new(move |_session| git_with_token(&root, &["fetch", &remote], &token)),
     })
 }
 
@@ -1182,8 +1160,8 @@ mod tests {
         let mut session = enabled_session();
         let err = call_tool_text(
             &mut session,
-            "github_git_status",
-            json!({"path":"relative/repo"}),
+            "github_git",
+            json!({"action":"status","path":"relative/repo"}),
         )
         .unwrap_err();
         assert!(err.contains("绝对路径"), "{err}");
@@ -1214,7 +1192,12 @@ mod tests {
         let mut session = enabled_session();
         let path = repo.to_string_lossy().into_owned();
         let status =
-            call_tool_text(&mut session, "github_git_status", json!({ "path": path })).unwrap();
+            call_tool_text(
+                &mut session,
+                "github_git",
+                json!({ "action": "status", "path": path }),
+            )
+            .unwrap();
         let status_json: Value = serde_json::from_str(&status).unwrap();
         let branch = status_json["branch"].as_str().unwrap_or_default();
         assert!(
@@ -1223,8 +1206,8 @@ mod tests {
         );
         let log = call_tool_text(
             &mut session,
-            "github_git_log",
-            json!({ "path": path, "limit": 5 }),
+            "github_git",
+            json!({ "action": "log", "path": path, "limit": 5 }),
         )
         .unwrap();
         let log_json: Value = serde_json::from_str(&log).unwrap();
@@ -1254,8 +1237,9 @@ mod tests {
         let creds = crate::github_mcp::list_credentials(&session).unwrap();
         let err = call_tool_text(
             &mut session,
-            "github_git_pull",
+            "github_git",
             json!({
+                "action": "pull",
                 "path": repo.to_string_lossy(),
                 "credential_id": creds[0].id
             }),
@@ -1267,26 +1251,22 @@ mod tests {
 
     #[test]
     fn write_tools_are_high_risk() {
-        for name in [
-            "github_git_stage",
-            "github_git_commit",
-            "github_git_push",
-            "github_git_pull",
-            "github_git_clone",
-        ] {
-            let definition = tool_definitions()
-                .into_iter()
-                .find(|tool| tool["name"] == name)
-                .unwrap();
-            assert_eq!(definition["readOnly"], false);
-            assert_eq!(definition["risk"], "high");
-            assert_eq!(definition["annotations"]["readOnlyHint"], false);
-            assert_eq!(definition["annotations"]["destructiveHint"], true);
+        let definitions = tool_definitions();
+        assert_eq!(definitions.len(), 1);
+        let definition = &definitions[0];
+        assert_eq!(definition["name"], "github_git");
+        assert_eq!(definition["readOnly"], false);
+        assert_eq!(definition["risk"], "high");
+        assert_eq!(definition["annotations"]["readOnlyHint"], false);
+        assert_eq!(definition["annotations"]["destructiveHint"], true);
+        let actions = definition["inputSchema"]["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap();
+        for action in ["status", "diff", "log", "branches", "fetch", "pull", "commit", "push", "clone"] {
+            assert!(actions.iter().any(|item| item == action), "missing {action}");
         }
-        assert!(!tool_definitions()
-            .iter()
-            .any(|tool| tool["name"] == "github_git_list"));
-        assert!(!tool_definitions()
+        assert!(!definitions.iter().any(|tool| tool["name"] == "github_git_list"));
+        assert!(!definitions
             .iter()
             .any(|tool| tool["name"] == "github_git_workspace_register"));
     }
@@ -1297,8 +1277,8 @@ mod tests {
         let mut session = enabled_session();
         let status = call_tool_text(
             &mut session,
-            "github_git_status",
-            json!({ "path": repo.to_string_lossy() }),
+            "github_git",
+            json!({ "action": "status", "path": repo.to_string_lossy() }),
         )
         .unwrap();
         let status_json: Value = serde_json::from_str(&status).unwrap();
@@ -1369,8 +1349,9 @@ mod tests {
             .unwrap();
         let err = call_tool_text(
             &mut session,
-            "github_git_push",
+            "github_git",
             json!({
+                "action": "push",
                 "path": repo.to_string_lossy(),
                 "tag": "v0.1.7",
                 "branch": "master"
@@ -1389,8 +1370,8 @@ mod tests {
         let error = crate::confirm::with_auto(Some(false), || {
             call_tool_text(
                 &mut session,
-                "github_git_commit",
-                json!({ "path": path, "message": "nope" }),
+                "github_git",
+                json!({ "action": "commit", "path": path, "message": "nope" }),
             )
         })
         .unwrap_err();
@@ -1407,29 +1388,34 @@ mod tests {
         let path = repo.to_string_lossy().into_owned();
         let prepared = prepare_tool(
             &mut session,
-            "github_git_stage",
-            json!({ "path": path, "files": ["b.txt", "a.txt", "a.txt"] }),
+            "github_git",
+            json!({
+                "action": "commit",
+                "path": path,
+                "message": "add both",
+                "files": ["b.txt", "a.txt", "a.txt"]
+            }),
         )
         .unwrap();
         let PreparedGitOp::Pending { payload, exec, .. } = prepared else {
-            panic!("stage must wait for one confirmation");
+            panic!("commit must wait for one confirmation");
         };
-        let operation = payload
+        let staged = payload
             .fields
             .iter()
-            .find(|field| field.label == "操作")
+            .find(|field| field.label == "暂存")
             .map(|field| field.value.as_str())
             .unwrap_or_default();
-        assert_eq!(operation, "git add -- a.txt b.txt");
+        assert_eq!(staged, "git add -- a.txt b.txt");
         exec(&mut session).unwrap();
-        let staged = Command::new("git")
+        let committed = Command::new("git")
             .arg("-C")
             .arg(&repo)
-            .args(["diff", "--cached", "--name-only"])
+            .args(["show", "--name-only", "--pretty=format:", "HEAD"])
             .output()
             .unwrap();
-        let names = String::from_utf8_lossy(&staged.stdout);
-        assert!(staged.status.success());
+        let names = String::from_utf8_lossy(&committed.stdout);
+        assert!(committed.status.success());
         assert!(names.contains("a.txt"), "{names}");
         assert!(names.contains("b.txt"), "{names}");
         let _ = fs::remove_dir_all(&repo);
@@ -1444,8 +1430,13 @@ mod tests {
         let path = repo.to_string_lossy().into_owned();
         let prepared = prepare_tool(
             &mut session,
-            "github_git_stage",
-            json!({ "path": path, "files": ["a.txt", "b.txt"] }),
+            "github_git",
+            json!({
+                "action": "commit",
+                "path": path,
+                "message": "add both",
+                "files": ["a.txt", "b.txt"]
+            }),
         )
         .unwrap();
         let PreparedGitOp::Pending {
@@ -1483,8 +1474,13 @@ mod tests {
         let path = repo.to_string_lossy().into_owned();
         let error = match prepare_tool(
             &mut session,
-            "github_git_stage",
-            json!({ "path": path, "files": ["ok.txt", "../secret"] }),
+            "github_git",
+            json!({
+                "action": "commit",
+                "path": path,
+                "message": "nope",
+                "files": ["ok.txt", "../secret"]
+            }),
         ) {
             Err(error) => error,
             Ok(_) => panic!("parent path must be rejected before confirmation"),
