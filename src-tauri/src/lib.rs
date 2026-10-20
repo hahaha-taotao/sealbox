@@ -1,26 +1,20 @@
+pub use sealbox_core::{
+    certificate, crypto, db, http_guard, identity, passphrase_words, redact, sync, totp, vault,
+};
 pub mod assistant;
 pub mod backup;
-pub mod certificate;
 pub mod clipboard;
 pub mod commands;
 pub mod confirm;
-pub mod crypto;
 pub mod csv_import;
-pub mod db;
 pub mod extension_install;
 pub mod fill;
 pub mod git_workspace;
 pub mod github_api;
 pub mod github_mcp;
-pub mod http_guard;
 pub mod lock;
 pub mod mcp;
-pub mod passphrase_words;
-pub mod redact;
 pub mod session;
-pub mod sync;
-pub mod totp;
-pub mod vault;
 pub mod zoomkey;
 
 use commands::AppState;

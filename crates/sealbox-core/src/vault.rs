@@ -402,6 +402,36 @@ impl Vault {
         unwrap_key(&kek, &enc).map_err(|_| VaultError::BadPassword)
     }
 
+    /// Confirms a candidate DEK can open this vault without returning a secret.
+    pub fn dek_matches(&self, dek: &[u8; 32]) -> Result<(), VaultError> {
+        let wrapped: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM settings WHERE key='sync_key_check'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(hex_value) = wrapped {
+            let bytes = hex::decode(hex_value).map_err(|_| VaultError::Crypto(crate::crypto::CryptoError::Truncated))?;
+            let enc = Encrypted::from_bytes(&bytes)?;
+            decrypt(dek, &enc).map_err(|_| VaultError::BadPassword)?;
+            return Ok(());
+        }
+        let blob: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT secret_blob FROM entries ORDER BY id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(blob) = blob {
+            decrypt(dek, &Encrypted::from_bytes(&blob)?).map_err(|_| VaultError::BadPassword)?;
+        }
+        Ok(())
+    }
+
     pub fn change_master_password(
         &self,
         dek: &[u8; 32],
@@ -671,7 +701,7 @@ impl Vault {
         username: &str,
         exclude_id: Option<&str>,
     ) -> Result<Vec<EntryDto>, VaultError> {
-        let Some(key) = crate::fill::website_identity_key(url, username) else {
+        let Some(key) = crate::identity::website_identity_key(url, username) else {
             return Ok(Vec::new());
         };
         let entries = self.list_entries(&ListFilter {
@@ -688,7 +718,7 @@ impl Vault {
                     .url
                     .as_deref()
                     .and_then(|stored| {
-                        crate::fill::website_identity_key(
+                        crate::identity::website_identity_key(
                             stored,
                             entry.account.as_deref().unwrap_or(""),
                         )
@@ -1976,6 +2006,36 @@ fn remove_db_files(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[test]
+    fn dek_matches_rejects_a_different_key_and_accepts_the_real_one() {
+        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        vault
+            .upsert_entry(
+                &dek,
+                UpsertEntry {
+                    id: None,
+                    kind: EntryKind::ApiToken,
+                    title: "api".into(),
+                    account: None,
+                    url: None,
+                    folder_id: None,
+                    tags: vec![],
+                    pinned: false,
+                    expires_at: None,
+                    notes: None,
+                    secret: SecretPayload::ApiToken {
+                        service: "example".into(),
+                        account: None,
+                        token: "secret-token".into(),
+                    },
+                },
+            )
+            .unwrap();
+        assert!(vault.dek_matches(&dek).is_ok());
+        assert!(vault.dek_matches(&[9u8; 32]).is_err());
+    }
 
     #[test]
     fn upsert_normalizes_website_totp() {

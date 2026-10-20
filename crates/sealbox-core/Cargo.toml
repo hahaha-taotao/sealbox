@@ -1,0 +1,28 @@
+[package]
+name = "sealbox-core"
+version = "0.7.0"
+description = "Sealbox vault, crypto and sync shared by desktop and mobile"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+aes-gcm = "0.10"
+argon2 = "0.5"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+thiserror = "2"
+base64 = "0.22"
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+totp-rs = { version = "5", default-features = false, features = ["otpauth"] }
+regex = "1"
+ureq = { version = "2", default-features = false, features = ["tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+md-5 = "0.10"

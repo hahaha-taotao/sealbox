@@ -19,6 +19,16 @@ src-tauri/target/release/bundle/**
 !src-tauri/target/release/bundle/nsis/
 src-tauri/target/release/bundle/nsis/**
 !src-tauri/target/release/bundle/nsis/Sealbox_0.6.0_x64-setup.exe
+!src-tauri/target/release/bundle/nsis/Sealbox_0.7.0_x64-setup.exe
+target/
+src-tauri-mobile/gen/
+src-tauri-mobile/target/
+apps/mobile/dist/
+!dist/
+dist/*
+!dist/Sealbox-mobile-0.1.0-arm64.apk
+vite.config.ts.bak
+OH-Works/
 .superpowers/brainstorm/*/state
 .worktrees
 *.svbak
@@ -26,7 +36,6 @@ src-tauri/target/release/bundle/nsis/**
 # Local agent notes and design drafts
 .workbuddy-ai/
 .zcode/
-docs/
 
 # Local debug leftovers
 tmp-*.png

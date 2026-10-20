@@ -1,0 +1,41 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "productName": "Sealbox",
+  "version": "0.1.0",
+  "identifier": "com.sealbox.mobile",
+  "build": {
+    "frontendDist": "../apps/mobile/dist",
+    "devUrl": "http://localhost:1421",
+    "beforeDevCommand": "npm run mobile:dev",
+    "beforeBuildCommand": "npm run mobile:build"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Sealbox",
+        "width": 390,
+        "height": 780,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "android": {
+      "minSdkVersion": 28
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

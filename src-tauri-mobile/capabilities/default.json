@@ -1,0 +1,6 @@
+{
+  "identifier": "mobile",
+  "description": "Sealbox Android vault capabilities",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
