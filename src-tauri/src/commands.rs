@@ -35,10 +35,26 @@ impl AppState {
     }
 }
 
+pub fn vault_path_for(app: &AppHandle) -> Result<PathBuf, String> {
+    vault_path(app)
+}
+
 fn vault_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     Ok(dir.join("vault.db"))
+}
+
+/// Hotkey used before the vault is unlocked. Idle and clipboard stay at
+/// defaults until unlock, because the lock clock must not run on a guess.
+pub fn persisted_hotkey(path: &Path) -> Option<String> {
+    let vault = Vault::open(path.to_str().unwrap_or_default()).ok()?;
+    let hotkey = settings_from_vault(&vault).hotkey;
+    if hotkey.trim().is_empty() {
+        None
+    } else {
+        Some(hotkey)
+    }
 }
 
 fn map_err(e: impl ToString) -> String {
@@ -67,6 +83,62 @@ fn bind_open_vault(session: &mut Session, path: &Path) {
     if let Ok(v) = Vault::open(path.to_str().unwrap_or_default()) {
         session.attach_vault_if_unlocked(v);
     }
+}
+
+fn normalize_settings(settings: Settings) -> Settings {
+    Settings {
+        idle_secs: settings.idle_secs.max(60),
+        clipboard_secs: settings.clipboard_secs.clamp(5, 120),
+        hotkey: if settings.hotkey.trim().is_empty() {
+            Settings::default().hotkey
+        } else {
+            settings.hotkey
+        },
+    }
+}
+
+fn settings_from_vault(vault: &Vault) -> Settings {
+    let idle = vault
+        .get_setting("idle_secs")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<u64>().ok());
+    let clip = vault
+        .get_setting("clipboard_secs")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<u64>().ok());
+    let hotkey = vault.get_setting("hotkey").ok().flatten();
+    let defaults = Settings::default();
+    normalize_settings(Settings {
+        idle_secs: idle.unwrap_or(defaults.idle_secs),
+        clipboard_secs: clip.unwrap_or(defaults.clipboard_secs),
+        hotkey: hotkey.unwrap_or(defaults.hotkey),
+    })
+}
+
+fn apply_vault_settings(session: &mut Session) {
+    let Ok(vault) = session.vault() else {
+        return;
+    };
+    let settings = settings_from_vault(vault);
+    session.idle_secs = settings.idle_secs;
+    session.clipboard_secs = settings.clipboard_secs;
+    session.hotkey = settings.hotkey;
+}
+
+fn persist_session_settings(session: &Session) -> Result<(), String> {
+    let vault = session.vault().map_err(map_err)?;
+    vault
+        .set_setting("idle_secs", &session.idle_secs.to_string())
+        .map_err(map_err)?;
+    vault
+        .set_setting("clipboard_secs", &session.clipboard_secs.to_string())
+        .map_err(map_err)?;
+    vault
+        .set_setting("hotkey", &session.hotkey)
+        .map_err(map_err)?;
+    Ok(())
 }
 
 fn apply_bridge_tokens(state: &AppState, vault: &Vault, dek: &[u8; 32]) {
@@ -127,30 +199,7 @@ pub fn get_status(app: AppHandle, state: State<AppState>) -> Result<Status, Stri
         load_bridge_tokens(&state, &session);
     }
     if unlocked {
-        let idle = session
-            .vault()
-            .ok()
-            .and_then(|v| v.get_setting("idle_secs").ok())
-            .flatten();
-        let clip = session
-            .vault()
-            .ok()
-            .and_then(|v| v.get_setting("clipboard_secs").ok())
-            .flatten();
-        let hk = session
-            .vault()
-            .ok()
-            .and_then(|v| v.get_setting("hotkey").ok())
-            .flatten();
-        if let Some(idle) = idle.and_then(|s| s.parse::<u64>().ok()) {
-            session.idle_secs = idle.max(60);
-        }
-        if let Some(clip) = clip.and_then(|s| s.parse::<u64>().ok()) {
-            session.clipboard_secs = clip.clamp(5, 120);
-        }
-        if let Some(hk) = hk {
-            session.hotkey = hk;
-        }
+        apply_vault_settings(&mut session);
     }
     let counts = if unlocked {
         session.vault().ok().and_then(|v| v.counts().ok())
@@ -220,6 +269,7 @@ pub fn unlock_vault(
             let _ = vault.audit("unlock", None, "ok");
             let _ = vault.purge_expired_trash(chrono::Utc::now(), 30);
             session.set_unlocked(vault, dek);
+            apply_vault_settings(&mut session);
             drop(session);
             hydrate_bridge_tokens(&state);
             let _ = mcp::start(&state.mcp, state.session.clone());
@@ -244,7 +294,11 @@ pub fn unlock_hello(app: AppHandle, state: State<AppState>) -> Result<(), String
     let vault = require_existing_vault(&path)?;
     let dek = vault.unlock_with_hello_key(&key).map_err(map_err)?;
     let _ = vault.audit("unlock_hello", None, "ok");
-    lock_session(&state.session).set_unlocked(vault, dek);
+    {
+        let mut session = lock_session(&state.session);
+        session.set_unlocked(vault, dek);
+        apply_vault_settings(&mut session);
+    }
     hydrate_bridge_tokens(&state);
     let _ = mcp::start(&state.mcp, state.session.clone());
     notify_vault_unlocked(&app);
@@ -1011,16 +1065,16 @@ pub fn settings_set(
     state: State<AppState>,
     settings: Settings,
 ) -> Result<(), String> {
+    let settings = normalize_settings(settings);
     let mut s = lock_session(&state.session);
     idle_lock_if_needed(&mut s, &state.mcp);
-    s.idle_secs = settings.idle_secs.max(60);
-    s.clipboard_secs = settings.clipboard_secs.clamp(5, 120);
-    s.hotkey = settings.hotkey.clone();
-    if let Ok(v) = s.vault() {
-        let _ = v.set_setting("idle_secs", &s.idle_secs.to_string());
-        let _ = v.set_setting("clipboard_secs", &s.clipboard_secs.to_string());
-        let _ = v.set_setting("hotkey", &s.hotkey);
+    if !s.is_unlocked() || s.vault().is_err() {
+        return Err("请先解锁金库再保存设置".into());
     }
+    s.idle_secs = settings.idle_secs;
+    s.clipboard_secs = settings.clipboard_secs;
+    s.hotkey = settings.hotkey.clone();
+    persist_session_settings(&s)?;
     drop(s);
     register_hotkey(&app, &settings.hotkey)
 }
@@ -1535,6 +1589,59 @@ mod tests {
         assert!(session.vault().is_err());
         bind_open_vault(&mut session, &path);
         assert!(session.vault().is_ok());
+    }
+
+    #[test]
+    fn settings_survive_a_fresh_session() {
+        let (path, dek) = temp_vault_path();
+        let vault = Vault::open(path.to_str().unwrap()).unwrap();
+        let mut session = Session::default();
+        session.set_unlocked(vault, dek);
+        session.idle_secs = 3 * 60;
+        session.clipboard_secs = 45;
+        session.hotkey = "Ctrl+Alt+K".into();
+        persist_session_settings(&session).unwrap();
+        drop(session);
+
+        let reopened = Vault::open(path.to_str().unwrap()).unwrap();
+        let stored = settings_from_vault(&reopened);
+        assert_eq!(stored.idle_secs, 180);
+        assert_eq!(stored.clipboard_secs, 45);
+        assert_eq!(stored.hotkey, "Ctrl+Alt+K");
+        assert_eq!(persisted_hotkey(&path).as_deref(), Some("Ctrl+Alt+K"));
+
+        let mut restarted = Session::default();
+        assert_eq!(restarted.idle_secs, 15 * 60);
+        restarted.set_unlocked(reopened, dek);
+        apply_vault_settings(&mut restarted);
+        assert_eq!(restarted.idle_secs, 180);
+        assert_eq!(restarted.clipboard_secs, 45);
+        assert_eq!(restarted.hotkey, "Ctrl+Alt+K");
+    }
+
+    #[test]
+    fn settings_reject_out_of_range_and_require_an_unlocked_vault() {
+        let (path, dek) = temp_vault_path();
+        let vault = Vault::open(path.to_str().unwrap()).unwrap();
+        let mut session = Session::default();
+        session.set_unlocked(vault, dek);
+        let stored = normalize_settings(Settings {
+            idle_secs: 1,
+            clipboard_secs: 1,
+            hotkey: "  ".into(),
+        });
+        session.idle_secs = stored.idle_secs;
+        session.clipboard_secs = stored.clipboard_secs;
+        session.hotkey = stored.hotkey;
+        persist_session_settings(&session).unwrap();
+        session.lock();
+        assert!(persist_session_settings(&session).is_err());
+
+        let reopened = Vault::open(path.to_str().unwrap()).unwrap();
+        let stored = settings_from_vault(&reopened);
+        assert_eq!(stored.idle_secs, 60);
+        assert_eq!(stored.clipboard_secs, 5);
+        assert_eq!(stored.hotkey, Settings::default().hotkey);
     }
 
     #[test]

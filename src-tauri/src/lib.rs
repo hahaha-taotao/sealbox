@@ -178,10 +178,16 @@ pub fn run() {
                     _ => {}
                 })
                 .build(app)?;
-            let _ = commands::register_hotkey(app.handle(), "Ctrl+Shift+Space");
+            let mut startup_hotkey = commands::Settings::default().hotkey;
             if let Some(state) = app.try_state::<AppState>() {
+                if let Ok(path) = commands::vault_path_for(app.handle()) {
+                    if let Some(hotkey) = commands::persisted_hotkey(&path) {
+                        startup_hotkey = hotkey;
+                    }
+                }
                 let _ = mcp::start(&state.mcp, state.session.clone());
             }
+            let _ = commands::register_hotkey(app.handle(), &startup_hotkey);
             Ok(())
         })
         .on_window_event(|window, event| {

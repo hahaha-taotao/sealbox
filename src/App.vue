@@ -1434,7 +1434,9 @@ async function saveSettings() {
     });
     showToast("设置已保存");
   } catch (e) {
-    showToast("热键可能被占用：" + String(e));
+    const message = String(e);
+    showToast(message.includes("解锁") ? message : "热键可能被占用：" + message);
+    await loadSettings().catch(() => undefined);
   }
 }
 function formatBytes(bytes: number) {
