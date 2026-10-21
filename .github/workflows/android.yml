@@ -74,6 +74,9 @@ jobs:
         working-directory: src-tauri-mobile
         env:
           CI: true
+          # npm resets the script cwd to the repo root, where the CLI would pick
+          # up src-tauri/tauri.conf.json instead of the mobile configuration.
+          TAURI_APP_PATH: ${{ github.workspace }}/src-tauri-mobile
         run: |
           set +e
           npx tauri android build --ci --apk --target aarch64 > ../dist-build.log 2>&1
