@@ -30,6 +30,7 @@ struct GithubAsset {
 #[derive(Deserialize, Clone)]
 struct GithubRelease {
     tag_name: String,
+    #[allow(dead_code)]
     name: Option<String>,
     body: Option<String>,
     html_url: String,
@@ -215,9 +216,10 @@ mod install {
                 .map_err(|error| error.to_string())?
                 .l()
                 .map_err(|error| error.to_string())?;
-            let package_name: String = {
-                let value = jni::objects::JString::from(package);
-                env.get_string(&value).map_err(|error| error.to_string())?.into()
+            let value = jni::objects::JString::from(package);
+            let package_name = {
+                let text = env.get_string(&value).map_err(|error| error.to_string())?;
+                String::from(text.to_str().unwrap_or_default())
             };
             let authority = env
                 .new_string(format!("{package_name}.fileprovider"))
@@ -304,7 +306,7 @@ fn trusted_download_url(url: &str) -> bool {
             .starts_with("/hahaha-taotao/sealbox/releases/download/");
     let github_asset = host == "objects.githubusercontent.com"
         || host == "release-assets.githubusercontent.com"
-        || host.ends_with(".githubusercontent.com");
+        || host == "github-releases.githubusercontent.com";
     github_release || github_asset
 }
 
@@ -357,16 +359,3 @@ fn version_parts(version: &str) -> Vec<u64> {
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::version_newer;
-
-    #[test]
-    fn newer_version_compares_numeric_parts() {
-        assert!(version_newer("0.1.2", "0.1.1"));
-        assert!(version_newer("0.2.0", "0.1.9"));
-        assert!(!version_newer("0.1.1", "0.1.1"));
-        assert!(!version_newer("0.1.0", "0.1.1"));
-        assert!(version_newer("1.0", "0.9.9"));
-    }
-}

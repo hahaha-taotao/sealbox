@@ -137,7 +137,9 @@ mod host {
                 .map_err(|error| error.to_string())?;
             let value = JString::from(string);
             let text = env.get_string(&value).map_err(|error| error.to_string())?;
-            Ok(text.into())
+            let owned = String::from(text.to_str().unwrap_or_default());
+            drop(text);
+            Ok(owned)
         })
     }
 }
