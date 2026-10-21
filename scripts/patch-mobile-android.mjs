@@ -60,6 +60,44 @@ if (!/rootDirRel = "[^"]*"/.test(appGradle)) {
   process.exit(1);
 }
 appGradle = appGradle.replace(/rootDirRel = "[^"]*"/, `rootDirRel = "${rootDirRel}"`);
+
+// The Tauri template leaves release builds unsigned; sign them when CI writes
+// keystore.properties next to the generated project.
+if (!appGradle.includes("signingConfigs")) {
+  if (!appGradle.includes("    buildTypes {")) {
+    console.error(`Could not find the build types block in ${appGradlePath}`);
+    process.exit(1);
+  }
+  appGradle = appGradle.replace(
+    "    buildTypes {",
+    `    signingConfigs {
+        if (rootProject.file("keystore.properties").exists()) {
+            create("release") {
+                val keystorePropertiesFile = rootProject.file("keystore.properties")
+                val keystoreProperties = Properties()
+                keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+                keyAlias = keystoreProperties["keyAlias"] as String
+                keyPassword = keystoreProperties["password"] as String
+                storeFile = file(keystoreProperties["storeFile"] as String)
+                storePassword = keystoreProperties["password"] as String
+            }
+        }
+    }
+    buildTypes {`,
+  );
+}
+if (!appGradle.includes("signingConfig =")) {
+  appGradle = appGradle.replace(
+    /(getByName\("release"\) \{\r?\n)/,
+    `$1            signingConfigs.findByName("release")?.let { signingConfig = it }\n`,
+  );
+}
+if (!appGradle.includes("import java.io.FileInputStream")) {
+  appGradle = appGradle.replace(
+    "import java.util.Properties",
+    "import java.io.FileInputStream\nimport java.util.Properties",
+  );
+}
 writeFileSync(appGradlePath, appGradle);
 
 // The biometry plugin depends on kotlinx-coroutines 1.10.2, which requires a

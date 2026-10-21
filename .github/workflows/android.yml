@@ -70,6 +70,34 @@ jobs:
           cd ..
           node scripts/patch-mobile-android.mjs
 
+      - name: Configure Android signing
+        working-directory: .
+        env:
+          ANDROID_KEY_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          KEYSTORE="$RUNNER_TEMP/sealbox-release.jks"
+          if [ -n "$ANDROID_KEY_BASE64" ]; then
+            test -n "$ANDROID_KEY_ALIAS"
+            test -n "$ANDROID_KEY_PASSWORD"
+            printf '%s' "$ANDROID_KEY_BASE64" | base64 -d > "$KEYSTORE"
+            ALIAS="$ANDROID_KEY_ALIAS"
+            PASSWORD="$ANDROID_KEY_PASSWORD"
+          else
+            echo "::warning::ANDROID_KEY_BASE64 is not set; signing with a throwaway key."
+            ALIAS="sealbox"
+            PASSWORD="$(openssl rand -hex 16)"
+            keytool -genkeypair -keystore "$KEYSTORE" -storetype PKCS12 \
+              -storepass "$PASSWORD" -keypass "$PASSWORD" -alias "$ALIAS" \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Sealbox, O=Sealbox, C=CN"
+          fi
+          printf 'password=%s\nkeyAlias=%s\nstoreFile=%s\n' "$PASSWORD" "$ALIAS" "$KEYSTORE" \
+            > src-tauri-mobile/gen/android/keystore.properties
+          keytool -list -v -keystore "$KEYSTORE" -storepass "$PASSWORD" -alias "$ALIAS" \
+            | grep -E "SHA256:" | head -n 1
+
       - name: Build release APK
         working-directory: src-tauri-mobile
         env:
