@@ -225,9 +225,9 @@ pub fn sync_now(vault: &Vault, dek: &[u8; 32]) -> Result<SyncReport, String> {
             true,
         ),
         Some(bytes) => {
-            let remote_snap = decode_snapshot(&key, Some(dek), &bytes)?;
+            let (remote_snap, legacy) = decode_snapshot(&key, Some(dek), &bytes)?;
             let (merged, report) = merge_snapshots(&local, &remote_snap);
-            let changed = snapshot_digest(&merged) != snapshot_digest(&remote_snap);
+            let changed = legacy || snapshot_digest(&merged) != snapshot_digest(&remote_snap);
             (merged, report, changed)
         }
     };
@@ -378,11 +378,14 @@ fn encode_snapshot(
     Ok(out)
 }
 
+/// Returns the snapshot plus whether the remote file was the old, device-sealed
+/// format. Callers must rewrite that file, even when the merged content is
+/// unchanged, or other devices keep failing to open it.
 fn decode_snapshot(
     key: &[u8; 32],
     dek: Option<&[u8; 32]>,
     bytes: &[u8],
-) -> Result<SyncSnapshot, String> {
+) -> Result<(SyncSnapshot, bool), String> {
     if bytes.len() < MAGIC.len() + 16 || &bytes[..MAGIC.len()] != MAGIC {
         return Err("远端文件不是 Sealbox 同步快照".into());
     }
@@ -390,23 +393,25 @@ fn decode_snapshot(
         .map_err(|_| "远端同步文件损坏".to_string())?;
     let json = decrypt(key, &file.blob).map_err(|_| "同步密钥无法解开远端文件".to_string())?;
     if let Ok(mut snapshot) = serde_json::from_slice::<SyncSnapshot>(&json) {
-        if snapshot.entries.iter().any(|entry| entry.secret.is_none()) {
+        let legacy = snapshot.entries.iter().any(|entry| entry.secret.is_none());
+        if legacy {
             snapshot.entries = snapshot
                 .entries
                 .iter()
                 .map(|entry| entry.open_legacy(dek))
                 .collect::<Result<Vec<_>, _>>()?;
         }
-        return Ok(snapshot);
+        return Ok((snapshot, legacy));
     }
     let legacy: BackupSnapshot =
         serde_json::from_slice(&json).map_err(|_| "远端同步内容损坏".to_string())?;
     let Some(dek) = dek else {
         return Err("远端同步文件是旧格式，且无法用本机保险库密钥解开".into());
     };
-    SyncSnapshot::from_vault(dek, &legacy).map_err(|_| {
-        "远端条目是用另一台设备的保险库密钥加密的，请在那台设备上再同步一次".into()
-    })
+    let snapshot = SyncSnapshot::from_vault(dek, &legacy).map_err(|_| {
+        "远端条目是用另一台设备的保险库密钥加密的，请在那台设备上再同步一次".to_string()
+    })?;
+    Ok((snapshot, true))
 }
 
 fn snapshot_digest(snapshot: &SyncSnapshot) -> String {
@@ -852,7 +857,8 @@ mod tests {
             "dev",
         )
         .unwrap();
-        decode_snapshot(&key, None, &bytes).unwrap();
+        let (_, legacy) = decode_snapshot(&key, None, &bytes).unwrap();
+        assert!(!legacy);
         assert!(decode_snapshot(&sync_key("other secret"), None, &bytes).is_err());
     }
 
@@ -971,7 +977,8 @@ mod tests {
 
         let (dest, dest_dek) =
             Vault::create_in_memory("another horse battery staple extra").unwrap();
-        let decoded = decode_snapshot(&key, Some(&dest_dek), &bytes).unwrap();
+        let (decoded, legacy) = decode_snapshot(&key, Some(&dest_dek), &bytes).unwrap();
+        assert!(!legacy);
         dest.replace_snapshot_same_key(&dest_dek, &decoded.seal(&dest_dek).unwrap())
             .unwrap();
         match dest.get_secret(&dest_dek, "e1").unwrap() {
@@ -979,6 +986,57 @@ mod tests {
             _ => panic!("kind"),
         }
         assert_eq!(dest.get_notes(&dest_dek, "e1").unwrap().as_deref(), Some("note"));
+    }
+
+    #[test]
+    fn legacy_remote_is_flagged_for_rewrite_and_becomes_portable() {
+        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        vault
+            .upsert_entry_with_duplicate_policy(
+                &dek,
+                UpsertEntry {
+                    id: Some("e1".into()),
+                    kind: EntryKind::Website,
+                    title: "mail".into(),
+                    account: Some("a@b.c".into()),
+                    url: Some("https://example.com".into()),
+                    folder_id: None,
+                    tags: vec![],
+                    pinned: false,
+                    expires_at: None,
+                    notes: None,
+                    secret: SecretPayload::Website {
+                        url: Some("https://example.com".into()),
+                        username: Some("a@b.c".into()),
+                        password: "secret".into(),
+                        totp_secret: None,
+                    },
+                },
+                true,
+            )
+            .unwrap();
+
+        let key = sync_key("sync secret value");
+        let json = serde_json::to_vec(&vault.snapshot_for_backup().unwrap()).unwrap();
+        let file = SyncFile {
+            blob: encrypt(&key, &json).unwrap(),
+            device_id: "desktop".into(),
+            written_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let mut bytes = Vec::from(*MAGIC);
+        bytes.extend(serde_json::to_vec(&file).unwrap());
+
+        assert!(decode_snapshot(&key, None, &bytes).is_err());
+        let (decoded, legacy) = decode_snapshot(&key, Some(&dek), &bytes).unwrap();
+        assert!(legacy);
+
+        let rewritten = encode_snapshot(&key, &decoded, "desktop").unwrap();
+        let (portable, legacy) = decode_snapshot(&key, None, &rewritten).unwrap();
+        assert!(!legacy);
+        match &portable.entries[0].secret {
+            Some(SecretPayload::Website { password, .. }) => assert_eq!(password, "secret"),
+            _ => panic!("secret"),
+        }
     }
 }
 
