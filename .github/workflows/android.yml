@@ -2,16 +2,13 @@ name: Android APK
 
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - "mobile-v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   apk:
-    name: Build and publish Android arm64 APK
+    name: Build Android arm64 APK
     runs-on: ubuntu-22.04
     defaults:
       run:
@@ -113,15 +110,6 @@ jobs:
           mkdir -p ../dist
           cp ../dist-build.log ../dist/android-build.log
           tail -n 160 ../dist/android-build.log
-          if [ "$status" -ne 0 ]; then
-            cd ..
-            git config user.email "435915720@qq.com"
-            git config user.name "张文宇"
-            git checkout -B ci/android-build-log
-            git add -f dist/android-build.log
-            git commit -m "chore: capture Android build log"
-            git push --force origin ci/android-build-log
-          fi
           exit "$status"
 
       - name: Upload Android build log
@@ -141,7 +129,6 @@ jobs:
           mkdir -p dist
           cp "$APK" "dist/Sealbox-mobile-${VERSION}-arm64.apk"
           echo "APK_PATH=dist/Sealbox-mobile-${VERSION}-arm64.apk" >> "$GITHUB_ENV"
-          echo "MOBILE_VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -149,18 +136,3 @@ jobs:
           name: sealbox-mobile-arm64
           path: ${{ env.APK_PATH }}
           if-no-files-found: error
-
-      - name: Publish the mobile release
-        if: startsWith(github.ref, 'refs/tags/mobile-v')
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: Sealbox mobile ${{ env.MOBILE_VERSION }}
-          body: |
-            Android arm64 release APK for Sealbox mobile ${{ env.MOBILE_VERSION }}.
-            Install `Sealbox-mobile-${{ env.MOBILE_VERSION }}-arm64.apk` on the phone.
-          files: ${{ env.APK_PATH }}
-          draft: false
-          prerelease: false
-          make_latest: false
-          fail_on_unmatched_files: true
