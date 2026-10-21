@@ -80,6 +80,23 @@ export interface SettingsView {
   biometry_enabled: boolean;
 }
 
+export interface MobileRelease {
+  current_version: string;
+  latest_version: string;
+  published_at: string | null;
+  notes: string | null;
+  release_url: string;
+  download_url: string;
+  asset_name: string;
+  asset_size: number;
+  update_available: boolean;
+}
+
+export interface UpdateDownload {
+  path: string;
+  bytes: number;
+}
+
 export const KINDS: { id: EntryKind; label: string; count: keyof Counts }[] = [
   { id: "website", label: "网站", count: "website" },
   { id: "api_token", label: "Token", count: "api_token" },
@@ -136,4 +153,8 @@ export const api = {
   syncSave: (input: Record<string, unknown>) => invoke<SyncView>("sync_save", { input }),
   syncClear: () => invoke("sync_clear"),
   syncNow: () => invoke<SyncReport>("sync_now"),
+  appVersion: () => invoke<string>("app_version"),
+  checkUpdate: () => invoke<MobileRelease>("check_mobile_update"),
+  downloadUpdate: (url: string) => invoke<UpdateDownload>("download_mobile_update", { url }),
+  installUpdate: (path: string) => invoke("install_mobile_update", { path }),
 };

@@ -104,3 +104,11 @@ textarea { min-height: 72px; resize: vertical; }
   border-radius: 12px; padding: 10px 12px; text-align: center; font-size: 13px;
 }
 .gap { height: 8px; }
+.update-note, .update-notes, .update-progress, .update-actions { padding: 0 14px 12px; }
+.update-notes { color: var(--muted); font-size: 13px; line-height: 1.55; }
+.update-notes strong { display: block; color: var(--ink); margin-bottom: 4px; }
+.update-notes p { margin: 0; white-space: pre-wrap; }
+.update-progress-head { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 6px; }
+.track { height: 6px; border-radius: 999px; background: var(--line); overflow: hidden; }
+.track span { display: block; height: 100%; background: var(--brand); }
+.update-actions { display: flex; flex-direction: column; gap: 8px; }

@@ -1781,6 +1781,18 @@ impl Vault {
         dek: &[u8; 32],
         snapshot: &BackupSnapshot,
     ) -> Result<(), VaultError> {
+        self.replace_snapshot_reencrypted(dek, dek, snapshot)
+    }
+
+    /// Same as `replace_snapshot_same_key`, but each blob is decrypted with
+    /// `source_dek` and stored again under `dest_dek`. Sync uses this because
+    /// two devices encrypt their snapshots with different vault keys.
+    pub fn replace_snapshot_reencrypted(
+        &self,
+        source_dek: &[u8; 32],
+        dest_dek: &[u8; 32],
+        snapshot: &BackupSnapshot,
+    ) -> Result<(), VaultError> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
             self.conn.execute("DELETE FROM entry_tags", [])?;
@@ -1795,11 +1807,16 @@ impl Vault {
                 )?;
             }
             for entry in &snapshot.entries {
-                let enc = Encrypted::from_bytes(&entry.secret_blob)?;
-                decrypt(dek, &enc)?;
-                if let Some(notes) = &entry.notes_blob {
-                    decrypt(dek, &Encrypted::from_bytes(notes)?)?;
-                }
+                let secret = decrypt(source_dek, &Encrypted::from_bytes(&entry.secret_blob)?)?;
+                let notes = match &entry.notes_blob {
+                    Some(blob) => Some(decrypt(source_dek, &Encrypted::from_bytes(blob)?)?),
+                    None => None,
+                };
+                let secret_blob = encrypt(dest_dek, &secret)?.to_bytes();
+                let notes_blob = notes
+                    .as_ref()
+                    .map(|plain| encrypt(dest_dek, plain).map(|enc| enc.to_bytes()))
+                    .transpose()?;
                 let folder_id = entry.folder_id.as_ref().filter(|id| {
                     snapshot.folders.iter().any(|folder| folder.id == **id)
                 });
@@ -1825,8 +1842,8 @@ impl Vault {
                         &entry.deleted_at,
                         entry.has_totp as i64,
                         &entry.fingerprint,
-                        &entry.secret_blob,
-                        &entry.notes_blob,
+                        &secret_blob,
+                        &notes_blob,
                     ],
                 )?;
                 for tag in normalize_tag_names(&entry.tags) {

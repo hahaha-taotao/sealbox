@@ -2,7 +2,7 @@
 import { computed, onMounted, reactive, ref } from "vue";
 import { listen } from "@tauri-apps/api/event";
 import { authenticate, checkStatus, getData, hasData, removeData, setData } from "@choochmeque/tauri-plugin-biometry-api";
-import { KINDS, api, kindLabel, type Counts, type EntryDto, type EntryKind, type Folder, type SyncReport, type SyncView } from "./api";
+import { KINDS, api, kindLabel, type Counts, type EntryDto, type EntryKind, type Folder, type MobileRelease, type SyncReport, type SyncView } from "./api";
 
 type Page = "lock" | "vault" | "query" | "detail" | "edit" | "settings" | "sync";
 const page = ref<Page>("lock");
@@ -33,6 +33,18 @@ const syncKind = ref<"webdav" | "s3">("webdav");
 const syncForm = reactive({ endpoint: "", username: "", secret: "", bucket: "", region: "us-east-1", prefix: "" });
 const idleSecs = ref(60);
 const busy = ref(false);
+const appVersion = ref("");
+const release = ref<MobileRelease | null>(null);
+const updateStage = ref<"idle" | "checking" | "available" | "downloading" | "ready" | "error">("idle");
+const updateError = ref("");
+const updateCheckedAt = ref("");
+const downloadedBytes = ref(0);
+const downloadTotal = ref<number | null>(null);
+const downloadedPath = ref("");
+const updateProgress = computed(() => {
+  if (!downloadTotal.value || downloadTotal.value <= 0) return null;
+  return Math.min(100, Math.round((downloadedBytes.value / downloadTotal.value) * 100));
+});
 
 const DOMAIN = "com.sealbox.mobile";
 const DEK_NAME = "vault-dek";
@@ -146,7 +158,13 @@ async function submitPassword() {
 async function unlockFingerprint() {
   error.value = "";
   try {
-    await authenticate("用指纹打开印盒", { title: "印盒", subtitle: "验证指纹", cancelTitle: "取消" });
+    await authenticate("用指纹打开印盒", {
+      title: "印盒",
+      subtitle: "验证指纹",
+      cancelTitle: "取消",
+      allowDeviceCredential: false,
+      confirmationRequired: false,
+    });
     const stored = await getData({ domain: DOMAIN, name: DEK_NAME, reason: "打开保险库" });
     await api.unlockDek(stored.data);
     await openVault();
@@ -164,7 +182,12 @@ async function toggleBiometry() {
       biometryOn.value = false;
       return;
     }
-    await authenticate("确认后启用指纹解锁", { title: "启用指纹", cancelTitle: "取消" });
+    await authenticate("确认后启用指纹解锁", {
+      title: "启用指纹",
+      cancelTitle: "取消",
+      allowDeviceCredential: false,
+      confirmationRequired: false,
+    });
     const dek = await api.exportDek();
     await setData({ domain: DOMAIN, name: DEK_NAME, data: dek });
     await api.setBiometry(true);
@@ -319,6 +342,81 @@ async function openSettings() {
   idleSecs.value = settings.idle_secs;
   biometryOn.value = settings.biometry_enabled;
   page.value = "settings";
+  if (!appVersion.value) {
+    appVersion.value = await api.appVersion().catch(() => "");
+  }
+}
+
+function formatBytes(bytes: number) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.ceil(bytes / 1024)} KB`;
+  return `${Math.ceil(bytes)} B`;
+}
+
+function formatWhen(value: string | null) {
+  if (!value) return "";
+  return value.slice(0, 16).replace("T", " ");
+}
+
+async function checkForUpdates() {
+  if (updateStage.value === "checking" || updateStage.value === "downloading") return;
+  updateStage.value = "checking";
+  updateError.value = "";
+  try {
+    const found = await api.checkUpdate();
+    release.value = found;
+    appVersion.value = found.current_version;
+    updateCheckedAt.value = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    downloadedPath.value = "";
+    downloadedBytes.value = 0;
+    downloadTotal.value = found.asset_size || null;
+    updateStage.value = found.update_available ? "available" : "idle";
+    if (!found.update_available) toast.value = "已是最新版本";
+  } catch (caught) {
+    updateStage.value = "error";
+    updateError.value = caught instanceof Error ? caught.message : String(caught);
+  }
+}
+
+async function downloadUpdate() {
+  if (!release.value || updateStage.value === "downloading") return;
+  updateStage.value = "downloading";
+  updateError.value = "";
+  downloadedBytes.value = 0;
+  downloadTotal.value = release.value.asset_size || null;
+  const stop = await listen<{ bytes: number; total: number | null }>("mobile-update-progress", (event) => {
+    downloadedBytes.value = event.payload.bytes;
+    downloadTotal.value = event.payload.total;
+  });
+  try {
+    const saved = await api.downloadUpdate(release.value.download_url);
+    downloadedPath.value = saved.path;
+    downloadedBytes.value = saved.bytes;
+    updateStage.value = "ready";
+  } catch (caught) {
+    updateStage.value = "error";
+    updateError.value = caught instanceof Error ? caught.message : String(caught);
+  } finally {
+    stop();
+  }
+}
+
+async function installUpdate() {
+  if (!downloadedPath.value || !release.value) return;
+  if (!window.confirm(`将打开系统安装界面安装 v${release.value.latest_version}。保险库数据不会被替换。`)) return;
+  try {
+    await api.installUpdate(downloadedPath.value);
+    toast.value = "已打开系统安装界面";
+  } catch (caught) {
+    updateStage.value = "error";
+    updateError.value = caught instanceof Error ? caught.message : String(caught);
+  }
+}
+
+async function openReleasePage() {
+  if (!release.value) return;
+  window.open(release.value.release_url, "_blank");
 }
 
 async function saveIdle() {
@@ -548,6 +646,40 @@ onMounted(async () => {
           <div class="group">
             <button class="set" @click="openSync"><span class="t">数据同步<small>WebDAV / S3</small></span><span>›</span></button>
             <button class="set" @click="lockNow"><span class="t">立即锁定</span></button>
+          </div>
+          <div class="group">
+            <div class="set">
+              <span class="t">当前版本<small>Android</small></span>
+              <strong>v{{ appVersion || "…" }}</strong>
+            </div>
+            <div v-if="release" class="set">
+              <span class="t">最新版本<small>{{ formatWhen(release.published_at) || "GitHub Releases" }}</small></span>
+              <strong>v{{ release.latest_version }}</strong>
+            </div>
+            <p v-if="updateError" class="error update-note">{{ updateError }}</p>
+            <p v-else-if="updateStage === 'checking'" class="hint update-note">正在检查 GitHub Releases…</p>
+            <p v-else-if="updateStage === 'idle' && updateCheckedAt" class="hint update-note">已是最新版本 · {{ updateCheckedAt }} 检查</p>
+            <p v-else-if="updateStage === 'available'" class="hint update-note">发现新版本，下载后由系统安装。</p>
+            <div v-if="release?.notes" class="update-notes">
+              <strong>更新说明</strong>
+              <p>{{ release.notes }}</p>
+            </div>
+            <div v-if="updateStage === 'downloading' || updateStage === 'ready'" class="update-progress">
+              <div class="update-progress-head">
+                <span>{{ updateStage === 'ready' ? '下载完成' : '下载进度' }}</span>
+                <strong v-if="updateProgress !== null">{{ updateProgress }}%</strong>
+              </div>
+              <div class="track"><span :style="{ width: `${updateProgress ?? 0}%` }"></span></div>
+              <p class="hint">{{ formatBytes(downloadedBytes) }}<span v-if="downloadTotal"> / {{ formatBytes(downloadTotal) }}</span></p>
+            </div>
+            <div class="update-actions">
+              <button class="primary" :disabled="updateStage === 'checking' || updateStage === 'downloading'" @click="checkForUpdates">
+                {{ updateStage === 'checking' ? '检查中' : '检查更新' }}
+              </button>
+              <button v-if="updateStage === 'available' || (updateStage === 'error' && release?.update_available)" class="ghost" @click="downloadUpdate">下载更新</button>
+              <button v-if="updateStage === 'ready'" class="primary" @click="installUpdate">安装</button>
+              <button v-if="release" class="ghost" @click="openReleasePage">打开发布页</button>
+            </div>
           </div>
         </div>
         <div class="tabs">

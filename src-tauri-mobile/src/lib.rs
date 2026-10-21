@@ -1,6 +1,7 @@
 mod clipboard;
 mod commands;
 mod session;
+mod update;
 
 use tauri::{Emitter, Manager};
 
@@ -39,6 +40,10 @@ pub fn run() {
             commands::sync_save,
             commands::sync_clear,
             commands::sync_now,
+            commands::app_version,
+            commands::check_mobile_update,
+            commands::download_mobile_update,
+            commands::install_mobile_update,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

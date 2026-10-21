@@ -62,6 +62,7 @@ jobs:
           rm -rf src-tauri-mobile/gen/android
           npx tauri android init --ci --skip-targets-install
           test -d src-tauri-mobile/gen/android/app/src/main/java/com/sealbox/mobile
+          node scripts/patch-mobile-android.mjs
 
       - name: Build release APK
         env:

@@ -1,5 +1,6 @@
 use crate::clipboard;
 use crate::session::Session;
+use crate::update::{self, MobileRelease};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use sealbox_core::sync::{self, SyncConfig, SyncKind, SyncReport, SyncView};
 use sealbox_core::totp::{ssh_fingerprint, totp_now};
@@ -464,6 +465,54 @@ pub fn sync_clear(state: State<AppState>) -> Result<(), String> {
     let mut session = lock_session(&state.session);
     session.require_unlocked().map_err(map_err)?;
     sync::clear_config(session.vault().map_err(map_err)?).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn app_version() -> String {
+    update::current_version()
+}
+
+#[tauri::command]
+pub fn check_mobile_update() -> Result<MobileRelease, String> {
+    update::check()
+}
+
+#[derive(Serialize)]
+pub struct UpdateDownload {
+    pub path: String,
+    pub bytes: u64,
+}
+
+#[tauri::command]
+pub fn download_mobile_update(app: AppHandle, url: String) -> Result<UpdateDownload, String> {
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(map_err)?;
+    let path = update::download(&url, &dir, |bytes, total| {
+        let _ = app.emit(
+            "mobile-update-progress",
+            serde_json::json!({ "bytes": bytes, "total": total }),
+        );
+    })?;
+    let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+    Ok(UpdateDownload {
+        path: path.to_string_lossy().into_owned(),
+        bytes,
+    })
+}
+
+#[tauri::command]
+pub fn install_mobile_update(path: String) -> Result<(), String> {
+    let path = PathBuf::from(&path);
+    let cache_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if cache_name != "sealbox-mobile-update.apk" {
+        return Err("只能安装本次下载的更新包".into());
+    }
+    update::install_apk(&path)
 }
 
 #[tauri::command]

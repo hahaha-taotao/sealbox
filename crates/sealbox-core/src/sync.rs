@@ -1,6 +1,6 @@
 use crate::crypto::{decrypt, encrypt, Encrypted};
 use crate::http_guard::{assert_public_target, parse_http_url, PublicResolver};
-use crate::vault::{BackupEntry, BackupSnapshot, Vault, VaultError};
+use crate::vault::{BackupEntry, BackupSnapshot, SecretPayload, Vault, VaultError};
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -73,6 +73,25 @@ struct SyncFile {
     blob: Encrypted,
     device_id: String,
     written_at: String,
+}
+
+/// Secrets travel inside the sync key's ciphertext, not under a device DEK.
+/// `notes` is omitted on old files, whose blobs were sealed with a vault key.
+#[derive(Clone, Serialize, Deserialize)]
+struct SyncEntry {
+    #[serde(flatten)]
+    entry: BackupEntry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secret: Option<SecretPayload>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    notes: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SyncSnapshot {
+    folders: Vec<crate::vault::FolderDto>,
+    tags: Vec<String>,
+    entries: Vec<SyncEntry>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -189,7 +208,8 @@ pub fn sync_now(vault: &Vault, dek: &[u8; 32]) -> Result<SyncReport, String> {
     let key = sync_key(&secret);
     let client = RemoteClient::new(&config, &secret)?;
     let remote = client.get().map_err(|e| format!("读取远端失败: {e}"))?;
-    let local = vault.snapshot_for_backup().map_err(|e| e.to_string())?;
+    let local_raw = vault.snapshot_for_backup().map_err(|e| e.to_string())?;
+    let local = SyncSnapshot::from_vault(dek, &local_raw)?;
     let device = device_id(vault).map_err(|e| e.to_string())?;
 
     let (merged, report, changed) = match remote {
@@ -205,7 +225,7 @@ pub fn sync_now(vault: &Vault, dek: &[u8; 32]) -> Result<SyncReport, String> {
             true,
         ),
         Some(bytes) => {
-            let remote_snap = decode_snapshot(&key, &bytes)?;
+            let remote_snap = decode_snapshot(&key, Some(dek), &bytes)?;
             let (merged, report) = merge_snapshots(&local, &remote_snap);
             let changed = snapshot_digest(&merged) != snapshot_digest(&remote_snap);
             (merged, report, changed)
@@ -218,8 +238,9 @@ pub fn sync_now(vault: &Vault, dek: &[u8; 32]) -> Result<SyncReport, String> {
             .put(&bytes)
             .map_err(|e| format!("写入远端失败: {e}"))?;
     }
+    let sealed = merged.seal(dek)?;
     vault
-        .replace_snapshot_same_key(dek, &merged)
+        .replace_snapshot_same_key(dek, &sealed)
         .map_err(|e| e.to_string())?;
     let summary = format!(
         "pulled={} pushed={} unchanged={} conflicts={}",
@@ -266,9 +287,84 @@ fn sync_key(secret: &str) -> [u8; 32] {
     key
 }
 
+impl SyncSnapshot {
+    fn from_vault(dek: &[u8; 32], snapshot: &BackupSnapshot) -> Result<Self, String> {
+        let entries = snapshot
+            .entries
+            .iter()
+            .map(|entry| SyncEntry::from_sealed(dek, entry).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            folders: snapshot.folders.clone(),
+            tags: snapshot.tags.clone(),
+            entries,
+        })
+    }
+
+    fn seal(&self, dek: &[u8; 32]) -> Result<BackupSnapshot, String> {
+        let entries = self
+            .entries
+            .iter()
+            .map(|entry| entry.seal(dek).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(BackupSnapshot {
+            folders: self.folders.clone(),
+            tags: self.tags.clone(),
+            entries,
+        })
+    }
+}
+
+impl SyncEntry {
+    fn from_sealed(dek: &[u8; 32], entry: &BackupEntry) -> Result<Self, VaultError> {
+        let secret_bytes = decrypt(dek, &Encrypted::from_bytes(&entry.secret_blob)?)?;
+        let secret: SecretPayload =
+            serde_json::from_slice(&secret_bytes).map_err(|_| VaultError::CorruptBackup)?;
+        let notes = match &entry.notes_blob {
+            Some(blob) => {
+                let bytes = decrypt(dek, &Encrypted::from_bytes(blob)?)?;
+                Some(String::from_utf8(bytes).map_err(|_| VaultError::CorruptBackup)?)
+            }
+            None => None,
+        };
+        let mut entry = entry.clone();
+        entry.secret_blob.clear();
+        entry.notes_blob = None;
+        Ok(Self {
+            entry,
+            secret: Some(secret),
+            notes,
+        })
+    }
+
+    fn open_legacy(&self, dek: Option<&[u8; 32]>) -> Result<Self, String> {
+        if self.secret.is_some() {
+            return Ok(self.clone());
+        }
+        let Some(dek) = dek else {
+            return Err("远端同步文件是旧格式，且无法用本机保险库密钥解开".into());
+        };
+        Self::from_sealed(dek, &self.entry).map_err(|_| {
+            "远端条目是用另一台设备的保险库密钥加密的，请在那台设备上再同步一次".into()
+        })
+    }
+
+    fn seal(&self, dek: &[u8; 32]) -> Result<BackupEntry, VaultError> {
+        let secret = self.secret.as_ref().ok_or(VaultError::CorruptBackup)?;
+        let mut entry = self.entry.clone();
+        let secret = serde_json::to_vec(secret)?;
+        entry.secret_blob = encrypt(dek, &secret)?.to_bytes();
+        entry.notes_blob = match &self.notes {
+            Some(notes) => Some(encrypt(dek, notes.as_bytes())?.to_bytes()),
+            None => None,
+        };
+        Ok(entry)
+    }
+}
+
 fn encode_snapshot(
     key: &[u8; 32],
-    snapshot: &BackupSnapshot,
+    snapshot: &SyncSnapshot,
     device_id: &str,
 ) -> Result<Vec<u8>, VaultError> {
     let json = serde_json::to_vec(snapshot)?;
@@ -282,27 +378,48 @@ fn encode_snapshot(
     Ok(out)
 }
 
-fn decode_snapshot(key: &[u8; 32], bytes: &[u8]) -> Result<BackupSnapshot, String> {
+fn decode_snapshot(
+    key: &[u8; 32],
+    dek: Option<&[u8; 32]>,
+    bytes: &[u8],
+) -> Result<SyncSnapshot, String> {
     if bytes.len() < MAGIC.len() + 16 || &bytes[..MAGIC.len()] != MAGIC {
         return Err("远端文件不是 Sealbox 同步快照".into());
     }
     let file: SyncFile = serde_json::from_slice(&bytes[MAGIC.len()..])
         .map_err(|_| "远端同步文件损坏".to_string())?;
     let json = decrypt(key, &file.blob).map_err(|_| "同步密钥无法解开远端文件".to_string())?;
-    serde_json::from_slice(&json).map_err(|_| "远端同步内容损坏".to_string())
+    if let Ok(mut snapshot) = serde_json::from_slice::<SyncSnapshot>(&json) {
+        if snapshot.entries.iter().any(|entry| entry.secret.is_none()) {
+            snapshot.entries = snapshot
+                .entries
+                .iter()
+                .map(|entry| entry.open_legacy(dek))
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        return Ok(snapshot);
+    }
+    let legacy: BackupSnapshot =
+        serde_json::from_slice(&json).map_err(|_| "远端同步内容损坏".to_string())?;
+    let Some(dek) = dek else {
+        return Err("远端同步文件是旧格式，且无法用本机保险库密钥解开".into());
+    };
+    SyncSnapshot::from_vault(dek, &legacy).map_err(|_| {
+        "远端条目是用另一台设备的保险库密钥加密的，请在那台设备上再同步一次".into()
+    })
 }
 
-fn snapshot_digest(snapshot: &BackupSnapshot) -> String {
+fn snapshot_digest(snapshot: &SyncSnapshot) -> String {
     let mut entries = snapshot.entries.clone();
-    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    entries.sort_by(|a, b| a.entry.id.cmp(&b.entry.id));
     hex::encode(Sha256::digest(serde_json::to_vec(&entries).unwrap_or_default()))
 }
 
-fn merge_snapshots(local: &BackupSnapshot, remote: &BackupSnapshot) -> (BackupSnapshot, SyncReport) {
-    let mut remote_by_id: HashMap<&str, &BackupEntry> = remote
+fn merge_snapshots(local: &SyncSnapshot, remote: &SyncSnapshot) -> (SyncSnapshot, SyncReport) {
+    let mut remote_by_id: HashMap<&str, &SyncEntry> = remote
         .entries
         .iter()
-        .map(|e| (e.id.as_str(), e))
+        .map(|e| (e.entry.id.as_str(), e))
         .collect();
     let mut entries = Vec::new();
     let mut pulled = 0usize;
@@ -311,38 +428,42 @@ fn merge_snapshots(local: &BackupSnapshot, remote: &BackupSnapshot) -> (BackupSn
     let mut conflicts = Vec::new();
 
     for local_entry in &local.entries {
-        match remote_by_id.remove(local_entry.id.as_str()) {
+        match remote_by_id.remove(local_entry.entry.id.as_str()) {
             None => {
                 pushed += 1;
                 entries.push(local_entry.clone());
             }
-            Some(remote_entry) => match cmp_time(&local_entry.updated_at, &remote_entry.updated_at)
-            {
-                std::cmp::Ordering::Greater => {
-                    pushed += 1;
-                    entries.push(local_entry.clone());
-                }
-                std::cmp::Ordering::Less => {
-                    pulled += 1;
-                    entries.push(remote_entry.clone());
-                }
-                std::cmp::Ordering::Equal => {
-                    if entry_digest(local_entry) == entry_digest(remote_entry) {
-                        unchanged += 1;
-                        entries.push(local_entry.clone());
-                    } else {
-                        conflicts.push(format!("{} ({})", local_entry.title, local_entry.id));
+            Some(remote_entry) => {
+                match cmp_time(&local_entry.entry.updated_at, &remote_entry.entry.updated_at) {
+                    std::cmp::Ordering::Greater => {
+                        pushed += 1;
                         entries.push(local_entry.clone());
                     }
+                    std::cmp::Ordering::Less => {
+                        pulled += 1;
+                        entries.push(remote_entry.clone());
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if entry_digest(local_entry) == entry_digest(remote_entry) {
+                            unchanged += 1;
+                            entries.push(local_entry.clone());
+                        } else {
+                            conflicts.push(format!(
+                                "{} ({})",
+                                local_entry.entry.title, local_entry.entry.id
+                            ));
+                            entries.push(local_entry.clone());
+                        }
+                    }
                 }
-            },
+            }
         }
     }
     for remote_entry in remote_by_id.into_values() {
         pulled += 1;
         entries.push(remote_entry.clone());
     }
-    entries.sort_by(|a, b| a.id.cmp(&b.id));
+    entries.sort_by(|a, b| a.entry.id.cmp(&b.entry.id));
 
     let mut folders = local.folders.clone();
     for folder in &remote.folders {
@@ -360,7 +481,7 @@ fn merge_snapshots(local: &BackupSnapshot, remote: &BackupSnapshot) -> (BackupSn
         }
     }
     (
-        BackupSnapshot {
+        SyncSnapshot {
             folders,
             tags,
             entries,
@@ -375,7 +496,7 @@ fn merge_snapshots(local: &BackupSnapshot, remote: &BackupSnapshot) -> (BackupSn
     )
 }
 
-fn entry_digest(entry: &BackupEntry) -> String {
+fn entry_digest(entry: &SyncEntry) -> String {
     hex::encode(Sha256::digest(serde_json::to_vec(entry).unwrap_or_default()))
 }
 
@@ -644,44 +765,42 @@ fn brief(response: ureq::Response) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::random_key;
     use crate::vault::{EntryKind, FolderDto, SecretPayload, UpsertEntry};
 
-    fn entry(id: &str, title: &str, updated_at: &str, password: &str) -> BackupEntry {
-        let key = random_key();
-        let secret = SecretPayload::Website {
-            url: Some("https://example.com".into()),
-            username: Some("a".into()),
-            password: password.into(),
-            totp_secret: None,
-        };
-        let blob = encrypt(&key, &serde_json::to_vec(&secret).unwrap())
-            .unwrap()
-            .to_bytes();
-        BackupEntry {
-            id: id.into(),
-            kind: "website".into(),
-            title: title.into(),
-            account: Some("a".into()),
-            url: Some("https://example.com".into()),
-            folder_id: None,
-            pinned: false,
-            expires_at: None,
-            use_count: 0,
-            last_used_at: None,
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: updated_at.into(),
-            deleted_at: None,
-            has_totp: false,
-            fingerprint: None,
-            secret_blob: blob,
-            notes_blob: None,
-            tags: vec![],
+    fn entry(id: &str, title: &str, updated_at: &str, password: &str) -> SyncEntry {
+        SyncEntry {
+            entry: BackupEntry {
+                id: id.into(),
+                kind: "website".into(),
+                title: title.into(),
+                account: Some("a".into()),
+                url: Some("https://example.com".into()),
+                folder_id: None,
+                pinned: false,
+                expires_at: None,
+                use_count: 0,
+                last_used_at: None,
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: updated_at.into(),
+                deleted_at: None,
+                has_totp: false,
+                fingerprint: None,
+                secret_blob: Vec::new(),
+                notes_blob: None,
+                tags: vec![],
+            },
+            secret: Some(SecretPayload::Website {
+                url: Some("https://example.com".into()),
+                username: Some("a".into()),
+                password: password.into(),
+                totp_secret: None,
+            }),
+            notes: None,
         }
     }
 
-    fn snap(entries: Vec<BackupEntry>) -> BackupSnapshot {
-        BackupSnapshot {
+    fn snap(entries: Vec<SyncEntry>) -> SyncSnapshot {
+        SyncSnapshot {
             folders: vec![FolderDto {
                 id: "f1".into(),
                 name: "work".into(),
@@ -707,8 +826,12 @@ mod tests {
         assert_eq!(report.pulled, 2);
         assert_eq!(report.pushed, 2);
         assert_eq!(merged.entries.len(), 4);
-        let kept = merged.entries.iter().find(|item| item.id == "b").unwrap();
-        assert_eq!(kept.title, "remote-new");
+        let kept = merged
+            .entries
+            .iter()
+            .find(|item| item.entry.id == "b")
+            .unwrap();
+        assert_eq!(kept.entry.title, "remote-new");
     }
 
     #[test]
@@ -717,7 +840,7 @@ mod tests {
         let remote = snap(vec![entry("a", "remote", "2026-02-02T00:00:00Z", "two")]);
         let (merged, report) = merge_snapshots(&local, &remote);
         assert_eq!(report.conflicts.len(), 1);
-        assert_eq!(merged.entries[0].title, "local");
+        assert_eq!(merged.entries[0].entry.title, "local");
     }
 
     #[test]
@@ -729,8 +852,8 @@ mod tests {
             "dev",
         )
         .unwrap();
-        decode_snapshot(&key, &bytes).unwrap();
-        assert!(decode_snapshot(&sync_key("other secret"), &bytes).is_err());
+        decode_snapshot(&key, None, &bytes).unwrap();
+        assert!(decode_snapshot(&sync_key("other secret"), None, &bytes).is_err());
     }
 
     #[test]
@@ -811,6 +934,51 @@ mod tests {
             SecretPayload::Website { password, .. } => assert_eq!(password, "secret"),
             _ => panic!("kind"),
         }
+    }
+
+    #[test]
+    fn sync_snapshot_reseals_under_another_vault_key() {
+        let (source, source_dek) =
+            Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        source
+            .upsert_entry_with_duplicate_policy(
+                &source_dek,
+                UpsertEntry {
+                    id: Some("e1".into()),
+                    kind: EntryKind::Website,
+                    title: "mail".into(),
+                    account: Some("a@b.c".into()),
+                    url: Some("https://example.com".into()),
+                    folder_id: None,
+                    tags: vec!["work".into()],
+                    pinned: false,
+                    expires_at: None,
+                    notes: Some("note".into()),
+                    secret: SecretPayload::Website {
+                        url: Some("https://example.com".into()),
+                        username: Some("a@b.c".into()),
+                        password: "secret".into(),
+                        totp_secret: None,
+                    },
+                },
+                true,
+            )
+            .unwrap();
+        let portable = SyncSnapshot::from_vault(&source_dek, &source.snapshot_for_backup().unwrap())
+            .unwrap();
+        let key = sync_key("sync secret value");
+        let bytes = encode_snapshot(&key, &portable, "desktop").unwrap();
+
+        let (dest, dest_dek) =
+            Vault::create_in_memory("another horse battery staple extra").unwrap();
+        let decoded = decode_snapshot(&key, Some(&dest_dek), &bytes).unwrap();
+        dest.replace_snapshot_same_key(&dest_dek, &decoded.seal(&dest_dek).unwrap())
+            .unwrap();
+        match dest.get_secret(&dest_dek, "e1").unwrap() {
+            SecretPayload::Website { password, .. } => assert_eq!(password, "secret"),
+            _ => panic!("kind"),
+        }
+        assert_eq!(dest.get_notes(&dest_dek, "e1").unwrap().as_deref(), Some("note"));
     }
 }
 

@@ -3758,11 +3758,12 @@ dependencies = [
 
 [[package]]
 name = "sealbox-mobile"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "jni 0.21.1",
  "ndk-context",
+ "rustls",
  "sealbox-core",
  "serde",
  "serde_json",
@@ -3770,6 +3771,8 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-biometry",
+ "ureq",
+ "url",
  "zeroize",
 ]
 
