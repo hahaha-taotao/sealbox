@@ -19,7 +19,7 @@ jobs:
     env:
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
-      NDK_HOME: /usr/local/lib/android/sdk/ndk/27.2.12479018
+      NDK_HOME: /usr/local/lib/android/sdk/ndk/29.0.13846066
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -52,7 +52,7 @@ jobs:
           SM="$(find "$SDK/cmdline-tools" -type f -name sdkmanager | head -n 1)"
           test -n "$SM"
           yes | "$SM" --sdk_root="$SDK" --licenses >/dev/null || true
-          "$SM" --sdk_root="$SDK" --install "platforms;android-36" "build-tools;35.0.0" "ndk;27.2.12479018"
+          "$SM" --sdk_root="$SDK" --install "platforms;android-36" "build-tools;35.0.0" "ndk;29.0.13846066"
           test -d "$NDK_HOME"
 
       - name: Generate the Android project
