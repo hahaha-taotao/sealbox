@@ -60,29 +60,13 @@ jobs:
         env:
           CI: true
         run: |
-          # A tracked fragment of gen/android makes Tauri skip project generation.
-          log="$(mktemp)"
-          set +e
-          {
-            echo "ANDROID_HOME=$ANDROID_HOME"
-            echo "NDK_HOME=$NDK_HOME"
-            ls -ld "$ANDROID_HOME" "$NDK_HOME"
-            rm -rf src-tauri-mobile/gen/android
-            npx tauri android init --ci --skip-targets-install -v
-            test -d src-tauri-mobile/gen/android/app/src/main/java/com/sealbox/mobile
-            node scripts/patch-mobile-android.mjs
-          } >"$log" 2>&1
-          status=$?
-          set -e
-          {
-            echo '### Android project generation'
-            echo '```'
-            tail -n 80 "$log"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          mkdir -p dist
-          cp "$log" dist/android-init.log
-          exit "$status"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "NDK_HOME=$NDK_HOME"
+          ls -ld "$ANDROID_HOME" "$NDK_HOME"
+          rm -rf src-tauri-mobile/gen/android
+          npx tauri android init --ci --skip-targets-install -v
+          test -d src-tauri-mobile/gen/android/app/src/main/java/com/sealbox/mobile
+          node scripts/patch-mobile-android.mjs
 
       - name: Upload Android init log
         if: always()
