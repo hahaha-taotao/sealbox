@@ -909,6 +909,11 @@ fn git_with_token(root: &Path, args: &[&str], token: &str) -> Result<String, Str
 
 fn git_command(root: &Path, args: &[&str], token: Option<&str>) -> Result<Output, String> {
     let mut command = Command::new("git");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000);
+    }
     command.arg("-C").arg(root);
     if token.is_some() {
         command.args(["-c", "credential.helper="]);
