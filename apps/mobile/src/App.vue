@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from "vue";
 import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { authenticate, checkStatus, getData, hasData, removeData, setData } from "@choochmeque/tauri-plugin-biometry-api";
 import { KINDS, api, kindLabel, type Counts, type EntryDto, type EntryKind, type Folder, type MobileRelease, type SyncReport, type SyncView } from "./api";
 
@@ -416,7 +417,11 @@ async function installUpdate() {
 
 async function openReleasePage() {
   if (!release.value) return;
-  window.open(release.value.release_url, "_blank");
+  try {
+    await openUrl(release.value.release_url);
+  } catch (caught) {
+    updateError.value = caught instanceof Error ? caught.message : String(caught);
+  }
 }
 
 async function saveIdle() {

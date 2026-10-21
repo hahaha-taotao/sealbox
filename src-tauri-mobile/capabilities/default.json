@@ -2,5 +2,15 @@
   "identifier": "mobile",
   "description": "Sealbox Android vault capabilities",
   "windows": ["main"],
-  "permissions": ["core:default", "biometry:default"]
+  "permissions": [
+    "core:default",
+    "biometry:default",
+    "opener:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://github.com/hahaha-taotao/sealbox/releases/*" }
+      ]
+    }
+  ]
 }

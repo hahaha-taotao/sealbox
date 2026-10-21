@@ -16,7 +16,7 @@ The `v0.2.4` code and this README define the current shipped scope. The Septembe
 
 在「设置」底部的「关于 Sealbox」中点击「检查更新」，应用会查询固定的 HTTPS Tauri updater endpoint。发现更新后，应用会在窗口内下载并校验签名，显示下载进度；下载完成后确认安装，签名 NSIS 安装器会接管替换并重启应用。若签名元数据暂不可用，仍可打开 GitHub 发布页手动安装。
 
-发布工作流同时上传 Windows 安装包、Tauri updater 元数据 `latest.json` 和对应的 `.sig` 签名文件。现有 v0.1.4 及更早安装包没有应用内签名安装能力，首次升级到已启用 Tauri updater 的版本必须手动运行一次安装包。升级后金库文件仍留在原数据目录，不会随程序安装目录移动。
+发布工作流同时上传 Windows 安装包、Tauri updater 元数据 `latest.json` 和对应的 `.sig` 签名文件。桌面更新读取 GitHub `/releases/latest` 上的 `latest.json`，因此只有 `v*` 桌面发布可以成为最新发布。`mobile-v*` 必须设置 `make_latest: false`，否则会把桌面更新入口指到没有 `latest.json` 的 APK 发布上，检查更新会报 `Could not fetch a valid release JSON from the remote`。现有 v0.1.4 及更早安装包没有应用内签名安装能力，首次升级到已启用 Tauri updater 的版本必须手动运行一次安装包。升级后金库文件仍留在原数据目录，不会随程序安装目录移动。
 
 ## 首次手动升级 First manual upgrade
 

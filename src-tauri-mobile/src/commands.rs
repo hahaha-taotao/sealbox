@@ -503,16 +503,30 @@ pub fn download_mobile_update(app: AppHandle, url: String) -> Result<UpdateDownl
 }
 
 #[tauri::command]
-pub fn install_mobile_update(path: String) -> Result<(), String> {
+pub fn install_mobile_update(app: AppHandle, state: State<AppState>, path: String) -> Result<(), String> {
     let path = PathBuf::from(&path);
     let cache_name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
-    if cache_name != "sealbox-mobile-update.apk" {
+    if cache_name != "sealbox-mobile-update.apk" || path.components().count() < 2 {
         return Err("只能安装本次下载的更新包".into());
     }
-    update::install_apk(&path)
+    let cache = app.path().app_cache_dir().map_err(map_err)?;
+    let expected = cache.join("sealbox-mobile-update.apk");
+    let actual = path.canonicalize().map_err(|error| format!("找不到安装包：{error}"))?;
+    let expected = expected
+        .canonicalize()
+        .map_err(|error| format!("找不到安装包：{error}"))?;
+    if actual != expected {
+        return Err("只能安装本次下载的更新包".into());
+    }
+    {
+        let mut session = lock_session(&state.session);
+        session.lock();
+    }
+    let _ = app.emit("lock-now", ());
+    update::install_apk(&actual)
 }
 
 #[tauri::command]

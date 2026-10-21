@@ -3,12 +3,25 @@ mod commands;
 mod session;
 mod update;
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn newer_version_compares_numeric_parts() {
+        assert!(crate::update::version_newer("0.1.2", "0.1.1"));
+        assert!(crate::update::version_newer("0.2.0", "0.1.9"));
+        assert!(!crate::update::version_newer("0.1.1", "0.1.1"));
+        assert!(!crate::update::version_newer("0.1.0", "0.1.1"));
+        assert!(crate::update::version_newer("1.0", "0.9.9"));
+    }
+}
+
 use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_biometry::init())
+        .plugin(tauri_plugin_opener::init())
         .manage(commands::AppState::new())
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
