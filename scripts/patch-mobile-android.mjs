@@ -7,6 +7,7 @@ const manifestPath = resolve(root, "src-tauri-mobile/gen/android/app/src/main/An
 const pathsFile = resolve(root, "src-tauri-mobile/gen/android/app/src/main/res/xml/file_paths.xml");
 const appModuleDir = resolve(root, "src-tauri-mobile/gen/android/app");
 const appGradlePath = resolve(appModuleDir, "build.gradle.kts");
+const androidRootGradlePath = resolve(root, "src-tauri-mobile/gen/android/build.gradle.kts");
 const mobileDir = resolve(root, "src-tauri-mobile");
 
 const installPermission = '    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />';
@@ -61,4 +62,18 @@ if (!/rootDirRel = "[^"]*"/.test(appGradle)) {
 appGradle = appGradle.replace(/rootDirRel = "[^"]*"/, `rootDirRel = "${rootDirRel}"`);
 writeFileSync(appGradlePath, appGradle);
 
-console.log("patched Android install permission and Gradle working directory");
+// The biometry plugin depends on kotlinx-coroutines 1.10.2, which requires a
+// Kotlin 2.x compiler; the Tauri 2.11 template still pins 1.9.25.
+const kotlinGradlePlugin = /org\.jetbrains\.kotlin:kotlin-gradle-plugin:[^"]+/;
+let rootGradle = readFileSync(androidRootGradlePath, "utf8");
+if (!kotlinGradlePlugin.test(rootGradle)) {
+  console.error(`Could not find the Kotlin Gradle plugin in ${androidRootGradlePath}`);
+  process.exit(1);
+}
+rootGradle = rootGradle.replace(
+  kotlinGradlePlugin,
+  "org.jetbrains.kotlin:kotlin-gradle-plugin:2.2.10",
+);
+writeFileSync(androidRootGradlePath, rootGradle);
+
+console.log("patched Android install permission, Gradle working directory and Kotlin version");
