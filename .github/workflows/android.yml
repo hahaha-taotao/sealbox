@@ -61,8 +61,11 @@ jobs:
           CI: true
         run: |
           # A tracked fragment of gen/android makes Tauri skip project generation.
+          set -x
+          test -d "$ANDROID_HOME"
+          test -d "$NDK_HOME"
           rm -rf src-tauri-mobile/gen/android
-          npx tauri android init --ci --skip-targets-install
+          npx tauri android init --ci --skip-targets-install -v
           test -d src-tauri-mobile/gen/android/app/src/main/java/com/sealbox/mobile
           node scripts/patch-mobile-android.mjs
 
