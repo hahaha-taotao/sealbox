@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   apk:
-    name: Build Android arm64 debug APK
+    name: Build and publish Android arm64 APK
     runs-on: ubuntu-22.04
     defaults:
       run:
@@ -53,12 +53,49 @@ jobs:
           echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
           echo "NDK_HOME=$SDK/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
-      - name: Build debug APK
-        run: npx tauri android build --debug --apk --target aarch64
+      - name: Generate the Android project
+        working-directory: .
+        env:
+          CI: true
+        run: |
+          # A tracked fragment of gen/android makes Tauri skip project generation.
+          rm -rf src-tauri-mobile/gen/android
+          npx tauri android init --ci --skip-targets-install
+          test -d src-tauri-mobile/gen/android/app/src/main/java/com/sealbox/mobile
 
-      - name: Upload APK
+      - name: Build release APK
+        env:
+          CI: true
+        run: npx tauri android build --ci --apk --target aarch64
+
+      - name: Collect the APK
+        working-directory: .
+        run: |
+          VERSION="$(node -p "require('./src-tauri-mobile/tauri.conf.json').version")"
+          APK="$(find src-tauri-mobile/gen/android/app/build/outputs/apk -type f -name '*.apk' | head -n 1)"
+          test -n "$APK"
+          mkdir -p dist
+          cp "$APK" "dist/Sealbox-mobile-${VERSION}-arm64.apk"
+          echo "APK_PATH=dist/Sealbox-mobile-${VERSION}-arm64.apk" >> "$GITHUB_ENV"
+          echo "MOBILE_VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sealbox-mobile-arm64-debug
-          path: src-tauri-mobile/gen/android/app/build/outputs/apk/universal/debug/*.apk
+          name: sealbox-mobile-arm64
+          path: ${{ env.APK_PATH }}
           if-no-files-found: error
+
+      - name: Publish the mobile release
+        if: startsWith(github.ref, 'refs/tags/mobile-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Sealbox mobile ${{ env.MOBILE_VERSION }}
+          body: |
+            Android arm64 release APK for Sealbox mobile ${{ env.MOBILE_VERSION }}.
+            Install `Sealbox-mobile-${{ env.MOBILE_VERSION }}-arm64.apk` on the phone.
+          files: ${{ env.APK_PATH }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true

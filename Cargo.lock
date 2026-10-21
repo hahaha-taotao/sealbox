@@ -3758,7 +3758,7 @@ dependencies = [
 
 [[package]]
 name = "sealbox-mobile"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "jni 0.21.1",
@@ -4459,6 +4459,8 @@ dependencies = [
 [[package]]
 name = "tauri-plugin-biometry"
 version = "0.2.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1d70628154316603585a1e82e41edac5f8a3946c045fb365c38c9ccc2255122"
 dependencies = [
  "block2",
  "log",
