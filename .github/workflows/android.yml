@@ -1,0 +1,60 @@
+name: Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "mobile-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    name: Build Android arm64 debug APK
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: src-tauri-mobile
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Install JavaScript dependencies
+        working-directory: .
+        run: npm ci
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager --install "platforms;android-36" "build-tools;35.0.0" "ndk;27.2.12479018" "platform-tools"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Build debug APK
+        run: npx tauri android build --debug --apk --target aarch64
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: sealbox-mobile-arm64-debug
+          path: src-tauri-mobile/gen/android/app/build/outputs/apk/universal/debug/*.apk
+          if-no-files-found: error

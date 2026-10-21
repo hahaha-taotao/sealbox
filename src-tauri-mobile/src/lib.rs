@@ -7,6 +7,7 @@ use tauri::{Emitter, Manager};
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_biometry::init())
         .manage(commands::AppState::new())
         .invoke_handler(tauri::generate_handler![
             commands::get_status,

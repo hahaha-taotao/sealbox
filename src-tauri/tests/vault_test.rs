@@ -88,6 +88,24 @@ fn empty_sqlite_leftover_is_not_initialized_and_can_be_replaced() {
 }
 
 #[test]
+fn unreadable_db_file_is_not_initialized_so_setup_does_not_claim_it_exists() {
+    let path = temp_db_path();
+    std::fs::write(&path, b"this is not a sqlite database").unwrap();
+    assert!(
+        !Vault::is_initialized(path.to_str().unwrap()),
+        "a file that cannot be opened must not look like an existing vault"
+    );
+    match Vault::create(path.to_str().unwrap(), "correct horse battery staple extra") {
+        Ok(_) => {}
+        Err(VaultError::AlreadyExists) => {
+            panic!("setup must not report vault already exists for an unreadable file")
+        }
+        Err(e) => panic!("expected setup to replace the unreadable file, got {e}"),
+    }
+    assert!(Vault::is_initialized(path.to_str().unwrap()));
+}
+
+#[test]
 fn website_duplicates_use_normalized_origin_and_ignore_trash_or_self() {
     let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
     let first = vault

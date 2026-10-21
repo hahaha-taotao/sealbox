@@ -348,15 +348,14 @@ impl Vault {
         std::path::Path::new(path).exists()
     }
 
+    /// True only when this path holds a vault that can be opened.
+    ///
+    /// Setup and unlock both trust this answer. A file that exists but cannot
+    /// be opened (locked, corrupt, or not a database) must stay false: treating
+    /// it as initialized sends the lock screen down the create path, and
+    /// `create` then refuses with "vault already exists".
     pub fn is_initialized(path: &str) -> bool {
-        if !std::path::Path::new(path).exists() {
-            return false;
-        }
-        match Self::open(path) {
-            Ok(_) => true,
-            Err(VaultError::NotInitialized) => false,
-            Err(_) => true,
-        }
+        matches!(Self::open(path), Ok(_))
     }
 
     fn has_meta(&self) -> bool {
@@ -403,21 +402,11 @@ impl Vault {
     }
 
     /// Confirms a candidate DEK can open this vault without returning a secret.
+    ///
+    /// `sync_key_check` is sealed with the sync passphrase, not the vault DEK.
+    /// Using it here makes fingerprint unlock fail as soon as sync is saved,
+    /// and on an empty vault that is the only ciphertext `dek_matches` sees.
     pub fn dek_matches(&self, dek: &[u8; 32]) -> Result<(), VaultError> {
-        let wrapped: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT value FROM settings WHERE key='sync_key_check'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(hex_value) = wrapped {
-            let bytes = hex::decode(hex_value).map_err(|_| VaultError::Crypto(crate::crypto::CryptoError::Truncated))?;
-            let enc = Encrypted::from_bytes(&bytes)?;
-            decrypt(dek, &enc).map_err(|_| VaultError::BadPassword)?;
-            return Ok(());
-        }
         let blob: Option<Vec<u8>> = self
             .conn
             .query_row(
@@ -2008,9 +1997,46 @@ mod tests {
     use super::*;
 
     #[test]
-    #[test]
     fn dek_matches_rejects_a_different_key_and_accepts_the_real_one() {
         let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        vault
+            .upsert_entry(
+                &dek,
+                UpsertEntry {
+                    id: None,
+                    kind: EntryKind::ApiToken,
+                    title: "api".into(),
+                    account: None,
+                    url: None,
+                    folder_id: None,
+                    tags: vec![],
+                    pinned: false,
+                    expires_at: None,
+                    notes: None,
+                    secret: SecretPayload::ApiToken {
+                        service: "example".into(),
+                        account: None,
+                        token: "secret-token".into(),
+                    },
+                },
+            )
+            .unwrap();
+        assert!(vault.dek_matches(&dek).is_ok());
+        assert!(vault.dek_matches(&[9u8; 32]).is_err());
+    }
+
+    #[test]
+    fn dek_matches_ignores_sync_key_check_sealed_with_the_sync_passphrase() {
+        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        let mut sync_key = [0u8; 32];
+        sync_key[0] = 7;
+        let check = encrypt(&sync_key, b"sealbox-sync-v1").unwrap();
+        vault
+            .set_setting("sync_key_check", &hex::encode(check.to_bytes()))
+            .unwrap();
+        assert!(vault.dek_matches(&dek).is_ok());
+        assert!(vault.dek_matches(&[9u8; 32]).is_ok());
+
         vault
             .upsert_entry(
                 &dek,
