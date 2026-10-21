@@ -81,7 +81,16 @@ jobs:
           set -e
           mkdir -p ../dist
           cp ../dist-build.log ../dist/android-build.log
-          tail -n 120 ../dist/android-build.log
+          tail -n 160 ../dist/android-build.log
+          if [ "$status" -ne 0 ]; then
+            cd ..
+            git config user.email "435915720@qq.com"
+            git config user.name "张文宇"
+            git checkout -B ci/android-build-log
+            git add -f dist/android-build.log
+            git commit -m "chore: capture Android build log"
+            git push --force origin ci/android-build-log
+          fi
           exit "$status"
 
       - name: Upload Android build log
