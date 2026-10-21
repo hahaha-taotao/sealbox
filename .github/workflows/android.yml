@@ -64,8 +64,10 @@ jobs:
           echo "NDK_HOME=$NDK_HOME"
           ls -ld "$ANDROID_HOME" "$NDK_HOME"
           rm -rf src-tauri-mobile/gen/android
+          cd src-tauri-mobile
           npx tauri android init --ci --skip-targets-install -v
-          test -d src-tauri-mobile/gen/android/app/src/main/java/com/sealbox/mobile
+          test -d gen/android/app/src/main/java/com/sealbox/mobile
+          cd ..
           node scripts/patch-mobile-android.mjs
 
       - name: Upload Android init log
@@ -77,6 +79,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Build release APK
+        working-directory: src-tauri-mobile
         env:
           CI: true
         run: npx tauri android build --ci --apk --target aarch64
