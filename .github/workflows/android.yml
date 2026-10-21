@@ -70,19 +70,27 @@ jobs:
           cd ..
           node scripts/patch-mobile-android.mjs
 
-      - name: Upload Android init log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-init-log
-          path: dist/android-init.log
-          if-no-files-found: ignore
-
       - name: Build release APK
         working-directory: src-tauri-mobile
         env:
           CI: true
-        run: npx tauri android build --ci --apk --target aarch64
+        run: |
+          set +e
+          npx tauri android build --ci --apk --target aarch64 > ../dist-build.log 2>&1
+          status=$?
+          set -e
+          mkdir -p ../dist
+          cp ../dist-build.log ../dist/android-build.log
+          tail -n 120 ../dist/android-build.log
+          exit "$status"
+
+      - name: Upload Android build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-log
+          path: dist/android-build.log
+          if-no-files-found: ignore
 
       - name: Collect the APK
         working-directory: .
