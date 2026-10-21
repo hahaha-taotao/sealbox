@@ -42,11 +42,16 @@ jobs:
         run: npm ci
 
       - name: Install Android SDK packages
+        working-directory: .
         run: |
-          yes | sdkmanager --licenses >/dev/null
-          sdkmanager --install "platforms;android-36" "build-tools;35.0.0" "ndk;27.2.12479018"
-          echo "ANDROID_HOME=${ANDROID_SDK_ROOT}" >> "$GITHUB_ENV"
-          echo "NDK_HOME=${ANDROID_SDK_ROOT}/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          SDK="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          SM="$(find "$SDK/cmdline-tools" -type f -name sdkmanager | head -n 1)"
+          test -n "$SM"
+          yes | "$SM" --sdk_root="$SDK" --licenses >/dev/null || true
+          "$SM" --sdk_root="$SDK" --install "platforms;android-36" "build-tools;35.0.0" "ndk;27.2.12479018"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$SDK/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
       - name: Build debug APK
         run: npx tauri android build --debug --apk --target aarch64
