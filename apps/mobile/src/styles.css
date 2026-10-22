@@ -132,6 +132,10 @@ textarea { min-height: 72px; resize: vertical; }
 .set:last-child { border-bottom: 0; }
 .set .t { flex: 1; }
 .set small { display: block; color: var(--muted); margin-top: 2px; }
+.set input[type="checkbox"] {
+  width: 20px; height: 20px; flex: 0 0 auto; margin: 0; padding: 0;
+  border: 0; background: none; accent-color: var(--brand);
+}
 .lock {
   padding: calc(64px + var(--safe-top)) calc(22px + var(--safe-right))
     calc(22px + var(--safe-bottom)) calc(22px + var(--safe-left));

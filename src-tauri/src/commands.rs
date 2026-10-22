@@ -18,6 +18,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 pub struct AppState {
     pub session: Arc<Mutex<Session>>,
     pub mcp: McpState,
+    pub auto: Mutex<crate::auto_sync::AutoSync>,
     pub db_path: Mutex<Option<PathBuf>>,
 }
 
@@ -30,6 +31,7 @@ impl AppState {
         Self {
             session,
             mcp,
+            auto: Mutex::new(crate::auto_sync::AutoSync::default()),
             db_path: Mutex::new(None),
         }
     }
@@ -250,6 +252,9 @@ pub fn unlock_vault(
             let _ = vault.purge_expired_trash(chrono::Utc::now(), 30);
             session.set_unlocked(vault, dek);
             apply_vault_settings(&mut session);
+            if let Ok(vault) = session.vault() {
+                crate::auto_sync::refresh_from_vault(&state, vault);
+            }
             drop(session);
             hydrate_bridge_tokens(&state);
             let _ = mcp::start(&state.mcp, state.session.clone());
@@ -1100,6 +1105,10 @@ pub struct SyncSaveInput {
     pub bucket: Option<String>,
     pub region: Option<String>,
     pub prefix: Option<String>,
+    #[serde(default)]
+    pub auto_sync: Option<bool>,
+    #[serde(default)]
+    pub auto_sync_secs: Option<u64>,
 }
 
 #[tauri::command]
@@ -1111,31 +1120,41 @@ pub fn sync_status(state: State<AppState>) -> Result<SyncView, String> {
 
 #[tauri::command]
 pub fn sync_save(state: State<AppState>, input: SyncSaveInput) -> Result<SyncView, String> {
-    let mut session = lock_session(&state.session);
-    session.require_unlocked().map_err(map_err)?;
-    let dek = *session.dek().map_err(map_err)?;
-    let vault = session.vault().map_err(map_err)?;
-    sync::save_config(
-        vault,
-        &dek,
-        SyncConfig {
-            kind: input.kind,
-            endpoint: input.endpoint,
-            username: input.username,
-            bucket: input.bucket.unwrap_or_default(),
-            region: input.region.unwrap_or_default(),
-            prefix: input.prefix.unwrap_or_default(),
-        },
-        input.secret.as_deref(),
-    )?;
-    sync::view(vault).map_err(map_err)
+    let (view, auto) = {
+        let mut session = lock_session(&state.session);
+        session.require_unlocked().map_err(map_err)?;
+        let dek = *session.dek().map_err(map_err)?;
+        let vault = session.vault().map_err(map_err)?;
+        sync::save_config(
+            vault,
+            &dek,
+            SyncConfig {
+                kind: input.kind,
+                endpoint: input.endpoint,
+                username: input.username,
+                bucket: input.bucket.unwrap_or_default(),
+                region: input.region.unwrap_or_default(),
+                prefix: input.prefix.unwrap_or_default(),
+            },
+            input.secret.as_deref(),
+        )?;
+        let auto =
+            sync::save_auto(vault, input.auto_sync, input.auto_sync_secs).map_err(map_err)?;
+        (sync::view(vault).map_err(map_err)?, auto)
+    };
+    crate::auto_sync::apply(&state, auto.enabled, auto.secs);
+    Ok(view)
 }
 
 #[tauri::command]
 pub fn sync_clear(state: State<AppState>) -> Result<(), String> {
-    let mut session = lock_session(&state.session);
-    session.require_unlocked().map_err(map_err)?;
-    sync::clear_config(session.vault().map_err(map_err)?).map_err(map_err)
+    {
+        let mut session = lock_session(&state.session);
+        session.require_unlocked().map_err(map_err)?;
+        sync::clear_config(session.vault().map_err(map_err)?).map_err(map_err)?;
+    }
+    crate::auto_sync::apply(&state, false, sync::DEFAULT_AUTO_SYNC_SECS);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1735,6 +1754,7 @@ mod tests {
         let state = AppState {
             session: Arc::new(Mutex::new(session)),
             mcp: McpState::default(),
+            auto: Mutex::new(crate::auto_sync::AutoSync::default()),
             db_path: Mutex::new(None),
         };
         *recover_lock(&state.mcp.fill_token) = "fill_ephemeral_boot".into();
@@ -1763,6 +1783,7 @@ mod tests {
         let state = AppState {
             session: Arc::new(Mutex::new(Session::default())),
             mcp: McpState::default(),
+            auto: Mutex::new(crate::auto_sync::AutoSync::default()),
             db_path: Mutex::new(None),
         };
         load_bridge_tokens(&state, &session);
@@ -1785,6 +1806,7 @@ mod tests {
         let state = AppState {
             session: Arc::new(Mutex::new(Session::default())),
             mcp: McpState::default(),
+            auto: Mutex::new(crate::auto_sync::AutoSync::default()),
             db_path: Mutex::new(None),
         };
         load_bridge_tokens(&state, &session);
@@ -1805,6 +1827,7 @@ mod tests {
         let state = AppState {
             session: Arc::new(Mutex::new(Session::default())),
             mcp: McpState::default(),
+            auto: Mutex::new(crate::auto_sync::AutoSync::default()),
             db_path: Mutex::new(None),
         };
         *recover_lock(&state.mcp.token) = "sbx_should_not_serialize".into();
@@ -1875,6 +1898,7 @@ mod tests {
         let state = AppState {
             session: Arc::new(Mutex::new(session)),
             mcp: McpState::default(),
+            auto: Mutex::new(crate::auto_sync::AutoSync::default()),
             db_path: Mutex::new(None),
         };
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -1894,6 +1918,7 @@ mod tests {
         let state = AppState {
             session: Arc::new(Mutex::new(session)),
             mcp: McpState::default(),
+            auto: Mutex::new(crate::auto_sync::AutoSync::default()),
             db_path: Mutex::new(None),
         };
         state.mcp.open_pairing();

@@ -1317,6 +1317,8 @@ const syncPrefix = ref("");
 const syncView = ref<SyncView | null>(null);
 const syncBusy = ref(false);
 const syncReport = ref<SyncReport | null>(null);
+const syncAuto = ref(true);
+const syncAutoSecs = ref(60);
 
 async function loadSync() {
   syncView.value = await api.syncStatus();
@@ -1327,6 +1329,8 @@ async function loadSync() {
   syncBucket.value = syncView.value.bucket;
   syncRegion.value = syncView.value.region || "us-east-1";
   syncPrefix.value = syncView.value.prefix;
+  syncAuto.value = syncView.value.auto_sync;
+  syncAutoSecs.value = syncView.value.auto_sync_secs;
 }
 
 async function saveSync() {
@@ -1340,6 +1344,8 @@ async function saveSync() {
       bucket: syncBucket.value || null,
       region: syncRegion.value || null,
       prefix: syncPrefix.value || null,
+      auto_sync: syncAuto.value,
+      auto_sync_secs: Number(syncAutoSecs.value) || 60,
     });
     syncSecret.value = "";
     showToast("同步配置已保存");
@@ -1727,6 +1733,22 @@ onMounted(async () => {
       await loadSettings();
     }
   });
+  const unSync = await listen<{ ok: boolean; error: string | null; report: SyncReport | null }>(
+    "sync-finished",
+    async (event) => {
+      if (!status.value?.unlocked) return;
+      const report = event.payload.report;
+      if (report && (report.pulled > 0 || report.removed > 0)) await refreshVault();
+      if (!syncView.value) return;
+      try {
+        const fresh = await api.syncStatus();
+        syncView.value.last_sync_at = fresh.last_sync_at;
+        syncView.value.last_result = fresh.last_result;
+      } catch {
+        // Vault locked between the event and the refresh; nothing to show.
+      }
+    },
+  );
   onUnmounted(() => {
     applyLockedUi();
     window.removeEventListener("keydown", onKey);
@@ -1734,6 +1756,7 @@ onMounted(async () => {
     unFocus();
     unLock();
     unUnlock();
+    unSync();
     stopPairingTimer();
   });
 });
@@ -2529,7 +2552,7 @@ onMounted(async () => {
           </div>
           <div class="mcp-card settings-master">
             <h3>数据同步</h3>
-            <p class="crumb">支持 WebDAV 和 S3。上传的是用同步密钥再加密的快照，服务器看不到明文，也解不开主密码。两端修改时间相同、内容却不同时，会保留本机版本并记为冲突；其中一边是删除时以删除为准，避免已删条目复活。</p>
+            <p class="crumb">支持 WebDAV 和 S3。上传的是用同步密钥再加密的快照，服务器看不到明文，也解不开主密码。两端修改时间相同、内容却不同时，会保留本机版本并记为冲突；其中一边是删除时以删除为准，避免已删条目复活。解锁后按设定间隔自动同步，默认 60 秒；改完点「保存配置」生效。</p>
             <div class="settings-fields">
               <div class="field">
                 <label>类型</label>
@@ -2563,6 +2586,13 @@ onMounted(async () => {
               <div class="field settings-span">
                 <label>路径前缀（可选）</label>
                 <input v-model="syncPrefix" placeholder="留空则使用 sealbox/vault.sboxsync" />
+              </div>
+              <div class="field">
+                <label class="check"><input v-model="syncAuto" type="checkbox" /><span>定时自动同步</span></label>
+              </div>
+              <div class="field">
+                <label>自动同步间隔（秒）</label>
+                <input v-model.number="syncAutoSecs" type="number" min="15" max="86400" :disabled="!syncAuto" />
               </div>
             </div>
             <p v-if="syncView?.last_sync_at" class="crumb">上次同步 {{ fmtTime(syncView.last_sync_at) }}<span v-if="syncView.last_result"> · {{ syncView.last_result }}</span></p>

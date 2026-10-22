@@ -18,6 +18,12 @@ const MAX_REMOTE_BYTES: usize = 64 * 1024 * 1024;
 /// How long a deletion keeps being broadcast. Older clients that stayed
 /// offline longer than this can still resurrect an item.
 const TOMBSTONE_RETENTION_DAYS: i64 = 180;
+/// Auto sync is per-device: the interval lives in the local settings table.
+pub const DEFAULT_AUTO_SYNC_SECS: u64 = 60;
+pub const MIN_AUTO_SYNC_SECS: u64 = 15;
+pub const MAX_AUTO_SYNC_SECS: u64 = 86_400;
+/// Returned when a background sync notices the vault locked mid-flight.
+pub const SYNC_ABORTED: &str = "已锁定，本次同步已中止";
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,6 +80,43 @@ impl SyncConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutoSyncSettings {
+    pub enabled: bool,
+    pub secs: u64,
+}
+
+/// Auto sync never schedules work until a target exists, so a vault that was
+/// never set up stays quiet. Once configured it defaults to on, every 60s.
+pub fn auto_settings(vault: &Vault) -> Result<AutoSyncSettings, VaultError> {
+    let configured = vault.get_setting("sync_config")?.is_some();
+    let enabled = configured && vault.get_setting("sync_auto")?.as_deref() != Some("0");
+    let secs = vault
+        .get_setting("sync_auto_secs")?
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_AUTO_SYNC_SECS)
+        .clamp(MIN_AUTO_SYNC_SECS, MAX_AUTO_SYNC_SECS);
+    Ok(AutoSyncSettings { enabled, secs })
+}
+
+/// `None` keeps the stored value, so callers can save only what changed.
+pub fn save_auto(
+    vault: &Vault,
+    enabled: Option<bool>,
+    secs: Option<u64>,
+) -> Result<AutoSyncSettings, VaultError> {
+    let current = auto_settings(vault)?;
+    let settings = AutoSyncSettings {
+        enabled: enabled.unwrap_or(current.enabled),
+        secs: secs
+            .unwrap_or(current.secs)
+            .clamp(MIN_AUTO_SYNC_SECS, MAX_AUTO_SYNC_SECS),
+    };
+    vault.set_setting("sync_auto", if settings.enabled { "1" } else { "0" })?;
+    vault.set_setting("sync_auto_secs", &settings.secs.to_string())?;
+    Ok(settings)
+}
+
 #[derive(Serialize, Deserialize)]
 struct SyncFile {
     blob: Encrypted,
@@ -117,6 +160,8 @@ pub struct SyncView {
     pub device_id: String,
     pub last_sync_at: Option<String>,
     pub last_result: Option<String>,
+    pub auto_sync: bool,
+    pub auto_sync_secs: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -131,6 +176,7 @@ pub struct SyncReport {
 
 pub fn view(vault: &Vault) -> Result<SyncView, VaultError> {
     let config = load_config(vault)?;
+    let auto = auto_settings(vault)?;
     Ok(SyncView {
         configured: config.is_some(),
         kind: config.as_ref().map(|c| c.kind.clone()),
@@ -152,6 +198,8 @@ pub fn view(vault: &Vault) -> Result<SyncView, VaultError> {
         device_id: device_id(vault)?,
         last_sync_at: vault.get_setting("sync_last_at")?,
         last_result: vault.get_setting("sync_last_result")?,
+        auto_sync: auto.enabled,
+        auto_sync_secs: auto.secs,
     })
 }
 
@@ -200,6 +248,8 @@ pub fn clear_config(vault: &Vault) -> Result<(), VaultError> {
         "sync_key_check",
         "sync_last_at",
         "sync_last_result",
+        "sync_auto",
+        "sync_auto_secs",
     ] {
         vault.delete_setting(key)?;
     }
@@ -208,6 +258,16 @@ pub fn clear_config(vault: &Vault) -> Result<(), VaultError> {
 }
 
 pub fn sync_now(vault: &Vault, dek: &[u8; 32]) -> Result<SyncReport, String> {
+    sync_now_guarded(vault, dek, &|| true)
+}
+
+/// `still_wanted` runs between the network round trips and the writes, so
+/// background sync can stop once the vault locks.
+pub fn sync_now_guarded(
+    vault: &Vault,
+    dek: &[u8; 32],
+    still_wanted: &dyn Fn() -> bool,
+) -> Result<SyncReport, String> {
     let config = load_config(vault)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "还没有配置同步".to_string())?;
@@ -246,18 +306,29 @@ pub fn sync_now(vault: &Vault, dek: &[u8; 32]) -> Result<SyncReport, String> {
     };
 
     if changed {
+        if !still_wanted() {
+            return Err(SYNC_ABORTED.into());
+        }
         let bytes = encode_snapshot(&key, &merged, &device).map_err(|e| e.to_string())?;
         client
             .put(&bytes)
             .map_err(|e| format!("写入远端失败: {e}"))?;
     }
-    let sealed = merged.seal(dek)?;
-    vault
-        .replace_snapshot_same_key(dek, &sealed)
-        .map_err(|e| e.to_string())?;
-    vault
-        .replace_sync_tombstones(&merged.deleted)
-        .map_err(|e| e.to_string())?;
+    if !still_wanted() {
+        return Err(SYNC_ABORTED.into());
+    }
+    // Rewriting an unchanged vault every interval would churn the database and
+    // its WAL for nothing.
+    let local_changed = snapshot_digest(&merged) != snapshot_digest(&local);
+    if local_changed {
+        let sealed = merged.seal(dek)?;
+        vault
+            .replace_snapshot_same_key(dek, &sealed)
+            .map_err(|e| e.to_string())?;
+        vault
+            .replace_sync_tombstones(&merged.deleted)
+            .map_err(|e| e.to_string())?;
+    }
     let summary = format!(
         "pulled={} pushed={} unchanged={} removed={} conflicts={}",
         report.pulled,
@@ -269,7 +340,10 @@ pub fn sync_now(vault: &Vault, dek: &[u8; 32]) -> Result<SyncReport, String> {
     let now = chrono::Utc::now().to_rfc3339();
     let _ = vault.set_setting("sync_last_at", &now);
     let _ = vault.set_setting("sync_last_result", &summary);
-    let _ = vault.audit("sync", None, &summary);
+    // Auto sync runs every minute; only record runs that actually moved data.
+    if changed || local_changed {
+        let _ = vault.audit("sync", None, &summary);
+    }
     Ok(report)
 }
 
@@ -1334,6 +1408,63 @@ mod tests {
         });
         let snapshot: SyncSnapshot = serde_json::from_value(raw).unwrap();
         assert!(snapshot.deleted.is_empty());
+    }
+
+    fn vault_with_sync() -> Vault {
+        let (vault, _dek) =
+            Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        let config = SyncConfig {
+            kind: SyncKind::Webdav,
+            endpoint: "https://dav.example.com".into(),
+            username: "user".into(),
+            bucket: String::new(),
+            region: "us-east-1".into(),
+            prefix: String::new(),
+        };
+        vault
+            .set_setting("sync_config", &serde_json::to_string(&config).unwrap())
+            .unwrap();
+        vault
+    }
+
+    #[test]
+    fn auto_sync_stays_off_without_a_target() {
+        let (vault, _dek) =
+            Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        let auto = auto_settings(&vault).unwrap();
+        assert!(!auto.enabled);
+        assert_eq!(auto.secs, DEFAULT_AUTO_SYNC_SECS);
+        // Even an explicit "on" schedules nothing until a target exists.
+        save_auto(&vault, Some(true), None).unwrap();
+        assert!(!auto_settings(&vault).unwrap().enabled);
+    }
+
+    #[test]
+    fn auto_sync_defaults_to_60_seconds_once_configured() {
+        let vault = vault_with_sync();
+        let auto = auto_settings(&vault).unwrap();
+        assert!(auto.enabled);
+        assert_eq!(auto.secs, DEFAULT_AUTO_SYNC_SECS);
+    }
+
+    #[test]
+    fn save_auto_clamps_interval_and_keeps_unspecified_values() {
+        let vault = vault_with_sync();
+        save_auto(&vault, Some(true), Some(1)).unwrap();
+        assert_eq!(auto_settings(&vault).unwrap().secs, MIN_AUTO_SYNC_SECS);
+        save_auto(&vault, None, Some(999_999)).unwrap();
+        let auto = auto_settings(&vault).unwrap();
+        assert!(auto.enabled);
+        assert_eq!(auto.secs, MAX_AUTO_SYNC_SECS);
+    }
+
+    #[test]
+    fn save_auto_can_turn_it_off() {
+        let vault = vault_with_sync();
+        save_auto(&vault, Some(false), Some(120)).unwrap();
+        let view = view(&vault).unwrap();
+        assert!(!view.auto_sync);
+        assert_eq!(view.auto_sync_secs, 120);
     }
 }
 

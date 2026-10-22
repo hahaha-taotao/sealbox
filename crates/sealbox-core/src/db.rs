@@ -24,7 +24,8 @@ pub fn open_existing(path: &str) -> Result<Connection, DbError> {
 fn prepare(conn: Connection) -> Result<Connection, DbError> {
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;
-         PRAGMA journal_mode = WAL;",
+         PRAGMA journal_mode = WAL;
+         PRAGMA busy_timeout = 5000;",
     )?;
     migrate(&conn)?;
     Ok(conn)

@@ -2,6 +2,7 @@ pub use sealbox_core::{
     certificate, crypto, db, http_guard, identity, passphrase_words, redact, sync, totp, vault,
 };
 pub mod assistant;
+pub mod auto_sync;
 pub mod backup;
 pub mod clipboard;
 pub mod commands;
@@ -148,6 +149,7 @@ pub fn run() {
                 if commands::tick_security(&state) {
                     let _ = handle.emit("lock-now", ());
                 }
+                crate::auto_sync::tick(&handle, &state);
             });
             let show = MenuItem::with_id(app, "show", "打开", true, None::<&str>)?;
             let lock = MenuItem::with_id(app, "lock", "锁定", true, None::<&str>)?;
@@ -182,6 +184,7 @@ pub fn run() {
                     }
                 }
                 let _ = mcp::start(&state.mcp, state.session.clone());
+                crate::auto_sync::refresh_from_disk(app.handle(), &state);
             }
             let _ = commands::register_hotkey(app.handle(), &startup_hotkey);
             Ok(())

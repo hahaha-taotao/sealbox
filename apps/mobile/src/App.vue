@@ -33,7 +33,7 @@ const form = reactive(blankForm());
 const sync = ref<SyncView | null>(null);
 const report = ref<SyncReport | null>(null);
 const syncKind = ref<"webdav" | "s3">("webdav");
-const syncForm = reactive({ endpoint: "", username: "", secret: "", bucket: "", region: "us-east-1", prefix: "" });
+const syncForm = reactive({ endpoint: "", username: "", secret: "", bucket: "", region: "us-east-1", prefix: "", auto: true, autoSecs: 60 });
 const idleSecs = ref(60);
 const busy = ref(false);
 const appVersion = ref("");
@@ -463,6 +463,8 @@ async function openSync() {
   syncForm.bucket = sync.value.bucket;
   syncForm.region = sync.value.region || "us-east-1";
   syncForm.prefix = sync.value.prefix;
+  syncForm.auto = sync.value.auto_sync;
+  syncForm.autoSecs = sync.value.auto_sync_secs;
   page.value = "sync";
 }
 
@@ -478,10 +480,15 @@ async function saveSync(run: boolean) {
       bucket: syncForm.bucket || null,
       region: syncForm.region || null,
       prefix: syncForm.prefix || null,
+      auto_sync: syncForm.auto,
+      auto_sync_secs: Number(syncForm.autoSecs) || 60,
     });
     if (run) {
       report.value = await api.syncNow();
       sync.value = await api.syncStatus();
+    } else {
+      toast.value = "已保存";
+      setTimeout(() => (toast.value = ""), 1600);
     }
     syncForm.secret = "";
   } catch (caught) {
@@ -504,6 +511,22 @@ onMounted(async () => {
     page.value = "lock";
     entries.value = [];
   });
+  await listen<{ ok: boolean; error: string | null; report: SyncReport | null }>(
+    "sync-finished",
+    async (event) => {
+      if (page.value === "lock") return;
+      const report = event.payload.report;
+      if (report && (report.pulled > 0 || report.removed > 0) && page.value === "vault") {
+        await loadVault();
+      }
+      if (!sync.value) return;
+      try {
+        sync.value = await api.syncStatus();
+      } catch {
+        // Vault locked between the event and the refresh; nothing to show.
+      }
+    },
+  );
   window.setInterval(() => {
     if (page.value !== "lock") void api.tick();
   }, 5000);
@@ -763,9 +786,22 @@ onMounted(async () => {
           <div class="field"><label>Region</label><input v-model="syncForm.region" /></div>
         </template>
         <div class="field"><label>路径前缀，可选</label><input v-model="syncForm.prefix" placeholder="sealbox/vault.sboxsync" /></div>
+        <div class="group" style="margin:0 0 14px">
+          <label class="set">
+            <span class="t">定时自动同步<small>解锁后按间隔自动同步，默认 60 秒</small></span>
+            <input v-model="syncForm.auto" type="checkbox" />
+          </label>
+          <div class="set">
+            <span class="t">间隔（秒）</span>
+            <input v-model.number="syncForm.autoSecs" type="number" min="15" max="86400" :disabled="!syncForm.auto" style="width:96px" />
+          </div>
+        </div>
         <p v-if="sync?.last_result" class="hint">上次：{{ sync.last_result }}</p>
         <p v-if="error" class="error">{{ error }}</p>
-        <button class="primary" :disabled="busy" @click="saveSync(true)">{{ busy ? "同步中" : "保存并同步" }}</button>
+        <div class="actions">
+          <button class="ghost" :disabled="busy" @click="saveSync(false)">仅保存</button>
+          <button class="primary" :disabled="busy" @click="saveSync(true)">{{ busy ? "同步中" : "保存并同步" }}</button>
+        </div>
         <div v-if="report" class="secret">
           <div class="row"><span class="k">拉取</span><span>{{ report.pulled }}</span></div>
           <div class="row"><span class="k">推送</span><span>{{ report.pushed }}</span></div>

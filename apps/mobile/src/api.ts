@@ -64,6 +64,8 @@ export interface SyncView {
   device_id: string;
   last_sync_at: string | null;
   last_result: string | null;
+  auto_sync: boolean;
+  auto_sync_secs: number;
 }
 
 export interface SyncReport {

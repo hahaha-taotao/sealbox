@@ -12,12 +12,14 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 pub struct AppState {
     pub session: Arc<Mutex<Session>>,
+    pub auto: Mutex<crate::auto_sync::AutoSync>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
             session: Arc::new(Mutex::new(Session::default())),
+            auto: Mutex::new(crate::auto_sync::AutoSync::default()),
         }
     }
 }
@@ -26,11 +28,11 @@ fn map_err(error: impl ToString) -> String {
     error.to_string()
 }
 
-fn lock_session(session: &Mutex<Session>) -> std::sync::MutexGuard<'_, Session> {
+pub(crate) fn lock_session(session: &Mutex<Session>) -> std::sync::MutexGuard<'_, Session> {
     session.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
-fn vault_path(app: &AppHandle) -> Result<PathBuf, String> {
+pub(crate) fn vault_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(map_err)?;
     std::fs::create_dir_all(&dir).map_err(map_err)?;
     Ok(dir.join("vault.db"))
@@ -139,6 +141,9 @@ pub fn unlock_vault(app: AppHandle, state: State<AppState>, password: String) ->
             let mut session = lock_session(&state.session);
             session.set_unlocked(vault, dek);
             apply_settings(&mut session);
+            if let Ok(vault) = session.vault() {
+                crate::auto_sync::refresh_from_vault(&state, vault);
+            }
             Ok(())
         }
         Err(error) => {
@@ -164,6 +169,9 @@ pub fn unlock_with_dek(app: AppHandle, state: State<AppState>, dek_b64: String) 
     let mut session = lock_session(&state.session);
     session.set_unlocked(vault, dek);
     apply_settings(&mut session);
+    if let Ok(vault) = session.vault() {
+        crate::auto_sync::refresh_from_vault(&state, vault);
+    }
     Ok(())
 }
 
@@ -436,35 +444,49 @@ pub struct SyncSaveInput {
     pub bucket: Option<String>,
     pub region: Option<String>,
     pub prefix: Option<String>,
+    #[serde(default)]
+    pub auto_sync: Option<bool>,
+    #[serde(default)]
+    pub auto_sync_secs: Option<u64>,
 }
 
 #[tauri::command]
 pub fn sync_save(state: State<AppState>, input: SyncSaveInput) -> Result<SyncView, String> {
-    let mut session = lock_session(&state.session);
-    session.require_unlocked().map_err(map_err)?;
-    let dek = *session.dek().map_err(map_err)?;
-    let vault = session.vault().map_err(map_err)?;
-    sync::save_config(
-        vault,
-        &dek,
-        SyncConfig {
-            kind: input.kind,
-            endpoint: input.endpoint,
-            username: input.username,
-            bucket: input.bucket.unwrap_or_default(),
-            region: input.region.unwrap_or_default(),
-            prefix: input.prefix.unwrap_or_default(),
-        },
-        input.secret.as_deref(),
-    )?;
-    sync::view(vault).map_err(map_err)
+    let (view, auto) = {
+        let mut session = lock_session(&state.session);
+        session.require_unlocked().map_err(map_err)?;
+        let dek = *session.dek().map_err(map_err)?;
+        let vault = session.vault().map_err(map_err)?;
+        sync::save_config(
+            vault,
+            &dek,
+            SyncConfig {
+                kind: input.kind,
+                endpoint: input.endpoint,
+                username: input.username,
+                bucket: input.bucket.unwrap_or_default(),
+                region: input.region.unwrap_or_default(),
+                prefix: input.prefix.unwrap_or_default(),
+            },
+            input.secret.as_deref(),
+        )?;
+        let auto =
+            sync::save_auto(vault, input.auto_sync, input.auto_sync_secs).map_err(map_err)?;
+        (sync::view(vault).map_err(map_err)?, auto)
+    };
+    crate::auto_sync::apply(&state, auto.enabled, auto.secs);
+    Ok(view)
 }
 
 #[tauri::command]
 pub fn sync_clear(state: State<AppState>) -> Result<(), String> {
-    let mut session = lock_session(&state.session);
-    session.require_unlocked().map_err(map_err)?;
-    sync::clear_config(session.vault().map_err(map_err)?).map_err(map_err)
+    {
+        let mut session = lock_session(&state.session);
+        session.require_unlocked().map_err(map_err)?;
+        sync::clear_config(session.vault().map_err(map_err)?).map_err(map_err)?;
+    }
+    crate::auto_sync::apply(&state, false, sync::DEFAULT_AUTO_SYNC_SECS);
+    Ok(())
 }
 
 #[tauri::command]

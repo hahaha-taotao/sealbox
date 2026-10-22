@@ -1,3 +1,4 @@
+mod auto_sync;
 mod clipboard;
 mod commands;
 mod session;
@@ -60,12 +61,16 @@ pub fn run() {
         ])
         .setup(|app| {
             let handle = app.handle().clone();
+            if let Some(state) = handle.try_state::<commands::AppState>() {
+                auto_sync::refresh_from_disk(&handle, &state);
+            }
             std::thread::spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 let locked = {
                     let Some(state) = handle.try_state::<commands::AppState>() else {
                         continue;
                     };
+                    auto_sync::tick(&handle, &state);
                     commands::tick_idle(state).unwrap_or(false)
                 };
                 if locked {

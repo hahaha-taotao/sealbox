@@ -27,8 +27,8 @@ The `v0.2.4` code and this README define the current shipped scope. The Septembe
 
 安装程序只替换应用文件，不会删除或搬移金库。金库路径是 `%APPDATA%\\com.sealbox.app\\vault.db`；升级前仍建议先导出 `.svbak` 加密备份。
 
-> 可选 WebDAV / S3 同步。远端只保存用同步密钥加密的快照，不保存明文，也解不开主密码。
-> Optional WebDAV / S3 sync stores an encrypted snapshot. The remote never sees plaintext and cannot unlock the master password.
+> 可选 WebDAV / S3 同步。远端只保存用同步密钥加密的快照，不保存明文，也解不开主密码。解锁后可按自定义间隔（默认 60 秒）自动同步。
+> Optional WebDAV / S3 sync stores an encrypted snapshot. The remote never sees plaintext and cannot unlock the master password. Auto sync runs on a configurable interval (60s by default) while unlocked.
 
 > 当前工作区的在线更新实现已经支持签名下载、进度展示和安装确认；v0.1.4 及更早安装包仍需按上面的步骤手动升级一次。请只从本项目的 GitHub Releases 下载，并核对版本号与签名元数据。
 
@@ -70,7 +70,7 @@ npm run tauri build
 
 ### 当前明确不做 Current non-goals
 
-- 不做多用户、账号系统或定时自动上传。可选的 WebDAV / S3 同步只上传加密快照，不上传明文金库或 `.svbak`。
+- 不做多用户、账号系统或常驻后台服务。可选的 WebDAV / S3 同步只上传加密快照，不上传明文金库或 `.svbak`；自动同步仅在应用运行且金库解锁时按本机设定的间隔执行。
 - 不做 Firefox / Safari / Brave 适配、浏览器商店上架、`.crx`、注册表强制安装或静默加载；当前扩展只支持 Chrome / Edge 的本机加载流程。
 - 不读 Chrome `Login Data` 或其他浏览器凭据数据库，不使用 DPAPI，不做 Passkey、HIBP、扫描导入或 QR 入库；2026-09-28 的 QR TOTP 与页面 OTP 候选仍是待审阅提案。
 - 不提供任意 HTTP、任意 URL / 方法 / 请求头 / 原始请求体；不把 Token、主密码、备份、Authorization header 或完整远端响应交给模型。
