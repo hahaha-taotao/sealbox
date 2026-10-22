@@ -16,6 +16,15 @@ const password = ref("");
 const password2 = ref("");
 const error = ref("");
 const toast = ref("");
+let toastTimer: number | undefined;
+function showToast(message: string, ms = 1800) {
+  toast.value = message;
+  if (toastTimer !== undefined) window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => {
+    toast.value = "";
+    toastTimer = undefined;
+  }, ms);
+}
 const counts = ref<Counts | null>(null);
 const scopedCounts = ref<Counts | null>(null);
 const entries = ref<EntryDto[]>([]);
@@ -257,6 +266,7 @@ async function toggleBiometry() {
       await removeData({ domain: DOMAIN, name: DEK_NAME });
       await api.setBiometry(false);
       biometryOn.value = false;
+      showToast("指纹解锁已关闭");
       return;
     }
     await authenticate("确认后启用指纹解锁", {
@@ -269,7 +279,7 @@ async function toggleBiometry() {
     await setData({ domain: DOMAIN, name: DEK_NAME, data: dek });
     await api.setBiometry(true);
     biometryOn.value = true;
-    toast.value = "指纹解锁已打开，只在这台手机生效";
+    showToast("指纹解锁已打开，只在这台手机生效");
   } catch (caught) {
     showError(caught);
   }
@@ -291,8 +301,7 @@ async function reveal() {
 async function copy(field: string) {
   if (!selected.value) return;
   await api.copy(selected.value.id, field);
-  toast.value = "已复制，约 20 秒后清空剪贴板";
-  setTimeout(() => (toast.value = ""), 1600);
+  showToast("已复制，约 20 秒后清空剪贴板", 1600);
 }
 
 function startCreate(next: EntryKind) {
@@ -475,8 +484,7 @@ async function checkForUpdates(auto = false) {
     if (found.update_available && page.value !== "lock") {
       updateDialogOpen.value = true;
     } else if (!auto) {
-      toast.value = "已是最新版本";
-      window.setTimeout(() => (toast.value = ""), 1800);
+      showToast("已是最新版本");
     }
   } catch (caught) {
     updateStage.value = "error";
@@ -485,8 +493,7 @@ async function checkForUpdates(auto = false) {
       updateStage.value = "idle";
       updateError.value = "";
     } else {
-      toast.value = `检查更新失败：${updateError.value}`;
-      window.setTimeout(() => (toast.value = ""), 2400);
+      showToast(`检查更新失败：${updateError.value}`, 2400);
     }
   }
 }
@@ -533,8 +540,7 @@ async function installUpdate() {
   if (!downloadedPath.value || !release.value) return;
   try {
     await api.installUpdate(downloadedPath.value);
-    toast.value = "已打开系统安装界面";
-    window.setTimeout(() => (toast.value = ""), 1800);
+    showToast("已打开系统安装界面");
   } catch (caught) {
     updateStage.value = "error";
     updateError.value = caught instanceof Error ? caught.message : String(caught);
@@ -557,7 +563,7 @@ async function openReleasePage() {
 
 async function saveIdle() {
   await api.saveSettings(Number(idleSecs.value) || 60, 20);
-  toast.value = "已保存";
+  showToast("已保存");
 }
 
 async function openSync() {
@@ -592,8 +598,7 @@ async function saveSync(run: boolean) {
       report.value = await api.syncNow();
       sync.value = await api.syncStatus();
     } else {
-      toast.value = "已保存";
-      setTimeout(() => (toast.value = ""), 1600);
+      showToast("已保存", 1600);
     }
     syncForm.secret = "";
   } catch (caught) {
