@@ -215,7 +215,15 @@ pub fn canonical_tool_name(name: &str) -> &str {
 /// 常用任务工具按 action 落到已有实现。未知名原样返回。
 fn task_dispatch_name(name: &str, args: &Value) -> Result<String, String> {
     let canonical = canonical_tool_name(name);
-    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+    let action = if is_task_tool(canonical) {
+        args.as_object().ok_or_else(|| "工具参数必须是对象".to_string())?;
+        args.get("action")
+            .ok_or_else(|| "缺少参数 action".to_string())?
+            .as_str()
+            .ok_or_else(|| "参数 action 必须是字符串".to_string())?
+    } else {
+        ""
+    };
     let mapped = match canonical {
         "github_release" => match action {
             "list" => "github_release_list",
@@ -330,6 +338,34 @@ pub fn api_tool_definitions() -> Vec<Value> {
                     ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":30})),
                 ],
                 &["repo"],
+            ),
+        ),
+        tool(
+            "github_issues_get",
+            "读取单个 Issue（不含 PR）的详情。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("number", json!({"type":"integer","minimum":1,"maximum":1000000000})),
+                ],
+                &["repo", "number"],
+            ),
+        ),
+        write_tool(
+            "github_issue_close",
+            "关闭一个 Issue（不含 PR），不改标题和正文。每次都会弹出 Sealbox 桌面确认。",
+            schema(
+                &[
+                    ("credential", credential_prop()),
+                    ("credential_id", credential_id_prop()),
+                    ("repo", repo_prop()),
+                    ("owner", string_schema(1, 100)),
+                    ("number", json!({"type":"integer","minimum":1,"maximum":1000000000})),
+                ],
+                &["repo", "number"],
             ),
         ),
         tool(
@@ -513,115 +549,22 @@ pub fn api_tool_definitions() -> Vec<Value> {
     ]
 }
 
-fn task_tool(name: &str, description: &str, actions: &[&str], properties: &[(&str, Value)], required: &[&str]) -> Value {
-    let mut props = Map::new();
-    props.insert(
-        "action".into(),
-        json!({
-            "type": "string",
-            "enum": actions,
-            "description": "要执行的动作。只读动作不弹确认，写入动作弹出一次桌面确认。"
-        }),
-    );
-    for (key, value) in properties {
-        props.insert((*key).to_string(), value.clone());
-    }
-    let mut required_fields = vec![Value::String("action".into())];
-    required_fields.extend(required.iter().map(|item| Value::String((*item).to_string())));
-    json!({
-        "name": name,
-        "description": description,
-        "inputSchema": {
-            "type": "object",
-            "properties": Value::Object(props),
-            "required": required_fields,
-            "additionalProperties": false
-        },
-        "readOnly": false,
-        "risk": "high",
-        "annotations": annotations(false, true)
-    })
+fn is_task_tool(name: &str) -> bool {
+    matches!(name, "github_issue" | "github_pr" | "github_release")
 }
 
-fn task_tool_definitions() -> Vec<Value> {
-    let credential = ("credential", credential_prop());
-    let credential_id = ("credential_id", credential_id_prop());
-    let repo = ("repo", repo_prop());
-    let owner = ("owner", string_schema(1, 100));
-    let number = (
-        "number",
-        json!({"type":"integer","minimum":1,"maximum":1000000000}),
-    );
-    vec![
-        task_tool(
-            "github_release",
-            "版本管理。list 列 Release，get 读一个（id 或 tag_name），notes 只生成说明不创建，create 建草稿，publish 把草稿发布。",
-            &["list", "get", "notes", "create", "publish"],
-            &[
-                credential.clone(),
-                credential_id.clone(),
-                repo.clone(),
-                owner.clone(),
-                ("id", json!({"type":"integer","minimum":1,"maximum":9007199254740991u64})),
-                ("tag_name", string_schema(1, 200)),
-                ("previous_tag_name", string_schema(1, 200)),
-                ("target_commitish", string_schema(1, 200)),
-                ("name", string_schema(1, 200)),
-                ("body", string_schema(0, MAX_RELEASE_BODY_BYTES as u64)),
-                ("draft", json!({"type":"boolean","default":true})),
-                ("prerelease", json!({"type":"boolean"})),
-                ("page", json!({"type":"integer","minimum":1,"maximum":100,"default":1})),
-                ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":30})),
-            ],
-            &["repo"],
-        ),
-        task_tool(
-            "github_pr",
-            "Pull Request。list 与 get 只读；create 默认草稿；merge 必须带编号，方式为 merge、squash 或 rebase。",
-            &["list", "get", "create", "merge"],
-            &[
-                credential.clone(),
-                credential_id.clone(),
-                repo.clone(),
-                owner.clone(),
-                ("state", json!({"type":"string","enum":["open","closed","all"],"default":"open"})),
-                number.clone(),
-                ("title", string_schema(1, 256)),
-                ("head", string_schema(1, 200)),
-                ("base", string_schema(1, 200)),
-                ("body", string_schema(0, MAX_RELEASE_BODY_BYTES as u64)),
-                ("draft", json!({"type":"boolean","default":true})),
-                ("merge_method", json!({"type":"string","enum":["merge","squash","rebase"],"default":"merge"})),
-                ("page", json!({"type":"integer","minimum":1,"maximum":100,"default":1})),
-                ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":30})),
-            ],
-            &["repo"],
-        ),
-        task_tool(
-            "github_issue",
-            "Issue。list 与 get 只读；create 开新单；comment 追加评论；close 关闭，不改标题和正文。",
-            &["list", "get", "create", "comment", "close"],
-            &[
-                credential,
-                credential_id,
-                repo,
-                owner,
-                ("state", json!({"type":"string","enum":["open","closed","all"],"default":"open"})),
-                number,
-                ("title", string_schema(1, 256)),
-                ("body", string_schema(0, MAX_RELEASE_BODY_BYTES as u64)),
-                ("labels", string_schema(1, 400)),
-                ("page", json!({"type":"integer","minimum":1,"maximum":100,"default":1})),
-                ("per_page", json!({"type":"integer","minimum":1,"maximum":50,"default":30})),
-            ],
-            &["repo"],
-        ),
-    ]
+fn normalize_tool_call(name: &str, mut args: Value) -> Result<(String, Value), String> {
+    let dispatched = task_dispatch_name(name, &args)?;
+    if is_task_tool(name) {
+        args.as_object_mut()
+            .ok_or_else(|| "工具参数必须是对象".to_string())?
+            .remove("action");
+    }
+    Ok((dispatched, args))
 }
 
 pub fn tool_definitions() -> Vec<Value> {
     let mut tools = api_tool_definitions();
-    tools.extend(task_tool_definitions());
     tools.extend(crate::git_workspace::tool_definitions());
     tools
 }
@@ -680,7 +623,7 @@ fn write_tool(name: &str, description: &str, input_schema: Value) -> Value {
 
 pub fn is_github_api_tool(name: &str) -> bool {
     let canonical = canonical_tool_name(name);
-    api_tool_definitions()
+    is_task_tool(canonical) || api_tool_definitions()
         .iter()
         .any(|definition| definition.get("name").and_then(Value::as_str) == Some(canonical))
 }
@@ -901,11 +844,7 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             .map(|text| (200, text))
             .map_err(|e| e.to_string());
     }
-    let dispatched = if name.starts_with("github_git_") {
-        name.to_string()
-    } else {
-        task_dispatch_name(name, &args)?
-    };
+    let (dispatched, args) = normalize_tool_call(name, args)?;
     let name = dispatched.as_str();
     let (token, credential_label) = prepare(session, name, &args)?;
     let (status, result) = match name {
@@ -1027,6 +966,40 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             )?;
             let dto = release_dto(&value).ok_or_else(|| "GitHub 响应格式不正确".to_string())?;
             Ok((status, dto))
+        }
+        "github_issues_get" | "github_issue_close" => {
+            let repository = repository_args(&args)?;
+            let number = issue_number(&args)?;
+            let path = format!("/repos/{repository}/issues/{number}");
+            let github = crate::github_api::Github::open(token.clone(), credential_label.clone());
+            let (status, value) = github.get(&path, Vec::new())?;
+            let dto = issue_dto(&value)
+                .ok_or_else(|| "目标不是 Issue 或 GitHub 响应格式不正确".to_string())?;
+            if name == "github_issues_get" {
+                Ok((status, dto))
+            } else {
+                let (status, value) = github.send(
+                    &crate::github_api::Call {
+                        method: crate::github_api::Method::Patch,
+                        path,
+                        query: Vec::new(),
+                        body: Some(crate::github_api::Body::Json(json!({"state":"closed"}))),
+                        ok: &[200],
+                        allow_missing_confirm: false,
+                    },
+                    Some(&crate::github_api::Confirm {
+                        title: "关闭 GitHub Issue".into(),
+                        prompt: "允许这次 GitHub 写操作？".into(),
+                        fields: vec![
+                            ("仓库".into(), format!("{repository}#{number}")),
+                            ("凭据".into(), credential_label.clone()),
+                        ],
+                    }),
+                )?;
+                let dto = issue_dto(&value)
+                    .ok_or_else(|| "GitHub 响应格式不正确".to_string())?;
+                Ok((status, dto))
+            }
         }
         "github_issue_create" => {
             let repository = repository_args(&args)?;
@@ -2055,9 +2028,9 @@ mod tests {
     fn all_write_tools_are_registered_for_shared_mcp() {
         let definitions = tool_definitions_for_mcp();
         for name in [
-            "github_release",
-            "github_pr",
-            "github_issue",
+            "github_release_publish",
+            "github_pr_merge",
+            "github_issue_close",
             "github_git",
             "github_release_create",
         ] {
@@ -2086,7 +2059,7 @@ mod tests {
     #[test]
     fn file_and_ref_tools_are_registered_for_shared_mcp() {
         let definitions = tool_definitions_for_mcp();
-        for name in ["github_release", "github_pr", "github_issue", "github_git"] {
+        for name in ["github_release_create", "github_pr_create", "github_issue_close", "github_git"] {
             assert!(definitions.iter().any(|definition| definition["name"] == name), "{name} missing");
         }
     }
@@ -2104,16 +2077,21 @@ mod tests {
 
 
     #[test]
-    fn issue_update_tool_is_registered_for_shared_mcp() {
+    fn compatibility_tools_are_callable_but_not_duplicated_in_catalog() {
         let definitions = tool_definitions_for_mcp();
+        let names: std::collections::HashSet<_> = definitions.iter()
+            .map(|definition| definition["name"].as_str().unwrap()).collect();
+        assert_eq!(names.len(), definitions.len());
         for name in ["github_issue", "github_pr", "github_release"] {
-            assert!(definitions.iter().any(|definition| definition["name"] == name), "{name} missing");
+            assert!(is_github_api_tool(name));
+            assert!(!names.contains(name));
         }
+        assert!(!names.contains("github_get_authenticated_user"));
     }
 
     #[test]
     fn task_tools_are_high_risk() {
-        for name in ["github_release", "github_pr", "github_issue", "github_git"] {
+        for name in ["github_release_create", "github_pr_create", "github_issue_close", "github_git"] {
             let def = find_tool(name);
             assert_eq!(def["readOnly"], false);
             assert_eq!(def["risk"], "high");
@@ -2273,8 +2251,8 @@ mod tests {
             "github_release_list",
             "github_release_get",
             "github_release_generate_notes",
-            "github_pr",
-            "github_issue",
+            "github_get_pull_request",
+            "github_issues_get",
         ] {
             assert!(
                 definitions
@@ -2295,7 +2273,7 @@ mod tests {
             .filter(|definition| definition["readOnly"] == true)
             .count();
         // Credentials, account, repos, issues, pull requests, and releases.
-        assert_eq!(read_only, 10);
+        assert_eq!(read_only, 11);
     }
 
     #[test]
@@ -2417,6 +2395,121 @@ mod tests {
         let text = call_tool(&mut session, "github_list_credentials", json!({})).unwrap();
         assert!(text.contains("github"));
         assert!(!text.contains("ghp_test_token_value"));
+    }
+
+    #[test]
+    fn all_legacy_actions_dispatch_to_valid_fine_grained_tools() {
+        let cases = [
+            ("github_issue", "list", "github_issues_list", json!({})),
+            ("github_issue", "get", "github_issues_get", json!({"number":1})),
+            ("github_issue", "create", "github_issue_create", json!({"title":"bug"})),
+            ("github_issue", "comment", "github_issue_comment", json!({"number":1,"body":"comment"})),
+            ("github_issue", "close", "github_issue_close", json!({"number":1})),
+            ("github_pr", "list", "github_pulls_list", json!({})),
+            ("github_pr", "get", "github_get_pull_request", json!({"number":1})),
+            ("github_pr", "create", "github_pr_create", json!({"title":"fix","head":"feature","base":"main"})),
+            ("github_pr", "merge", "github_pr_merge", json!({"number":1})),
+            ("github_release", "list", "github_release_list", json!({})),
+            ("github_release", "get", "github_release_get", json!({"id":1})),
+            ("github_release", "notes", "github_release_generate_notes", json!({"tag_name":"v1.0.0"})),
+            ("github_release", "create", "github_release_create", json!({"tag_name":"v1.0.0"})),
+            ("github_release", "publish", "github_release_publish", json!({"id":1})),
+        ];
+        let (vault, dek, _) = token_entry("github");
+        enable_mcp(&vault, &dek);
+        let mut session = Session::default();
+        session.set_unlocked(vault, dek);
+        for (legacy, action, target, mut args) in cases {
+            args["repo"] = json!("octocat/hello-world");
+            let expected = args.clone();
+            args["action"] = json!(action);
+            assert!(is_github_api_tool(legacy));
+            let (name, normalized) = normalize_tool_call(legacy, args).unwrap();
+            assert_eq!(name, target);
+            assert_eq!(normalized, expected);
+            prepare(&session, &name, &normalized).unwrap();
+        }
+    }
+
+    #[test]
+    fn compatibility_normalization_preserves_strict_validation() {
+        let (vault, dek, _) = token_entry("github");
+        enable_mcp(&vault, &dek);
+        let mut session = Session::default();
+        session.set_unlocked(vault, dek);
+        let probe = crate::github_api::TransportProbe::install(|_| panic!("invalid arguments must not send HTTP"));
+        for (name, args, expected) in [
+            ("github_issue", json!({"repo":"o/r"}), "action"),
+            ("github_issue", json!({"action":1,"repo":"o/r"}), "字符串"),
+            ("github_issue", json!({"action":"reopen","repo":"o/r"}), "不支持"),
+            ("github_issue", json!({"action":"get","repo":"o/r"}), "number"),
+            ("github_issue", json!({"action":"get","repo":"o/r","number":"1"}), "number"),
+            ("github_issue", json!({"action":"close","repo":"o/r","number":1,"title":"bad"}), "title"),
+            ("github_pr", json!({"action":"create","repo":"o/r","title":"x","base":"main"}), "head"),
+            ("github_release", json!({"action":"create","repo":"o/r","tag_name":"v1","draft":"true"}), "draft"),
+            ("github_issues_get", json!({"action":"get","repo":"o/r","number":1}), "action"),
+            ("github_get_authenticated_user", json!({"action":"get"}), "action"),
+        ] {
+            let error = call_tool(&mut session, name, args).unwrap_err();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+        assert!(probe.calls().is_empty());
+    }
+
+    #[test]
+    fn issue_get_and_close_send_expected_http_requests() {
+        let (vault, dek, _) = token_entry("github");
+        enable_mcp(&vault, &dek);
+        let mut session = Session::default();
+        session.set_unlocked(vault, dek);
+        for (name, args, close) in [
+            ("github_issues_get", json!({"repo":"octocat/hello-world","number":7}), false),
+            ("github_issue", json!({"action":"get","repo":"octocat/hello-world","number":7}), false),
+            ("github_issue_close", json!({"repo":"octocat/hello-world","number":7}), true),
+            ("github_issue", json!({"action":"close","repo":"octocat/hello-world","number":7}), true),
+        ] {
+            let probe = crate::github_api::TransportProbe::install(|call| {
+                Ok(crate::github_api::HttpReply {
+                    status: 200,
+                    body: serde_json::to_vec(&json!({"number":7,"title":"bug","state":if call.method == "PATCH" { "closed" } else { "open" }})).unwrap(),
+                })
+            });
+            let text = crate::confirm::with_auto(Some(true), || call_tool(&mut session, name, args)).unwrap();
+            let result: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(result["number"], 7);
+            assert_eq!(result["state"], if close { "closed" } else { "open" });
+            let calls = probe.calls();
+            assert_eq!(calls.len(), if close { 2 } else { 1 });
+            assert_eq!(calls[0].method, "GET");
+            for call in &calls {
+                assert_eq!(call.url, "https://api.github.com/repos/octocat/hello-world/issues/7");
+                assert_eq!(call.authorization, "Bearer ghp_test_token_value");
+            }
+            if close {
+                assert_eq!(calls[1].method, "PATCH");
+                assert_eq!(serde_json::from_slice::<Value>(&calls[1].body).unwrap(), json!({"state":"closed"}));
+            }
+        }
+    }
+
+    #[test]
+    fn issue_tools_reject_pull_requests_without_writing() {
+        let (vault, dek, _) = token_entry("github");
+        enable_mcp(&vault, &dek);
+        let mut session = Session::default();
+        session.set_unlocked(vault, dek);
+        let probe = crate::github_api::TransportProbe::install(|_| Ok(crate::github_api::HttpReply {
+            status: 200,
+            body: br#"{"number":7,"pull_request":{}}"#.to_vec(),
+        }));
+        for action in ["get", "close"] {
+            let error = crate::confirm::with_auto(Some(true), || call_tool(
+                &mut session, "github_issue", json!({"action":action,"repo":"o/r","number":7}),
+            )).unwrap_err();
+            assert!(error.contains("不是 Issue"), "{error}");
+        }
+        assert_eq!(probe.calls().len(), 2);
+        assert!(probe.calls().iter().all(|call| call.method == "GET"));
     }
 
     #[test]

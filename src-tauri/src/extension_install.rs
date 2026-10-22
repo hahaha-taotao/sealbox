@@ -603,8 +603,8 @@ mod windows_omnibox {
         use super::*;
 
         #[test]
-        fn missing_exe_has_no_window() {
-            let err = find_windows(Path::new(r"C:\missing\chrome.exe")).unwrap_err();
+        fn missing_process_has_no_window() {
+            let err = find_windows(Path::new(r"C:\missing\sealbox-missing-browser-test.exe")).unwrap_err();
             assert!(err.contains("未找到"), "{err}");
         }
 

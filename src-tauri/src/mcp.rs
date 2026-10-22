@@ -819,9 +819,9 @@ mod tests {
             "github_repo_list",
             "github_repo_get",
             "github_git",
-            "github_issue",
-            "github_pr",
-            "github_release",
+            "github_issues_get",
+            "github_pr_create",
+            "github_release_create",
             "github_list_credentials",
             "github_user_info",
         ] {
@@ -884,10 +884,10 @@ mod tests {
         for name in [
             "github_repo_list",
             "github_git",
-            "github_issue",
+            "github_issue_close",
             "github_list_credentials",
-            "github_release",
-            "github_pr",
+            "github_release_publish",
+            "github_pr_merge",
         ] {
             assert!(enabled.iter().any(|tool| tool == name), "missing {name}");
         }
@@ -902,6 +902,111 @@ mod tests {
         assert!(recover_lock(&mcp.fill_token).is_empty());
         assert!(recover_lock(&mcp.token).is_empty());
         stop(&mcp);
+    }
+
+    fn github_session(enabled: bool) -> Mutex<Session> {
+        let (vault, dek) = crate::vault::Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        vault.set_secret_setting(&dek, "zoomkey_mcp_policy", &format!(r#"{{"enabled":{enabled}}}"#)).unwrap();
+        vault.upsert_entry(&dek, crate::vault::UpsertEntry {
+            id: None,
+            kind: crate::vault::EntryKind::ApiToken,
+            title: "github".into(),
+            account: Some("octocat".into()),
+            url: None,
+            folder_id: None,
+            tags: Vec::new(),
+            pinned: false,
+            expires_at: None,
+            notes: None,
+            secret: crate::vault::SecretPayload::ApiToken {
+                service: "github".into(),
+                account: Some("octocat".into()),
+                token: "ghp_test_token_value".into(),
+            },
+        }).unwrap();
+        let mut session = Session::default();
+        session.set_unlocked(vault, dek);
+        Mutex::new(session)
+    }
+
+    fn github_rpc(session: &Mutex<Session>, name: &str, args: Value) -> Value {
+        handle_rpc(session, &McpState::default(), JsonRpcReq {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            method: "tools/call".into(),
+            params: json!({"name":name,"arguments":args}),
+        }).unwrap()
+    }
+
+    #[test]
+    fn github_legacy_rpc_reads_and_denied_writes_reach_shared_handlers() {
+        let session = github_session(true);
+        let probe = crate::github_api::TransportProbe::install(|call| {
+            assert_eq!(call.method, "GET");
+            Ok(crate::github_api::HttpReply {
+                status: 200,
+                body: br#"{"number":7,"title":"bug","state":"open","login":"octocat"}"#.to_vec(),
+            })
+        });
+        let read = github_rpc(&session, "github_issue", json!({"action":"get","repo":"o/r","number":7}));
+        assert_eq!(read["result"]["isError"], false, "{read}");
+        assert_eq!(read["result"]["structuredContent"]["number"], 7);
+        assert_eq!(probe.calls()[0].url, "https://api.github.com/repos/o/r/issues/7");
+        let alias = github_rpc(&session, "github_get_authenticated_user", json!({}));
+        assert_eq!(alias["result"]["isError"], false, "{alias}");
+        assert_eq!(alias["result"]["structuredContent"]["login"], "octocat");
+        let denied = crate::confirm::with_auto(Some(false), || github_rpc(
+            &session, "github_issue", json!({"action":"close","repo":"o/r","number":7}),
+        ));
+        assert_eq!(denied["result"]["isError"], true, "{denied}");
+        assert!(denied["result"]["content"][0]["text"].as_str().unwrap().contains("拒绝"));
+        let create_denied = crate::confirm::with_auto(Some(false), || github_rpc(
+            &session, "github_issue", json!({"action":"create","repo":"o/r","title":"bug"}),
+        ));
+        assert_eq!(create_denied["result"]["isError"], true, "{create_denied}");
+        assert!(create_denied["result"]["content"][0]["text"].as_str().unwrap().contains("拒绝"));
+        assert_eq!(probe.calls().len(), 3);
+        assert!(probe.calls().iter().all(|call| call.method == "GET"));
+    }
+
+    #[test]
+    fn github_compatibility_rpc_respects_lock_and_mcp_switch() {
+        let probe = crate::github_api::TransportProbe::install(|_| panic!("disabled calls must not reach HTTP"));
+        for (session, expected) in [
+            (Mutex::new(Session::default()), "锁定"),
+            (github_session(false), "未启用"),
+        ] {
+            for (name, args) in [
+                ("github_issue", json!({"action":"get","repo":"o/r","number":1})),
+                ("github_pr", json!({"action":"list","repo":"o/r"})),
+                ("github_release", json!({"action":"list","repo":"o/r"})),
+                ("github_get_authenticated_user", json!({})),
+            ] {
+                let response = github_rpc(&session, name, args);
+                assert_eq!(response["result"]["isError"], true);
+                assert!(response["result"]["content"][0]["text"].as_str().unwrap().contains(expected), "{response}");
+            }
+        }
+        assert!(probe.calls().is_empty());
+    }
+
+    #[test]
+    fn github_rpc_catalog_contains_only_fine_grained_api_tools() {
+        let response = handle_rpc(&github_session(true), &McpState::default(), JsonRpcReq {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            method: "tools/list".into(),
+            params: json!({}),
+        }).unwrap();
+        let tools = response["result"]["tools"].as_array().unwrap();
+        let names: std::collections::HashSet<_> = tools.iter().map(|tool| tool["name"].as_str().unwrap()).collect();
+        assert_eq!(names.len(), tools.len());
+        for name in ["github_issue", "github_pr", "github_release", "github_get_authenticated_user"] {
+            assert!(!names.contains(name));
+        }
+        for name in ["github_issues_get", "github_issue_close", "github_git", "github_user_info"] {
+            assert!(names.contains(name));
+        }
     }
 
     #[test]
