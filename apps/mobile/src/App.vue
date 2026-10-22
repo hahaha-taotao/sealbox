@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onMounted, reactive, ref, watch } from "vue";
 import { listen } from "@tauri-apps/api/event";
+import { onBackButtonPress } from "@tauri-apps/api/app";
+import type { PluginListener } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { authenticate, checkStatus, getData, hasData, removeData, setData } from "@choochmeque/tauri-plugin-biometry-api";
 import { KINDS, api, kindLabel, type Counts, type EntryDto, type EntryKind, type Folder, type MobileRelease, type SyncReport, type SyncView } from "./api";
@@ -48,6 +50,54 @@ const updateProgress = computed(() => {
   if (!downloadTotal.value || downloadTotal.value <= 0) return null;
   return Math.min(100, Math.round((downloadedBytes.value / downloadTotal.value) * 100));
 });
+
+let backListener: PluginListener | null = null;
+let backQueue: Promise<void> = Promise.resolve();
+
+function canGoBackInApp() {
+  if (page.value === "vault") return filtersOpen.value;
+  return page.value === "detail" || page.value === "edit" || page.value === "settings" || page.value === "sync";
+}
+
+function goBack() {
+  switch (page.value) {
+    case "detail":
+      page.value = "vault";
+      break;
+    case "edit":
+      page.value = editing.value ? "detail" : "vault";
+      break;
+    case "sync":
+      page.value = "settings";
+      break;
+    case "settings":
+      page.value = "vault";
+      break;
+    case "vault":
+      filtersOpen.value = false;
+      break;
+  }
+}
+
+function syncBackListener() {
+  backQueue = backQueue
+    .then(async () => {
+      const wanted = canGoBackInApp();
+      if (wanted === Boolean(backListener)) return;
+      if (wanted) {
+        backListener = await onBackButtonPress(() => {
+          if (canGoBackInApp()) goBack();
+        });
+        return;
+      }
+      const listener = backListener;
+      backListener = null;
+      await listener?.unregister();
+    })
+    .catch(() => {});
+}
+
+watch([page, filtersOpen], syncBackListener);
 
 const DOMAIN = "com.sealbox.mobile";
 const DEK_NAME = "vault-dek";
