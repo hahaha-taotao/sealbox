@@ -105,6 +105,7 @@ textarea { min-height: 72px; resize: vertical; }
   display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; font-size: 12px;
 }
 .tab.on { color: var(--brand); font-weight: 700; }
+.tab svg { width: 22px; height: 22px; display: block; }
 .fab {
   position: fixed; right: calc(18px + var(--safe-right)); bottom: calc(78px + var(--safe-bottom));
   width: 52px; height: 52px; border: 0; border-radius: 18px;
