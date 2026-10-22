@@ -4,19 +4,19 @@
 
 A local credential vault for Windows. Unlock with a master password. Website logins, API tokens, SSH keys, mailboxes, servers, and databases stay encrypted on disk. Copied secrets are cleared from the clipboard on a timer. Encrypted `.svbak` backups can be exported and imported. An optional localhost MCP lets Cursor / Claude Code use credentials without seeing plaintext. A Chrome / Edge extension can fill or save website logins.
 
-当前版本 Current version: **v0.6.1** (`0.6.1`)
+当前版本 Current version: **v0.9.0** (`0.9.0`)
 
 ### 当前范围口径 Scope of this release
 
-当前实现以 `v0.6.1` 的代码和本文档为准。`docs/superpowers/specs/2026-09-11-local-credential-vault-design.md` 是 9 月 11 日的初始基线；后续 9 月 17 日、18 日、20 日和 24 日的规格对冲突部分作了增量修订，尤其是 Chrome / Edge 填充、TOTP、CSV 导入、本地 Git 和受控 GitHub MCP。9 月 28 日的 QR 入库与页面 OTP 候选仍是待审阅提案，不属于当前版本。
+当前实现以当前 `master` 的代码和本文档为准。`docs/superpowers/specs/2026-09-11-local-credential-vault-design.md` 是 9 月 11 日的初始基线；后续 9 月 17 日、18 日、20 日和 24 日的规格对冲突部分作了增量修订，尤其是 Chrome / Edge 填充、TOTP、CSV 导入、本地 Git 和受控 GitHub MCP。9 月 28 日的 QR 入库与页面 OTP 候选仍是待审阅提案，不属于当前版本。
 
-The `v0.2.4` code and this README define the current shipped scope. The September 11 design is the original baseline; later dated specifications supersede conflicting parts, including Chrome / Edge fill, TOTP, CSV import, local Git, and guarded GitHub MCP. The September 28 QR-enrollment and page-OTP proposals are not shipped.
+The current `master` code and this README define the current shipped scope. The September 11 design is the original baseline; later dated specifications supersede conflicting parts, including Chrome / Edge fill, TOTP, CSV import, local Git, and guarded GitHub MCP. The September 28 QR-enrollment and page-OTP proposals are not shipped.
 
 ## 在线更新 Online updates
 
 在「设置」底部的「关于 Sealbox」中点击「检查更新」，应用会查询固定的 HTTPS Tauri updater endpoint。发现更新后，应用会在窗口内下载并校验签名，显示下载进度；下载完成后确认安装，签名 NSIS 安装器会接管替换并重启应用。若签名元数据暂不可用，仍可打开 GitHub 发布页手动安装。
 
-发布工作流同时上传 Windows 安装包、Tauri updater 元数据 `latest.json` 和对应的 `.sig` 签名文件。桌面更新读取 GitHub `/releases/latest` 上的 `latest.json`，因此只有 `v*` 桌面发布可以成为最新发布。`mobile-v*` 必须设置 `make_latest: false`，否则会把桌面更新入口指到没有 `latest.json` 的 APK 发布上，检查更新会报 `Could not fetch a valid release JSON from the remote`。现有 v0.1.4 及更早安装包没有应用内签名安装能力，首次升级到已启用 Tauri updater 的版本必须手动运行一次安装包。升级后金库文件仍留在原数据目录，不会随程序安装目录移动。
+发布工作流同时上传 Windows 安装包、Android APK、Tauri updater 元数据 `latest.json` 和对应的 `.sig` 签名文件。桌面与 Android 共用同一个版本号，一次 `vX.Y.Z` 发布同时产出两端；桌面更新读取 GitHub `/releases/latest` 上的 `latest.json`，所以只有 `v*` 发布会成为最新发布。现有 v0.1.4 及更早安装包没有应用内签名安装能力，首次升级到已启用 Tauri updater 的版本必须手动运行一次安装包。升级后金库文件仍留在原数据目录，不会随程序安装目录移动。
 
 ## 首次手动升级 First manual upgrade
 
@@ -97,12 +97,12 @@ npm run tauri build
 
 ## 发布 Release
 
-发布只接受形如 `v0.6.0` 的 Git tag。`.github/workflows/release.yml` 在 Windows runner 上依次执行 `npm ci`、版本一致性校验、Rust 测试、前端构建和扩展测试，全部通过后由 `tauri-apps/tauri-action` 构建并发布 NSIS 安装包、`latest.json` 和对应的 `.sig` updater 签名文件。
+发布只接受形如 `v0.9.0` 的 Git tag，桌面和 Android 共用这一个版本号。`.github/workflows/release.yml` 在 Windows runner 上依次执行 `npm ci`、版本一致性校验、Rust 测试、前端构建和扩展测试，全部通过后由 `tauri-apps/tauri-action` 构建并发布 NSIS 安装包、`latest.json` 和对应的 `.sig` updater 签名文件；随后的 `android` job 用同一个 commit 构建 arm64 APK，挂到同一个 Release 上。
 
-版本号必须同时匹配以下文件：`package.json`、`package-lock.json`（根版本和 `packages[""].version`）、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json`、`extension/manifest.json`。本地可在打 tag 前运行：
+版本号必须同时匹配以下 9 个字段：`package.json`、`package-lock.json`（根版本和 `packages[""].version`）、`src-tauri/Cargo.toml`、`src-tauri/tauri.conf.json`、`extension/manifest.json`、`src-tauri-mobile/tauri.conf.json`、`src-tauri-mobile/Cargo.toml`、`Cargo.lock` 里的 `sealbox` 与 `sealbox-mobile`。本地可在打 tag 前运行：
 
 ```bash
-node scripts/check-version.mjs v0.6.0
+node scripts/check-version.mjs v0.9.0
 ```
 
 GitHub Actions 只从 Secrets 注入签名材料，不会把私钥写入仓库或工作区。请在仓库 Settings → Secrets and variables → Actions 中配置：

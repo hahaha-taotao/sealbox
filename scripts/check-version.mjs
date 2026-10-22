@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
-const tagPattern = /^(mobile-)?v(\d+\.\d+\.\d+)$/;
+const tagPattern = /^v(\d+\.\d+\.\d+)$/;
 
 function readText(relativePath) {
   return readFileSync(join(repoRoot, relativePath), "utf8");
@@ -83,16 +83,16 @@ function mobileVersions() {
 function main() {
   const [tag, ...extraArgs] = process.argv.slice(2);
   if (!tag || extraArgs.length > 0) {
-    throw new Error("用法：node scripts/check-version.mjs v0.7.2 | mobile-v0.1.5");
+    throw new Error("用法：node scripts/check-version.mjs v0.9.0");
   }
 
   const match = tag.match(tagPattern);
   if (!match) {
-    throw new Error(`发布 tag 必须是 vX.Y.Z 或 mobile-vX.Y.Z 格式，收到：${tag}`);
+    throw new Error(`发布 tag 必须是 vX.Y.Z 格式，收到：${tag}`);
   }
-  // 桌面和 Android 各自一条版本线：v* 校桌面字段，mobile-v* 校移动字段。
-  const expectedVersion = match[2];
-  const versions = match[1] ? mobileVersions() : desktopVersions();
+  // 桌面与 Android 共用一条版本线，v* 校验两端的全部字段。
+  const expectedVersion = match[1];
+  const versions = [...desktopVersions(), ...mobileVersions()];
   const mismatches = versions.filter(([, version]) => version !== expectedVersion);
 
   if (mismatches.length > 0) {
