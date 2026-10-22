@@ -2,9 +2,12 @@ name: Android APK
 
 on:
   workflow_dispatch:
+  push:
+    tags:
+      - "mobile-v*"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   apk:
@@ -124,11 +127,17 @@ jobs:
         working-directory: .
         run: |
           VERSION="$(node -p "require('./src-tauri-mobile/tauri.conf.json').version")"
+          # 手机上的更新检查按 tag 里的版本号比较，打错 tag 会直接推错包。
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "mobile-v${VERSION}" != "$GITHUB_REF_NAME" ]; then
+            echo "tag ${GITHUB_REF_NAME} 与 tauri.conf.json 的 ${VERSION} 不一致" >&2
+            exit 1
+          fi
           APK="$(find src-tauri-mobile/gen/android/app/build/outputs/apk -type f -name '*.apk' | head -n 1)"
           test -n "$APK"
           mkdir -p dist
           cp "$APK" "dist/Sealbox-mobile-${VERSION}-arm64.apk"
           echo "APK_PATH=dist/Sealbox-mobile-${VERSION}-arm64.apk" >> "$GITHUB_ENV"
+          echo "APK_VERSION=${VERSION}" >> "$GITHUB_ENV"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -136,3 +145,12 @@ jobs:
           name: sealbox-mobile-arm64
           path: ${{ env.APK_PATH }}
           if-no-files-found: error
+
+      - name: Upload APK to the release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Sealbox mobile ${{ env.APK_VERSION }}
+          files: ${{ env.APK_PATH }}
+          fail_on_unmatched_files: true

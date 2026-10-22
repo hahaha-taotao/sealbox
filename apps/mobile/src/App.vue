@@ -5,7 +5,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { authenticate, checkStatus, getData, hasData, removeData, setData } from "@choochmeque/tauri-plugin-biometry-api";
 import { KINDS, api, kindLabel, type Counts, type EntryDto, type EntryKind, type Folder, type MobileRelease, type SyncReport, type SyncView } from "./api";
 
-type Page = "lock" | "vault" | "query" | "detail" | "edit" | "settings" | "sync";
+type Page = "lock" | "vault" | "detail" | "edit" | "settings" | "sync";
 const page = ref<Page>("lock");
 const initialized = ref(false);
 const biometryOn = ref(false);
@@ -23,6 +23,8 @@ const query = ref("");
 const folderId = ref("");
 const tag = ref("");
 const trash = ref(false);
+const uncategorized = ref(false);
+const filtersOpen = ref(false);
 const selected = ref<EntryDto | null>(null);
 const revealed = ref("");
 const notes = ref("");
@@ -117,6 +119,7 @@ async function loadVault() {
     api.entries({
       query: null,
       folder_id: folderId.value || null,
+      uncategorized: uncategorized.value,
       tag: tag.value || null,
       trash: trash.value,
       sort: "updated",
@@ -334,8 +337,31 @@ async function togglePin() {
 async function addFolder() {
   const name = window.prompt("文件夹名称");
   if (!name) return;
-  await api.createFolder(name);
-  folders.value = await api.folders();
+  const folder = await api.createFolder(name);
+  await pickFolder(folder.id);
+}
+
+async function pickFolder(id: string) {
+  folderId.value = id;
+  uncategorized.value = false;
+  trash.value = false;
+  await loadVault();
+}
+
+async function pickUncategorized() {
+  folderId.value = "";
+  uncategorized.value = true;
+  trash.value = false;
+  await loadVault();
+}
+
+async function toggleTrash() {
+  trash.value = !trash.value;
+  if (trash.value) {
+    folderId.value = "";
+    uncategorized.value = false;
+  }
+  await loadVault();
 }
 
 async function openSettings() {
@@ -501,15 +527,44 @@ onMounted(async () => {
 
     <template v-else-if="page === 'vault'">
       <div class="view">
-        <div class="chips">
-          <button class="chip" :class="{ on: !kind && !trash }" @click="kind = ''; trash = false">全部 {{ counts?.total ?? 0 }}</button>
-          <button v-for="item in KINDS" :key="item.id" class="chip" :class="{ on: kind === item.id }" @click="kind = item.id">
-            {{ item.label }} {{ counts?.[item.count] ?? 0 }}
+        <div class="searchbar">
+          <input v-model="query" placeholder="搜索键名 / 账号 / 网址" />
+          <button
+            class="icon"
+            :class="{ on: filtersOpen }"
+            :aria-expanded="filtersOpen"
+            aria-label="筛选"
+            @click="filtersOpen = !filtersOpen"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M7 12h10M10 17h4"/></svg>
           </button>
-          <span style="flex:1"></span>
-          <button class="icon" title="查询" @click="page = 'query'">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="6"/><path d="m20 20-3.2-3.2"/></svg>
-          </button>
+        </div>
+        <div class="chips folders">
+          <button class="chip" :class="{ on: !folderId && !uncategorized && !trash }" @click="pickFolder('')">全部 {{ counts?.total ?? 0 }}</button>
+          <button class="chip" :class="{ on: uncategorized }" @click="pickUncategorized()">未归类</button>
+          <button v-for="folder in folders" :key="folder.id" class="chip" :class="{ on: folderId === folder.id }" @click="pickFolder(folder.id)">{{ folder.name }}</button>
+          <button class="chip" @click="addFolder">+ 新建</button>
+        </div>
+        <div v-if="filtersOpen" class="panel">
+          <div class="lbl">类型</div>
+          <div class="chips flat">
+            <button class="chip" :class="{ on: !kind }" @click="kind = ''">全部</button>
+            <button v-for="item in KINDS" :key="item.id" class="chip" :class="{ on: kind === item.id }" @click="kind = item.id">
+              {{ item.label }} {{ counts?.[item.count] ?? 0 }}
+            </button>
+          </div>
+          <template v-if="tags.length">
+            <div class="lbl">标签</div>
+            <div class="chips flat">
+              <button class="chip" :class="{ on: !tag }" @click="tag = ''; loadVault()">全部</button>
+              <button v-for="item in tags" :key="item" class="chip" :class="{ on: tag === item }" @click="tag = item; loadVault()">{{ item }}</button>
+            </div>
+          </template>
+          <div class="lbl">其他</div>
+          <div class="chips flat">
+            <button class="chip" :class="{ on: trash }" @click="toggleTrash">回收站 {{ counts?.trash ?? 0 }}</button>
+          </div>
+          <button v-if="trash" class="danger" @click="api.emptyTrash().then(loadVault)">清空回收站，不可恢复</button>
         </div>
         <div class="scroll">
           <div class="list">
@@ -530,33 +585,6 @@ onMounted(async () => {
       </div>
       <button class="fab" @click="page = 'edit'; Object.assign(form, blankForm())">+</button>
     </template>
-
-    <section v-else-if="page === 'query'" class="view">
-      <div class="top"><button class="link" @click="page = 'vault'">返回</button><h1>查询</h1></div>
-      <div class="scroll pad">
-        <div class="field"><label>关键字</label><input v-model="query" placeholder="键名、账号、网址" /></div>
-        <div class="lbl">文件夹</div>
-        <div class="chips" style="padding:0;flex-wrap:wrap">
-          <button class="chip" :class="{ on: !folderId }" @click="folderId = ''; loadVault()">全部</button>
-          <button class="chip" @click="folderId = ''; loadVault()">未归类</button>
-          <button v-for="folder in folders" :key="folder.id" class="chip" :class="{ on: folderId === folder.id }" @click="folderId = folder.id; loadVault()">{{ folder.name }}</button>
-          <button class="chip" @click="addFolder">新建</button>
-        </div>
-        <div class="gap"></div>
-        <div class="lbl">标签</div>
-        <div class="chips" style="padding:0;flex-wrap:wrap">
-          <button class="chip" :class="{ on: !tag }" @click="tag = ''; loadVault()">全部</button>
-          <button v-for="item in tags" :key="item" class="chip" :class="{ on: tag === item }" @click="tag = item; loadVault()">{{ item }}</button>
-        </div>
-        <div class="gap"></div>
-        <button class="item" @click="trash = !trash; loadVault()">
-          <span class="meta"><span class="name">回收站</span><span class="line">{{ counts?.trash ?? 0 }} 条 · 清空需要再次确认</span></span>
-        </button>
-        <div class="gap"></div>
-        <button v-if="trash" class="danger" @click="api.emptyTrash().then(loadVault)">清空回收站</button>
-        <p class="hint">删除没有墓碑。一台删掉而另一台还留着，下次同步会回来。想让删除传过去，放进回收站。</p>
-      </div>
-    </section>
 
     <section v-else-if="page === 'detail' && selected" class="view">
       <div class="top"><button class="link" @click="page = 'vault'">返回</button><h1>{{ selected.title }}</h1><button class="link" @click="startEdit">编辑</button></div>
