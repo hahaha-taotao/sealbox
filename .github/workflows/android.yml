@@ -9,6 +9,11 @@ on:
 permissions:
   contents: write
 
+# 同一个 ref 被重复触发时（比如 tag 推了两遍）只留一套构建，避免两套并行抢同一个 Release 资产。
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   apk:
     name: Build Android arm64 APK
