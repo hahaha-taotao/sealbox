@@ -46,9 +46,28 @@ const updateCheckedAt = ref("");
 const downloadedBytes = ref(0);
 const downloadTotal = ref<number | null>(null);
 const downloadedPath = ref("");
+const updateDialogOpen = ref(false);
+let autoUpdateChecked = false;
 const updateProgress = computed(() => {
   if (!downloadTotal.value || downloadTotal.value <= 0) return null;
   return Math.min(100, Math.round((downloadedBytes.value / downloadTotal.value) * 100));
+});
+const aboutUpdateText = computed(() => {
+  if (updateStage.value === "checking") return "正在检查更新…";
+  if (updateStage.value === "downloading") {
+    return updateProgress.value === null ? "正在下载更新…" : `正在下载更新… ${updateProgress.value}%`;
+  }
+  if (updateStage.value === "ready") return "更新已下载，等待安装";
+  if (updateStage.value === "error") return "更新未完成，可重试";
+  if (release.value?.update_available) return `发现新版本 v${release.value.latest_version}`;
+  if (updateCheckedAt.value) return `已是最新版本 · ${updateCheckedAt.value} 检查`;
+  return "从 GitHub Releases 检查";
+});
+const aboutUpdateAction = computed(() => {
+  if (updateStage.value === "checking") return "检查中…";
+  return release.value?.update_available || updateStage.value === "downloading" || updateStage.value === "ready"
+    ? "查看更新"
+    : "检查更新";
 });
 
 let backListener: PluginListener | null = null;
@@ -152,6 +171,7 @@ async function refreshStatus() {
   biometryOn.value = status.biometry_enabled;
   counts.value = status.counts;
   if (!status.unlocked && page.value !== "lock") page.value = "lock";
+  if (!status.unlocked) updateDialogOpen.value = false;
   biometryReady.value = false;
   if (status.biometry_enabled && !status.unlocked) {
     try {
@@ -186,6 +206,7 @@ async function loadVault() {
 
 async function openVault() {
   page.value = "vault";
+  void autoCheckUpdate();
   await loadVault();
 }
 
@@ -212,14 +233,12 @@ async function submitPassword() {
 async function unlockFingerprint() {
   error.value = "";
   try {
-    await authenticate("用指纹打开印盒", {
-      title: "印盒",
-      subtitle: "验证指纹",
+    const stored = await getData({
+      domain: DOMAIN,
+      name: DEK_NAME,
+      reason: "用指纹打开印盒",
       cancelTitle: "取消",
-      allowDeviceCredential: false,
-      confirmationRequired: false,
     });
-    const stored = await getData({ domain: DOMAIN, name: DEK_NAME, reason: "打开保险库" });
     await api.unlockDek(stored.data);
     await openVault();
   } catch (caught) {
@@ -436,7 +455,7 @@ function formatWhen(value: string | null) {
   return value.slice(0, 16).replace("T", " ");
 }
 
-async function checkForUpdates() {
+async function checkForUpdates(auto = false) {
   if (updateStage.value === "checking" || updateStage.value === "downloading") return;
   updateStage.value = "checking";
   updateError.value = "";
@@ -449,11 +468,37 @@ async function checkForUpdates() {
     downloadedBytes.value = 0;
     downloadTotal.value = found.asset_size || null;
     updateStage.value = found.update_available ? "available" : "idle";
-    if (!found.update_available) toast.value = "已是最新版本";
+    if (found.update_available && page.value !== "lock") {
+      updateDialogOpen.value = true;
+    } else if (!auto) {
+      toast.value = "已是最新版本";
+      window.setTimeout(() => (toast.value = ""), 1800);
+    }
   } catch (caught) {
     updateStage.value = "error";
     updateError.value = caught instanceof Error ? caught.message : String(caught);
+    if (auto) {
+      updateStage.value = "idle";
+      updateError.value = "";
+    } else {
+      toast.value = `检查更新失败：${updateError.value}`;
+      window.setTimeout(() => (toast.value = ""), 2400);
+    }
   }
+}
+
+async function autoCheckUpdate() {
+  if (autoUpdateChecked) return;
+  autoUpdateChecked = true;
+  await checkForUpdates(true);
+}
+
+function onUpdateClick() {
+  if (release.value?.update_available || updateStage.value === "downloading" || updateStage.value === "ready") {
+    updateDialogOpen.value = true;
+    return;
+  }
+  void checkForUpdates();
 }
 
 async function downloadUpdate() {
@@ -471,6 +516,7 @@ async function downloadUpdate() {
     downloadedPath.value = saved.path;
     downloadedBytes.value = saved.bytes;
     updateStage.value = "ready";
+    if (page.value !== "lock") updateDialogOpen.value = true;
   } catch (caught) {
     updateStage.value = "error";
     updateError.value = caught instanceof Error ? caught.message : String(caught);
@@ -481,14 +527,19 @@ async function downloadUpdate() {
 
 async function installUpdate() {
   if (!downloadedPath.value || !release.value) return;
-  if (!window.confirm(`将打开系统安装界面安装 v${release.value.latest_version}。保险库数据不会被替换。`)) return;
   try {
     await api.installUpdate(downloadedPath.value);
     toast.value = "已打开系统安装界面";
+    window.setTimeout(() => (toast.value = ""), 1800);
   } catch (caught) {
     updateStage.value = "error";
     updateError.value = caught instanceof Error ? caught.message : String(caught);
   }
+}
+
+function retryUpdate() {
+  if (release.value?.update_available) void downloadUpdate();
+  else void checkForUpdates();
 }
 
 async function openReleasePage() {
@@ -551,6 +602,7 @@ async function saveSync(run: boolean) {
 async function lockNow() {
   await api.lock();
   page.value = "lock";
+  updateDialogOpen.value = false;
   entries.value = [];
   selected.value = null;
 }
@@ -559,6 +611,7 @@ onMounted(async () => {
   await refreshStatus();
   await listen("lock-now", () => {
     page.value = "lock";
+    updateDialogOpen.value = false;
     entries.value = [];
   });
   await listen<{ ok: boolean; error: string | null; report: SyncReport | null }>(
@@ -771,34 +824,10 @@ onMounted(async () => {
               <span class="t">当前版本<small>Android</small></span>
               <strong>v{{ appVersion || "…" }}</strong>
             </div>
-            <div v-if="release" class="set">
-              <span class="t">最新版本<small>{{ formatWhen(release.published_at) || "GitHub Releases" }}</small></span>
-              <strong>v{{ release.latest_version }}</strong>
-            </div>
-            <p v-if="updateError" class="error update-note">{{ updateError }}</p>
-            <p v-else-if="updateStage === 'checking'" class="hint update-note">正在检查 GitHub Releases…</p>
-            <p v-else-if="updateStage === 'idle' && updateCheckedAt" class="hint update-note">已是最新版本 · {{ updateCheckedAt }} 检查</p>
-            <p v-else-if="updateStage === 'available'" class="hint update-note">发现新版本，下载后由系统安装。</p>
-            <div v-if="release?.notes" class="update-notes">
-              <strong>更新说明</strong>
-              <p>{{ release.notes }}</p>
-            </div>
-            <div v-if="updateStage === 'downloading' || updateStage === 'ready'" class="update-progress">
-              <div class="update-progress-head">
-                <span>{{ updateStage === 'ready' ? '下载完成' : '下载进度' }}</span>
-                <strong v-if="updateProgress !== null">{{ updateProgress }}%</strong>
-              </div>
-              <div class="track"><span :style="{ width: `${updateProgress ?? 0}%` }"></span></div>
-              <p class="hint">{{ formatBytes(downloadedBytes) }}<span v-if="downloadTotal"> / {{ formatBytes(downloadTotal) }}</span></p>
-            </div>
-            <div class="update-actions">
-              <button class="primary" :disabled="updateStage === 'checking' || updateStage === 'downloading'" @click="checkForUpdates">
-                {{ updateStage === 'checking' ? '检查中' : '检查更新' }}
-              </button>
-              <button v-if="updateStage === 'available' || (updateStage === 'error' && release?.update_available)" class="ghost" @click="downloadUpdate">下载更新</button>
-              <button v-if="updateStage === 'ready'" class="primary" @click="installUpdate">安装</button>
-              <button v-if="release" class="ghost" @click="openReleasePage">打开发布页</button>
-            </div>
+            <button class="set" :disabled="updateStage === 'checking'" @click="onUpdateClick">
+              <span class="t">检查更新<small>{{ aboutUpdateText }}</small></span>
+              <span>›</span>
+            </button>
           </div>
         </div>
         <div class="tabs">
@@ -862,6 +891,41 @@ onMounted(async () => {
         <p class="hint">远端只有加密快照。同步密钥解不开主密码。</p>
       </div>
     </section>
+    <div v-if="updateDialogOpen && release" class="sheet-mask" @click.self="updateDialogOpen = false">
+      <div class="sheet update-sheet" role="dialog" aria-modal="true" aria-labelledby="update-sheet-title">
+        <div class="sheet-head">
+          <div>
+            <h2 id="update-sheet-title">{{ updateStage === "ready" ? "更新已就绪" : "发现新版本" }}</h2>
+            <p class="hint">Sealbox Android</p>
+          </div>
+          <span class="ver">v{{ release.latest_version }}</span>
+        </div>
+        <div class="update-versions">
+          <span>当前版本</span>
+          <strong>v{{ appVersion || release.current_version }}</strong>
+          <template v-if="release.published_at">
+            <span>发布时间</span>
+            <strong>{{ formatWhen(release.published_at) }}</strong>
+          </template>
+        </div>
+        <div v-if="updateStage === 'downloading' || updateStage === 'ready'" class="update-progress">
+          <div class="update-progress-head">
+            <span>{{ updateStage === "ready" ? "下载完成" : "正在下载更新" }}</span>
+            <strong v-if="updateProgress !== null">{{ updateProgress }}%</strong>
+          </div>
+          <div class="track"><span :style="{ width: `${updateProgress ?? 0}%` }"></span></div>
+          <p class="hint">{{ formatBytes(downloadedBytes) }}<span v-if="downloadTotal"> / {{ formatBytes(downloadTotal) }}</span></p>
+        </div>
+        <p v-if="updateError" class="error update-sheet-error">{{ updateError }}</p>
+        <div class="sheet-actions">
+          <button class="ghost" @click="updateDialogOpen = false">稍后</button>
+          <button v-if="updateStage === 'available'" class="primary" @click="downloadUpdate">立即更新</button>
+          <button v-else-if="updateStage === 'error'" class="primary" @click="retryUpdate">重试下载</button>
+          <button v-else-if="updateStage === 'ready'" class="primary" @click="installUpdate">安装</button>
+        </div>
+        <button class="link release-link" @click="openReleasePage">打开发布页</button>
+      </div>
+    </div>
     <div v-if="toast" class="toast">{{ toast }}</div>
   </div>
 </template>

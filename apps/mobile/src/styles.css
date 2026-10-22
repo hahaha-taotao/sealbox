@@ -151,11 +151,30 @@ textarea { min-height: 72px; resize: vertical; }
   border-radius: 12px; padding: 10px 12px; text-align: center; font-size: 13px;
 }
 .gap { height: 8px; }
-.update-note, .update-notes, .update-progress, .update-actions { padding: 0 14px 12px; }
-.update-notes { color: var(--muted); font-size: 13px; line-height: 1.55; }
-.update-notes strong { display: block; color: var(--ink); margin-bottom: 4px; }
-.update-notes p { margin: 0; white-space: pre-wrap; }
+.sheet-mask {
+  position: fixed; inset: 0; z-index: 30;
+  display: flex; align-items: flex-end;
+  background: rgba(20, 20, 30, 0.32);
+}
+.sheet {
+  width: 100%; background: #fff; border-radius: 18px 18px 0 0;
+  padding: 18px calc(16px + var(--safe-right)) calc(14px + var(--safe-bottom)) calc(16px + var(--safe-left));
+}
+.sheet-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.sheet-head h2 { margin: 0 0 4px; font-size: 17px; }
+.sheet-head .hint { margin: 0; }
+.sheet-head .ver {
+  flex: none; border-radius: 999px; background: var(--soft); color: var(--brand);
+  padding: 4px 10px; font-size: 12px; font-weight: 700;
+}
+.update-versions { display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; margin: 16px 0; font-size: 14px; }
+.update-versions span { color: var(--muted); }
+.update-versions strong { font-weight: 650; }
+.update-progress { margin-bottom: 4px; }
 .update-progress-head { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 6px; }
 .track { height: 6px; border-radius: 999px; background: var(--line); overflow: hidden; }
-.track span { display: block; height: 100%; background: var(--brand); }
-.update-actions { display: flex; flex-direction: column; gap: 8px; }
+.track span { display: block; height: 100%; background: var(--brand); transition: width .2s ease; }
+.update-sheet-error { margin: 0 0 4px; font-size: 12px; overflow-wrap: anywhere; }
+.sheet-actions { display: flex; gap: 8px; margin-top: 14px; }
+.sheet-actions button { flex: 1; }
+.release-link { display: block; margin: 10px auto 0; }

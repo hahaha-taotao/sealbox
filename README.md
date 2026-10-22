@@ -14,7 +14,7 @@ The current `master` code and this README define the current shipped scope. The 
 
 ## 在线更新 Online updates
 
-在「设置」底部的「关于 Sealbox」中点击「检查更新」，应用会查询固定的 HTTPS Tauri updater endpoint。发现更新后，应用会在窗口内下载并校验签名，显示下载进度；下载完成后确认安装，签名 NSIS 安装器会接管替换并重启应用。若签名元数据暂不可用，仍可打开 GitHub 发布页手动安装。
+桌面端和 Android 端解锁后会在后台自动检查一次新版本，发现更新时直接弹出更新窗口，只展示当前版本、最新版本和发布时间，不再把更新说明铺在设置页上。桌面的「关于 Sealbox」和 Android 的「设置 › 检查更新」也保留手动检查入口，结果同样在弹窗里展示：桌面在窗口内下载并校验签名，下载完成后由签名 NSIS 安装器替换并重启；Android 下载 APK 后交给系统安装器。若签名元数据暂不可用，仍可打开 GitHub 发布页手动安装。
 
 发布工作流同时上传 Windows 安装包、Android APK、Tauri updater 元数据 `latest.json` 和对应的 `.sig` 签名文件。桌面与 Android 共用同一个版本号，一次 `vX.Y.Z` 发布同时产出两端；桌面更新读取 GitHub `/releases/latest` 上的 `latest.json`，所以只有 `v*` 发布会成为最新发布。现有 v0.1.4 及更早安装包没有应用内签名安装能力，首次升级到已启用 Tauri updater 的版本必须手动运行一次安装包。升级后金库文件仍留在原数据目录，不会随程序安装目录移动。
 
