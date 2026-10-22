@@ -3,14 +3,21 @@ name: Release
 on:
   push:
     tags:
+      # 一个 tag 就是一次完整发布：桌面版和 Android 都从同一个 commit 出包。
       - "v*"
+      - "mobile-v*"
 
 permissions:
   contents: write
 
+# 同一个 ref 被重复触发时只留一套构建，避免两套并行抢同一个 Release 资产。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   release:
-    name: Build and release Windows installer
+    name: Build desktop installer and publish the release
     runs-on: windows-latest
     steps:
       - name: Check out source
@@ -43,6 +50,18 @@ jobs:
       - name: Run extension tests
         run: node --test extension/fill-logic.test.js
 
+      - name: Resolve release name
+        id: meta
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ($tag.StartsWith("mobile-v")) {
+            $name = "Sealbox mobile " + $tag.Substring(8)
+          } else {
+            $name = "Sealbox " + $tag
+          }
+          "release_name=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
       - name: Build and publish Tauri release
         uses: tauri-apps/tauri-action@v1
         env:
@@ -51,8 +70,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: Sealbox ${{ github.ref_name }}
-          releaseBody: See the assets below to install or update Sealbox.
+          releaseName: ${{ steps.meta.outputs.release_name }}
+          releaseBody: 桌面安装包与 Android APK 由同一次构建产出（${{ github.sha }}），两端都不单独发布。
           releaseDraft: false
           prerelease: false
           uploadUpdaterJson: true

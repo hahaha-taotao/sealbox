@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 
 const repoRoot = fileURLToPath(new URL("../", import.meta.url));
-const tagPattern = /^v(\d+\.\d+\.\d+)$/;
+const tagPattern = /^(mobile-)?v(\d+\.\d+\.\d+)$/;
 
 function readText(relativePath) {
   return readFileSync(join(repoRoot, relativePath), "utf8");
@@ -20,8 +20,8 @@ function requireVersion(value, source) {
   return value;
 }
 
-function readCargoPackageVersion() {
-  const lines = readText("src-tauri/Cargo.toml").split(/\r?\n/);
+function readCargoPackageVersion(manifestPath) {
+  const lines = readText(manifestPath).split(/\r?\n/);
   let inPackage = false;
 
   for (const line of lines) {
@@ -33,13 +33,23 @@ function readCargoPackageVersion() {
     if (!inPackage) continue;
 
     const version = line.match(/^\s*version\s*=\s*["']([^"']+)["']\s*(?:#.*)?$/);
-    if (version) return requireVersion(version[1], "src-tauri/Cargo.toml [package].version");
+    if (version) return requireVersion(version[1], `${manifestPath} [package].version`);
   }
 
-  throw new Error("src-tauri/Cargo.toml 缺少 [package].version");
+  throw new Error(`${manifestPath} 缺少 [package].version`);
 }
 
-function collectVersions() {
+function readLockPackageVersion(lockPath, packageName) {
+  const lines = readText(lockPath).split(/\r?\n/);
+  for (let i = 0; i < lines.length; i += 1) {
+    if (lines[i].trim() !== `name = "${packageName}"`) continue;
+    const version = lines[i + 1]?.match(/^\s*version\s*=\s*"([^"]+)"\s*$/);
+    return requireVersion(version?.[1], `${lockPath} 里的 ${packageName}`);
+  }
+  throw new Error(`${lockPath} 里找不到 ${packageName}`);
+}
+
+function desktopVersions() {
   const packageJson = readJson("package.json");
   const tauriConfig = readJson("src-tauri/tauri.conf.json");
   const manifest = readJson("extension/manifest.json");
@@ -47,29 +57,42 @@ function collectVersions() {
 
   return [
     ["package.json", requireVersion(packageJson.version, "package.json version")],
-    ["src-tauri/Cargo.toml", readCargoPackageVersion()],
+    ["src-tauri/Cargo.toml", readCargoPackageVersion("src-tauri/Cargo.toml")],
     ["src-tauri/tauri.conf.json", requireVersion(tauriConfig.version, "src-tauri/tauri.conf.json version")],
     ["extension/manifest.json", requireVersion(manifest.version, "extension/manifest.json version")],
     ["package-lock.json", requireVersion(packageLock.version, "package-lock.json version")],
     [
-      "package-lock.json packages[\"\"].version",
-      requireVersion(packageLock.packages?.[""]?.version, "package-lock.json packages[\"\"].version"),
+      'package-lock.json packages[""].version',
+      requireVersion(packageLock.packages?.[""]?.version, 'package-lock.json packages[""].version'),
     ],
+  ];
+}
+
+function mobileVersions() {
+  const config = readJson("src-tauri-mobile/tauri.conf.json");
+  return [
+    [
+      "src-tauri-mobile/tauri.conf.json",
+      requireVersion(config.version, "src-tauri-mobile/tauri.conf.json version"),
+    ],
+    ["src-tauri-mobile/Cargo.toml", readCargoPackageVersion("src-tauri-mobile/Cargo.toml")],
+    ["Cargo.lock", readLockPackageVersion("Cargo.lock", "sealbox-mobile")],
   ];
 }
 
 function main() {
   const [tag, ...extraArgs] = process.argv.slice(2);
   if (!tag || extraArgs.length > 0) {
-    throw new Error("用法：node scripts/check-version.mjs v0.1.5");
+    throw new Error("用法：node scripts/check-version.mjs v0.7.2 | mobile-v0.1.5");
   }
 
   const match = tag.match(tagPattern);
   if (!match) {
-    throw new Error(`发布 tag 必须是 vMAJOR.MINOR.PATCH 格式，收到：${tag}`);
+    throw new Error(`发布 tag 必须是 vX.Y.Z 或 mobile-vX.Y.Z 格式，收到：${tag}`);
   }
-  const expectedVersion = match[1];
-  const versions = collectVersions();
+  // 桌面和 Android 各自一条版本线：v* 校桌面字段，mobile-v* 校移动字段。
+  const expectedVersion = match[2];
+  const versions = match[1] ? mobileVersions() : desktopVersions();
   const mismatches = versions.filter(([, version]) => version !== expectedVersion);
 
   if (mismatches.length > 0) {
