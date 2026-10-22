@@ -83,14 +83,25 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release view "${{ github.ref_name }}" --json assets --jq '.assets[].name' | grep -qx 'latest.json'
 
-      # Desktop in-app updates read releases/latest/download/latest.json, so a
-      # mobile release must never take the "latest" slot away from a desktop one.
+      # Desktop in-app updates read releases/latest/download/latest.json, so the
+      # latest pointer must stay on a desktop release. Setting the mobile
+      # release to non-latest alone leaves the pointer where it is, so also
+      # mark the newest desktop release explicitly.
       - name: Keep the desktop release as latest
         if: startsWith(github.ref_name, 'mobile-v')
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "${{ github.ref_name }}" --latest=false
+        run: |
+          gh release edit "${{ github.ref_name }}" --latest=false
+          for _ in $(seq 1 30); do
+            desktop_tag="$(gh release list --exclude-drafts --limit 50 --json tagName --jq 'map(.tagName | select(startswith("v")))[0]')"
+            if [ -n "$desktop_tag" ] && [ "$desktop_tag" != "null" ]; then
+              gh release edit "$desktop_tag" --latest
+              break
+            fi
+            sleep 20
+          done
 
   android:
     name: Build and upload Android arm64 APK

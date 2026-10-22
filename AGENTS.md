@@ -13,10 +13,10 @@
     `Cargo.lock` 里的 `sealbox-mobile`。
   `scripts/check-version.mjs` 按 tag 前缀选择对应的一组字段校验，改版本号时这几处要一起改。
 - 同一个 ref 被重复触发时由 workflow 的 `concurrency` 合并，只保留最新一套构建。
-- 桌面自动更新读取 `releases/latest/download/latest.json`。因此每次发布都会校验
-  `latest.json` 确实上传成功，并且 `mobile-v*` 发布后会把该 Release 的 latest 标记取消
-  （`gh release edit --latest=false`），避免移动发布抢占“latest”后桌面更新报
-  `Could not fetch a valid release JSON from the remote`。
+- 桌面自动更新读取 `releases/latest/download/latest.json`。因此每次发布会校验
+  `latest.json` 确实上传成功；`mobile-v*` 发布后先把该 Release 的 latest 标记取消，
+  再把最新的桌面 `v*` Release 显式标记为 latest，保证“latest”始终指向桌面发布，
+  避免移动发布抢占“latest”后桌面更新报 `Could not fetch a valid release JSON from the remote`。
 
 ## 本地开发
 
