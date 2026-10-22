@@ -1358,8 +1358,11 @@ async function runSync() {
     syncReport.value = report;
     await loadSync();
     await refreshVault();
-    const conflict = report.conflicts.length ? `，冲突 ${report.conflicts.length} 条已保留本地` : "";
-    showToast(`已同步：拉取 ${report.pulled}，推送 ${report.pushed}${conflict}`);
+    const removed = report.removed ? `，删除 ${report.removed}` : "";
+    const conflict = report.conflicts.length
+      ? `，修改时间相同 ${report.conflicts.length} 条，已保留本地`
+      : "";
+    showToast(`已同步：拉取 ${report.pulled}，推送 ${report.pushed}${removed}${conflict}`);
   } catch (e) {
     showToast(String(e));
   } finally {
@@ -2526,7 +2529,7 @@ onMounted(async () => {
           </div>
           <div class="mcp-card settings-master">
             <h3>数据同步</h3>
-            <p class="crumb">支持 WebDAV 和 S3。上传的是用同步密钥再加密的快照，服务器看不到明文，也解不开主密码。同一条在两边同时改过且时间相同，会保留本机版本并记为冲突。</p>
+            <p class="crumb">支持 WebDAV 和 S3。上传的是用同步密钥再加密的快照，服务器看不到明文，也解不开主密码。两端修改时间相同、内容却不同时，会保留本机版本并记为冲突；其中一边是删除时以删除为准，避免已删条目复活。</p>
             <div class="settings-fields">
               <div class="field">
                 <label>类型</label>
@@ -2563,7 +2566,7 @@ onMounted(async () => {
               </div>
             </div>
             <p v-if="syncView?.last_sync_at" class="crumb">上次同步 {{ fmtTime(syncView.last_sync_at) }}<span v-if="syncView.last_result"> · {{ syncView.last_result }}</span></p>
-            <p v-if="syncReport?.conflicts.length" class="error">冲突保留了本地版本：{{ syncReport.conflicts.join('、') }}</p>
+            <p v-if="syncReport?.conflicts.length" class="error">两端修改时间相同，已保留本地版本：{{ syncReport.conflicts.join('、') }}</p>
             <div class="mcp-actions">
               <button class="btn primary" type="button" :disabled="syncBusy" @click="saveSync">保存配置</button>
               <button class="btn" type="button" :disabled="syncBusy || !syncView?.configured" @click="runSync">{{ syncBusy ? '同步中…' : '立即同步' }}</button>

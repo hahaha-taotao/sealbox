@@ -59,6 +59,7 @@ export interface SyncReport {
   pulled: number;
   pushed: number;
   unchanged: number;
+  removed: number;
   conflicts: string[];
   remote_missing: boolean;
 }

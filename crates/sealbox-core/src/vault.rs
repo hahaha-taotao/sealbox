@@ -999,6 +999,12 @@ impl Vault {
                 |row| row.get::<_, i64>(0),
             )? as usize;
             conn.execute(
+                "INSERT INTO sync_tombstones (kind, id, deleted_at)
+                 SELECT ?1, id, deleted_at FROM entries WHERE deleted_at IS NOT NULL
+                 ON CONFLICT(kind, id) DO UPDATE SET deleted_at=excluded.deleted_at",
+                params![TOMBSTONE_ENTRY],
+            )?;
+            conn.execute(
                 "DELETE FROM entry_tags WHERE entry_id IN (
                     SELECT id FROM entries WHERE deleted_at IS NOT NULL
                 )",
@@ -1031,6 +1037,13 @@ impl Vault {
                 params![&cutoff],
                 |row| row.get::<_, i64>(0),
             )? as usize;
+            conn.execute(
+                "INSERT INTO sync_tombstones (kind, id, deleted_at)
+                 SELECT ?1, id, deleted_at FROM entries
+                 WHERE deleted_at IS NOT NULL AND deleted_at <= ?2
+                 ON CONFLICT(kind, id) DO UPDATE SET deleted_at=excluded.deleted_at",
+                params![TOMBSTONE_ENTRY, &cutoff],
+            )?;
             conn.execute(
                 "DELETE FROM entry_tags WHERE entry_id IN (
                     SELECT id FROM entries WHERE deleted_at IS NOT NULL AND deleted_at <= ?1
@@ -1103,9 +1116,15 @@ impl Vault {
                 })
                 .optional()?;
             let name = name.ok_or(VaultError::FolderNotFound)?;
+            let now = now_rfc3339();
             let moved = conn.execute(
                 "UPDATE entries SET folder_id=NULL, updated_at=?1 WHERE folder_id=?2",
-                params![now_rfc3339(), id],
+                params![&now, id],
+            )?;
+            conn.execute(
+                "INSERT INTO sync_tombstones (kind, id, deleted_at) VALUES (?1,?2,?3)
+                 ON CONFLICT(kind, id) DO UPDATE SET deleted_at=excluded.deleted_at",
+                params![TOMBSTONE_FOLDER, id, &now],
             )?;
             conn.execute("DELETE FROM folders WHERE id=?1", params![id])?;
             audit_on(
@@ -1139,9 +1158,15 @@ impl Vault {
                 .optional()?;
             let source_name = source_name.ok_or(VaultError::FolderNotFound)?;
             let target_name = target_name.ok_or(VaultError::FolderNotFound)?;
+            let now = now_rfc3339();
             let moved = conn.execute(
                 "UPDATE entries SET folder_id=?1, updated_at=?2 WHERE folder_id=?3",
-                params![target_id, now_rfc3339(), source_id],
+                params![target_id, &now, source_id],
+            )?;
+            conn.execute(
+                "INSERT INTO sync_tombstones (kind, id, deleted_at) VALUES (?1,?2,?3)
+                 ON CONFLICT(kind, id) DO UPDATE SET deleted_at=excluded.deleted_at",
+                params![TOMBSTONE_FOLDER, source_id, &now],
             )?;
             conn.execute("DELETE FROM folders WHERE id=?1", params![source_id])?;
             audit_on(
@@ -1194,6 +1219,12 @@ impl Vault {
                 "UPDATE tags SET name=?1 WHERE id=?2",
                 params![&new_name, &tag_id],
             )?;
+            conn.execute(
+                "UPDATE entries SET updated_at=?1 WHERE id IN (
+                    SELECT entry_id FROM entry_tags WHERE tag_id=?2
+                )",
+                params![now_rfc3339(), &tag_id],
+            )?;
             audit_on(
                 conn,
                 "rename_tag",
@@ -1213,6 +1244,12 @@ impl Vault {
                 })
                 .optional()?;
             let tag_id = tag_id.ok_or(VaultError::TagNotFound)?;
+            conn.execute(
+                "UPDATE entries SET updated_at=?1 WHERE id IN (
+                    SELECT entry_id FROM entry_tags WHERE tag_id=?2
+                )",
+                params![now_rfc3339(), &tag_id],
+            )?;
             let removed =
                 conn.execute("DELETE FROM entry_tags WHERE tag_id=?1", params![&tag_id])?;
             conn.execute("DELETE FROM tags WHERE id=?1", params![&tag_id])?;
@@ -1244,6 +1281,12 @@ impl Vault {
                 .optional()?;
             let source_id = source_id.ok_or(VaultError::TagNotFound)?;
             let target_id = target_id.ok_or(VaultError::TagNotFound)?;
+            conn.execute(
+                "UPDATE entries SET updated_at=?1 WHERE id IN (
+                    SELECT entry_id FROM entry_tags WHERE tag_id=?2
+                )",
+                params![now_rfc3339(), &source_id],
+            )?;
             let moved = conn.execute(
                 "INSERT OR IGNORE INTO entry_tags (entry_id, tag_id)
                  SELECT entry_id, ?1 FROM entry_tags WHERE tag_id=?2",
@@ -1774,6 +1817,37 @@ impl Vault {
         Ok(())
     }
 
+    /// Ids of entries and folders that were deleted for good. Sync carries
+    /// them to other devices, otherwise "missing here, present there" reads
+    /// as a new item and the deletion comes back.
+    pub fn sync_tombstones(&self) -> Result<Vec<Tombstone>, VaultError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT kind, id, deleted_at FROM sync_tombstones ORDER BY kind, id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Tombstone {
+                kind: r.get(0)?,
+                id: r.get(1)?,
+                deleted_at: r.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(VaultError::from)
+    }
+
+    pub fn replace_sync_tombstones(&self, tombstones: &[Tombstone]) -> Result<(), VaultError> {
+        self.with_transaction(|conn| {
+            conn.execute("DELETE FROM sync_tombstones", [])?;
+            let mut stmt = conn.prepare(
+                "INSERT INTO sync_tombstones (kind, id, deleted_at) VALUES (?1,?2,?3)",
+            )?;
+            for item in tombstones {
+                stmt.execute(params![&item.kind, &item.id, &item.deleted_at])?;
+            }
+            Ok(())
+        })
+    }
+
     /// Replace folders, tags and entries with a snapshot whose secret blobs
     /// are already encrypted with this vault's DEK. Settings and audit stay.
     pub fn replace_snapshot_same_key(
@@ -1916,6 +1990,16 @@ pub struct BackupEntry {
     pub notes_blob: Option<Vec<u8>>,
     pub tags: Vec<String>,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Tombstone {
+    pub kind: String,
+    pub id: String,
+    pub deleted_at: String,
+}
+
+pub const TOMBSTONE_ENTRY: &str = "entry";
+pub const TOMBSTONE_FOLDER: &str = "folder";
 
 fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()

@@ -770,7 +770,8 @@ onMounted(async () => {
           <div class="row"><span class="k">拉取</span><span>{{ report.pulled }}</span></div>
           <div class="row"><span class="k">推送</span><span>{{ report.pushed }}</span></div>
           <div class="row"><span class="k">未变</span><span>{{ report.unchanged }}</span></div>
-          <p v-if="report.conflicts.length" class="error">冲突保留了本机：{{ report.conflicts.join("、") }}</p>
+          <div class="row" v-if="report.removed"><span class="k">删除</span><span>{{ report.removed }}</span></div>
+          <p v-if="report.conflicts.length" class="error">两端修改时间相同，已保留本机：{{ report.conflicts.join("、") }}</p>
         </div>
         <p class="hint">远端只有加密快照。同步密钥解不开主密码。</p>
       </div>

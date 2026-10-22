@@ -95,6 +95,12 @@ fn migrate(conn: &Connection) -> Result<(), DbError> {
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS sync_tombstones (
+          kind TEXT NOT NULL,
+          id TEXT NOT NULL,
+          deleted_at TEXT NOT NULL,
+          PRIMARY KEY (kind, id)
+        );
         "#,
     )?;
     drop_hello_columns(conn)?;

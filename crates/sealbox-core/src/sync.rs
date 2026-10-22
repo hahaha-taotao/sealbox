@@ -1,6 +1,9 @@
 use crate::crypto::{decrypt, encrypt, Encrypted};
 use crate::http_guard::{assert_public_target, parse_http_url, PublicResolver};
-use crate::vault::{BackupEntry, BackupSnapshot, SecretPayload, Vault, VaultError};
+use crate::vault::{
+    BackupEntry, BackupSnapshot, SecretPayload, Tombstone, Vault, VaultError, TOMBSTONE_ENTRY,
+    TOMBSTONE_FOLDER,
+};
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -12,6 +15,9 @@ use std::time::Duration;
 const MAGIC: &[u8; 6] = b"SBOXS1";
 const OBJECT_NAME: &str = "sealbox/vault.sboxsync";
 const MAX_REMOTE_BYTES: usize = 64 * 1024 * 1024;
+/// How long a deletion keeps being broadcast. Older clients that stayed
+/// offline longer than this can still resurrect an item.
+const TOMBSTONE_RETENTION_DAYS: i64 = 180;
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -92,6 +98,10 @@ struct SyncSnapshot {
     folders: Vec<crate::vault::FolderDto>,
     tags: Vec<String>,
     entries: Vec<SyncEntry>,
+    /// Entries and folders removed for good. Old snapshot files predate this
+    /// field, so it defaults to empty.
+    #[serde(default)]
+    deleted: Vec<Tombstone>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -114,6 +124,7 @@ pub struct SyncReport {
     pub pulled: usize,
     pub pushed: usize,
     pub unchanged: usize,
+    pub removed: usize,
     pub conflicts: Vec<String>,
     pub remote_missing: bool,
 }
@@ -209,7 +220,8 @@ pub fn sync_now(vault: &Vault, dek: &[u8; 32]) -> Result<SyncReport, String> {
     let client = RemoteClient::new(&config, &secret)?;
     let remote = client.get().map_err(|e| format!("读取远端失败: {e}"))?;
     let local_raw = vault.snapshot_for_backup().map_err(|e| e.to_string())?;
-    let local = SyncSnapshot::from_vault(dek, &local_raw)?;
+    let mut local = SyncSnapshot::from_vault(dek, &local_raw)?;
+    local.deleted = vault.sync_tombstones().map_err(|e| e.to_string())?;
     let device = device_id(vault).map_err(|e| e.to_string())?;
 
     let (merged, report, changed) = match remote {
@@ -219,6 +231,7 @@ pub fn sync_now(vault: &Vault, dek: &[u8; 32]) -> Result<SyncReport, String> {
                 pulled: 0,
                 pushed: local.entries.len(),
                 unchanged: 0,
+                removed: 0,
                 conflicts: Vec::new(),
                 remote_missing: true,
             },
@@ -242,11 +255,15 @@ pub fn sync_now(vault: &Vault, dek: &[u8; 32]) -> Result<SyncReport, String> {
     vault
         .replace_snapshot_same_key(dek, &sealed)
         .map_err(|e| e.to_string())?;
+    vault
+        .replace_sync_tombstones(&merged.deleted)
+        .map_err(|e| e.to_string())?;
     let summary = format!(
-        "pulled={} pushed={} unchanged={} conflicts={}",
+        "pulled={} pushed={} unchanged={} removed={} conflicts={}",
         report.pulled,
         report.pushed,
         report.unchanged,
+        report.removed,
         report.conflicts.len()
     );
     let now = chrono::Utc::now().to_rfc3339();
@@ -298,6 +315,7 @@ impl SyncSnapshot {
             folders: snapshot.folders.clone(),
             tags: snapshot.tags.clone(),
             entries,
+            deleted: Vec::new(),
         })
     }
 
@@ -414,13 +432,111 @@ fn decode_snapshot(
     Ok((snapshot, true))
 }
 
+fn sorted_tombstones(snapshot: &SyncSnapshot) -> Vec<Tombstone> {
+    let mut deleted = snapshot.deleted.clone();
+    deleted.sort_by(|a, b| {
+        (a.kind.as_str(), a.id.as_str()).cmp(&(b.kind.as_str(), b.id.as_str()))
+    });
+    deleted
+}
+
+/// Everything both sides must agree on for an entry to count as unchanged.
+/// `use_count`/`last_used_at` move on every autofill without touching
+/// `updated_at`, so they are excluded here and merged separately.
+fn normalized_entry(entry: &SyncEntry) -> SyncEntry {
+    let mut copy = entry.clone();
+    copy.entry.use_count = 0;
+    copy.entry.last_used_at = None;
+    copy
+}
+
 fn snapshot_digest(snapshot: &SyncSnapshot) -> String {
-    let mut entries = snapshot.entries.clone();
+    let mut entries: Vec<SyncEntry> = snapshot.entries.iter().map(normalized_entry).collect();
     entries.sort_by(|a, b| a.entry.id.cmp(&b.entry.id));
-    hex::encode(Sha256::digest(serde_json::to_vec(&entries).unwrap_or_default()))
+    let mut folders = snapshot.folders.clone();
+    folders.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut tags = snapshot.tags.clone();
+    tags.sort();
+    #[derive(Serialize)]
+    struct Digest<'a> {
+        folders: &'a [crate::vault::FolderDto],
+        tags: &'a [String],
+        entries: &'a [SyncEntry],
+        deleted: Vec<Tombstone>,
+    }
+    let digest = Digest {
+        folders: &folders,
+        tags: &tags,
+        entries: &entries,
+        deleted: sorted_tombstones(snapshot),
+    };
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(&digest).unwrap_or_default(),
+    ))
+}
+
+/// Returns true when the tombstone removes the entry. An entry edited after
+/// its tombstone wins instead, and the stale tombstone is dropped.
+fn apply_entry_tombstone(
+    tombstones: &mut HashMap<(String, String), String>,
+    entry: &SyncEntry,
+) -> bool {
+    let key = (TOMBSTONE_ENTRY.to_string(), entry.entry.id.clone());
+    match tombstones.get(&key) {
+        Some(at) if cmp_time(&entry.entry.updated_at, at) != std::cmp::Ordering::Greater => true,
+        Some(_) => {
+            tombstones.remove(&key);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Usage counters are per-device bookkeeping, not user content, so keep the
+/// furthest value instead of letting one device rewind the other.
+fn merge_usage(mut kept: SyncEntry, other: &SyncEntry) -> SyncEntry {
+    kept.entry.use_count = kept.entry.use_count.max(other.entry.use_count);
+    kept.entry.last_used_at = match (&kept.entry.last_used_at, &other.entry.last_used_at) {
+        (Some(left), Some(right)) => Some(if cmp_time(left, right) == std::cmp::Ordering::Less {
+            right.clone()
+        } else {
+            left.clone()
+        }),
+        (Some(value), None) | (None, Some(value)) => Some(value.clone()),
+        (None, None) => None,
+    };
+    kept
+}
+
+fn prune_tombstones(tombstones: HashMap<(String, String), String>) -> Vec<Tombstone> {
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(TOMBSTONE_RETENTION_DAYS);
+    let mut deleted: Vec<Tombstone> = tombstones
+        .into_iter()
+        .filter(|(_, at)| parse_time(at).map_or(true, |time| time >= cutoff))
+        .map(|((kind, id), deleted_at)| Tombstone {
+            kind,
+            id,
+            deleted_at,
+        })
+        .collect();
+    deleted.sort_by(|a, b| {
+        (a.kind.as_str(), a.id.as_str()).cmp(&(b.kind.as_str(), b.id.as_str()))
+    });
+    deleted
 }
 
 fn merge_snapshots(local: &SyncSnapshot, remote: &SyncSnapshot) -> (SyncSnapshot, SyncReport) {
+    let mut tombstones: HashMap<(String, String), String> = HashMap::new();
+    for item in local.deleted.iter().chain(remote.deleted.iter()) {
+        let key = (item.kind.clone(), item.id.clone());
+        let keep_existing = tombstones
+            .get(&key)
+            .is_some_and(|current| cmp_time(current, &item.deleted_at) != std::cmp::Ordering::Less);
+        if !keep_existing {
+            tombstones.insert(key, item.deleted_at.clone());
+        }
+    }
+
     let mut remote_by_id: HashMap<&str, &SyncEntry> = remote
         .entries
         .iter()
@@ -430,48 +546,73 @@ fn merge_snapshots(local: &SyncSnapshot, remote: &SyncSnapshot) -> (SyncSnapshot
     let mut pulled = 0usize;
     let mut pushed = 0usize;
     let mut unchanged = 0usize;
+    let mut removed = 0usize;
     let mut conflicts = Vec::new();
 
     for local_entry in &local.entries {
+        if apply_entry_tombstone(&mut tombstones, local_entry) {
+            remote_by_id.remove(local_entry.entry.id.as_str());
+            removed += 1;
+            continue;
+        }
         match remote_by_id.remove(local_entry.entry.id.as_str()) {
             None => {
                 pushed += 1;
                 entries.push(local_entry.clone());
             }
             Some(remote_entry) => {
+                let local_deleted = local_entry.entry.deleted_at.is_some();
+                let remote_deleted = remote_entry.entry.deleted_at.is_some();
                 match cmp_time(&local_entry.entry.updated_at, &remote_entry.entry.updated_at) {
                     std::cmp::Ordering::Greater => {
                         pushed += 1;
-                        entries.push(local_entry.clone());
+                        entries.push(merge_usage(local_entry.clone(), remote_entry));
                     }
                     std::cmp::Ordering::Less => {
                         pulled += 1;
-                        entries.push(remote_entry.clone());
+                        entries.push(merge_usage(remote_entry.clone(), local_entry));
+                    }
+                    std::cmp::Ordering::Equal if local_deleted != remote_deleted => {
+                        // A delete and an edit landed in the same instant.
+                        // Keep the delete, otherwise the item silently returns.
+                        if remote_deleted {
+                            pulled += 1;
+                            entries.push(remote_entry.clone());
+                        } else {
+                            pushed += 1;
+                            entries.push(local_entry.clone());
+                        }
                     }
                     std::cmp::Ordering::Equal => {
                         if entry_digest(local_entry) == entry_digest(remote_entry) {
                             unchanged += 1;
-                            entries.push(local_entry.clone());
                         } else {
                             conflicts.push(format!(
                                 "{} ({})",
                                 local_entry.entry.title, local_entry.entry.id
                             ));
-                            entries.push(local_entry.clone());
                         }
+                        entries.push(merge_usage(local_entry.clone(), remote_entry));
                     }
                 }
             }
         }
     }
     for remote_entry in remote_by_id.into_values() {
+        if apply_entry_tombstone(&mut tombstones, remote_entry) {
+            removed += 1;
+            continue;
+        }
         pulled += 1;
         entries.push(remote_entry.clone());
     }
     entries.sort_by(|a, b| a.entry.id.cmp(&b.entry.id));
 
-    let mut folders = local.folders.clone();
-    for folder in &remote.folders {
+    let mut folders: Vec<crate::vault::FolderDto> = Vec::new();
+    for folder in local.folders.iter().chain(remote.folders.iter()) {
+        if tombstones.contains_key(&(TOMBSTONE_FOLDER.to_string(), folder.id.clone())) {
+            continue;
+        }
         if !folders
             .iter()
             .any(|item| item.id == folder.id || item.name == folder.name)
@@ -479,6 +620,21 @@ fn merge_snapshots(local: &SyncSnapshot, remote: &SyncSnapshot) -> (SyncSnapshot
             folders.push(folder.clone());
         }
     }
+    for entry in entries.iter_mut() {
+        let Some(folder_id) = entry.entry.folder_id.clone() else {
+            continue;
+        };
+        if folders.iter().any(|folder| folder.id == folder_id) {
+            continue;
+        }
+        entry.entry.folder_id = None;
+        if let Some(at) = tombstones.get(&(TOMBSTONE_FOLDER.to_string(), folder_id)) {
+            if cmp_time(&entry.entry.updated_at, at) == std::cmp::Ordering::Less {
+                entry.entry.updated_at = at.clone();
+            }
+        }
+    }
+
     let mut tags = local.tags.clone();
     for tag in &remote.tags {
         if !tags.iter().any(|item| item == tag) {
@@ -490,11 +646,13 @@ fn merge_snapshots(local: &SyncSnapshot, remote: &SyncSnapshot) -> (SyncSnapshot
             folders,
             tags,
             entries,
+            deleted: prune_tombstones(tombstones),
         },
         SyncReport {
             pulled,
             pushed,
             unchanged,
+            removed,
             conflicts,
             remote_missing: false,
         },
@@ -502,7 +660,9 @@ fn merge_snapshots(local: &SyncSnapshot, remote: &SyncSnapshot) -> (SyncSnapshot
 }
 
 fn entry_digest(entry: &SyncEntry) -> String {
-    hex::encode(Sha256::digest(serde_json::to_vec(entry).unwrap_or_default()))
+    hex::encode(Sha256::digest(
+        serde_json::to_vec(&normalized_entry(entry)).unwrap_or_default(),
+    ))
 }
 
 fn cmp_time(left: &str, right: &str) -> std::cmp::Ordering {
@@ -812,6 +972,7 @@ mod tests {
             }],
             tags: vec!["mail".into()],
             entries,
+            deleted: Vec::new(),
         }
     }
 
@@ -1037,6 +1198,142 @@ mod tests {
             Some(SecretPayload::Website { password, .. }) => assert_eq!(password, "secret"),
             _ => panic!("secret"),
         }
+    }
+
+    fn days_ago(days: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339()
+    }
+
+    fn tombstone(kind: &str, id: &str, at: &str) -> Tombstone {
+        Tombstone {
+            kind: kind.into(),
+            id: id.into(),
+            deleted_at: at.into(),
+        }
+    }
+
+    #[test]
+    fn tombstone_removes_entry_from_both_sides() {
+        let local = snap(vec![entry("a", "gone", &days_ago(60), "p")]);
+        let mut remote = snap(vec![]);
+        remote.deleted = vec![tombstone(TOMBSTONE_ENTRY, "a", &days_ago(30))];
+
+        let (merged, report) = merge_snapshots(&local, &remote);
+        assert!(merged.entries.is_empty());
+        assert_eq!(report.removed, 1);
+        assert_eq!(merged.deleted.len(), 1);
+
+        let (again, report) = merge_snapshots(&local, &merged);
+        assert!(again.entries.is_empty());
+        assert_eq!(report.removed, 1);
+    }
+
+    #[test]
+    fn entry_edited_after_tombstone_survives() {
+        let local = snap(vec![entry("a", "kept", &days_ago(1), "p")]);
+        let mut remote = snap(vec![]);
+        remote.deleted = vec![tombstone(TOMBSTONE_ENTRY, "a", &days_ago(30))];
+
+        let (merged, report) = merge_snapshots(&local, &remote);
+        assert_eq!(merged.entries.len(), 1);
+        assert_eq!(merged.entries[0].entry.title, "kept");
+        assert!(merged.deleted.is_empty());
+        assert_eq!(report.removed, 0);
+    }
+
+    #[test]
+    fn deleted_side_wins_when_timestamps_match() {
+        let at = days_ago(5);
+        let local = snap(vec![entry("a", "live", &at, "one")]);
+        let mut trashed = entry("a", "trashed", &at, "two");
+        trashed.entry.deleted_at = Some(at.clone());
+        let remote = snap(vec![trashed]);
+
+        let (merged, report) = merge_snapshots(&local, &remote);
+        assert!(report.conflicts.is_empty());
+        assert_eq!(merged.entries.len(), 1);
+        assert_eq!(merged.entries[0].entry.deleted_at.as_deref(), Some(at.as_str()));
+    }
+
+    #[test]
+    fn usage_counters_do_not_conflict() {
+        let at = "2026-02-02T00:00:00Z";
+        let mut local_entry = entry("a", "same", at, "p");
+        local_entry.entry.use_count = 7;
+        local_entry.entry.last_used_at = Some("2026-02-02T00:00:00Z".into());
+        let mut remote_entry = entry("a", "same", at, "p");
+        remote_entry.entry.use_count = 3;
+        remote_entry.entry.last_used_at = Some("2026-01-15T00:00:00Z".into());
+
+        let (merged, report) = merge_snapshots(&snap(vec![local_entry]), &snap(vec![remote_entry]));
+        assert!(report.conflicts.is_empty());
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(merged.entries[0].entry.use_count, 7);
+        assert_eq!(
+            merged.entries[0].entry.last_used_at.as_deref(),
+            Some("2026-02-02T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn snapshot_digest_tracks_folders_tags_and_tombstones() {
+        let base = snap(vec![entry("a", "x", "2026-01-01T00:00:00Z", "p")]);
+
+        let mut counters = base.clone();
+        counters.entries[0].entry.use_count = 9;
+        counters.entries[0].entry.last_used_at = Some("2026-01-02T00:00:00Z".into());
+        assert_eq!(snapshot_digest(&base), snapshot_digest(&counters));
+
+        let mut folder = base.clone();
+        folder.folders.push(FolderDto {
+            id: "f2".into(),
+            name: "extra".into(),
+        });
+        assert_ne!(snapshot_digest(&base), snapshot_digest(&folder));
+
+        let mut tag = base.clone();
+        tag.tags.push("other".into());
+        assert_ne!(snapshot_digest(&base), snapshot_digest(&tag));
+
+        let mut deleted = base.clone();
+        deleted.deleted = vec![tombstone(TOMBSTONE_ENTRY, "b", "2026-01-01T00:00:00Z")];
+        assert_ne!(snapshot_digest(&base), snapshot_digest(&deleted));
+    }
+
+    #[test]
+    fn folder_tombstone_drops_folder_and_clears_reference() {
+        let at = days_ago(30);
+        let mut local = snap(vec![entry("a", "x", &days_ago(60), "p")]);
+        local.entries[0].entry.folder_id = Some("f1".into());
+        let mut remote = snap(vec![]);
+        remote.folders.clear();
+        remote.deleted = vec![tombstone(TOMBSTONE_FOLDER, "f1", &at)];
+
+        let (merged, _) = merge_snapshots(&local, &remote);
+        assert!(merged.folders.is_empty());
+        assert_eq!(merged.entries[0].entry.folder_id, None);
+        assert_eq!(merged.entries[0].entry.updated_at, at);
+    }
+
+    #[test]
+    fn snapshot_roundtrip_keeps_tombstones() {
+        let key = sync_key("correct horse battery");
+        let mut snapshot = snap(vec![entry("a", "x", "2026-01-01T00:00:00Z", "p")]);
+        snapshot.deleted = vec![tombstone(TOMBSTONE_ENTRY, "z", "2026-01-01T00:00:00Z")];
+        let bytes = encode_snapshot(&key, &snapshot, "dev").unwrap();
+        let (decoded, _) = decode_snapshot(&key, None, &bytes).unwrap();
+        assert_eq!(decoded.deleted, snapshot.deleted);
+    }
+
+    #[test]
+    fn snapshot_without_tombstones_still_decodes() {
+        let raw = serde_json::json!({
+            "folders": [],
+            "tags": [],
+            "entries": []
+        });
+        let snapshot: SyncSnapshot = serde_json::from_value(raw).unwrap();
+        assert!(snapshot.deleted.is_empty());
     }
 }
 

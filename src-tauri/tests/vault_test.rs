@@ -1,7 +1,8 @@
 use chrono::{Duration, Utc};
 use sealbox_lib::db;
 use sealbox_lib::vault::{
-    EntryKind, ListFilter, SecretPayload, SortBy, UpsertEntry, Vault, VaultError,
+    EntryKind, ListFilter, SecretPayload, SortBy, Tombstone, UpsertEntry, Vault, VaultError,
+    TOMBSTONE_ENTRY, TOMBSTONE_FOLDER,
 };
 use std::path::PathBuf;
 
@@ -709,4 +710,101 @@ fn secret_settings_encrypt_and_migrate_plaintext() {
         .get_secret_setting(&wrong, "fill_token")
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn empty_trash_records_entry_tombstones() {
+    let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+    let row = vault
+        .upsert_entry(&dek, sample_website("removed", None))
+        .unwrap();
+    vault.soft_delete(&[row.id.clone()]).unwrap();
+    assert!(vault.sync_tombstones().unwrap().is_empty());
+
+    vault.empty_trash().unwrap();
+    let tombstones = vault.sync_tombstones().unwrap();
+    assert_eq!(tombstones.len(), 1);
+    assert_eq!(tombstones[0].kind, TOMBSTONE_ENTRY);
+    assert_eq!(tombstones[0].id, row.id);
+    assert!(!tombstones[0].deleted_at.is_empty());
+    assert!(vault
+        .snapshot_for_backup()
+        .unwrap()
+        .entries
+        .iter()
+        .all(|entry| entry.id != row.id));
+}
+
+#[test]
+fn purge_expired_trash_records_entry_tombstones() {
+    let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+    let row = vault
+        .upsert_entry(&dek, sample_website("expired", None))
+        .unwrap();
+    vault.soft_delete(&[row.id.clone()]).unwrap();
+
+    // Move "now" past the retention window so this row becomes purgeable.
+    vault
+        .purge_expired_trash(Utc::now() + Duration::days(40), 30)
+        .unwrap();
+    let tombstones = vault.sync_tombstones().unwrap();
+    assert_eq!(tombstones.len(), 1);
+    assert_eq!(tombstones[0].kind, TOMBSTONE_ENTRY);
+    assert_eq!(tombstones[0].id, row.id);
+}
+
+#[test]
+fn delete_folder_records_tombstone() {
+    let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+    let folder = vault.create_folder("work").unwrap();
+    let mut entry = sample_website("filed", None);
+    entry.folder_id = Some(folder.id.clone());
+    vault.upsert_entry(&dek, entry).unwrap();
+
+    vault.delete_folder(&folder.id).unwrap();
+    let tombstones = vault.sync_tombstones().unwrap();
+    assert!(tombstones
+        .iter()
+        .any(|item| item.kind == TOMBSTONE_FOLDER && item.id == folder.id));
+}
+
+#[test]
+fn tombstones_survive_snapshot_replace_and_can_be_cleared() {
+    let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+    let row = vault
+        .upsert_entry(&dek, sample_website("gone", None))
+        .unwrap();
+    vault.soft_delete(&[row.id.clone()]).unwrap();
+    vault.empty_trash().unwrap();
+
+    let snapshot = vault.snapshot_for_backup().unwrap();
+    vault.replace_snapshot_same_key(&dek, &snapshot).unwrap();
+    assert_eq!(vault.sync_tombstones().unwrap().len(), 1);
+
+    let kept: Vec<Tombstone> = vault.sync_tombstones().unwrap();
+    vault.replace_sync_tombstones(&kept).unwrap();
+    assert_eq!(vault.sync_tombstones().unwrap(), kept);
+
+    vault.replace_sync_tombstones(&[]).unwrap();
+    assert!(vault.sync_tombstones().unwrap().is_empty());
+}
+
+#[test]
+fn deleting_a_tag_touches_its_entries() {
+    let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+    let row = vault
+        .upsert_entry(&dek, sample_website("tagged", None))
+        .unwrap();
+    let updated_at = |vault: &Vault| {
+        vault
+            .list_entries(&ListFilter::default())
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == row.id)
+            .unwrap()
+            .updated_at
+    };
+    let before = updated_at(&vault);
+    vault.delete_tag("work").unwrap();
+    assert_ne!(before, updated_at(&vault));
 }
