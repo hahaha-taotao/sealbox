@@ -77,6 +77,21 @@ jobs:
           uploadUpdaterJson: true
           uploadUpdaterSignatures: true
 
+      - name: Verify the updater manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release view "${{ github.ref_name }}" --json assets --jq '.assets[].name' | grep -qx 'latest.json'
+
+      # Desktop in-app updates read releases/latest/download/latest.json, so a
+      # mobile release must never take the "latest" slot away from a desktop one.
+      - name: Keep the desktop release as latest
+        if: startsWith(github.ref_name, 'mobile-v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ github.ref_name }}" --latest=false
+
   android:
     name: Build and upload Android arm64 APK
     needs: release
