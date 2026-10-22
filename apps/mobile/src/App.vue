@@ -17,6 +17,7 @@ const password2 = ref("");
 const error = ref("");
 const toast = ref("");
 const counts = ref<Counts | null>(null);
+const scopedCounts = ref<Counts | null>(null);
 const entries = ref<EntryDto[]>([]);
 const folders = ref<Folder[]>([]);
 const tags = ref<string[]>([]);
@@ -185,23 +186,26 @@ async function refreshStatus() {
 }
 
 async function loadVault() {
-  const [rows, folderRows, tagRows, countRows] = await Promise.all([
-    api.entries({
-      query: null,
-      folder_id: folderId.value || null,
-      uncategorized: uncategorized.value,
-      tag: tag.value || null,
-      trash: trash.value,
-      sort: "updated",
-    }),
+  const scope = {
+    query: null,
+    folder_id: folderId.value || null,
+    uncategorized: uncategorized.value,
+    tag: tag.value || null,
+    trash: trash.value,
+    sort: "updated",
+  };
+  const [rows, folderRows, tagRows, countRows, scopedCountRows] = await Promise.all([
+    api.entries(scope),
     api.folders(),
     api.tags(),
-    api.counts(),
+    api.counts({}),
+    api.counts(scope),
   ]);
   entries.value = rows;
   folders.value = folderRows;
   tags.value = tagRows;
   counts.value = countRows;
+  scopedCounts.value = scopedCountRows;
 }
 
 async function openVault() {
@@ -676,7 +680,7 @@ onMounted(async () => {
           <div class="chips flat">
             <button class="chip" :class="{ on: !kind }" @click="kind = ''">全部</button>
             <button v-for="item in KINDS" :key="item.id" class="chip" :class="{ on: kind === item.id }" @click="kind = item.id">
-              {{ item.label }} {{ counts?.[item.count] ?? 0 }}
+              {{ item.label }} {{ scopedCounts?.[item.count] ?? 0 }}
             </button>
           </div>
           <template v-if="tags.length">
