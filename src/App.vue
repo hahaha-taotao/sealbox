@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import packageJson from "../package.json";
+import { auditDateBounds, createAuditRequestGuard } from "./lib/audit-request";
 import {
   checkForUpdate,
   download,
@@ -56,6 +57,15 @@ const scopedCounts = ref<Counts | null>(null);
 const folders = ref<FolderDto[]>([]);
 const tags = ref<string[]>([]);
 const audit = ref<AuditEvent[]>([]);
+const auditTotal = ref(0);
+const auditOffset = ref(0);
+const auditLoading = ref(false);
+const auditError = ref("");
+const auditActions = ref<[string, string][]>([]);
+const auditResults = ref<[string, string][]>([]);
+const auditFilter = reactive({ keyword: "", action: "", result: "", from: "", to: "" });
+const auditGuard = createAuditRequestGuard();
+let auditApplied = { ...auditFilter };
 const selected = ref<Set<string>>(new Set());
 const filter = reactive<ListFilter>({
   query: "",
@@ -349,7 +359,39 @@ async function doUnlock() {
 }
 async function openAudit() {
   goPage("audit");
-  audit.value = await api.audit();
+  await queryAudit();
+}
+async function queryAudit(offset = 0, applyFilters = true) {
+  if (!status.value?.unlocked) return;
+  const request = auditGuard.begin();
+  auditLoading.value = true;
+  auditError.value = "";
+  audit.value = [];
+  auditTotal.value = 0;
+  if (applyFilters) auditApplied = { ...auditFilter };
+  try {
+    const bounds = auditDateBounds(auditApplied.from, auditApplied.to);
+    const result = await api.audit({
+      keyword: auditApplied.keyword,
+      actions: auditApplied.action ? [auditApplied.action] : [],
+      result: auditApplied.result,
+      ...bounds, limit: 50, offset,
+    });
+    if (!auditGuard.isCurrent(request)) return;
+    audit.value = result.items;
+    auditTotal.value = result.total;
+    auditActions.value = result.actions;
+    auditResults.value = result.results;
+    auditOffset.value = offset;
+  } catch (e) {
+    if (auditGuard.isCurrent(request)) auditError.value = String(e);
+  } finally {
+    if (auditGuard.isCurrent(request)) auditLoading.value = false;
+  }
+}
+function resetAudit() {
+  Object.assign(auditFilter, { keyword: "", action: "", result: "", from: "", to: "" });
+  void queryAudit();
 }
 async function togglePin(row: EntryDto) {
   await api.pin(row.id, !row.pinned);
@@ -1478,12 +1520,20 @@ function clearSecrets() {
 }
 
 function applyLockedUi() {
+  if (status.value) status.value = { ...status.value, unlocked: false };
   clearSecrets();
   backupOpen.value = false;
   updateDialogOpen.value = false;
   entries.value = [];
   scopedCounts.value = null;
+  auditGuard.invalidate();
   audit.value = [];
+  auditTotal.value = 0;
+  auditOffset.value = 0;
+  auditLoading.value = false;
+  auditError.value = "";
+  Object.assign(auditFilter, { keyword: "", action: "", result: "", from: "", to: "" });
+  auditApplied = { ...auditFilter };
   recent.value = [];
   expiring.value = [];
   selected.value = new Set();
@@ -2545,18 +2595,39 @@ onMounted(async () => {
       <section class="main" v-else-if="page === 'audit'">
         <div class="content content-page">
           <h2>审计</h2>
-          <div class="table">
+          <p class="crumb">查询当前本地金库保存的全部历史，不包含其他设备或金库。搜索中文操作、结果、已翻译详情及原始操作、详情、条目 ID；空格分隔的关键词须全部匹配，% 和 _ 按字面匹配。日期按本地时间，包含结束日期。</p>
+          <form class="audit-filters" @submit.prevent="queryAudit()">
+            <label>关键词<input v-model="auditFilter.keyword" placeholder="如：复制 动态验证码" maxlength="500" /></label>
+            <label>操作类型<select v-model="auditFilter.action"><option value="">全部操作</option><option v-for="[key, label] in auditActions" :key="key" :value="key">{{ label }}</option></select></label>
+            <label>结果<select v-model="auditFilter.result"><option value="">全部结果</option><option v-for="[key, label] in auditResults" :key="key" :value="key">{{ label }}</option></select></label>
+            <label>起始日期<input v-model="auditFilter.from" type="date" /></label>
+            <label>结束日期<input v-model="auditFilter.to" type="date" /></label>
+            <button class="btn primary" type="submit">查询</button>
+            <button class="btn" type="button" @click="resetAudit">重置</button>
+          </form>
+          <p v-if="auditLoading" role="status">正在查询历史记录…</p>
+          <p v-else-if="auditError" class="audit-error" role="alert">{{ auditError }}</p>
+          <p v-else-if="!audit.length">{{ auditTotal ? '此页已无记录，请重新查询。' : '没有符合条件的记录。' }}</p>
+          <div v-if="audit.length" class="table audit-table">
             <table>
-              <thead><tr><th>时间</th><th>动作</th><th>详情</th></tr></thead>
+              <thead><tr><th>时间</th><th>操作</th><th>结果</th><th>详情</th><th>原始记录</th></tr></thead>
               <tbody>
                 <tr v-for="a in audit" :key="a.id">
                   <td>{{ fmtTime(a.at) }}</td>
-                  <td>{{ a.action }}</td>
-                  <td>{{ a.detail }}</td>
+                  <td>{{ a.operation }}</td>
+                  <td>{{ a.result_label }}</td>
+                  <td>{{ a.description }}<div v-if="a.entry_id" class="crumb">条目 ID：{{ a.entry_id }}</div></td>
+                  <td><details><summary>展开</summary><pre>{{ JSON.stringify({ id: a.id, at: a.at, action: a.action, entry_id: a.entry_id, detail: a.detail }, null, 2) }}</pre></details></td>
                 </tr>
               </tbody>
             </table>
           </div>
+          <div class="audit-pagination">
+            <span>共 {{ auditTotal }} 条 · 每页 50 条 · 第 {{ Math.floor(auditOffset / 50) + 1 }} 页</span>
+            <button class="btn" :disabled="auditLoading || auditOffset === 0" @click="queryAudit(auditOffset - 50, false)">上一页</button>
+            <button class="btn" :disabled="auditLoading || auditOffset + 50 >= auditTotal" @click="queryAudit(auditOffset + 50, false)">下一页</button>
+          </div>
+          <p class="crumb">“已记录”不代表已验证成功；“未获准”不推断为用户拒绝。新增日志可能使分页位置变化，重新查询可刷新。</p>
         </div>
       </section>
 

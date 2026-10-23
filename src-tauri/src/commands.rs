@@ -6,9 +6,7 @@ use crate::mcp::{self, McpState};
 use crate::session::Session;
 use crate::sync::{self, SyncConfig, SyncKind, SyncReport, SyncView};
 use crate::totp::{generate_passphrase, generate_password_with_options, ssh_fingerprint, totp_now};
-use crate::vault::{
-    AuditEvent, Counts, EntryDto, FolderDto, ListFilter, SecretPayload, UpsertEntry, Vault,
-};
+use crate::vault::{Counts, EntryDto, FolderDto, ListFilter, SecretPayload, UpsertEntry, Vault};
 use crate::zoomkey::{self, ZoomkeyCandidates, ZoomkeyMcpPolicy};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -576,13 +574,23 @@ pub fn merge_tags(
 }
 
 #[tauri::command]
-pub fn list_audit(state: State<AppState>) -> Result<Vec<AuditEvent>, String> {
-    let mut session = lock_session(&state.session);
+pub fn list_audit(
+    state: State<AppState>,
+    query: sealbox_core::audit::AuditQuery,
+) -> Result<sealbox_core::audit::AuditPage, String> {
+    query_audit_for_session(&state.session, &query)
+}
+
+fn query_audit_for_session(
+    session: &Mutex<Session>,
+    query: &sealbox_core::audit::AuditQuery,
+) -> Result<sealbox_core::audit::AuditPage, String> {
+    let mut session = lock_session(session);
     session.require_unlocked().map_err(map_err)?;
     session
         .vault()
         .map_err(map_err)?
-        .list_audit(200)
+        .query_audit(&query)
         .map_err(map_err)
 }
 
@@ -1546,6 +1554,27 @@ mod tests {
         let dek =
             Vault::create(path.to_str().unwrap(), "correct horse battery staple extra").unwrap();
         (path, dek)
+    }
+
+    #[test]
+    fn audit_query_requires_unlocked_session_and_reads_all_history() {
+        let query = sealbox_core::audit::AuditQuery {
+            limit: 50,
+            ..Default::default()
+        };
+        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        for _ in 0..225 {
+            vault.audit("unlock", None, "ok").unwrap();
+        }
+        let session = Mutex::new(Session::default());
+        assert!(query_audit_for_session(&session, &query).is_err());
+        lock_session(&session).set_unlocked(vault, dek);
+        assert_eq!(
+            query_audit_for_session(&session, &query).unwrap().total,
+            225
+        );
+        lock_session(&session).lock();
+        assert!(query_audit_for_session(&session, &query).is_err());
     }
 
     #[test]

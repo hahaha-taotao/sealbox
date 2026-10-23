@@ -138,6 +138,27 @@ export interface AuditEvent {
   action: string;
   entry_id: string | null;
   detail: string;
+  operation: string;
+  result: string;
+  result_label: string;
+  description: string;
+}
+
+export interface AuditQuery {
+  keyword: string;
+  actions: string[];
+  result: string;
+  from: string | null;
+  to: string | null;
+  limit: number;
+  offset: number;
+}
+
+export interface AuditPage {
+  items: AuditEvent[];
+  total: number;
+  actions: [string, string][];
+  results: [string, string][];
 }
 
 export interface Counts {
@@ -327,7 +348,7 @@ export const api = {
   deleteTag: (name: string) => invoke<number>("delete_tag", { name }),
   mergeTags: (sourceName: string, targetName: string) =>
     invoke<number>("merge_tags", { sourceName, targetName }),
-  audit: () => invoke<AuditEvent[]>("list_audit"),
+  audit: (query: AuditQuery) => invoke<AuditPage>("list_audit", { query }),
   copy: (id: string, field: string) => invoke("copy_secret", { id, field }),
   copyClientCert: (id: string) => invoke("copy_client_cert", { id }),
   reveal: (id: string) => invoke<SecretPayload>("reveal_secret", { id }),

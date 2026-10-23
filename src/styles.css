@@ -827,3 +827,10 @@ html:has(.confirm-win), body:has(.confirm-win) {
   gap: 8px;
   flex-shrink: 0;
 }
+.audit-filters, .audit-pagination { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin: 16px 0; }
+.audit-filters label { display: flex; flex-direction: column; gap: 6px; }
+.audit-filters input, .audit-filters select { padding: 8px; }
+.audit-table td { white-space: normal; overflow-wrap: anywhere; vertical-align: top; }
+.audit-table pre { white-space: pre-wrap; max-width: 400px; overflow-wrap: anywhere; }
+.audit-pagination { align-items: center; }
+.audit-error { color: var(--danger, #b42318); }

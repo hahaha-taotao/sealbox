@@ -92,6 +92,8 @@ fn migrate(conn: &Connection) -> Result<(), DbError> {
           entry_id TEXT,
           detail TEXT NOT NULL
         );
+        CREATE INDEX IF NOT EXISTS audit_events_at_id ON audit_events(at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS audit_events_action_at_id ON audit_events(action, at DESC, id DESC);
         CREATE TABLE IF NOT EXISTS settings (
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL

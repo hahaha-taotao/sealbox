@@ -61,6 +61,8 @@ pub enum VaultError {
     DuplicateWebsite,
     #[error("来源和目标不能相同")]
     SameOrganizationTarget,
+    #[error("审计查询参数无效：分页须为 1–100 条、非负偏移，日期须为有效且递增的 RFC3339 时间")]
+    InvalidAuditQuery,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1321,7 +1323,7 @@ impl Vault {
 
     pub fn list_audit(&self, limit: i64) -> Result<Vec<AuditEvent>, VaultError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, at, action, entry_id, detail FROM audit_events ORDER BY at DESC LIMIT ?1",
+            "SELECT id, at, action, entry_id, detail FROM audit_events ORDER BY at DESC, id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], |r| {
             Ok(AuditEvent {
@@ -1332,7 +1334,101 @@ impl Vault {
                 detail: r.get(4)?,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(VaultError::from)
+    }
+
+    pub fn query_audit(
+        &self,
+        query: &crate::audit::AuditQuery,
+    ) -> Result<crate::audit::AuditPage, VaultError> {
+        use crate::audit::{format_event, AuditPage, ACTIONS, RESULTS};
+        let invalid = || VaultError::InvalidAuditQuery;
+        if !(1..=100).contains(&query.limit)
+            || query.offset < 0
+            || query.keyword.len() > 2000
+            || query.actions.len() > 100
+            || (!query.result.is_empty() && !RESULTS.iter().any(|(key, _)| *key == query.result))
+        {
+            return Err(invalid());
+        }
+        let parse_date = |s: &str| -> Result<DateTime<Utc>, VaultError> {
+            DateTime::parse_from_rfc3339(s)
+                .map(|v| v.with_timezone(&Utc))
+                .map_err(|_| invalid())
+        };
+        let from = query.from.as_deref().map(parse_date).transpose()?;
+        let to = query.to.as_deref().map(parse_date).transpose()?;
+        if from.zip(to).is_some_and(|(a, b)| a >= b) {
+            return Err(invalid());
+        }
+        let keywords: Vec<String> = query
+            .keyword
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
+        let mut sql = "SELECT id, at, action, entry_id, detail FROM audit_events".to_string();
+        let values: Vec<rusqlite::types::Value> =
+            query.actions.iter().cloned().map(Into::into).collect();
+        if !values.is_empty() {
+            sql.push_str(&format!(
+                " WHERE action IN ({})",
+                vec!["?"; values.len()].join(",")
+            ));
+        }
+        sql.push_str(" ORDER BY at DESC, id DESC");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
+        let mut items = Vec::new();
+        let mut total = 0;
+        // Stream the full history through the same formatter used for display. Memory is bounded
+        // by the requested page; a single read cursor keeps count and page on the same snapshot.
+        while let Some(row) = rows.next()? {
+            let raw = AuditEvent {
+                id: row.get(0)?,
+                at: row.get(1)?,
+                action: row.get(2)?,
+                entry_id: row.get(3)?,
+                detail: row.get(4)?,
+            };
+            if from.is_some() || to.is_some() {
+                let Ok(at) = DateTime::parse_from_rfc3339(&raw.at) else {
+                    continue;
+                };
+                if from.is_some_and(|v| at < v) || to.is_some_and(|v| at >= v) {
+                    continue;
+                }
+            }
+            let display = format_event(raw);
+            if !query.result.is_empty() && display.result != query.result {
+                continue;
+            }
+            if !keywords.is_empty() {
+                let text = format!(
+                    "{} {} {} {} {} {}",
+                    display.raw.action,
+                    display.raw.detail,
+                    display.raw.entry_id.as_deref().unwrap_or(""),
+                    display.operation,
+                    display.result_label,
+                    display.description
+                )
+                .to_lowercase();
+                if !keywords.iter().all(|word| text.contains(word)) {
+                    continue;
+                }
+            }
+            if total >= query.offset && items.len() < query.limit as usize {
+                items.push(display);
+            }
+            total += 1;
+        }
+        Ok(AuditPage {
+            items,
+            total,
+            actions: ACTIONS.to_vec(),
+            results: RESULTS.to_vec(),
+        })
     }
 
     pub fn audit(
@@ -1838,9 +1934,8 @@ impl Vault {
     pub fn replace_sync_tombstones(&self, tombstones: &[Tombstone]) -> Result<(), VaultError> {
         self.with_transaction(|conn| {
             conn.execute("DELETE FROM sync_tombstones", [])?;
-            let mut stmt = conn.prepare(
-                "INSERT INTO sync_tombstones (kind, id, deleted_at) VALUES (?1,?2,?3)",
-            )?;
+            let mut stmt = conn
+                .prepare("INSERT INTO sync_tombstones (kind, id, deleted_at) VALUES (?1,?2,?3)")?;
             for item in tombstones {
                 stmt.execute(params![&item.kind, &item.id, &item.deleted_at])?;
             }
@@ -1891,9 +1986,10 @@ impl Vault {
                     .as_ref()
                     .map(|plain| encrypt(dest_dek, plain).map(|enc| enc.to_bytes()))
                     .transpose()?;
-                let folder_id = entry.folder_id.as_ref().filter(|id| {
-                    snapshot.folders.iter().any(|folder| folder.id == **id)
-                });
+                let folder_id = entry
+                    .folder_id
+                    .as_ref()
+                    .filter(|id| snapshot.folders.iter().any(|folder| folder.id == **id));
                 self.conn.execute(
                     "INSERT INTO entries (
                         id, kind, title, account, url, folder_id, pinned, expires_at,
@@ -2096,6 +2192,109 @@ fn remove_db_files(path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_queries_cover_full_history_and_literal_chinese_search() {
+        use crate::audit::AuditQuery;
+        let (vault, _) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        for i in 0..260 {
+            vault
+                .conn
+                .execute(
+                    "INSERT INTO audit_events VALUES (?1,?2,?3,?4,?5)",
+                    params![
+                        format!("{i:04}"),
+                        if i < 5 {
+                            "2025-01-01T08:00:00+08:00"
+                        } else {
+                            "2026-01-01T00:00:00Z"
+                        },
+                        if i < 5 { "copy" } else { "unlock" },
+                        "entry-needle",
+                        if i < 5 { "totp" } else { "ok" }
+                    ],
+                )
+                .unwrap();
+        }
+        let mut q = AuditQuery {
+            limit: 50,
+            ..Default::default()
+        };
+        let page = vault.query_audit(&q).unwrap();
+        assert_eq!(page.total, 260);
+        assert_eq!(page.items[0].raw.id, "0259");
+        q.offset = 250;
+        assert_eq!(vault.query_audit(&q).unwrap().items.len(), 10);
+        q.offset = 0;
+        q.keyword = "复制 动态验证码".into();
+        let page = vault.query_audit(&q).unwrap();
+        assert_eq!(page.total, 5);
+        assert_eq!(page.items[0].raw.id, "0004");
+        q.actions = vec!["copy".into(), "unknown".into()];
+        q.result = "recorded".into();
+        q.from = Some("2025-01-01T00:00:00Z".into());
+        q.to = Some("2025-01-02T00:00:00Z".into());
+        q.limit = 2;
+        q.offset = 2;
+        let page = vault.query_audit(&q).unwrap();
+        assert_eq!(page.total, 5);
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].raw.id, "0002");
+        q.result = "success".into();
+        assert_eq!(vault.query_audit(&q).unwrap().total, 0);
+        vault
+            .audit("new_future_action", None, "100%_ ' OR 1=1 --")
+            .unwrap();
+        q = AuditQuery {
+            keyword: "100%_".into(),
+            limit: 50,
+            ..Default::default()
+        };
+        assert_eq!(vault.query_audit(&q).unwrap().total, 1);
+        q.keyword = "OR 1=1 --".into();
+        assert_eq!(vault.query_audit(&q).unwrap().total, 1);
+        q.actions = vec!["' OR 1=1 --".into()];
+        assert_eq!(vault.query_audit(&q).unwrap().total, 0);
+        q.limit = 0;
+        assert!(vault.query_audit(&q).is_err());
+        q.limit = 101;
+        assert!(vault.query_audit(&q).is_err());
+        q.limit = 50;
+        q.offset = -1;
+        assert!(vault.query_audit(&q).is_err());
+        q.offset = 0;
+        q.from = Some("not a date".into());
+        assert!(vault.query_audit(&q).is_err());
+        q.from = Some("2026-01-01T00:00:00Z".into());
+        q.to = q.from.clone();
+        assert!(vault.query_audit(&q).is_err());
+        vault.conn.execute("INSERT INTO audit_events VALUES (?1,?2,?3,NULL,?4)", params![
+            "older-mcp", "2024-01-01T00:00:00Z", "mcp_zoomkey_denied",
+            "operation=zoomkey_crm_project_members decision=deny reason=network endpoint=crm detail=project=a b key=value status=- count=- credential=abc"
+        ]).unwrap();
+        q = AuditQuery {
+            keyword: "项目成员 网络失败".into(),
+            result: "network".into(),
+            limit: 50,
+            ..Default::default()
+        };
+        let page = vault.query_audit(&q).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].raw.id, "older-mcp");
+        q.result = "denied".into();
+        assert_eq!(vault.query_audit(&q).unwrap().total, 0);
+        // Corrupt rows must not silently disappear from count or compatibility reads.
+        vault
+            .conn
+            .execute("UPDATE audit_events SET detail=x'00' WHERE id='0000'", [])
+            .unwrap();
+        q = AuditQuery {
+            limit: 50,
+            ..Default::default()
+        };
+        assert!(vault.query_audit(&q).is_err());
+        assert!(vault.list_audit(1000).is_err());
+    }
 
     #[test]
     fn dek_matches_rejects_a_different_key_and_accepts_the_real_one() {
