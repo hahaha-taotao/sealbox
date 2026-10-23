@@ -483,7 +483,7 @@ async function checkForUpdates(auto = false) {
     updateStage.value = found.update_available ? "available" : "idle";
     if (found.update_available && page.value !== "lock") {
       updateDialogOpen.value = true;
-    } else if (!auto) {
+    } else if (!found.update_available && !auto) {
       showToast("已是最新版本");
     }
   } catch (caught) {

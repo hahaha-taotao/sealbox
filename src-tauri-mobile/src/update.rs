@@ -47,12 +47,21 @@ pub fn current_version() -> String {
 pub fn check() -> Result<MobileRelease, String> {
     let current = current_version();
     let releases = fetch_releases()?;
-    let Some(release) = releases.into_iter().find_map(mobile_release) else {
-        return Err("没有找到 Android 发布".into());
-    };
-    let update_available = version_newer(&release.version, &current);
+    release_response(releases, &current)
+}
+
+fn select_release(releases: Vec<GithubRelease>) -> Option<PickedRelease> {
+    releases
+        .into_iter()
+        .filter_map(mobile_release)
+        .max_by_key(|release| (release.version_key, release.unified_tag))
+}
+
+fn release_response(releases: Vec<GithubRelease>, current: &str) -> Result<MobileRelease, String> {
+    let release = select_release(releases).ok_or("没有找到 Android 发布")?;
+    let update_available = version_newer(&release.version, current);
     Ok(MobileRelease {
-        current_version: current,
+        current_version: current.to_string(),
         latest_version: release.version,
         published_at: release.published_at,
         notes: release.notes,
@@ -66,6 +75,8 @@ pub fn check() -> Result<MobileRelease, String> {
 
 struct PickedRelease {
     version: String,
+    version_key: [u64; 3],
+    unified_tag: bool,
     published_at: Option<String>,
     notes: Option<String>,
     html_url: String,
@@ -74,31 +85,45 @@ struct PickedRelease {
     asset_size: u64,
 }
 
+fn release_version(tag: &str) -> Option<(&str, [u64; 3], bool)> {
+    let unified = tag.starts_with(['v', 'V']);
+    let version = tag
+        .strip_prefix('v')
+        .or_else(|| tag.strip_prefix('V'))
+        .or_else(|| tag.strip_prefix("mobile-v"))
+        .or_else(|| tag.strip_prefix("mobile-V"))?;
+    let mut parts = version.split('.');
+    let mut key = [0; 3];
+    for value in &mut key {
+        let part = parts.next()?;
+        if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        *value = part.parse().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((version, key, unified))
+}
+
 fn mobile_release(release: GithubRelease) -> Option<PickedRelease> {
     if release.draft || release.prerelease {
         return None;
     }
-    let version = release
-        .tag_name
-        .strip_prefix("mobile-v")
-        .or_else(|| release.tag_name.strip_prefix("mobile-V"))?
-        .trim()
-        .trim_start_matches('v')
-        .trim_start_matches('V')
-        .to_string();
-    if version.is_empty() || version.split('.').any(|part| part.is_empty()) {
-        return None;
-    }
+    let (version, version_key, unified_tag) = release_version(&release.tag_name)?;
     let asset = release.assets.into_iter().find(|asset| {
         let name = asset.name.to_ascii_lowercase();
-        name.ends_with(".apk") && asset.browser_download_url.starts_with("https://")
+        name.ends_with(".apk") && trusted_download_url(&asset.browser_download_url)
     })?;
     let notes = release
         .body
         .map(|body| body.trim().to_string())
         .filter(|body| !body.is_empty());
     Some(PickedRelease {
-        version,
+        version: version.to_string(),
+        version_key,
+        unified_tag,
         published_at: release.published_at,
         notes,
         html_url: release.html_url,
@@ -357,5 +382,154 @@ fn version_parts(version: &str) -> Vec<u64> {
         .map(|part| part.chars().take_while(|ch| ch.is_ascii_digit()).collect::<String>())
         .map(|part| part.parse::<u64>().unwrap_or(0))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn release(tag: &str) -> GithubRelease {
+        GithubRelease {
+            tag_name: tag.into(),
+            name: None,
+            body: Some("  Release notes  ".into()),
+            html_url: format!("https://github.com/hahaha-taotao/sealbox/releases/tag/{tag}"),
+            published_at: Some("2026-10-01T00:00:00Z".into()),
+            draft: false,
+            prerelease: false,
+            assets: vec![GithubAsset {
+                name: "Sealbox-arm64.APK".into(),
+                size: 12345,
+                browser_download_url: format!(
+                    "https://github.com/hahaha-taotao/sealbox/releases/download/{tag}/Sealbox-arm64.apk"
+                ),
+            }],
+        }
+    }
+
+    #[test]
+    fn unified_release_builds_update_response_for_093() {
+        let source = release("v0.9.4");
+        let result = release_response(vec![source.clone()], "0.9.3").unwrap();
+        assert!(result.update_available);
+        assert_eq!(result.current_version, "0.9.3");
+        assert_eq!(result.latest_version, "0.9.4");
+        assert_eq!(result.notes.as_deref(), Some("Release notes"));
+        assert_eq!(result.published_at, source.published_at);
+        assert_eq!(result.release_url, source.html_url);
+        assert_eq!(result.download_url, source.assets[0].browser_download_url);
+        assert_eq!(result.asset_name, source.assets[0].name);
+        assert_eq!(result.asset_size, 12345);
+        for current in ["0.9.4", "0.9.5"] {
+            assert!(!release_response(vec![source.clone()], current).unwrap().update_available);
+        }
+    }
+
+    #[test]
+    fn accepts_unified_and_legacy_tag_case() {
+        for tag in ["v0.9.4", "V0.9.4", "mobile-v0.9.4", "mobile-V0.9.4"] {
+            let result = release_response(vec![release(tag)], "0.9.3").unwrap();
+            assert_eq!(result.latest_version, "0.9.4", "{tag}");
+            assert!(result.update_available, "{tag}");
+        }
+    }
+
+    #[test]
+    fn selects_numeric_latest_independent_of_publication_order() {
+        let mut newest = release("v0.9.10");
+        newest.published_at = Some("2020-01-01T00:00:00Z".into());
+        let releases = vec![release("v0.9.9"), newest, release("mobile-v0.9.4")];
+        for releases in [releases.clone(), releases.into_iter().rev().collect()] {
+            let result = release_response(releases, "0.9.9").unwrap();
+            assert_eq!(result.latest_version, "0.9.10");
+            assert!(result.update_available);
+        }
+    }
+
+    #[test]
+    fn same_version_prefers_unified_tag_in_both_orders() {
+        for tags in [["v0.9.4", "mobile-v0.9.4"], ["mobile-v0.9.4", "v0.9.4"]] {
+            let result = release_response(tags.into_iter().map(release).collect(), "0.9.3").unwrap();
+            assert!(result.release_url.ends_with("/v0.9.4"));
+            assert!(result.download_url.contains("/v0.9.4/"));
+        }
+    }
+
+    #[test]
+    fn rejects_non_stable_or_malformed_releases() {
+        let mut invalid = Vec::new();
+        for tag in [
+            "0.9.5", "v", "v0.9", "v0.9.5.1", "v0..5", "v0.9.x",
+            "v0.9.5-beta", "v0.9.5+build", "v+0.9.5", "v0.9. 5",
+            " v0.9.5", "v0.9.5 ", "mobile-vv0.9.5", "mobile-VV0.9.5",
+            "v0.9.５", "v18446744073709551616.0.0",
+        ] {
+            invalid.push(release(tag));
+        }
+        let mut draft = release("v9.0.0");
+        draft.draft = true;
+        invalid.push(draft);
+        let mut prerelease = release("v9.0.0");
+        prerelease.prerelease = true;
+        invalid.push(prerelease);
+        assert_eq!(release_response(invalid.clone(), "0.9.3").err().as_deref(), Some("没有找到 Android 发布"));
+        invalid.push(release("v0.9.4"));
+        assert_eq!(release_response(invalid, "0.9.3").unwrap().latest_version, "0.9.4");
+    }
+
+    #[test]
+    fn skips_newer_releases_without_trusted_apk() {
+        let mut no_apk = release("v1.0.0");
+        no_apk.assets.clear();
+        let mut desktop = release("v2.0.0");
+        desktop.assets[0].name = "Sealbox.exe".into();
+        let result = release_response(vec![no_apk, desktop, release("v0.9.4")], "0.9.3").unwrap();
+        assert_eq!(result.latest_version, "0.9.4");
+        assert!(release_response(vec![], "0.9.3").is_err());
+    }
+
+    #[test]
+    fn selection_uses_existing_download_trust_boundary() {
+        for url in [
+            "http://github.com/hahaha-taotao/sealbox/releases/download/v1/a.apk",
+            "https://evil.example/a.apk",
+            "https://github.com.evil.example/hahaha-taotao/sealbox/releases/download/v1/a.apk",
+            "https://github.com@evil.example/hahaha-taotao/sealbox/releases/download/v1/a.apk",
+            "https://github.com/other/repo/releases/download/v1/a.apk",
+            "https://github.com/hahaha-taotao/sealbox/releases/tag/v1/a.apk",
+            "not a URL",
+        ] {
+            let mut invalid = release("v1.0.0");
+            invalid.assets[0].browser_download_url = url.into();
+            assert!(release_response(vec![invalid], "0.9.3").is_err(), "{url}");
+        }
+        for host in ["objects.githubusercontent.com", "release-assets.githubusercontent.com", "github-releases.githubusercontent.com"] {
+            let mut valid = release("v0.9.4");
+            valid.assets[0].browser_download_url = format!("https://{host}/a.apk");
+            assert!(release_response(vec![valid], "0.9.3").unwrap().update_available);
+        }
+        let mut mixed = release("v0.9.4");
+        let mut bad = mixed.assets[0].clone();
+        bad.browser_download_url = "https://evil.example/a.apk".into();
+        mixed.assets.insert(0, bad);
+        assert!(release_response(vec![mixed], "0.9.3").unwrap().download_url.starts_with("https://github.com/"));
+    }
+
+    #[test]
+    #[ignore = "requires public GitHub API network access"]
+    fn live_github_094_updates_093() {
+        let releases = fetch_releases().expect("fetch real public GitHub releases");
+        let target = releases.iter().find(|release| release.tag_name == "v0.9.4")
+            .expect("v0.9.4 in real GitHub release metadata").clone();
+        let result = release_response(vec![target], "0.9.3").unwrap();
+        assert_eq!(result.latest_version, "0.9.4");
+        assert!(result.update_available);
+        assert!(trusted_download_url(&result.download_url));
+        println!("real GitHub v0.9.4: {} -> {}, update_available={}, APK={}",
+            result.current_version, result.latest_version, result.update_available, result.download_url);
+        let latest = release_response(releases, "0.9.3").unwrap();
+        assert!(latest.update_available);
+        println!("real release list selected {} ({})", latest.latest_version, latest.download_url);
+    }
 }
 
