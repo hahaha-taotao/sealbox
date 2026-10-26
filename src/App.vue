@@ -2597,13 +2597,15 @@ onMounted(async () => {
           <h2>审计</h2>
           <p class="crumb">查询当前本地金库保存的全部历史，不包含其他设备或金库。搜索中文操作、结果、已翻译详情及原始操作、详情、条目 ID；空格分隔的关键词须全部匹配，% 和 _ 按字面匹配。日期按本地时间，包含结束日期。</p>
           <form class="audit-filters" @submit.prevent="queryAudit()">
-            <label>关键词<input v-model="auditFilter.keyword" placeholder="如：复制 动态验证码" maxlength="500" /></label>
-            <label>操作类型<select v-model="auditFilter.action"><option value="">全部操作</option><option v-for="[key, label] in auditActions" :key="key" :value="key">{{ label }}</option></select></label>
-            <label>结果<select v-model="auditFilter.result"><option value="">全部结果</option><option v-for="[key, label] in auditResults" :key="key" :value="key">{{ label }}</option></select></label>
-            <label>起始日期<input v-model="auditFilter.from" type="date" /></label>
-            <label>结束日期<input v-model="auditFilter.to" type="date" /></label>
-            <button class="btn primary" type="submit">查询</button>
-            <button class="btn" type="button" @click="resetAudit">重置</button>
+            <label class="audit-keyword">关键词<input v-model="auditFilter.keyword" placeholder="如：复制 动态验证码" maxlength="500" /></label>
+            <label class="audit-select">操作类型<select v-model="auditFilter.action"><option value="">全部操作</option><option v-for="[key, label] in auditActions" :key="key" :value="key">{{ label }}</option></select></label>
+            <label class="audit-select">结果<select v-model="auditFilter.result"><option value="">全部结果</option><option v-for="[key, label] in auditResults" :key="key" :value="key">{{ label }}</option></select></label>
+            <label class="audit-date">起始日期<input v-model="auditFilter.from" type="date" /></label>
+            <label class="audit-date">结束日期<input v-model="auditFilter.to" type="date" /></label>
+            <div class="audit-filter-actions">
+              <button class="btn primary" type="submit">查询</button>
+              <button class="btn" type="button" @click="resetAudit">重置</button>
+            </div>
           </form>
           <p v-if="auditLoading" role="status">正在查询历史记录…</p>
           <p v-else-if="auditError" class="audit-error" role="alert">{{ auditError }}</p>
