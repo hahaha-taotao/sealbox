@@ -562,6 +562,23 @@ td { padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: m
 tr:hover td { background: #fafbff; }
 .title-cell { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .title-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.title-link { border: 0; background: transparent; padding: 0; color: inherit; font: inherit; cursor: pointer; text-align: left; }
+.title-link:hover { color: var(--brand); }
+.home-row { cursor: pointer; }
+.overview-counts { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 20px; }
+.overview-counts button {
+  border: 1px solid var(--line); background: #fff; border-radius: 999px; padding: 6px 12px; cursor: pointer; color: inherit;
+}
+.overview-counts button:hover { background: #f4f5fb; }
+.overview-counts strong { margin-left: 6px; color: var(--muted); font-weight: 600; }
+.detail-fields { display: grid; grid-template-columns: 96px 1fr; gap: 8px 12px; margin: 0 0 16px; }
+.detail-fields dt { color: var(--muted); }
+.detail-fields dd { margin: 0; word-break: break-word; }
+.detail-notes { white-space: pre-wrap; margin: 0 0 16px; }
+.detail-secret { display: flex; gap: 12px; align-items: flex-start; margin: 0 0 16px; }
+.detail-secret span { color: var(--muted); min-width: 96px; }
+.detail-secret code { white-space: pre-wrap; word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.detail-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
 .vault-account-cell { overflow: hidden; }
 .account-text { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .vault-table th.vault-actions-col,

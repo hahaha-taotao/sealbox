@@ -5,7 +5,7 @@ import { onBackButtonPress } from "@tauri-apps/api/app";
 import type { PluginListener } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { authenticate, checkStatus, getData, hasData, removeData, setData } from "@choochmeque/tauri-plugin-biometry-api";
-import { KINDS, api, kindLabel, type Counts, type EntryDto, type EntryKind, type Folder, type MobileRelease, type SyncReport, type SyncView } from "./api";
+import { KINDS, api, kindLabel, type Counts, type EntryDto, type EntryField, type EntryKind, type Folder, type MobileRelease, type SyncReport, type SyncView } from "./api";
 
 type Page = "lock" | "vault" | "detail" | "edit" | "settings" | "sync";
 const page = ref<Page>("lock");
@@ -40,6 +40,7 @@ const filtersOpen = ref(false);
 const selected = ref<EntryDto | null>(null);
 const revealed = ref("");
 const notes = ref("");
+const fields = ref<EntryField[]>([]);
 const editing = ref(false);
 const form = reactive(blankForm());
 const sync = ref<SyncView | null>(null);
@@ -162,13 +163,24 @@ function blankForm() {
   };
 }
 
-const visible = computed(() => {
-  const text = query.value.trim().toLowerCase();
-  return entries.value.filter((row) => {
-    if (kind.value && row.kind !== kind.value) return false;
-    if (!text) return true;
-    return [row.title, row.account, row.url, row.fingerprint].join(" ").toLowerCase().includes(text);
-  });
+const visible = computed(() =>
+  kind.value ? entries.value.filter((row) => row.kind === kind.value) : entries.value,
+);
+
+let queryTimer: number | undefined;
+function clearQueryTimer() {
+  if (queryTimer !== undefined) {
+    window.clearTimeout(queryTimer);
+    queryTimer = undefined;
+  }
+}
+watch(query, () => {
+  clearQueryTimer();
+  if (page.value === "lock") return;
+  queryTimer = window.setTimeout(() => {
+    queryTimer = undefined;
+    void loadVault().catch(showError);
+  }, 200);
 });
 
 function showError(caught: unknown) {
@@ -194,9 +206,12 @@ async function refreshStatus() {
   }
 }
 
+let loadSeq = 0;
 async function loadVault() {
+  clearQueryTimer();
+  const seq = ++loadSeq;
   const scope = {
-    query: null,
+    query: query.value.trim() || null,
     folder_id: folderId.value || null,
     uncategorized: uncategorized.value,
     tag: tag.value || null,
@@ -210,6 +225,7 @@ async function loadVault() {
     api.counts({}),
     api.counts(scope),
   ]);
+  if (seq !== loadSeq) return;
   entries.value = rows;
   folders.value = folderRows;
   tags.value = tagRows;
@@ -288,8 +304,18 @@ async function toggleBiometry() {
 async function openDetail(row: EntryDto) {
   selected.value = row;
   revealed.value = "";
-  notes.value = (await api.notes(row.id)) ?? "";
+  fields.value = [];
+  notes.value = "";
   page.value = "detail";
+  try {
+    const profile = await api.profile(row.id);
+    if (selected.value?.id !== row.id) return;
+    selected.value = profile.entry;
+    fields.value = profile.fields;
+    notes.value = profile.notes ?? "";
+  } catch (caught) {
+    showError(caught);
+  }
 }
 
 async function reveal() {
@@ -609,16 +635,22 @@ async function saveSync(run: boolean) {
 }
 
 async function lockNow() {
+  clearQueryTimer();
   await api.lock();
   page.value = "lock";
   updateDialogOpen.value = false;
   entries.value = [];
   selected.value = null;
+  fields.value = [];
+  revealed.value = "";
 }
 
 onMounted(async () => {
   await refreshStatus();
   await listen("lock-now", () => {
+    clearQueryTimer();
+    fields.value = [];
+    revealed.value = "";
     page.value = "lock";
     updateDialogOpen.value = false;
     entries.value = [];
@@ -663,7 +695,7 @@ onMounted(async () => {
     <template v-else-if="page === 'vault'">
       <div class="view">
         <div class="searchbar">
-          <input v-model="query" placeholder="搜索键名 / 账号 / 网址" />
+          <input v-model="query" placeholder="搜索键名、账号、网址、备注" />
           <button
             class="icon"
             :class="{ on: filtersOpen }"
@@ -752,6 +784,9 @@ onMounted(async () => {
           </div>
           <div class="actions" v-if="selected.has_totp"><button class="ghost" @click="copy('totp')">复制 TOTP</button></div>
           <p v-if="selected.kind === 'client_cert'" class="hint">私钥不显示、不复制。可以复制公开证书。</p>
+        </div>
+        <div v-if="fields.length" class="kv">
+          <div v-for="(field, i) in fields" :key="`${field.label}-${i}`" class="row"><span class="k">{{ field.label }}</span><span>{{ field.value }}</span></div>
         </div>
         <p v-if="notes" class="hint">{{ notes }}</p>
         <div class="gap"></div>

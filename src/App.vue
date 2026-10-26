@@ -27,6 +27,7 @@ import {
   type CsvImportPreview,
   type EntryDto,
   type EntryKind,
+  type EntryProfile,
   type ExtensionInstallStatus,
   type FolderDto,
   type ListFilter,
@@ -309,7 +310,27 @@ function fmtTime(s: string | null) {
 async function refreshStatus() {
   status.value = await api.status();
 }
+let vaultSeq = 0;
+let vaultSearchTimer: ReturnType<typeof setTimeout> | null = null;
+function clearVaultSearchTimer() {
+  if (vaultSearchTimer) {
+    clearTimeout(vaultSearchTimer);
+    vaultSearchTimer = null;
+  }
+}
+function scheduleVaultSearch() {
+  clearVaultSearchTimer();
+  vaultSearchTimer = setTimeout(() => {
+    vaultSearchTimer = null;
+    void refreshVault();
+  }, 200);
+}
+function searchVaultNow() {
+  clearVaultSearchTimer();
+  void refreshVault();
+}
 async function refreshVault() {
+  const seq = ++vaultSeq;
   const kinds = selectedKindIds.value;
   const scoped = {
     ...filter,
@@ -317,15 +338,23 @@ async function refreshVault() {
     kinds,
     kind: kinds.length === 1 ? kinds[0] : null,
   };
-  entries.value = await api.list(scoped);
-  scopedCounts.value = await api.counts({
-    ...scoped,
-    kinds: [],
-    kind: null,
-  });
-  folders.value = await api.folders();
-  tags.value = await api.tags();
-  status.value = await api.status();
+  const [nextEntries, nextCounts, nextFolders, nextTags, nextStatus] = await Promise.all([
+    api.list(scoped),
+    api.counts({
+      ...scoped,
+      kinds: [],
+      kind: null,
+    }),
+    api.folders(),
+    api.tags(),
+    api.status(),
+  ]);
+  if (seq !== vaultSeq) return;
+  entries.value = nextEntries;
+  scopedCounts.value = nextCounts;
+  folders.value = nextFolders;
+  tags.value = nextTags;
+  status.value = nextStatus;
 }
 
 async function doSetup() {
@@ -393,14 +422,21 @@ function resetAudit() {
   Object.assign(auditFilter, { keyword: "", action: "", result: "", from: "", to: "" });
   void queryAudit();
 }
+function syncOpenDetail(id: string) {
+  if (detail.value?.entry.id !== id) return;
+  const row = entries.value.find((entry) => entry.id === id);
+  if (row) detail.value = { ...detail.value, entry: row };
+}
 async function togglePin(row: EntryDto) {
   await api.pin(row.id, !row.pinned);
   await refreshVault();
+  syncOpenDetail(row.id);
 }
 async function doEmptyTrash() {
   if (!confirm("彻底删除回收站中的全部条目？不可恢复。")) return;
   await api.emptyTrash();
   selected.value.clear();
+  if (detailTrashed.value) closeDetail();
   await refreshVault();
 }
 
@@ -924,6 +960,64 @@ function closeForm() {
   clearWebsiteDuplicateState();
   resetFormFields();
 }
+const detailOpen = ref(false);
+const detailTrashed = ref(false);
+const detail = ref<EntryProfile | null>(null);
+let detailSeq = 0;
+function closeDetail() {
+  detailSeq += 1;
+  detailOpen.value = false;
+  detailTrashed.value = false;
+  detail.value = null;
+  hideSecret();
+}
+function folderName(id: string | null) {
+  if (!id) return "未归类";
+  return folders.value.find((folder) => folder.id === id)?.name || "未归类";
+}
+function revealedSecretText() {
+  const payload = reveal.value;
+  if (!payload) return "";
+  if (payload.type === "website" || payload.type === "mailbox" || payload.type === "server" || payload.type === "database") return payload.password;
+  if (payload.type === "api_token") return payload.token;
+  if (payload.type === "mail_auth") return payload.auth_code;
+  if (payload.type === "ssh") return payload.private_key;
+  return "";
+}
+async function openDetail(row: EntryDto, trashed = page.value === "vault" && Boolean(filter.trash)) {
+  const seq = ++detailSeq;
+  detailOpen.value = true;
+  detailTrashed.value = trashed;
+  detail.value = null;
+  hideSecret();
+  try {
+    const profile = await api.profile(row.id);
+    if (seq !== detailSeq) return;
+    detail.value = profile;
+  } catch (e) {
+    if (seq !== detailSeq) return;
+    closeDetail();
+    showToast(String(e));
+  }
+}
+async function refreshOpenDetail() {
+  const id = detail.value?.entry.id;
+  if (!detailOpen.value || !id) return;
+  const seq = ++detailSeq;
+  try {
+    const profile = await api.profile(id);
+    if (seq !== detailSeq) return;
+    detail.value = profile;
+  } catch {
+    if (seq === detailSeq) closeDetail();
+  }
+}
+function openOverview(kind: EntryKind | null, trash = false) {
+  filter.kinds = kind ? [kind] : [];
+  filter.kind = kind;
+  setFilter(trash ? { trash: true } : {});
+  goPage("vault");
+}
 function openCreate() {
   editing.value = null;
   clearWebsiteDuplicateState();
@@ -1137,6 +1231,7 @@ async function saveEntry(allowWebsiteDuplicate = false) {
       closeForm();
       showToast("客户端证书已保存");
       await refreshVault();
+      await refreshOpenDetail();
     } catch (e) {
       showToast(String(e));
     } finally {
@@ -1166,6 +1261,7 @@ async function saveEntry(allowWebsiteDuplicate = false) {
     closeForm();
     showToast("已保存");
     await refreshVault();
+    await refreshOpenDetail();
   } catch (e) {
     const message = String(e);
     if (form.kind === "website" && message.includes("已有同站同账号")) {
@@ -1181,6 +1277,7 @@ async function copy(id: string, field = "secret") {
   await api.copy(id, field);
   showToast(field === "account" ? "已复制账号" : field === "totp" ? "已复制验证码" : "已复制，20 秒后清空剪贴板");
   await refreshVault();
+  syncOpenDetail(id);
 }
 async function copyClientCertificate(id: string) {
   await api.copyClientCert(id);
@@ -1209,10 +1306,12 @@ async function remove(ids: string[]) {
   if (!confirm("移入回收站？")) return;
   await api.remove(ids);
   selected.value.clear();
+  if (detail.value && ids.includes(detail.value.entry.id)) closeDetail();
   await refreshVault();
 }
 async function restore(ids: string[]) {
   await api.restore(ids);
+  if (detail.value && ids.includes(detail.value.entry.id)) closeDetail();
   await refreshVault();
 }
 async function gen() {
@@ -1491,7 +1590,10 @@ function nativeDialogInFlight() {
 function hideVisibleSecrets() {
   hideSecret();
   // 文件选择框（以及它的收尾事件）导致的失焦不算数，其余失焦照旧关表单。
-  if (!nativeDialogInFlight()) closeForm();
+  if (!nativeDialogInFlight()) {
+    closeForm();
+    closeDetail();
+  }
   hideBridgeTokens();
 }
 
@@ -1521,6 +1623,8 @@ function clearSecrets() {
 
 function applyLockedUi() {
   if (status.value) status.value = { ...status.value, unlocked: false };
+  clearVaultSearchTimer();
+  vaultSeq += 1;
   clearSecrets();
   backupOpen.value = false;
   updateDialogOpen.value = false;
@@ -1839,6 +1943,8 @@ onMounted(async () => {
     },
   );
   onUnmounted(() => {
+    clearVaultSearchTimer();
+    vaultSeq += 1;
     applyLockedUi();
     window.removeEventListener("keydown", onKey);
     document.removeEventListener("visibilitychange", onVisibility);
@@ -1970,16 +2076,30 @@ onMounted(async () => {
       <section class="main" v-if="page === 'home'">
         <div class="content">
           <h2>概览</h2>
-          <p>全部 {{ status.counts?.total ?? 0 }} · 网站 {{ status.counts?.website ?? 0 }} · Token {{ status.counts?.api_token ?? 0 }} · SSH {{ status.counts?.ssh ?? 0 }} · 邮箱 {{ status.counts?.mailbox ?? 0 }} · 授权码 {{ status.counts?.mail_auth ?? 0 }} · 服务器 {{ status.counts?.server ?? 0 }} · 数据库 {{ status.counts?.database ?? 0 }} · 证书 {{ status.counts?.client_cert ?? 0 }} · 回收站 {{ status.counts?.trash ?? 0 }}</p>
+          <div class="overview-counts">
+            <button type="button" @click="openOverview(null)">全部<strong>{{ status.counts?.total ?? 0 }}</strong></button>
+            <button type="button" @click="openOverview('website')">网站<strong>{{ status.counts?.website ?? 0 }}</strong></button>
+            <button type="button" @click="openOverview('api_token')">Token<strong>{{ status.counts?.api_token ?? 0 }}</strong></button>
+            <button type="button" @click="openOverview('ssh')">SSH<strong>{{ status.counts?.ssh ?? 0 }}</strong></button>
+            <button type="button" @click="openOverview('mailbox')">邮箱<strong>{{ status.counts?.mailbox ?? 0 }}</strong></button>
+            <button type="button" @click="openOverview('mail_auth')">授权码<strong>{{ status.counts?.mail_auth ?? 0 }}</strong></button>
+            <button type="button" @click="openOverview('server')">服务器<strong>{{ status.counts?.server ?? 0 }}</strong></button>
+            <button type="button" @click="openOverview('database')">数据库<strong>{{ status.counts?.database ?? 0 }}</strong></button>
+            <button type="button" @click="openOverview('client_cert')">证书<strong>{{ status.counts?.client_cert ?? 0 }}</strong></button>
+            <button type="button" @click="openOverview(null, true)">回收站<strong>{{ status.counts?.trash ?? 0 }}</strong></button>
+          </div>
           <h3>最近使用</h3>
           <div class="table" v-if="recent.length">
             <table>
               <tbody>
-                <tr v-for="row in recent" :key="row.id">
+                <tr v-for="row in recent" :key="row.id" class="home-row" @click="openDetail(row)">
                   <td>{{ row.title }}</td>
                   <td>{{ row.account || "—" }}</td>
                   <td>{{ fmtTime(row.last_used_at) }}</td>
-                  <td><button class="btn" @click="copy(row.id)">复制</button></td>
+                  <td>
+                    <button class="btn" type="button" @click.stop="row.kind === 'client_cert' ? copyClientCertificate(row.id) : copy(row.id)">复制</button>
+                    <button class="btn" type="button" @click.stop="openEdit(row)">编辑</button>
+                  </td>
                 </tr>
               </tbody>
             </table>
@@ -1989,9 +2109,13 @@ onMounted(async () => {
           <div class="table" v-if="expiring.length">
             <table>
               <tbody>
-                <tr v-for="row in expiring" :key="'e'+row.id">
+                <tr v-for="row in expiring" :key="'e'+row.id" class="home-row" @click="openDetail(row)">
                   <td>{{ row.title }}</td>
                   <td>{{ fmtTime(row.expires_at) }}</td>
+                  <td>
+                    <button class="btn" type="button" @click.stop="row.kind === 'client_cert' ? copyClientCertificate(row.id) : copy(row.id)">复制</button>
+                    <button class="btn" type="button" @click.stop="openEdit(row)">编辑</button>
+                  </td>
                 </tr>
               </tbody>
             </table>
@@ -2063,7 +2187,7 @@ onMounted(async () => {
         </aside>
         <div class="content vault-content">
           <div class="toolbar">
-            <input class="search" v-model="filter.query" placeholder="搜索键名 / 账号 / 网址… (Ctrl+F)" @keyup.enter="refreshVault" />
+            <input class="search" v-model="filter.query" placeholder="搜索键名 / 账号 / 网址 / 标签 / 备注… (Ctrl+F)" @input="scheduleVaultSearch" @keyup.enter="searchVaultNow" />
             <select class="select" v-model="filter.sort" @change="refreshVault">
               <option value="use_count">使用次数</option>
               <option value="updated">修改时间</option>
@@ -2114,7 +2238,7 @@ onMounted(async () => {
                   <td>
                     <div class="title-cell">
                       <span class="letter" :style="{ background: letterColor(row.title) }">{{ row.title.slice(0,1).toUpperCase() }}</span>
-                      <span class="title-text" :title="row.title">{{ row.title }}</span>
+                      <button class="title-link title-text" type="button" :title="row.title" @click.stop="openDetail(row)">{{ row.title }}</button>
                       <button
                         v-if="!filter.trash"
                         class="icon-btn pin"
@@ -2740,6 +2864,51 @@ onMounted(async () => {
         </div>
       </section>
 
+      <div class="dialog-mask" v-if="detailOpen" @click.self="closeDetail">
+        <div class="dialog detail-dialog" role="dialog" aria-modal="true" aria-labelledby="detail-title">
+          <p v-if="!detail" class="crumb">正在读取…</p>
+          <template v-else>
+          <div class="dialog-heading">
+            <div>
+              <h3 id="detail-title">{{ detail.entry.title }}</h3>
+              <p class="crumb">{{ kindLabel(detail.entry.kind) }} · {{ folderName(detail.entry.folder_id) }}</p>
+            </div>
+            <button class="nav-btn" type="button" @click="closeDetail">×</button>
+          </div>
+          <dl class="detail-fields">
+            <template v-for="field in detail.fields" :key="field.label">
+              <dt>{{ field.label }}</dt>
+              <dd>{{ field.value }}</dd>
+            </template>
+            <dt>标签</dt>
+            <dd>{{ detail.entry.tags.length ? detail.entry.tags.join("、") : "—" }}</dd>
+            <dt>过期</dt>
+            <dd>{{ detail.entry.expires_at ? fmtTime(detail.entry.expires_at) : "永不" }}</dd>
+            <dt>使用次数</dt>
+            <dd>{{ detail.entry.use_count }}</dd>
+          </dl>
+          <p v-if="detail.notes" class="detail-notes">{{ detail.notes }}</p>
+          <p v-else class="crumb">没有备注</p>
+          <div v-if="detail.entry.kind !== 'client_cert'" class="detail-secret">
+            <span>秘密</span>
+            <code>{{ revealFor === detail.entry.id ? revealedSecretText() : "••••••••" }}</code>
+          </div>
+          <p v-else class="crumb">私钥不在详情里显示。可以复制公开证书，或进入编辑查看证书信息。</p>
+          <div class="detail-actions">
+            <button v-if="detail.entry.kind !== 'client_cert'" class="btn" type="button" @click="copy(detail.entry.id)">复制密码</button>
+            <button class="btn" type="button" @click="copy(detail.entry.id, 'account')">复制账号</button>
+            <button v-if="detail.entry.has_totp" class="btn" type="button" @click="copy(detail.entry.id, 'totp')">复制 TOTP</button>
+            <button v-if="detail.entry.kind === 'client_cert'" class="btn" type="button" @click="copyClientCertificate(detail.entry.id)">复制公开证书</button>
+            <button v-if="detail.entry.kind !== 'client_cert'" class="btn" type="button" @click="revealRow(detail.entry)">{{ revealFor === detail.entry.id ? "隐藏" : "显示" }}</button>
+            <button v-if="!detailTrashed" class="btn" type="button" @click="togglePin(detail.entry)">{{ detail.entry.pinned ? "取消置顶" : "置顶" }}</button>
+            <button v-if="!detailTrashed" class="btn" type="button" @click="openEdit(detail.entry)">编辑</button>
+            <button v-if="!detailTrashed" class="btn danger" type="button" @click="remove([detail.entry.id])">移入回收站</button>
+            <button v-else class="btn" type="button" @click="restore([detail.entry.id])">还原</button>
+            <button class="btn" type="button" @click="closeDetail">关闭</button>
+          </div>
+          </template>
+        </div>
+      </div>
       <div class="dialog-mask" v-if="showForm" @click.self="closeForm">
       <div class="dialog">
         <h3>{{ editing ? "编辑凭据" : "新建凭据" }}</h3>

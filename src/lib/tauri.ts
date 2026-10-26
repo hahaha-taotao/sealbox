@@ -27,6 +27,17 @@ export interface EntryDto {
   fingerprint: string | null;
 }
 
+export interface EntryField {
+  label: string;
+  value: string;
+}
+
+export interface EntryProfile {
+  entry: EntryDto;
+  notes: string | null;
+  fields: EntryField[];
+}
+
 export type WebsiteDuplicate = EntryDto;
 
 export type SyncKind = "webdav" | "s3";
@@ -366,6 +377,7 @@ export const api = {
   }) => invoke<EntryDto>("update_client_cert_metadata", { input }),
   importClientCert: (input: ImportClientCertInput) => invoke<EntryDto>("import_client_cert", { input }),
   notes: (id: string) => invoke<string | null>("get_notes", { id }),
+  profile: (id: string) => invoke<EntryProfile>("entry_profile", { id }),
   genPassword: (opts: {
     mode?: "password" | "passphrase";
     length?: number;

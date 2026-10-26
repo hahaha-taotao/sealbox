@@ -48,6 +48,7 @@ pub fn run() {
             commands::copy_secret,
             commands::reveal_secret,
             commands::get_notes,
+            commands::entry_profile,
             commands::settings_get,
             commands::settings_set,
             commands::sync_status,

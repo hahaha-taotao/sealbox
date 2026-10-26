@@ -27,6 +27,17 @@ export interface EntryDto {
   fingerprint: string | null;
 }
 
+export interface EntryField {
+  label: string;
+  value: string;
+}
+
+export interface EntryProfile {
+  entry: EntryDto;
+  notes: string | null;
+  fields: EntryField[];
+}
+
 export interface Counts {
   total: number;
   website: number;
@@ -149,6 +160,7 @@ export const api = {
   copy: (id: string, field: string) => invoke("copy_secret", { id, field }),
   reveal: (id: string) => invoke<Record<string, unknown>>("reveal_secret", { id }),
   notes: (id: string) => invoke<string | null>("get_notes", { id }),
+  profile: (id: string) => invoke<EntryProfile>("entry_profile", { id }),
   settings: () => invoke<SettingsView>("settings_get"),
   saveSettings: (idleSecs: number, clipboardSecs: number) =>
     invoke("settings_set", { idleSecs, clipboardSecs }),

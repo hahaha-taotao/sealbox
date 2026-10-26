@@ -11,6 +11,7 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("empty_trash", "清空回收站"),
     ("copy", "复制信息"),
     ("reveal", "查看秘密"),
+    ("view", "查看条目"),
     ("copy_certificate", "复制公开证书"),
     ("create_folder", "新建文件夹"),
     ("rename_folder", "重命名文件夹"),
@@ -275,6 +276,7 @@ pub fn format_event(raw: AuditEvent) -> AuditDisplay {
                     | "change_master"
                     | "restore"
                     | "reveal"
+                    | "view"
                     | "export"
                     | "browser_fill"
                     | "mcp_stop"
@@ -286,6 +288,7 @@ pub fn format_event(raw: AuditEvent) -> AuditDisplay {
             description = match raw.action.as_str() {
                 "unlock" => "已解锁密码库",
                 "browser_fill" => "已向浏览器填充登录信息",
+                "view" => "已查看条目",
                 _ => "操作成功",
             }
             .into();

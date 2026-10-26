@@ -4,7 +4,9 @@ use crate::update::{self, MobileRelease};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use sealbox_core::sync::{self, SyncConfig, SyncKind, SyncReport, SyncView};
 use sealbox_core::totp::{ssh_fingerprint, totp_now};
-use sealbox_core::vault::{Counts, EntryDto, FolderDto, ListFilter, SecretPayload, UpsertEntry, Vault};
+use sealbox_core::vault::{
+    Counts, EntryDto, EntryProfile, FolderDto, ListFilter, SecretPayload, UpsertEntry, Vault,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -217,14 +219,24 @@ pub fn tick_idle(state: State<AppState>) -> Result<bool, String> {
 pub fn list_entries(state: State<AppState>, filter: ListFilter) -> Result<Vec<EntryDto>, String> {
     let mut session = lock_session(&state.session);
     session.require_unlocked().map_err(map_err)?;
-    session.vault().map_err(map_err)?.list_entries(&filter).map_err(map_err)
+    let dek = *session.dek().map_err(map_err)?;
+    session
+        .vault()
+        .map_err(map_err)?
+        .search_entries(&dek, &filter)
+        .map_err(map_err)
 }
 
 #[tauri::command]
 pub fn list_counts(state: State<AppState>, filter: ListFilter) -> Result<Counts, String> {
     let mut session = lock_session(&state.session);
     session.require_unlocked().map_err(map_err)?;
-    session.vault().map_err(map_err)?.counts_for(&filter).map_err(map_err)
+    let dek = *session.dek().map_err(map_err)?;
+    session
+        .vault()
+        .map_err(map_err)?
+        .counts_for_search(&dek, &filter)
+        .map_err(map_err)
 }
 
 #[tauri::command]
@@ -388,6 +400,20 @@ pub fn get_notes(state: State<AppState>, id: String) -> Result<Option<String>, S
     session.require_unlocked().map_err(map_err)?;
     let dek = *session.dek().map_err(map_err)?;
     session.vault().map_err(map_err)?.get_notes(&dek, &id).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn entry_profile(state: State<AppState>, id: String) -> Result<EntryProfile, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let dek = *session.dek().map_err(map_err)?;
+    let profile = session
+        .vault()
+        .map_err(map_err)?
+        .entry_profile(&dek, &id)
+        .map_err(map_err)?;
+    let _ = session.vault().map_err(map_err)?.audit("view", Some(&id), "ok");
+    Ok(profile)
 }
 
 #[derive(Serialize)]

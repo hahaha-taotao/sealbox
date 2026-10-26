@@ -141,6 +141,19 @@ pub struct EntryDto {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EntryField {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EntryProfile {
+    pub entry: EntryDto,
+    pub notes: Option<String>,
+    pub fields: Vec<EntryField>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ListFilter {
     pub query: Option<String>,
@@ -1796,6 +1809,277 @@ impl Vault {
             |r| r.get(0),
         )?;
         Ok(counts)
+    }
+
+    fn query_text(filter: &ListFilter) -> Option<&str> {
+        filter
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+    }
+
+    fn contains_query(haystack: &str, query: &str) -> bool {
+        haystack.to_lowercase().contains(&query.to_lowercase())
+    }
+
+    fn folder_name_map(&self) -> Result<HashMap<String, String>, VaultError> {
+        Ok(self
+            .list_folders()?
+            .into_iter()
+            .map(|folder| (folder.id, folder.name))
+            .collect())
+    }
+
+    fn notes_plain(&self, dek: &[u8; 32], id: &str) -> Result<Option<String>, VaultError> {
+        let blob = self
+            .conn
+            .query_row(
+                "SELECT notes_blob FROM entries WHERE id=?1",
+                params![id],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .optional()?
+            .ok_or(VaultError::NotFound)?;
+        match blob {
+            Some(bytes) => {
+                let enc = Encrypted::from_bytes(&bytes)?;
+                let plain = decrypt(dek, &enc)?;
+                Ok(Some(String::from_utf8_lossy(&plain).into_owned()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn entry_matches_query(
+        &self,
+        dek: &[u8; 32],
+        entry: &EntryDto,
+        query: &str,
+        folders: &HashMap<String, String>,
+    ) -> Result<bool, VaultError> {
+        let folder = entry
+            .folder_id
+            .as_ref()
+            .and_then(|id| folders.get(id))
+            .map(String::as_str)
+            .unwrap_or("");
+        let tags = entry.tags.join(" ");
+        let notes = self.notes_plain(dek, &entry.id)?.unwrap_or_default();
+        let fields = [
+            entry.title.as_str(),
+            entry.account.as_deref().unwrap_or(""),
+            entry.url.as_deref().unwrap_or(""),
+            tags.as_str(),
+            folder,
+            entry.fingerprint.as_deref().unwrap_or(""),
+            notes.as_str(),
+        ];
+        Ok(fields
+            .iter()
+            .any(|field| Self::contains_query(field, query)))
+    }
+
+    pub fn search_entries(
+        &self,
+        dek: &[u8; 32],
+        filter: &ListFilter,
+    ) -> Result<Vec<EntryDto>, VaultError> {
+        let Some(query) = Self::query_text(filter) else {
+            return self.list_entries(filter);
+        };
+        let mut scoped = filter.clone();
+        scoped.query = None;
+        let folders = self.folder_name_map()?;
+        let mut out = Vec::new();
+        for entry in self.list_entries(&scoped)? {
+            if self.entry_matches_query(dek, &entry, query, &folders)? {
+                out.push(entry);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn counts_for_search(
+        &self,
+        dek: &[u8; 32],
+        filter: &ListFilter,
+    ) -> Result<Counts, VaultError> {
+        if Self::query_text(filter).is_none() {
+            return self.counts_for(filter);
+        }
+        let mut scoped = filter.clone();
+        scoped.kind = None;
+        scoped.kinds.clear();
+        let mut counts = Counts::default();
+        for entry in self.search_entries(dek, &scoped)? {
+            match entry.kind {
+                EntryKind::Website => counts.website += 1,
+                EntryKind::ApiToken => counts.api_token += 1,
+                EntryKind::Ssh => counts.ssh += 1,
+                EntryKind::Mailbox => counts.mailbox += 1,
+                EntryKind::MailAuth => counts.mail_auth += 1,
+                EntryKind::Server => counts.server += 1,
+                EntryKind::Database => counts.database += 1,
+                EntryKind::ClientCert => counts.client_cert += 1,
+            }
+            counts.total += 1;
+        }
+        counts.trash = self.conn.query_row(
+            "SELECT COUNT(*) FROM entries WHERE deleted_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(counts)
+    }
+
+    fn push_field(fields: &mut Vec<EntryField>, label: &str, value: Option<&str>) {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return;
+        };
+        fields.push(EntryField {
+            label: label.to_string(),
+            value: value.to_string(),
+        });
+    }
+
+    fn push_port(fields: &mut Vec<EntryField>, label: &str, port: Option<u16>) {
+        if let Some(port) = port {
+            fields.push(EntryField {
+                label: label.to_string(),
+                value: port.to_string(),
+            });
+        }
+    }
+
+    pub fn entry_profile(&self, dek: &[u8; 32], id: &str) -> Result<EntryProfile, VaultError> {
+        let entry = self.get_dto(id)?;
+        let notes = self.notes_plain(dek, id)?;
+        let deleted_at = self
+            .conn
+            .query_row(
+                "SELECT deleted_at FROM entries WHERE id=?1",
+                params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or(VaultError::NotFound)?;
+        let mut fields = Vec::new();
+        if deleted_at.is_some() {
+            Self::push_field(&mut fields, "网址", entry.url.as_deref());
+            Self::push_field(&mut fields, "账号", entry.account.as_deref());
+            return Ok(EntryProfile { entry, notes, fields });
+        }
+        let secret = self.get_active_secret(dek, id)?;
+        match secret {
+            SecretPayload::Website { url, username, .. } => {
+                Self::push_field(&mut fields, "网址", url.as_deref().or(entry.url.as_deref()));
+                Self::push_field(
+                    &mut fields,
+                    "账号",
+                    username.as_deref().or(entry.account.as_deref()),
+                );
+            }
+            SecretPayload::ApiToken { service, account, .. } => {
+                Self::push_field(&mut fields, "服务", Some(service.as_str()));
+                Self::push_field(
+                    &mut fields,
+                    "账号",
+                    account.as_deref().or(entry.account.as_deref()),
+                );
+                Self::push_field(&mut fields, "允许的网址", entry.url.as_deref());
+            }
+            SecretPayload::Ssh {
+                key_type,
+                public_fingerprint,
+                ..
+            } => {
+                Self::push_field(&mut fields, "密钥类型", Some(key_type.as_str()));
+                Self::push_field(
+                    &mut fields,
+                    "指纹",
+                    entry
+                        .fingerprint
+                        .as_deref()
+                        .or(public_fingerprint.as_deref()),
+                );
+            }
+            SecretPayload::Mailbox {
+                email,
+                imap_host,
+                imap_port,
+                smtp_host,
+                smtp_port,
+                ..
+            } => {
+                Self::push_field(&mut fields, "邮箱", Some(email.as_str()));
+                Self::push_field(&mut fields, "IMAP 主机", imap_host.as_deref());
+                Self::push_port(&mut fields, "IMAP 端口", imap_port);
+                Self::push_field(&mut fields, "SMTP 主机", smtp_host.as_deref());
+                Self::push_port(&mut fields, "SMTP 端口", smtp_port);
+            }
+            SecretPayload::MailAuth { email, provider, .. } => {
+                Self::push_field(&mut fields, "邮箱", Some(email.as_str()));
+                Self::push_field(&mut fields, "服务商", Some(provider.as_str()));
+            }
+            SecretPayload::Server {
+                host,
+                port,
+                protocol,
+                username,
+                ..
+            } => {
+                Self::push_field(&mut fields, "协议", Some(protocol.as_str()));
+                Self::push_field(&mut fields, "主机", Some(host.as_str()));
+                Self::push_port(&mut fields, "端口", port);
+                Self::push_field(&mut fields, "用户名", Some(username.as_str()));
+            }
+            SecretPayload::Database {
+                engine,
+                host,
+                port,
+                database,
+                username,
+                ..
+            } => {
+                Self::push_field(&mut fields, "数据库类型", Some(engine.as_str()));
+                Self::push_field(&mut fields, "主机", Some(host.as_str()));
+                Self::push_port(&mut fields, "端口", port);
+                Self::push_field(&mut fields, "库名", Some(database.as_str()));
+                Self::push_field(&mut fields, "用户名", Some(username.as_str()));
+            }
+            SecretPayload::ClientCert {
+                cert_pem,
+                key_pem,
+                passphrase,
+            } => {
+                let metadata =
+                    certificate::validate_client_cert(&cert_pem, &key_pem, passphrase.as_deref())
+                        .ok();
+                Self::push_field(
+                    &mut fields,
+                    "指纹",
+                    entry.fingerprint.as_deref().or_else(|| {
+                        metadata
+                            .as_ref()
+                            .map(|value| value.fingerprint.as_str())
+                    }),
+                );
+                if let Some(metadata) = metadata.as_ref() {
+                    fields.push(EntryField {
+                        label: "证书链张数".into(),
+                        value: metadata.certificate_count.to_string(),
+                    });
+                }
+                if passphrase.is_some() {
+                    fields.push(EntryField {
+                        label: "含私钥口令".into(),
+                        value: "是".into(),
+                    });
+                }
+            }
+        }
+        Ok(EntryProfile { entry, notes, fields })
     }
 
     pub fn recent_entries(&self, limit: i64) -> Result<Vec<EntryDto>, VaultError> {

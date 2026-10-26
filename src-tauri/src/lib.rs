@@ -68,6 +68,7 @@ pub fn run() {
             commands::update_client_cert_metadata,
             commands::import_client_cert,
             commands::get_notes,
+            commands::entry_profile,
             commands::tick_idle,
             commands::gen_password,
             commands::export_backup,

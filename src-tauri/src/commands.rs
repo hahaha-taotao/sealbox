@@ -6,7 +6,9 @@ use crate::mcp::{self, McpState};
 use crate::session::Session;
 use crate::sync::{self, SyncConfig, SyncKind, SyncReport, SyncView};
 use crate::totp::{generate_passphrase, generate_password_with_options, ssh_fingerprint, totp_now};
-use crate::vault::{Counts, EntryDto, FolderDto, ListFilter, SecretPayload, UpsertEntry, Vault};
+use crate::vault::{
+    Counts, EntryDto, EntryProfile, FolderDto, ListFilter, SecretPayload, UpsertEntry, Vault,
+};
 use crate::zoomkey::{self, ZoomkeyCandidates, ZoomkeyMcpPolicy};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -345,10 +347,11 @@ pub fn lock_vault(state: State<AppState>) -> Result<(), String> {
 pub fn list_entries(state: State<AppState>, filter: ListFilter) -> Result<Vec<EntryDto>, String> {
     let mut session = lock_session(&state.session);
     session.require_unlocked().map_err(map_err)?;
+    let dek = *session.dek().map_err(map_err)?;
     session
         .vault()
         .map_err(map_err)?
-        .list_entries(&filter)
+        .search_entries(&dek, &filter)
         .map_err(map_err)
 }
 
@@ -356,10 +359,11 @@ pub fn list_entries(state: State<AppState>, filter: ListFilter) -> Result<Vec<En
 pub fn list_counts(state: State<AppState>, filter: ListFilter) -> Result<Counts, String> {
     let mut session = lock_session(&state.session);
     session.require_unlocked().map_err(map_err)?;
+    let dek = *session.dek().map_err(map_err)?;
     session
         .vault()
         .map_err(map_err)?
-        .counts_for(&filter)
+        .counts_for_search(&dek, &filter)
         .map_err(map_err)
 }
 
@@ -852,6 +856,23 @@ pub fn get_notes(state: State<AppState>, id: String) -> Result<Option<String>, S
         .map_err(map_err)?
         .get_notes(&dek, &id)
         .map_err(map_err)
+}
+
+#[tauri::command]
+pub fn entry_profile(state: State<AppState>, id: String) -> Result<EntryProfile, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let dek = *session.dek().map_err(map_err)?;
+    let profile = session
+        .vault()
+        .map_err(map_err)?
+        .entry_profile(&dek, &id)
+        .map_err(map_err)?;
+    let _ = session
+        .vault()
+        .map_err(map_err)?
+        .audit("view", Some(&id), "ok");
+    Ok(profile)
 }
 
 /// Clipboard wipe and idle lock. Runs on the Rust clock, not a webview listener,

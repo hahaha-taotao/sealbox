@@ -204,6 +204,80 @@ fn list_dto_has_no_password_and_search_skips_notes() {
 }
 
 #[test]
+fn search_entries_matches_notes_without_leaking_them() {
+    let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+    vault
+        .upsert_entry(
+            &dek,
+            sample_website("jira", Some("recovery-code-SHOULD-NOT-MATCH")),
+        )
+        .unwrap();
+    let filter = |query: &str| ListFilter {
+        query: Some(query.into()),
+        sort: SortBy::Title,
+        ..ListFilter::default()
+    };
+    let hit = vault.search_entries(&dek, &filter("recovery-code")).unwrap();
+    assert_eq!(hit.len(), 1);
+    let json = serde_json::to_string(&hit[0]).unwrap();
+    assert!(!json.contains("recovery-code"));
+    assert!(!json.contains("s3cret-pass"));
+    assert_eq!(
+        vault.search_entries(&dek, &filter("RECOVERY-CODE")).unwrap().len(),
+        1
+    );
+    assert!(vault
+        .search_entries(&dek, &filter("no-such-note"))
+        .unwrap()
+        .is_empty());
+    let counts = vault.counts_for_search(&dek, &filter("recovery-code")).unwrap();
+    assert_eq!(counts.website, 1);
+    assert_eq!(counts.total, 1);
+}
+
+#[test]
+fn entry_profile_shows_host_and_notes_but_not_password() {
+    let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+    let saved = vault
+        .upsert_entry(
+            &dek,
+            UpsertEntry {
+                id: None,
+                kind: EntryKind::Server,
+                title: "bastion".into(),
+                account: Some("root".into()),
+                url: None,
+                folder_id: None,
+                tags: vec![],
+                pinned: false,
+                expires_at: None,
+                notes: Some("机房门口".into()),
+                secret: SecretPayload::Server {
+                    host: "10.0.0.8".into(),
+                    port: Some(22),
+                    protocol: "ssh".into(),
+                    username: "root".into(),
+                    password: "s3cret-pass".into(),
+                },
+            },
+        )
+        .unwrap();
+    let profile = vault.entry_profile(&dek, &saved.id).unwrap();
+    let json = serde_json::to_string(&profile).unwrap();
+    assert!(json.contains("10.0.0.8"));
+    assert!(json.contains("机房门口"));
+    assert!(!json.contains("s3cret-pass"));
+    assert!(profile
+        .fields
+        .iter()
+        .any(|field| field.label == "主机" && field.value == "10.0.0.8"));
+    assert!(profile
+        .fields
+        .iter()
+        .any(|field| field.label == "端口" && field.value == "22"));
+}
+
+#[test]
 fn three_kinds_roundtrip_and_trash() {
     let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
     let web = vault

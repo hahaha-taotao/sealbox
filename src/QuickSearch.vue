@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
-import { api, type EntryDto, type EntryKind, type FolderDto, type Status } from "./lib/tauri";
+import { api, type EntryDto, type EntryKind, type FolderDto, type ListFilter, type Status } from "./lib/tauri";
 
 const status = ref<Status | null>(null);
 const query = ref("");
@@ -14,15 +14,57 @@ const error = ref("");
 const toast = ref("");
 const win = getCurrentWindow();
 
-const hits = computed(() => {
-  const q = query.value.toLowerCase();
-  return entries.value.filter(
-    (e) =>
-      e.title.toLowerCase().includes(q) ||
-      (e.account || "").toLowerCase().includes(q) ||
-      (e.url || "").toLowerCase().includes(q) ||
-      folderName(e.folder_id).toLowerCase().includes(q),
-  ).filter((e) => e.kind !== "client_cert");
+const hits = computed(() => entries.value.filter((e) => e.kind !== "client_cert"));
+
+let searchTimer: ReturnType<typeof setTimeout> | null = null;
+let searchSeq = 0;
+
+function clearSearchTimer() {
+  if (searchTimer) {
+    clearTimeout(searchTimer);
+    searchTimer = null;
+  }
+}
+
+function listFilter(): ListFilter {
+  return {
+    query: query.value.trim() || null,
+    kind: null,
+    kinds: [],
+    folder_id: null,
+    uncategorized: false,
+    tag: null,
+    trash: false,
+    sort: "use_count",
+  };
+}
+
+async function search() {
+  clearSearchTimer();
+  if (!status.value?.unlocked) return;
+  const seq = ++searchSeq;
+  try {
+    const rows = await api.list(listFilter());
+    if (seq !== searchSeq) return;
+    entries.value = rows;
+    error.value = "";
+  } catch (e) {
+    if (seq !== searchSeq) return;
+    entries.value = [];
+    error.value = String(e);
+  }
+  index.value = 0;
+}
+
+function onQueryInput() {
+  index.value = 0;
+  clearSearchTimer();
+  searchTimer = setTimeout(search, 200);
+}
+
+onUnmounted(() => {
+  clearSearchTimer();
+  searchSeq++;
 });
 
 function kindLabel(k: EntryKind) {
@@ -51,6 +93,8 @@ async function hide() {
 }
 
 async function refresh() {
+  clearSearchTimer();
+  const seq = ++searchSeq;
   status.value = await api.status();
   if (!status.value.unlocked) {
     entries.value = [];
@@ -58,21 +102,13 @@ async function refresh() {
     return;
   }
   try {
-    [entries.value, folders.value] = await Promise.all([
-      api.list({
-      query: null,
-      kind: null,
-      kinds: [],
-      folder_id: null,
-      uncategorized: false,
-      tag: null,
-      trash: false,
-      sort: "use_count",
-      }),
-      api.folders(),
-    ]);
+    const [rows, folderRows] = await Promise.all([api.list(listFilter()), api.folders()]);
+    folders.value = folderRows;
+    if (seq !== searchSeq) return;
+    entries.value = rows;
     error.value = "";
   } catch (e) {
+    if (seq !== searchSeq) return;
     entries.value = [];
     error.value = String(e);
   }
@@ -135,9 +171,9 @@ onMounted(async () => {
   window.addEventListener("keydown", onKey);
   await refresh();
   const un = await listen("quick-search", async () => {
-    await refresh();
     query.value = "";
     index.value = 0;
+    await refresh();
     setTimeout(() => {
       const el = document.querySelector("input") as HTMLInputElement | null;
       el?.focus();
@@ -184,7 +220,7 @@ onMounted(async () => {
     </div>
 
     <div v-else class="quick-body">
-      <input v-model="query" class="search" placeholder="搜索后回车复制…" autofocus @input="index = 0" />
+      <input v-model="query" class="search" placeholder="搜索键名、账号、网址、备注，回车复制" autofocus @input="onQueryInput" />
       <p v-if="error" class="error">{{ error }}</p>
       <div class="quick-list">
         <button
