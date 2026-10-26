@@ -2252,9 +2252,6 @@ onMounted(async () => {
               <button class="btn" type="button" @click="rotateMcp">轮换 MCP Token</button>
             </div>
           </div>
-          <p class="crumb">
-            这一个开关同时控制 GitHub 和 ZoomKey 工具。关闭后模型看不到任何工具；打开后，GitHub 只读和本地 git 立即可用。
-          </p>
           <div class="mcp-card">
             <h3>Cursor / Claude Code</h3>
             <p class="crumb">金库锁定时工具会失败并提示先解锁。</p>
@@ -2274,16 +2271,7 @@ onMounted(async () => {
           </div>
           <div class="mcp-card">
             <h3>ZoomKey JIRA / CRM</h3>
-            <p class="crumb">
-              把众齐内网的 JIRA 与 CRM 查询能力开放给本机 MCP 客户端。两个站点都在 172.16.x.x 内网且强制双向 TLS；
-              账号密码与客户端私钥都从金库取，不落磁盘明文，模型永远看不到明文。
-            </p>
             <template v-if="zoomkeyPolicy">
-              <div class="zoomkey-notice">
-                启用后 Sealbox 只对下方白名单里的主机名放行，解析结果会被钉住再使用；
-                回环、链路本地与云元数据地址（169.254.169.254 / 100.100.100.200）永远拒绝。
-                配齐凭据、客户端证书和 CA bundle 的端点会自动出现在工具列表。
-              </div>
               <div class="field">
                 <label>允许的主机名（每行一个，精确匹配）</label>
                 <textarea
@@ -2595,7 +2583,6 @@ onMounted(async () => {
       <section class="main" v-else-if="page === 'audit'">
         <div class="content content-page">
           <h2>审计</h2>
-          <p class="crumb">查询当前本地金库保存的全部历史，不包含其他设备或金库。搜索中文操作、结果、已翻译详情及原始操作、详情、条目 ID；空格分隔的关键词须全部匹配，% 和 _ 按字面匹配。日期按本地时间，包含结束日期。</p>
           <form class="audit-filters" @submit.prevent="queryAudit()">
             <label class="audit-keyword">关键词<input v-model="auditFilter.keyword" placeholder="如：复制 动态验证码" maxlength="500" /></label>
             <label class="audit-select">操作类型<select v-model="auditFilter.action"><option value="">全部操作</option><option v-for="[key, label] in auditActions" :key="key" :value="key">{{ label }}</option></select></label>
