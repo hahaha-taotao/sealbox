@@ -495,8 +495,10 @@ pub fn app_version() -> String {
 }
 
 #[tauri::command]
-pub fn check_mobile_update() -> Result<MobileRelease, String> {
-    update::check()
+pub async fn check_mobile_update() -> Result<MobileRelease, String> {
+    tauri::async_runtime::spawn_blocking(update::check)
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[derive(Serialize)]
@@ -506,17 +508,22 @@ pub struct UpdateDownload {
 }
 
 #[tauri::command]
-pub fn download_mobile_update(app: AppHandle, url: String) -> Result<UpdateDownload, String> {
+pub async fn download_mobile_update(app: AppHandle, url: String) -> Result<UpdateDownload, String> {
     let dir = app
         .path()
         .app_cache_dir()
         .map_err(map_err)?;
-    let path = update::download(&url, &dir, |bytes, total| {
-        let _ = app.emit(
-            "mobile-update-progress",
-            serde_json::json!({ "bytes": bytes, "total": total }),
-        );
-    })?;
+    let emitter = app.clone();
+    let path = tauri::async_runtime::spawn_blocking(move || {
+        update::download(&url, &dir, |bytes, total| {
+            let _ = emitter.emit(
+                "mobile-update-progress",
+                serde_json::json!({ "bytes": bytes, "total": total }),
+            );
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())??;
     let bytes = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
     Ok(UpdateDownload {
         path: path.to_string_lossy().into_owned(),

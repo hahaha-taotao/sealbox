@@ -900,15 +900,17 @@ onMounted(async () => {
         <p class="hint">远端只有加密快照。同步密钥解不开主密码。</p>
       </div>
     </section>
-    <div v-if="updateDialogOpen && release" class="sheet-mask" @click.self="updateDialogOpen = false">
-      <div class="sheet update-sheet" role="dialog" aria-modal="true" aria-labelledby="update-sheet-title">
-        <div class="sheet-head">
-          <div>
-            <h2 id="update-sheet-title">{{ updateStage === "ready" ? "更新已就绪" : "发现新版本" }}</h2>
-            <p class="hint">Sealbox Android</p>
-          </div>
-          <span class="ver">v{{ release.latest_version }}</span>
+    <div v-if="updateDialogOpen && release" class="update-mask" @click.self="updateDialogOpen = false">
+      <div class="update-dialog" role="dialog" aria-modal="true" aria-labelledby="update-dialog-title">
+        <div class="update-badge" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3.5v11" />
+            <path d="M7.5 10.5 12 15l4.5-4.5" />
+            <path d="M4.5 19.5h15" />
+          </svg>
         </div>
+        <h2 id="update-dialog-title">{{ updateStage === "ready" ? "更新已就绪" : "发现新版本" }}</h2>
+        <p class="update-sub">Sealbox Android · v{{ appVersion || release.current_version }} → v{{ release.latest_version }}</p>
         <div class="update-versions">
           <span>当前版本</span>
           <strong>v{{ appVersion || release.current_version }}</strong>
@@ -920,17 +922,18 @@ onMounted(async () => {
         <div v-if="updateStage === 'downloading' || updateStage === 'ready'" class="update-progress">
           <div class="update-progress-head">
             <span>{{ updateStage === "ready" ? "下载完成" : "正在下载更新" }}</span>
-            <strong v-if="updateProgress !== null">{{ updateProgress }}%</strong>
+            <strong>{{ updateProgress === null ? "…" : `${updateProgress}%` }}</strong>
           </div>
           <div class="track"><span :style="{ width: `${updateProgress ?? 0}%` }"></span></div>
           <p class="hint">{{ formatBytes(downloadedBytes) }}<span v-if="downloadTotal"> / {{ formatBytes(downloadTotal) }}</span></p>
         </div>
-        <p v-if="updateError" class="error update-sheet-error">{{ updateError }}</p>
-        <div class="sheet-actions">
-          <button class="ghost" @click="updateDialogOpen = false">稍后</button>
+        <p v-if="updateError" class="error update-dialog-error">{{ updateError }}</p>
+        <p v-if="updateStage === 'downloading'" class="hint update-background-hint">关闭此窗口后下载会在后台继续</p>
+        <div class="update-actions">
           <button v-if="updateStage === 'available'" class="primary" @click="downloadUpdate">立即更新</button>
           <button v-else-if="updateStage === 'error'" class="primary" @click="retryUpdate">重试下载</button>
-          <button v-else-if="updateStage === 'ready'" class="primary" @click="installUpdate">安装</button>
+          <button v-else-if="updateStage === 'ready'" class="primary" @click="installUpdate">立即安装</button>
+          <button class="ghost" @click="updateDialogOpen = false">{{ updateStage === "downloading" ? "后台下载" : "稍后" }}</button>
         </div>
         <button class="link release-link" @click="openReleasePage">打开发布页</button>
       </div>
