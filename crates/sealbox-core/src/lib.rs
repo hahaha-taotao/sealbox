@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod db;
 pub mod http_guard;
 pub mod identity;
+pub mod mail;
 pub mod passphrase_words;
 pub mod redact;
 pub mod sync;
