@@ -1,3 +1,8 @@
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use base64::Engine as _;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -585,6 +590,16 @@ pub fn parse_fetch(raw: &str) -> Result<Vec<MailMessage>, MailFailure> {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MailAccount {
+    pub id: String,
+    pub title: String,
+    pub email: String,
+    pub provider: String,
+    pub supported: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MailBody {
     pub text: String,
     pub truncated: bool,
@@ -761,6 +776,125 @@ pub fn fetch_body(io: &mut impl ImapIo, email: &str, auth: &str, uid: u32) -> Re
     Ok(MailBody { text, truncated })
 }
 
+fn map_io(err: std::io::Error) -> MailFailure {
+    if err.kind() == std::io::ErrorKind::TimedOut || err.kind() == std::io::ErrorKind::WouldBlock {
+        MailFailure::Timeout
+    } else {
+        MailFailure::Timeout
+    }
+}
+
+fn literal_length(line: &[u8]) -> Option<usize> {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let start = line.iter().rposition(|byte| *byte == b'{')?;
+    if line.last() != Some(&b'}') || start + 1 >= line.len() {
+        return None;
+    }
+    std::str::from_utf8(&line[start + 1..line.len() - 1]).ok()?.parse().ok()
+}
+
+fn response_complete(buf: &[u8], tag: &str) -> bool {
+    let tag = tag.as_bytes();
+    let mut index = 0;
+    while index < buf.len() {
+        let start = index;
+        let Some(end) = buf[index..].iter().position(|byte| *byte == b'\n') else {
+            return false;
+        };
+        let line_end = index + end;
+        let line = &buf[start..line_end];
+        if let Some(length) = literal_length(line) {
+            let after = line_end + 1;
+            if buf.len() < after + length {
+                return false;
+            }
+            index = after + length;
+            continue;
+        }
+        if line.starts_with(tag) && line.len() > tag.len() && line[tag.len()] == b' ' {
+            let rest = &line[tag.len() + 1..];
+            if rest.starts_with(b"OK") || rest.starts_with(b"NO") || rest.starts_with(b"BAD") {
+                return true;
+            }
+        }
+        index = line_end + 1;
+    }
+    false
+}
+
+fn transact_io(stream: &mut impl WriteRead, command: &str, timeout: Duration) -> Result<String, MailFailure> {
+    let tag = command.split_whitespace().next().ok_or(MailFailure::Protocol)?;
+    let mut bytes = command.as_bytes().to_vec();
+    bytes.extend_from_slice(b"\r\n");
+    stream.write_all(&bytes).map_err(map_io)?;
+    stream.flush().map_err(map_io)?;
+    let started = Instant::now();
+    let mut buf = Vec::new();
+    let mut tmp = [0_u8; 4096];
+    loop {
+        if started.elapsed() > timeout {
+            return Err(MailFailure::Timeout);
+        }
+        match stream.read(&mut tmp) {
+            Ok(0) => return Err(MailFailure::Protocol),
+            Ok(n) => {
+                buf.extend_from_slice(&tmp[..n]);
+                if response_complete(&buf, tag) {
+                    return Ok(String::from_utf8_lossy(&buf).into_owned());
+                }
+            }
+            Err(err) => return Err(map_io(err)),
+        }
+    }
+}
+
+trait WriteRead: Read + Write {}
+impl<T: Read + Write> WriteRead for T {}
+
+pub fn transact_stream(stream: &mut TcpStream, command: &str, timeout: Duration) -> Result<String, MailFailure> {
+    stream.set_read_timeout(Some(timeout)).map_err(|_| MailFailure::Timeout)?;
+    stream.set_write_timeout(Some(timeout)).map_err(|_| MailFailure::Timeout)?;
+    transact_io(stream, command, timeout)
+}
+
+pub struct TlsImap {
+    conn: rustls::ClientConnection,
+    sock: TcpStream,
+    timeout: Duration,
+}
+
+impl ImapIo for TlsImap {
+    fn transact(&mut self, command: &str) -> Result<String, MailFailure> {
+        self.sock.set_read_timeout(Some(self.timeout)).map_err(|_| MailFailure::Timeout)?;
+        self.sock.set_write_timeout(Some(self.timeout)).map_err(|_| MailFailure::Timeout)?;
+        let mut stream = rustls::Stream::new(&mut self.conn, &mut self.sock);
+        transact_io(&mut stream, command, self.timeout)
+    }
+}
+
+pub fn connect_tls(host: &str, port: u16, timeout: Duration) -> Result<TlsImap, MailFailure> {
+    if endpoint("qq") != Some((host, port)) && endpoint("gmail") != Some((host, port)) {
+        return Err(MailFailure::Unsupported);
+    }
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .map_err(|_| MailFailure::Protocol)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| MailFailure::Protocol)?;
+    let addr = (host, port)
+        .to_socket_addrs()
+        .map_err(|_| MailFailure::Timeout)?
+        .next()
+        .ok_or(MailFailure::Timeout)?;
+    let sock = TcpStream::connect_timeout(&addr, timeout).map_err(|_| MailFailure::Timeout)?;
+    let conn = rustls::ClientConnection::new(Arc::new(config), name).map_err(|_| MailFailure::Protocol)?;
+    Ok(TlsImap { conn, sock, timeout })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -888,5 +1022,53 @@ mod tests {
         let err = list_inbox(&mut io, "me@qq.com", "auth-SECRET", None, 50).unwrap_err();
         assert_eq!(failure_message(err), "登录失败，请检查授权码和 IMAP 是否已开启");
         assert!(!failure_message(err).contains("auth-SECRET"));
+    }
+
+    #[test]
+    fn tcp_roundtrip_reads_a_tagged_ok() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.write_all(b"* OK ready\r\n").unwrap();
+            let mut buf = [0_u8; 128];
+            let n = socket.read(&mut buf).unwrap();
+            assert!(std::str::from_utf8(&buf[..n]).unwrap().contains("EXAMINE"));
+            socket.write_all(b"A2 OK [READ-ONLY]\r\n").unwrap();
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let response = transact_stream(&mut client, "A2 EXAMINE INBOX", Duration::from_secs(2)).unwrap();
+        assert!(response.contains("[READ-ONLY]"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tcp_timeout_uses_the_public_timeout_sentence() {
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (_socket, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(800));
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let err = transact_stream(&mut client, "A2 EXAMINE INBOX", Duration::from_millis(200)).unwrap_err();
+        assert_eq!(failure_message(err), "连接超时，请稍后重试");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn connect_rejects_hosts_outside_qq_and_gmail() {
+        use std::time::Duration;
+        assert_eq!(
+            connect_tls("imap.163.com", 993, Duration::from_millis(50)).err(),
+            Some(MailFailure::Unsupported)
+        );
     }
 }

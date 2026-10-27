@@ -3753,6 +3753,7 @@ dependencies = [
  "totp-rs",
  "ureq",
  "uuid",
+ "webpki-roots 0.26.11",
  "zeroize",
 ]
 

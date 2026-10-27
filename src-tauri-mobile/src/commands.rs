@@ -1034,6 +1034,92 @@ fn open_unlocked_copy(app: &AppHandle, state: &AppState) -> Result<(Vault, [u8; 
     Ok((vault, dek))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailListRequest {
+    pub entry_id: String,
+    pub before_uid: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailBodyRequest {
+    pub entry_id: String,
+    pub uid: u32,
+}
+
+fn load_mail_auth(state: &AppState, id: &str) -> Result<(String, String, zeroize::Zeroizing<String>), String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let dek = *session.dek().map_err(map_err)?;
+    let payload = session.vault().map_err(map_err)?.get_active_secret(&dek, id).map_err(map_err)?;
+    match payload {
+        SecretPayload::MailAuth { email, provider, auth_code } => Ok((email, provider, zeroize::Zeroizing::new(auth_code))),
+        _ => Err("不是邮箱授权码".into()),
+    }
+}
+
+#[tauri::command]
+pub fn mail_accounts(state: State<AppState>) -> Result<Vec<sealbox_core::mail::MailAccount>, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let dek = *session.dek().map_err(map_err)?;
+    let vault = session.vault().map_err(map_err)?;
+    let filter = ListFilter {
+        kind: Some(sealbox_core::vault::EntryKind::MailAuth),
+        ..ListFilter::default()
+    };
+    let entries = vault.list_entries(&filter).map_err(map_err)?;
+    entries
+        .into_iter()
+        .map(|entry| {
+            let payload = vault.get_active_secret(&dek, &entry.id).map_err(map_err)?;
+            let SecretPayload::MailAuth { email, provider, .. } = payload else {
+                return Err("不是邮箱授权码".into());
+            };
+            Ok(sealbox_core::mail::MailAccount {
+                id: entry.id,
+                title: entry.title,
+                email,
+                provider: provider.clone(),
+                supported: sealbox_core::mail::endpoint(&provider).is_some(),
+            })
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub fn mail_list(state: State<AppState>, request: MailListRequest) -> Result<Vec<sealbox_core::mail::MailMessage>, String> {
+    let (email, provider, auth_code) = load_mail_auth(&state, &request.entry_id)?;
+    let Some((host, port)) = sealbox_core::mail::endpoint(&provider) else {
+        return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
+    };
+    let mut io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
+        .map_err(sealbox_core::mail::failure_message)?;
+    let messages = sealbox_core::mail::list_inbox(&mut io, &email, &auth_code, request.before_uid, 50)
+        .map_err(sealbox_core::mail::failure_message)?;
+    drop(auth_code);
+    let session = lock_session(&state.session);
+    session.vault().map_err(map_err)?.audit("mail_list", Some(&request.entry_id), "").map_err(map_err)?;
+    Ok(messages)
+}
+
+#[tauri::command]
+pub fn mail_body(state: State<AppState>, request: MailBodyRequest) -> Result<sealbox_core::mail::MailBody, String> {
+    let (email, provider, auth_code) = load_mail_auth(&state, &request.entry_id)?;
+    let Some((host, port)) = sealbox_core::mail::endpoint(&provider) else {
+        return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
+    };
+    let mut io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
+        .map_err(sealbox_core::mail::failure_message)?;
+    let body = sealbox_core::mail::fetch_body(&mut io, &email, &auth_code, request.uid)
+        .map_err(sealbox_core::mail::failure_message)?;
+    drop(auth_code);
+    let session = lock_session(&state.session);
+    session.vault().map_err(map_err)?.audit("mail_body", Some(&request.entry_id), "").map_err(map_err)?;
+    Ok(body)
+}
+
 #[tauri::command]
 pub fn sync_verify_conditional(app: AppHandle, state: State<AppState>) -> Result<sync::ConditionalSupportReport, String> {
     let (vault, dek) = open_unlocked_copy(&app, &state)?;
