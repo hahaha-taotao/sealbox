@@ -49,6 +49,9 @@ mod host {
     use jni::JNIEnv;
 
     fn with_env<T>(f: impl FnOnce(&mut JNIEnv) -> Result<T, String>) -> Result<T, String> {
+        if !crate::mobile_context::is_ready() {
+            return Err("Android 上下文未就绪，剪贴板不可用".into());
+        }
         let context = ndk_context::android_context();
         let vm = unsafe { jni::JavaVM::from_raw(context.vm() as *mut _) }
             .map_err(|error| error.to_string())?;

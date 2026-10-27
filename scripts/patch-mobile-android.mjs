@@ -31,6 +31,18 @@ export function patchFilePaths(paths) {
   );
 }
 
+export function patchProguard(rules) {
+  // These classes are only reachable through JNI and Tauri's reflective plugin loader.
+  const bridge = [
+    "-keep class com.sealbox.mobile.NdkContext { *; }",
+    "-keep class com.sealbox.mobile.MobileContextPlugin { *; }",
+    "-keep class com.sealbox.mobile.DocumentsPlugin { *; }",
+  ];
+  const missing = bridge.filter((rule) => !rules.includes(rule));
+  if (missing.length === 0) return rules;
+  return `${rules.trimEnd()}\n\n# Android context bridge and SAF plugin reflection.\n${missing.join("\n")}\n`;
+}
+
 export function patchAppGradle(appGradle, rootDirRel) {
   // Tauri derives the Gradle working directory from the Cargo workspace root.
   // Point rustBuild at the mobile crate instead of the desktop configuration.
@@ -95,10 +107,20 @@ export function applyAndroidPatches(projectRoot = root) {
   const pathsFile = resolve(appModuleDir, "src/main/res/xml/file_paths.xml");
   const appGradlePath = resolve(appModuleDir, "build.gradle.kts");
   const rootGradlePath = resolve(mobileDir, "gen/android/build.gradle.kts");
-  const templatePath = resolve(mobileDir, "android/DocumentsPlugin.kt");
-  const targetPath = resolve(appModuleDir, "src/main/java/com/sealbox/mobile/DocumentsPlugin.kt");
-  for (const path of [manifestPath, appGradlePath, rootGradlePath, templatePath]) {
-    if (!existsSync(path)) throw new Error(`Android project or SAF template is missing: ${path}`);
+  const proguardPath = resolve(appModuleDir, "proguard-rules.pro");
+  const kotlinTargetDir = resolve(appModuleDir, "src/main/java/com/sealbox/mobile");
+  // Every tracked Kotlin template is copied verbatim; the generated project is disposable.
+  const kotlinTemplates = ["DocumentsPlugin.kt", "MobileContext.kt"].map((name) => ({
+    source: resolve(mobileDir, "android", name),
+    target: resolve(kotlinTargetDir, name),
+  }));
+  for (const path of [
+    manifestPath,
+    appGradlePath,
+    rootGradlePath,
+    ...kotlinTemplates.map((template) => template.source),
+  ]) {
+    if (!existsSync(path)) throw new Error(`Android project or Kotlin template is missing: ${path}`);
   }
   // Read and validate all inputs before writing. No MainActivity modification is necessary.
   const manifest = patchManifest(readFileSync(manifestPath, "utf8"));
@@ -106,19 +128,26 @@ export function applyAndroidPatches(projectRoot = root) {
   const rootDirRel = relative(appModuleDir, mobileDir).split(sep).join("/");
   const appGradle = patchAppGradle(readFileSync(appGradlePath, "utf8"), rootDirRel);
   const rootGradle = patchRootGradle(readFileSync(rootGradlePath, "utf8"));
-  const template = readFileSync(templatePath, "utf8");
+  const proguard = existsSync(proguardPath)
+    ? patchProguard(readFileSync(proguardPath, "utf8"))
+    : null;
+  const templates = kotlinTemplates.map((template) => ({
+    ...template,
+    content: readFileSync(template.source, "utf8"),
+  }));
   writeChanged(manifestPath, manifest);
   if (paths !== null) writeChanged(pathsFile, paths);
   writeChanged(appGradlePath, appGradle);
   writeChanged(rootGradlePath, rootGradle);
-  mkdirSync(dirname(targetPath), { recursive: true });
-  writeChanged(targetPath, template);
+  if (proguard !== null) writeChanged(proguardPath, proguard);
+  mkdirSync(kotlinTargetDir, { recursive: true });
+  for (const template of templates) writeChanged(template.target, template.content);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     applyAndroidPatches();
-    console.log("patched Android install permission, Gradle working directory, Kotlin version and SAF template");
+    console.log("patched Android install permission, Gradle working directory, Kotlin version, SAF template and the Android context bridge");
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;

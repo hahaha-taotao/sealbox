@@ -1,6 +1,7 @@
 mod auto_sync;
 mod clipboard;
 mod commands;
+mod mobile_context;
 mod session;
 mod saf;
 mod transfer;
@@ -26,6 +27,7 @@ pub fn run() {
         .plugin(tauri_plugin_biometry::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(saf::init())
+        .plugin(mobile_context::init())
         .manage(commands::AppState::new())
         .invoke_handler(tauri::generate_handler![
             commands::get_status,

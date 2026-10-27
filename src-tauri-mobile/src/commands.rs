@@ -666,13 +666,16 @@ pub fn install_mobile_update(app: AppHandle, state: State<AppState>, path: Strin
     if actual != expected {
         return Err("只能安装本次下载的更新包".into());
     }
+    // Start the system installer first: a failure must stay visible in the update dialog instead
+    // of locking the vault and silently closing it.
+    update::install_apk(&actual)?;
     {
         let mut session = lock_session(&state.session);
         session.lock();
     }
     invalidate_runtime(&state);
     let _ = app.emit("lock-now", ());
-    update::install_apk(&actual)
+    Ok(())
 }
 
 #[tauri::command]

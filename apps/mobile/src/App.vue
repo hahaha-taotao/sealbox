@@ -127,6 +127,7 @@ const updateCheckedAt = ref("");
 const downloadedBytes = ref(0);
 const downloadTotal = ref<number | null>(null);
 const downloadedPath = ref("");
+const installing = ref(false);
 const updateDialogOpen = ref(false);
 let autoUpdateChecked = false;
 const updateProgress = computed(() => {
@@ -721,13 +722,18 @@ async function downloadUpdate() {
 }
 
 async function installUpdate() {
-  if (!downloadedPath.value || !release.value) return;
+  if (!downloadedPath.value || !release.value || installing.value) return;
+  installing.value = true;
+  updateError.value = "";
   try {
     await api.installUpdate(downloadedPath.value);
     showToast("已打开系统安装界面");
   } catch (caught) {
-    updateStage.value = "error";
+    // Keep the "ready" stage so the retry button stays "立即安装"; the error is rendered in the
+    // dialog above the buttons instead of being written into a dialog that already closed.
     updateError.value = caught instanceof Error ? caught.message : String(caught);
+  } finally {
+    installing.value = false;
   }
 }
 
@@ -1286,7 +1292,7 @@ onMounted(async () => {
         <div class="update-actions">
           <button v-if="updateStage === 'available'" class="primary" @click="downloadUpdate">立即更新</button>
           <button v-else-if="updateStage === 'error'" class="primary" @click="retryUpdate">重试下载</button>
-          <button v-else-if="updateStage === 'ready'" class="primary" @click="installUpdate">立即安装</button>
+          <button v-else-if="updateStage === 'ready'" class="primary" :disabled="installing" @click="installUpdate">{{ installing ? "正在打开安装器…" : "立即安装" }}</button>
           <button class="ghost" @click="updateDialogOpen = false">{{ updateStage === "downloading" ? "后台下载" : "稍后" }}</button>
         </div>
         <button class="link release-link" @click="openReleasePage">打开发布页</button>
