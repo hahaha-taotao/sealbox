@@ -1,7 +1,6 @@
 pub use sealbox_core::{
     certificate, crypto, db, http_guard, identity, passphrase_words, redact, sync, totp, vault,
 };
-pub mod assistant;
 pub mod auto_sync;
 pub mod backup;
 pub mod clipboard;
@@ -107,10 +106,6 @@ pub fn run() {
             commands::fill_pairing_status,
             commands::copy_pairing_code,
             commands::copy_extension_path,
-            commands::assistant_config_get,
-            commands::assistant_config_set,
-            commands::assistant_mcp_probe,
-            commands::assistant_chat,
             commands::mcp_tools,
             commands::zoomkey_policy_get,
             commands::zoomkey_policy_set,

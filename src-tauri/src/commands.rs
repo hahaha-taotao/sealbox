@@ -1,4 +1,3 @@
-use crate::assistant;
 use crate::backup::{
     export, export_envelope, import_envelope, inspect, restore_into_with_options,
     restore_new_with_options, BackupInspection, RestoreOptions, MAX_BACKUP_BYTES,
@@ -1748,36 +1747,6 @@ fn on_off(value: bool) -> &'static str {
     } else {
         "off"
     }
-}
-
-#[tauri::command]
-pub fn assistant_config_get(
-    state: State<AppState>,
-) -> Result<assistant::AssistantConfigView, String> {
-    let mut session = lock_session(&state.session);
-    assistant::config_get(&mut session)
-}
-
-#[tauri::command]
-pub fn assistant_config_set(
-    state: State<AppState>,
-    input: assistant::AssistantConfigInput,
-) -> Result<assistant::AssistantConfigView, String> {
-    let mut session = lock_session(&state.session);
-    assistant::config_set(&mut session, input)
-}
-
-#[tauri::command]
-pub fn assistant_mcp_probe(state: State<AppState>) -> Result<assistant::AssistantMcpProbe, String> {
-    assistant::mcp_probe(&state.session, &state.mcp)
-}
-
-#[tauri::command]
-pub fn assistant_chat(
-    state: State<AppState>,
-    request: assistant::AssistantChatRequest,
-) -> Result<assistant::AssistantChatResponse, String> {
-    assistant::chat(&state.session, &state.mcp, request)
 }
 
 #[tauri::command]
