@@ -29,6 +29,8 @@ import {
   type ExtensionInstallStatus,
   type FolderDto,
   type ListFilter,
+  type MailAccount,
+  type MailMessage,
   type McpStatus,
   type McpToolInfo,
   type SecretPayload,
@@ -45,7 +47,17 @@ import {
 } from "./lib/tauri";
 
 const status = ref<Status | null>(null);
-  type Page = "home" | "vault" | "audit" | "settings" | "mcp" | "plugin";
+const mailAccounts = ref<MailAccount[]>([]);
+const mailAccountId = ref("");
+const mailMessages = ref<MailMessage[]>([]);
+const mailSelectedUid = ref<number | null>(null);
+const mailBody = ref("");
+const mailTruncated = ref(false);
+const mailBusy = ref(false);
+const mailError = ref("");
+const mailOlderError = ref("");
+let mailSeq = 0;
+  type Page = "home" | "vault" | "audit" | "settings" | "mcp" | "plugin" | "mail";
 const page = ref<Page>("vault");
 const history = ref<Page[]>(["vault"]);
 const historyIndex = ref(0);
@@ -187,6 +199,7 @@ const crumb = computed(() => {
   if (page.value === "settings") return "设置";
   if (page.value === "mcp") return "MCP";
   if (page.value === "plugin") return "插件";
+  if (page.value === "mail") return "邮箱";
   if (filter.trash) return "回收站";
   const selectedKinds = selectedKindIds.value;
   if (selectedKinds.length === 1) {
@@ -1755,6 +1768,15 @@ function applyLockedUi() {
   expiring.value = [];
   selected.value = new Set();
   mcp.value = null;
+  mailSeq += 1;
+  mailAccounts.value = [];
+  mailAccountId.value = "";
+  mailMessages.value = [];
+  mailSelectedUid.value = null;
+  mailBody.value = "";
+  mailTruncated.value = false;
+  mailError.value = "";
+  mailOlderError.value = "";
 }
 
 async function lockVault(strict: boolean) {
@@ -1774,6 +1796,93 @@ async function doLock() {
 
 async function lockForUpdate() {
   await lockVault(true);
+}
+
+async function openMail() {
+  goPage("mail");
+  mailError.value = "";
+  mailOlderError.value = "";
+  const seq = ++mailSeq;
+  try {
+    const accounts = await api.mailAccounts();
+    if (seq !== mailSeq) return;
+    mailAccounts.value = accounts;
+    const current = accounts.find((account) => account.id === mailAccountId.value && account.supported);
+    const next = current ?? accounts.find((account) => account.supported);
+    mailAccountId.value = next?.id ?? "";
+    if (next) await loadMail(next.id, seq);
+    else {
+      mailMessages.value = [];
+      mailBody.value = "";
+    }
+  } catch (e) {
+    if (seq === mailSeq) mailError.value = String(e);
+  }
+}
+
+async function loadMail(entryId: string, seq = ++mailSeq) {
+  mailBusy.value = true;
+  mailError.value = "";
+  mailOlderError.value = "";
+  mailMessages.value = [];
+  mailSelectedUid.value = null;
+  mailBody.value = "";
+  mailTruncated.value = false;
+  try {
+    const messages = await api.mailList(entryId);
+    if (seq !== mailSeq) return;
+    mailMessages.value = messages.slice().reverse();
+  } catch (e) {
+    if (seq === mailSeq) mailError.value = String(e);
+  } finally {
+    if (seq === mailSeq) mailBusy.value = false;
+  }
+}
+
+async function loadOlderMail() {
+  const entryId = mailAccountId.value;
+  const oldest = mailMessages.value[mailMessages.value.length - 1]?.uid;
+  if (!entryId || oldest == null) return;
+  const seq = mailSeq;
+  mailBusy.value = true;
+  mailOlderError.value = "";
+  try {
+    const older = await api.mailList(entryId, oldest);
+    if (seq !== mailSeq) return;
+    const seen = new Set(mailMessages.value.map((message) => message.uid));
+    mailMessages.value = [...mailMessages.value, ...older.filter((message) => !seen.has(message.uid)).reverse()];
+    if (!older.length) mailOlderError.value = "没有更早的邮件";
+  } catch (e) {
+    if (seq === mailSeq) mailOlderError.value = String(e);
+  } finally {
+    if (seq === mailSeq) mailBusy.value = false;
+  }
+}
+
+async function openMailMessage(uid: number) {
+  const entryId = mailAccountId.value;
+  const seq = mailSeq;
+  mailSelectedUid.value = uid;
+  mailBody.value = "";
+  mailTruncated.value = false;
+  mailError.value = "";
+  mailBusy.value = true;
+  try {
+    const body = await api.mailBody(entryId, uid);
+    if (seq !== mailSeq) return;
+    mailBody.value = body.text;
+    mailTruncated.value = body.truncated;
+  } catch (e) {
+    if (seq === mailSeq) mailError.value = String(e);
+  } finally {
+    if (seq === mailSeq) mailBusy.value = false;
+  }
+}
+
+function selectMailAccount(account: MailAccount) {
+  if (!account.supported || mailBusy.value) return;
+  mailAccountId.value = account.id;
+  void loadMail(account.id);
 }
 
 async function loadSettings() {
@@ -2242,6 +2351,15 @@ onMounted(async () => {
             </svg>
           </span>
           <span>插件</span>
+        </button>
+        <button class="rail-btn" :class="{ active: page === 'mail' }" @click="openMail">
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="5" width="18" height="14" rx="2" />
+              <path d="m4 7 8 6 8-6" />
+            </svg>
+          </span>
+          <span>邮箱</span>
         </button>
         <div class="spacer" />
         <button class="rail-btn" :class="{ active: page === 'settings' }" @click="goPage('settings')">
@@ -2764,6 +2882,46 @@ onMounted(async () => {
                 <button class="btn" type="button" :disabled="!mcp?.has_fill_token" @click="copyFillToken">复制</button>
               </div>
             </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="main" v-else-if="page === 'mail'">
+        <div class="content content-page mail-page">
+          <div class="mail-head">
+            <h2>邮箱</h2>
+            <p class="crumb">只读收件箱。不会发信、删信、标已读或下载附件。</p>
+          </div>
+          <div class="mail-layout">
+            <aside class="card mail-accounts">
+              <h3>授权码</h3>
+              <p v-if="!mailAccounts.length" class="crumb">还没有邮箱授权码。先在保险库里新增一条。</p>
+              <button v-for="account in mailAccounts" :key="account.id" type="button" class="mail-account" :class="{ active: account.id === mailAccountId, disabled: !account.supported }" :disabled="!account.supported" @click="selectMailAccount(account)">
+                <strong>{{ account.title || account.email }}</strong>
+                <span>{{ account.email }}</span>
+                <em v-if="!account.supported">首版不支持</em>
+              </button>
+            </aside>
+            <div class="card mail-list">
+              <div class="mail-list-head">
+                <h3>收件箱</h3>
+                <button class="btn" type="button" :disabled="mailBusy || !mailAccountId" @click="loadOlderMail">加载更早</button>
+              </div>
+              <p v-if="mailBusy" class="crumb">正在读取…</p>
+              <p v-if="mailError" class="error">{{ mailError }}</p>
+              <p v-if="mailOlderError" class="crumb">{{ mailOlderError }}</p>
+              <button v-for="message in mailMessages" :key="message.uid" type="button" class="mail-row" :class="{ active: message.uid === mailSelectedUid }" @click="openMailMessage(message.uid)">
+                <strong>{{ message.subject || "(无主题)" }}</strong>
+                <span>{{ message.from }}</span>
+                <em>{{ message.date }}<template v-if="message.hasAttachment"> · 有附件</template></em>
+              </button>
+            </div>
+            <article class="card mail-body">
+              <h3>正文</h3>
+              <p v-if="mailTruncated" class="crumb">正文过长，已截断。</p>
+              <pre v-if="mailBody">{{ mailBody }}</pre>
+              <p v-else class="crumb">选择一封邮件后显示纯文本正文。</p>
+            </article>
           </div>
         </div>
       </section>

@@ -767,6 +767,18 @@ html:has(.confirm-win), body:has(.confirm-win) {
   background-position: right 8px center;
 }
 .audit-filters input[type="date"] { color-scheme: light; }
+.mail-layout { display: grid; grid-template-columns: 240px minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.mail-head { margin-bottom: 16px; }
+.mail-accounts, .mail-list, .mail-body { min-width: 0; }
+.mail-accounts h3, .mail-list h3, .mail-body h3 { margin-bottom: 12px; }
+.mail-account, .mail-row { width: 100%; display: grid; gap: 2px; text-align: left; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); padding: 10px 12px; margin-bottom: 8px; }
+.mail-account strong, .mail-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mail-account span, .mail-account em, .mail-row span, .mail-row em { color: var(--muted); font-size: 12px; font-style: normal; }
+.mail-account.active, .mail-row.active { border-color: #dfe2ff; background: #eef0ff; }
+.mail-account.disabled { color: var(--muted); background: #f6f7f9; }
+.mail-list-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.mail-body pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 640px; overflow: auto; line-height: 1.6; }
+@media (max-width: 1100px) { .mail-layout { grid-template-columns: 1fr; } }
 .audit-filter-actions { display: flex; gap: 8px; flex: 0 0 auto; }
 .audit-table td { white-space: normal; overflow-wrap: anywhere; vertical-align: top; }
 .audit-table pre { white-space: pre-wrap; max-width: 400px; overflow-wrap: anywhere; }

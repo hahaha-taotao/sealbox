@@ -300,6 +300,27 @@ export interface ZoomkeyCandidates {
   client_certs: ZoomkeyCertOption[];
 }
 
+export interface MailAccount {
+  id: string;
+  title: string;
+  email: string;
+  provider: string;
+  supported: boolean;
+}
+
+export interface MailMessage {
+  uid: number;
+  from: string;
+  subject: string;
+  date: string;
+  hasAttachment: boolean;
+}
+
+export interface MailBody {
+  text: string;
+  truncated: boolean;
+}
+
 export interface McpToolInfo {
   name: string;
   description: string;
@@ -458,4 +479,9 @@ export const api = {
   zoomkeyPolicySet: (policy: ZoomkeyMcpPolicy) => invoke<ZoomkeyMcpPolicy>("zoomkey_policy_set", { policy }),
   zoomkeyCandidates: () => invoke<ZoomkeyCandidates>("zoomkey_candidates"),
   zoomkeyTest: (endpoint: "jira" | "crm") => invoke<string>("zoomkey_test_connection", { endpoint }),
+  mailAccounts: () => invoke<MailAccount[]>("mail_accounts"),
+  mailList: (entryId: string, beforeUid?: number) =>
+    invoke<MailMessage[]>("mail_list", { request: { entryId, beforeUid: beforeUid ?? null } }),
+  mailBody: (entryId: string, uid: number) =>
+    invoke<MailBody>("mail_body", { request: { entryId, uid } }),
 };
