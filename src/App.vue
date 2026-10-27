@@ -1692,7 +1692,7 @@ const recent = ref<EntryDto[]>([]);
 const expiring = ref<EntryDto[]>([]);
 
 // 系统文件选择框是应用窗口的子窗口，弹出时会让窗口失焦。那种失焦不是「用户离开了」，
-// 所以开着文件框的时候不能把表单关掉，否则选完路径表单已经没了（新建凭据 -> 选择证书）。
+// 所以开着文件框的时候不按真正的失焦处理，避免底下的详情弹窗被关掉。
 let nativeDialogDepth = 0;
 let nativeDialogClosedAt = 0;
 const NATIVE_DIALOG_GRACE_MS = 400;
@@ -1713,9 +1713,9 @@ function nativeDialogInFlight() {
 
 function hideVisibleSecrets() {
   hideSecret();
-  // 文件选择框（以及它的收尾事件）导致的失焦不算数，其余失焦照旧关表单。
+  // 失焦/切后台只隐藏已明文展示的秘密，不再关闭正在录入的凭据表单，避免已输入内容丢失。
+  // 文件选择框（以及它的收尾事件）导致的失焦不算「用户离开了」，此时也不关详情弹窗。
   if (!nativeDialogInFlight()) {
-    closeForm();
     closeDetail();
   }
   hideBridgeTokens();
@@ -3157,7 +3157,8 @@ onMounted(async () => {
           </template>
         </div>
       </div>
-      <div class="dialog-mask" v-if="showForm" @click.self="closeForm">
+      <!-- 凭据表单是带状态的录入界面：点击遮罩空白处不关闭，避免刚录入的内容被清空。 -->
+      <div class="dialog-mask" v-if="showForm">
       <div class="dialog">
         <h3>{{ editing ? "编辑凭据" : "新建凭据" }}</h3>
         <div class="field"><label>类型</label>
