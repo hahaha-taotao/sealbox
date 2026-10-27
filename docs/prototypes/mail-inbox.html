@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>印盒 · 邮箱原型</title>
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --surface: #ffffff;
+    --line: #eceef2;
+    --text: #1f2329;
+    --muted: #8a9099;
+    --brand: #5b5bd6;
+    --green: #16a34a;
+    --danger: #e11d48;
+    --radius: 10px;
+    --rail: 64px;
+    --title: 44px;
+    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    color: var(--text);
+    background: var(--bg);
+    font-size: 13px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+  button { font: inherit; color: inherit; cursor: pointer; }
+  .app { display: flex; flex-direction: column; height: 100%; }
+  .titlebar {
+    height: var(--title); display: flex; align-items: center; padding: 0 16px;
+    background: var(--surface); border-bottom: 1px solid var(--line);
+  }
+  .titlebar strong { font-weight: 600; }
+  .crumb { color: var(--muted); margin-left: 12px; }
+  .proto { margin-left: auto; color: var(--brand); background: #eef0ff; border-radius: 999px; padding: 2px 10px; font-size: 12px; }
+  .body { flex: 1; display: flex; min-height: 0; }
+  .rail {
+    width: var(--rail); background: var(--surface); border-right: 1px solid var(--line);
+    display: flex; flex-direction: column; align-items: center; padding: 12px 0; gap: 4px;
+  }
+  .rail .spacer { flex: 1; }
+  .rail-btn {
+    width: 52px; border: 0; background: transparent; border-radius: 10px;
+    padding: 8px 0 6px; color: var(--muted); display: flex; flex-direction: column; align-items: center; gap: 4px;
+  }
+  .rail-btn span { font-size: 11px; }
+  .rail-btn.active { background: #eef0ff; color: var(--brand); }
+  .main { flex: 1; display: flex; min-width: 0; min-height: 0; }
+  .accounts {
+    width: 228px; flex-shrink: 0; background: var(--surface); border-right: 1px solid var(--line);
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  .side-label { font-size: 11px; color: var(--muted); margin: 14px 16px 8px; letter-spacing: 0.04em; }
+  .account {
+    margin: 0 10px 6px; border: 0; background: transparent; border-radius: 10px;
+    text-align: left; padding: 10px; display: flex; gap: 10px; align-items: center;
+  }
+  .account.on { background: #eef0ff; }
+  .account:disabled { opacity: 0.55; cursor: default; }
+  .mark {
+    width: 32px; height: 32px; border-radius: 8px; display: grid; place-items: center;
+    color: #fff; font-weight: 650; flex-shrink: 0;
+  }
+  .account b { display: block; font-weight: 600; }
+  .account small { color: var(--muted); }
+  .hint { margin: 8px 16px 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+  .list {
+    width: 360px; flex-shrink: 0; border-right: 1px solid var(--line);
+    display: flex; flex-direction: column; min-width: 0; background: var(--bg);
+  }
+  .list-head, .read-head {
+    height: 48px; display: flex; align-items: center; gap: 8px; padding: 0 14px;
+    background: var(--surface); border-bottom: 1px solid var(--line); flex-shrink: 0;
+  }
+  .list-head b, .read-head b { font-weight: 600; }
+  .rows { flex: 1; overflow: auto; }
+  .row {
+    width: 100%; border: 0; border-bottom: 1px solid var(--line); background: transparent;
+    text-align: left; padding: 10px 14px; display: block;
+  }
+  .row.on { background: #fff; box-shadow: inset 3px 0 0 var(--brand); }
+  .row .top { display: flex; justify-content: space-between; gap: 8px; }
+  .row .from { font-weight: 600; }
+  .row .when { color: var(--muted); font-size: 12px; flex-shrink: 0; }
+  .row .subject { margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .clip { color: var(--brand); font-size: 12px; margin-left: 6px; }
+  .more {
+    margin: 10px; border: 1px solid var(--line); background: #fff; border-radius: 8px; padding: 8px;
+  }
+  .more:disabled { opacity: 0.45; }
+  .read { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--surface); }
+  .read-body { flex: 1; overflow: auto; padding: 20px 24px; white-space: pre-wrap; line-height: 1.65; }
+  .empty { color: var(--muted); padding: 48px 24px; }
+  .meta { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  @media (max-width: 860px) {
+    .main { flex-direction: column; }
+    .accounts, .list { width: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+    .accounts { max-height: 180px; }
+    .list { max-height: 280px; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="titlebar">
+    <strong>印盒</strong>
+    <span class="crumb">邮箱 · 只读原型，未连接真实邮箱</span>
+    <span class="proto">原型</span>
+  </header>
+  <div class="body">
+    <nav class="rail">
+      <button class="rail-btn" type="button"><span>⌂</span><span>首页</span></button>
+      <button class="rail-btn" type="button"><span>☰</span><span>保险库</span></button>
+      <button class="rail-btn" type="button"><span>↗</span><span>审计</span></button>
+      <button class="rail-btn" type="button"><span>◇</span><span>MCP</span></button>
+      <button class="rail-btn" type="button"><span>▣</span><span>插件</span></button>
+      <button class="rail-btn active" type="button"><span>✉</span><span>邮箱</span></button>
+      <div class="spacer"></div>
+      <button class="rail-btn" type="button"><span>⚙</span><span>设置</span></button>
+    </nav>
+    <section class="main">
+      <aside class="accounts">
+        <div class="side-label">授权码</div>
+        <div id="accounts"></div>
+        <p class="hint">只读收件箱。不会发信、删信、标已读或下载附件。</p>
+      </aside>
+      <div class="list">
+        <div class="list-head"><b id="box-title">收件箱</b><span class="crumb" id="box-count"></span></div>
+        <div class="rows" id="rows"></div>
+      </div>
+      <article class="read">
+        <div class="read-head"><b id="read-title">正文</b></div>
+        <div class="read-body" id="read">选择一封邮件查看正文。</div>
+      </article>
+    </section>
+  </div>
+</div>
+<script>
+const accounts = [
+  { id: "qq", name: "工作 QQ", email: "work@qq.com", provider: "QQ", color: "#5b5bd6", enabled: true },
+  { id: "gmail", name: "个人 Gmail", email: "me@gmail.com", provider: "Gmail", color: "#e11d48", enabled: true },
+  { id: "163", name: "备用 163", email: "old@163.com", provider: "首版不支持", color: "#8a9099", enabled: false }
+];
+const mail = {
+  qq: [
+    { uid: 90, from: "财务部", subject: "10 月报销单据请查收", when: "今天 09:12", attach: true, body: "请查收本月报销材料。\n\n附件未下载。首版只显示「有附件」。\n\n财务部" },
+    { uid: 88, from: "GitHub", subject: "Your Dependabot alert", when: "昨天 18:40", attach: false, body: "A new security alert was found on sealbox.\n\nThis is plain text only. HTML from the original message is not rendered." },
+    { uid: 81, from: "人事", subject: "本周五下午例会", when: "10-24 14:02", attach: false, body: "本周五 15:00，三楼会议室。\n请准时参加。" }
+  ],
+  gmail: [
+    { uid: 40, from: "Stripe", subject: "Receipt for October", when: "10-26 08:01", attach: true, body: "Your receipt is attached.\n\n附件未下载。" },
+    { uid: 33, from: "Calendar", subject: "明日行程", when: "10-25 21:16", attach: false, body: "明天 10:00 有一个评审。" }
+  ]
+};
+const older = {
+  qq: [
+    { uid: 70, from: "税务", subject: "电子发票开具通知", when: "10-18 11:20", attach: true, body: "您有一张电子发票。\n\n首版不下载 PDF。" },
+    { uid: 64, from: "同事", subject: "接口文档更新", when: "10-12 16:48", attach: false, body: "文档已更新到最新版本，请看仓库。" }
+  ],
+  gmail: []
+};
+let current = "qq";
+let selected = null;
+const shown = { qq: mail.qq.slice(), gmail: mail.gmail.slice() };
+
+function renderAccounts() {
+  document.getElementById("accounts").innerHTML = accounts.map(a => `
+    <button class="account ${a.id === current ? "on" : ""}" type="button" ${a.enabled ? "" : "disabled"} data-id="${a.id}">
+      <span class="mark" style="background:${a.color}">${a.name.slice(0,1)}</span>
+      <span><b>${a.name}</b><small>${a.email} · ${a.provider}</small></span>
+    </button>`).join("");
+}
+
+function renderList() {
+  const rows = shown[current];
+  const account = accounts.find(a => a.id === current);
+  document.getElementById("box-title").textContent = account.name + " · 收件箱";
+  document.getElementById("box-count").textContent = rows.length + " 封";
+  const moreDisabled = older[current].length === 0;
+  document.getElementById("rows").innerHTML = rows.map(m => `
+    <button class="row ${selected === m.uid ? "on" : ""}" type="button" data-uid="${m.uid}">
+      <div class="top"><span class="from">${m.from}</span><span class="when">${m.when}</span></div>
+      <div class="subject">${m.subject}${m.attach ? '<span class="clip">有附件</span>' : ""}</div>
+    </button>`).join("") + `<button class="more" type="button" id="more" ${moreDisabled ? "disabled" : ""}>${moreDisabled ? "没有更早的信" : "加载更早"}</button>`;
+  const currentRow = rows.find(m => m.uid === selected);
+  const read = document.getElementById("read");
+  if (!currentRow) {
+    document.getElementById("read-title").textContent = "正文";
+    read.className = "read-body empty";
+    read.textContent = "选择一封邮件查看正文。";
+  } else {
+    document.getElementById("read-title").textContent = currentRow.subject;
+    read.className = "read-body";
+    read.textContent = currentRow.from + " · " + currentRow.when + (currentRow.attach ? " · 有附件" : "") + "\n\n" + currentRow.body;
+  }
+}
+
+document.body.addEventListener("click", (event) => {
+  const account = event.target.closest(".account");
+  if (account && !account.disabled) {
+    current = account.dataset.id;
+    selected = null;
+    renderAccounts();
+    renderList();
+    return;
+  }
+  const row = event.target.closest(".row");
+  if (row) {
+    selected = Number(row.dataset.uid);
+    renderList();
+    return;
+  }
+  if (event.target.id === "more") {
+    shown[current] = shown[current].concat(older[current]);
+    older[current] = [];
+    renderList();
+  }
+});
+
+renderAccounts();
+renderList();
+</script>
+</body>
+</html>
