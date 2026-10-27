@@ -16,6 +16,7 @@ pub mod github_mcp;
 pub mod lock;
 pub mod mcp;
 pub mod session;
+pub mod transfer;
 pub mod zoomkey;
 
 use commands::AppState;
@@ -75,12 +76,22 @@ pub fn run() {
             commands::import_backup,
             commands::import_csv_preview,
             commands::import_csv_commit,
+            commands::backup_inspect,
+            commands::backup_restore,
+            commands::backup_restore_new,
+            commands::backup_export,
+            commands::csv_preview,
+            commands::csv_commit,
+            commands::csv_export,
             commands::settings_get,
             commands::settings_set,
             commands::sync_status,
             commands::sync_save,
             commands::sync_clear,
             commands::sync_now,
+            commands::sync_preview,
+            commands::sync_commit,
+            commands::sync_verify_conditional,
             commands::change_master,
             commands::mcp_status,
             commands::mcp_start,
@@ -170,6 +181,7 @@ pub fn run() {
                     "lock" => {
                         if let Some(state) = app.try_state::<AppState>() {
                             lock::lock_everything(&state.session, &state.mcp);
+                            commands::clear_transfer_and_runtime(&state);
                         }
                         let _ = app.emit("lock-now", ());
                     }

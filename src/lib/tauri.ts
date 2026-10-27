@@ -70,6 +70,23 @@ export interface SyncSaveInput {
   auto_sync_secs?: number;
 }
 
+export type SyncPhase = "preview" | "conflicts" | "committed" | "local_pending" | "blocked";
+export type SyncConflictKind = "edit_edit" | "delete_edit";
+
+export interface SyncConflictDetail {
+  id: string;
+  title: string;
+  kind: SyncConflictKind;
+  local_deleted: boolean;
+  remote_deleted: boolean;
+}
+
+export interface SyncResolution {
+  id: string;
+  choice: "local" | "remote" | "both";
+  confirm_delete_edit: boolean;
+}
+
 export interface SyncReport {
   pulled: number;
   pushed: number;
@@ -77,6 +94,22 @@ export interface SyncReport {
   removed: number;
   conflicts: string[];
   remote_missing: boolean;
+  phase: SyncPhase;
+  blocked: string | null;
+  retryable: boolean;
+  conflict_details: SyncConflictDetail[];
+}
+
+export interface SyncPreview {
+  token: string;
+  expires_in_secs: number;
+  report: SyncReport;
+}
+
+export interface SyncVerifyResult {
+  verified: boolean;
+  probe_cleaned: boolean;
+  scope: string;
 }
 
 export interface ClientCertInfo {
@@ -110,6 +143,32 @@ export interface CsvImportResult {
   updated: number;
   skipped_existing: number;
   skipped_invalid: number;
+}
+
+export interface CsvPreview {
+  token: string;
+  summary: CsvImportPreview;
+}
+
+export interface BackupSummary {
+  version: number;
+  entries: number;
+  trash: number;
+  folders: number;
+  tags: number;
+  tombstones: number;
+  includes_settings: boolean;
+  warnings: string[];
+}
+
+export interface BackupPreview {
+  token: string;
+  summary: BackupSummary;
+}
+
+export interface BackupRestoreResult {
+  imported: number;
+  skipped: number;
 }
 
 export interface ImportClientCertInput {
@@ -389,19 +448,31 @@ export const api = {
     wordCount?: number;
     separator?: string;
   }) => invoke<string>("gen_password", { opts }),
-  exportBackup: (password: string, path: string) => invoke("export_backup", { password, path }),
-  importBackup: (password: string, path: string, overwrite: boolean) =>
-    invoke<[number, number]>("import_backup", { password, path, overwrite }),
-  importCsvPreview: (path: string) => invoke<CsvImportPreview>("import_csv_preview", { path }),
-  importCsvCommit: (path: string, overwrite: boolean) =>
-    invoke<CsvImportResult>("import_csv_commit", { path, overwrite }),
+  backupInspect: (args: { path: string; backupPassword: string }) =>
+    invoke<BackupPreview>("backup_inspect", args),
+  backupRestore: (args: { token: string; overwrite: boolean; restoreSettings: boolean }) =>
+    invoke<BackupRestoreResult>("backup_restore", args),
+  backupRestoreNew: (args: { token: string; newPassword: string; restoreSettings: boolean }) =>
+    invoke<BackupRestoreResult>("backup_restore_new", args),
+  backupExport: (args: { path: string; password: string; includeSettings: boolean }) =>
+    invoke<void>("backup_export", args),
+  csvPreview: (args: { path: string }) => invoke<CsvPreview>("csv_preview", args),
+  csvCommit: (args: { token: string; password: string; riskConfirmed: boolean; overwrite: boolean }) =>
+    invoke<CsvImportResult>("csv_commit", args),
+  csvExport: (args: { path: string; password: string; riskConfirmed: boolean }) =>
+    invoke<void>("csv_export", args),
   settingsGet: () => invoke<{ idle_secs: number; clipboard_secs: number; hotkey: string }>("settings_get"),
   settingsSet: (settings: { idle_secs: number; clipboard_secs: number; hotkey: string }) =>
     invoke("settings_set", { settings }),
   syncStatus: () => invoke<SyncView>("sync_status"),
   syncSave: (input: SyncSaveInput) => invoke<SyncView>("sync_save", { input }),
   syncClear: () => invoke("sync_clear"),
-  syncNow: () => invoke<SyncReport>("sync_now"),
+  syncPreview: () => invoke<SyncPreview>("sync_preview"),
+  syncCommit: (args: {
+    token: string;
+    resolutions: { id: string; choice: string; confirm_delete_edit: boolean }[];
+  }) => invoke<SyncReport>("sync_commit", args),
+  syncVerifyConditional: () => invoke<SyncVerifyResult>("sync_verify_conditional"),
   changeMaster: (oldPassword: string, newPassword: string) =>
     invoke("change_master", { oldPassword, newPassword }),
   window: (action: string) => invoke("window_control", { action }),

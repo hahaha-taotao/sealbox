@@ -11,12 +11,17 @@ use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[path = "vault_patch.rs"]
+pub mod vault_patch;
+
 #[derive(Debug, Error)]
 pub enum VaultError {
     #[error("database error: {0}")]
     Db(#[from] db::DbError),
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("filesystem: {0}")]
+    Io(#[from] std::io::Error),
     #[error("crypto: {0}")]
     Crypto(#[from] crate::crypto::CryptoError),
     #[error("json: {0}")]
@@ -43,6 +48,10 @@ pub enum VaultError {
     InvalidTotp(String),
     #[error("备份文件损坏或格式不正确")]
     CorruptBackup,
+    #[error("vault changed while sync was in progress; retry sync")]
+    ConcurrentModification,
+    #[error("invalid entry patch: {0}")]
+    InvalidPatch(String),
     #[error("备份密钥拉伸参数超出允许范围")]
     InvalidBackupKdf,
     #[error("文件夹名称不能为空")]
@@ -218,7 +227,7 @@ pub struct UpsertEntry {
     pub secret: SecretPayload,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, zeroize::Zeroize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SecretPayload {
     Website {
@@ -1323,12 +1332,8 @@ impl Vault {
     }
 
     pub fn list_tags(&self) -> Result<Vec<String>, VaultError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT t.name FROM tags t
-             JOIN entry_tags et ON et.tag_id=t.id
-             JOIN entries e ON e.id=et.entry_id
-             ORDER BY t.name",
-        )?;
+        // Tags are independently manageable, even when no entry uses them.
+        let mut stmt = self.conn.prepare("SELECT name FROM tags ORDER BY name")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(VaultError::from)
@@ -1465,7 +1470,10 @@ impl Vault {
 
     pub fn snapshot_for_backup(&self) -> Result<BackupSnapshot, VaultError> {
         let folders = self.list_folders()?;
-        let tags = self.list_tags()?;
+        // Read the full catalog, including deliberately empty tags.
+        let tags = self.conn.prepare("SELECT name FROM tags ORDER BY name")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, title, account, url, folder_id, pinned, expires_at,
                     use_count, last_used_at, created_at, updated_at, deleted_at,
@@ -1525,9 +1533,9 @@ impl Vault {
         if exists.is_some() && !overwrite {
             return Ok(false);
         }
-        let secret = decrypt(source_dek, &Encrypted::from_bytes(&entry.secret_blob)?)?;
-        let payload: SecretPayload =
-            serde_json::from_slice(&secret).map_err(|_| VaultError::CorruptBackup)?;
+        let secret = zeroize::Zeroizing::new(decrypt(source_dek, &Encrypted::from_bytes(&entry.secret_blob)?)?);
+        let payload = zeroize::Zeroizing::new(
+            serde_json::from_slice::<SecretPayload>(&secret).map_err(|_| VaultError::CorruptBackup)?);
         let expected_kind = EntryKind::parse(&entry.kind).map_err(|_| VaultError::CorruptBackup)?;
         if payload.kind() != expected_kind {
             return Err(VaultError::CorruptBackup);
@@ -1536,7 +1544,7 @@ impl Vault {
             cert_pem,
             key_pem,
             passphrase,
-        } = &payload
+        } = &*payload
         {
             certificate::validate_client_cert(cert_pem, key_pem, passphrase.as_deref())
                 .map_err(|_| VaultError::CorruptBackup)?;
@@ -1595,6 +1603,90 @@ impl Vault {
             )?;
         }
         Ok(true)
+    }
+
+    /// A fully validated portable backup, restored in one transaction. This is
+    /// deliberately separate from sync's snapshot replacement semantics.
+    pub(crate) fn import_backup_bundle(
+        &self,
+        source_dek: &[u8; 32],
+        dest_dek: &[u8; 32],
+        snapshot: &BackupSnapshot,
+        tombstones: &[Tombstone],
+        settings: &std::collections::BTreeMap<String, String>,
+        overwrite: bool,
+        preserve_folder_ids: bool,
+    ) -> Result<(usize, usize), VaultError> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| {
+            let mut folder_map = HashMap::new();
+            for folder in &snapshot.folders {
+                let name = normalize_name(&folder.name, true)?;
+                let dest_id = if let Some(id) = folder_id_by_name(&self.conn, &name)? {
+                    id
+                } else if preserve_folder_ids {
+                    self.conn.execute("INSERT INTO folders (id, name, parent_id) VALUES (?1,?2,NULL)", params![&folder.id, &name])?;
+                    folder.id.clone()
+                } else {
+                    self.ensure_folder_named(&name)?
+                };
+                folder_map.insert(folder.id.clone(), dest_id);
+            }
+            // Empty, unreferenced tags are part of the backup as well.
+            for tag in &snapshot.tags {
+                self.ensure_tag(tag)?;
+                self.conn.execute("DELETE FROM sync_tombstones WHERE kind='tag' AND id=?1", params![tag])?;
+            }
+            let (mut imported, mut skipped) = (0, 0);
+            for entry in &snapshot.entries {
+                let folder_id = entry.folder_id.as_ref().and_then(|id| folder_map.get(id)).map(String::as_str);
+                if self.insert_reencrypted_entry(source_dek, dest_dek, entry, folder_id, overwrite)? {
+                    imported += 1;
+                    self.conn.execute("DELETE FROM sync_tombstones WHERE kind='entry' AND id=?1", params![&entry.id])?;
+                } else { skipped += 1; }
+            }
+            for dest_id in folder_map.values() {
+                self.conn.execute("DELETE FROM sync_tombstones WHERE kind='folder' AND id=?1", params![dest_id])?;
+            }
+            for item in tombstones {
+                // A folder tombstone is not a live folder: do not remap it by
+                // a live folder name or accidentally delete unrelated target data.
+                let (table, column) = match item.kind.as_str() { "folder" => ("folders", "id"), "entry" => ("entries", "id"), "tag" => ("tags", "name"), _ => return Err(VaultError::CorruptBackup) };
+                let exists: bool = self.conn.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE {column}=?1)"), params![&item.id], |row| row.get(0))?;
+                if exists { continue; }
+                self.conn.execute("INSERT INTO sync_tombstones (kind,id,deleted_at) VALUES (?1,?2,?3) ON CONFLICT(kind,id) DO UPDATE SET deleted_at=MAX(deleted_at,excluded.deleted_at)", params![&item.kind,&item.id,&item.deleted_at])?;
+            }
+            for (key, value) in settings {
+                // Defense in depth: never accept device IDs, MCP or sync credentials.
+                if !matches!(key.as_str(), "idle_secs" | "clipboard_secs") { return Err(VaultError::CorruptBackup); }
+                self.set_setting(key, value)?;
+            }
+            self.audit("import", None, &format!("imported={imported} skipped={skipped} overwrite={overwrite}"))?;
+            Ok((imported, skipped))
+        })();
+        match result {
+            Ok(report) => {
+                if let Err(error) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
+                Ok(report)
+            }
+            Err(error) => { let _ = self.conn.execute_batch("ROLLBACK"); Err(error) }
+        }
+    }
+
+    /// Initialize only a temporary file exclusively reserved by the backup module.
+    pub(crate) fn initialize_backup_temp(path: &str, password: &str) -> Result<(Self, [u8; 32]), VaultError> {
+        let conn = db::open(path)?;
+        let dek = Self::init_meta(&conn, password)?;
+        Ok((Self { conn }, dek))
+    }
+
+    /// Drain WAL before publishing the main file under its final name.
+    pub(crate) fn prepare_backup_publication(&self) -> Result<(), VaultError> {
+        self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")?;
+        Ok(())
     }
 
     pub fn import_reencrypted_snapshot(
@@ -2246,7 +2338,8 @@ impl Vault {
         dest_dek: &[u8; 32],
         snapshot: &BackupSnapshot,
     ) -> Result<(), VaultError> {
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let owns_transaction = self.conn.is_autocommit();
+        if owns_transaction { self.conn.execute_batch("BEGIN IMMEDIATE")?; }
         let result = (|| {
             self.conn.execute("DELETE FROM entry_tags", [])?;
             self.conn.execute("DELETE FROM entries", [])?;
@@ -2308,6 +2401,7 @@ impl Vault {
                     )?;
                 }
             }
+            for tag in &snapshot.tags { self.ensure_tag(tag)?; }
             self.audit(
                 "sync_apply",
                 None,
@@ -2315,9 +2409,13 @@ impl Vault {
             )?;
             Ok(())
         })();
+        if !owns_transaction { return result; }
         match result {
             Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
+                if let Err(error) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
                 Ok(())
             }
             Err(error) => {
@@ -2325,6 +2423,40 @@ impl Vault {
                 Err(error)
             }
         }
+    }
+
+    /// Compare the exact local encrypted baseline and apply the merged bundle
+    /// while holding a single write lock. Never hold this lock across network IO.
+    pub fn replace_sync_bundle_if_unchanged(
+        &self,
+        dek: &[u8; 32],
+        expected_snapshot: &BackupSnapshot,
+        expected_tombstones: &[Tombstone],
+        snapshot: &BackupSnapshot,
+        tombstones: &[Tombstone],
+    ) -> Result<(), VaultError> {
+        fn canonical(snapshot: &BackupSnapshot, tombstones: &[Tombstone]) -> Result<Vec<u8>, VaultError> {
+            let mut snapshot = snapshot.clone();
+            snapshot.folders.sort_by(|a,b| a.id.cmp(&b.id));
+            snapshot.tags.sort();
+            snapshot.entries.sort_by(|a,b| a.id.cmp(&b.id));
+            for entry in &mut snapshot.entries { entry.tags.sort(); }
+            let mut tombstones = tombstones.to_vec();
+            tombstones.sort_by(|a,b| (&a.kind,&a.id,&a.deleted_at).cmp(&(&b.kind,&b.id,&b.deleted_at)));
+            Ok(serde_json::to_vec(&(snapshot, tombstones))?)
+        }
+        let expected = canonical(expected_snapshot, expected_tombstones)?;
+        self.with_transaction(|conn| {
+            if canonical(&self.snapshot_for_backup()?, &self.sync_tombstones()?)? != expected {
+                return Err(VaultError::ConcurrentModification);
+            }
+            self.replace_snapshot_same_key(dek, snapshot)?;
+            conn.execute("DELETE FROM sync_tombstones", [])?;
+            for item in tombstones {
+                conn.execute("INSERT INTO sync_tombstones (kind,id,deleted_at) VALUES (?1,?2,?3)", params![&item.kind,&item.id,&item.deleted_at])?;
+            }
+            Ok(())
+        })
     }
 }
 

@@ -2,6 +2,8 @@ mod auto_sync;
 mod clipboard;
 mod commands;
 mod session;
+mod saf;
+mod transfer;
 mod update;
 
 #[cfg(test)]
@@ -23,6 +25,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_biometry::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(saf::init())
         .manage(commands::AppState::new())
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
@@ -38,8 +41,12 @@ pub fn run() {
             commands::list_folders,
             commands::create_folder,
             commands::rename_folder,
+            commands::merge_folders,
             commands::delete_folder,
             commands::list_tags,
+            commands::rename_tag,
+            commands::delete_tag,
+            commands::merge_tags,
             commands::create_entry,
             commands::delete_entries,
             commands::restore_entries,
@@ -59,6 +66,20 @@ pub fn run() {
             commands::check_mobile_update,
             commands::download_mobile_update,
             commands::install_mobile_update,
+            commands::document_open,
+            commands::document_save,
+            commands::backup_inspect,
+            commands::backup_restore,
+            commands::backup_restore_new,
+            commands::backup_export,
+            commands::csv_preview,
+            commands::csv_commit,
+            commands::csv_export,
+            commands::change_master,
+            commands::import_client_cert,
+            commands::sync_preview,
+            commands::sync_commit,
+            commands::sync_verify_conditional,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

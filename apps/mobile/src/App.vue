@@ -5,7 +5,10 @@ import { onBackButtonPress } from "@tauri-apps/api/app";
 import type { PluginListener } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { authenticate, checkStatus, getData, hasData, removeData, setData } from "@choochmeque/tauri-plugin-biometry-api";
-import { KINDS, api, kindLabel, type Counts, type EntryDto, type EntryField, type EntryKind, type Folder, type MobileRelease, type SyncReport, type SyncView } from "./api";
+import { KINDS, api, kindLabel, type BackupPreview, type CsvPreview, type DocumentRef, type Counts, type EntryDto, type EntryField, type EntryKind, type Folder, type MobileRelease, type SyncReport, type SyncView } from "./api";
+import { DB_ENGINES, SERVER_PROTOCOLS, optionsWithStored, databaseFields, defaultPort } from "../../../src/lib/entry-options";
+import { preservePayload } from "../../../src/lib/entry-patch.mjs";
+import { completeChoices, buildResolutions, type SyncChoice } from '../../../src/lib/sync-choice.mjs';
 
 type Page = "lock" | "vault" | "detail" | "edit" | "settings" | "sync";
 const page = ref<Page>("lock");
@@ -43,8 +46,75 @@ const notes = ref("");
 const fields = ref<EntryField[]>([]);
 const editing = ref(false);
 const form = reactive(blankForm());
+let editBaseline: Record<string, unknown> | null = null;
+const certDocument = ref<DocumentRef | null>(null);
+const keyDocument = ref<DocumentRef | null>(null);
+const clearCertPassphrase = ref(false);
+const engineOptions = computed(() => optionsWithStored(DB_ENGINES, form.engine));
+const protocolOptions = computed(() => optionsWithStored(SERVER_PROTOCOLS, form.protocol));
+const dbFields = computed(() => databaseFields(form.engine));
+function changeConnectionType() {
+  const port = defaultPort(form.kind, form.kind === 'server' ? form.protocol : form.engine);
+  if (port !== undefined) form.port = port ? String(port) : '';
+}
+const management = ref<'' | 'backup-export' | 'backup-restore' | 'csv-import' | 'csv-export' | 'organization' | 'password'>('');
+const transferDocument = ref<DocumentRef | null>(null);
+const backupPreview = ref<BackupPreview | null>(null);
+const csvPreview = ref<CsvPreview | null>(null);
+const transferPassword = ref('');
+const newMaster = ref('');
+const repeatMaster = ref('');
+const reuseBackupPassword = ref(true);
+const restoreSettings = ref(false);
+const includeSettings = ref(false);
+const overwrite = ref(false);
+const riskConfirmed = ref(false);
+const categoryTargets = reactive<Record<string, string>>({});
+function clearManagement() {
+  management.value = ''; transferDocument.value = null; backupPreview.value = null; csvPreview.value = null;
+  transferPassword.value = ''; newMaster.value = ''; repeatMaster.value = ''; riskConfirmed.value = false;
+  restoreSettings.value = false; includeSettings.value = false; overwrite.value = false;
+}
+function openManagement(mode: typeof management.value) { clearManagement(); error.value = ''; management.value = mode; }
+function clearEdit() { editBaseline = null; Object.assign(form, blankForm()); certDocument.value = null; keyDocument.value = null; clearCertPassphrase.value = false; }
 const sync = ref<SyncView | null>(null);
 const report = ref<SyncReport | null>(null);
+const syncToken = ref('');
+const syncChoices = reactive<Record<string, SyncChoice>>({});
+const syncConflicts = computed(() => report.value?.conflict_details ?? []);
+const syncCanCommit = computed(() => Boolean(syncToken.value) && completeChoices(syncConflicts.value, syncChoices));
+function clearSyncPreview() { syncToken.value = ''; report.value = null; for (const id of Object.keys(syncChoices)) delete syncChoices[id]; }
+async function previewSync() {
+  clearSyncPreview();
+  const result = await api.syncPreview();
+  if (page.value === 'lock') return;
+  syncToken.value = result.token; report.value = result.report;
+  for (const item of syncConflicts.value) syncChoices[item.id] = { choice: '', confirm_delete_edit: false };
+}
+async function commitSync() {
+  if (!syncCanCommit.value || busy.value) return;
+  busy.value = true; error.value = '';
+  try {
+    const result = await api.syncCommit(syncToken.value, buildResolutions(syncConflicts.value, syncChoices));
+    syncToken.value = ''; report.value = result; await loadVault(); sync.value = await api.syncStatus();
+  } catch (caught) { showError(caught); } finally { busy.value = false; }
+}
+async function verifySync() {
+  busy.value = true;
+  try { const result = await api.syncVerifyConditional(); showToast(result.verified ? '安全条件写入已验证' : '服务端未通过安全验证'); }
+  catch (caught) { showError(caught); } finally { busy.value = false; }
+}
+async function changeMaster() {
+  if (newMaster.value.length < 10 || newMaster.value !== repeatMaster.value) { error.value = '新主密码至少 10 位，且两次输入必须一致'; return; }
+  busy.value = true;
+  try {
+    await api.changeMaster(transferPassword.value, newMaster.value);
+    try { await removeData({ domain: DOMAIN, name: DEK_NAME }); } catch { showToast('请在系统设置中清除旧指纹凭据；本机已禁用指纹', 4000); }
+    clearManagement(); clearEdit(); clearSyncPreview(); biometryOn.value = false; biometryReady.value = false;
+    page.value = 'lock'; entries.value = []; selected.value = null; fields.value = []; notes.value = ''; revealed.value = '';
+    showToast('主密码已修改，请用新主密码解锁');
+  } catch (caught) { showError(caught); } finally { transferPassword.value = ''; busy.value = false; }
+}
 const syncKind = ref<"webdav" | "s3">("webdav");
 const syncForm = reactive({ endpoint: "", username: "", secret: "", bucket: "", region: "us-east-1", prefix: "", auto: true, autoSecs: 60 });
 const idleSecs = ref(60);
@@ -85,11 +155,14 @@ let backListener: PluginListener | null = null;
 let backQueue: Promise<void> = Promise.resolve();
 
 function canGoBackInApp() {
+  if (management.value) return true;
   if (page.value === "vault") return filtersOpen.value;
   return page.value === "detail" || page.value === "edit" || page.value === "settings" || page.value === "sync";
 }
 
 function goBack() {
+  if (management.value) { clearManagement(); return; }
+  if (page.value === 'edit') clearEdit();
   switch (page.value) {
     case "detail":
       page.value = "vault";
@@ -127,7 +200,7 @@ function syncBackListener() {
     .catch(() => {});
 }
 
-watch([page, filtersOpen], syncBackListener);
+watch([page, filtersOpen, management], syncBackListener);
 
 const DOMAIN = "com.sealbox.mobile";
 const DEK_NAME = "vault-dek";
@@ -160,6 +233,7 @@ function blankForm() {
     tags: "",
     notes: "",
     pinned: false,
+    expiresAt: '',
   };
 }
 
@@ -244,6 +318,7 @@ async function submitPassword() {
   busy.value = true;
   try {
     if (!initialized.value) {
+      if (password.value.length < 10) throw new Error('主密码至少 10 位');
       if (password.value !== password2.value) throw new Error("两次主密码不一致");
       await api.setup(password.value);
     } else {
@@ -331,7 +406,7 @@ async function copy(field: string) {
 }
 
 function startCreate(next: EntryKind) {
-  Object.assign(form, blankForm());
+  clearEdit();
   form.kind = next;
   editing.value = false;
   page.value = "edit";
@@ -340,7 +415,7 @@ function startCreate(next: EntryKind) {
 async function startEdit() {
   if (!selected.value) return;
   const row = selected.value;
-  Object.assign(form, blankForm());
+  clearEdit();
   form.id = row.id;
   form.kind = row.kind;
   form.title = row.title;
@@ -350,8 +425,11 @@ async function startEdit() {
   form.tags = row.tags.join(", ");
   form.notes = notes.value;
   form.pinned = row.pinned;
+  form.expiresAt = row.expires_at ?? '';
   if (row.kind !== "client_cert") {
     const payload = await api.reveal(row.id);
+    if (page.value === 'lock' || selected.value?.id !== row.id) return;
+    editBaseline = { ...payload };
     fillFromPayload(payload);
   }
   editing.value = true;
@@ -377,6 +455,10 @@ function fillFromPayload(payload: Record<string, unknown>) {
 }
 
 function secretPayload() {
+  const changes = visibleSecretPayload();
+  return preservePayload(editBaseline, changes);
+}
+function visibleSecretPayload(): Record<string, unknown> {
   const port = form.port ? Number(form.port) : null;
   switch (form.kind) {
     case "website":
@@ -384,9 +466,9 @@ function secretPayload() {
     case "api_token":
       return { type: "api_token", service: form.service || form.title, account: form.account || null, token: form.token };
     case "ssh":
-      return { type: "ssh", key_type: "openssh", private_key: form.privateKey, passphrase: form.passphrase || null, public_fingerprint: null };
+      return { type: "ssh", ...(!editBaseline ? { key_type: "openssh", public_fingerprint: null } : {}), private_key: form.privateKey, passphrase: form.passphrase || null };
     case "mailbox":
-      return { type: "mailbox", email: form.email, password: form.password, imap_host: null, imap_port: null, smtp_host: null, smtp_port: null };
+      return { type: "mailbox", email: form.email, password: form.password, ...(!editBaseline ? { imap_host: null, imap_port: null, smtp_host: null, smtp_port: null } : {}) };
     case "mail_auth":
       return { type: "mail_auth", email: form.email, provider: form.provider, auth_code: form.authCode };
     case "server":
@@ -401,7 +483,7 @@ function secretPayload() {
 async function saveEntry() {
   error.value = "";
   try {
-    const saved = await api.save({
+    const input = {
       id: form.id || null,
       kind: form.kind,
       title: form.title,
@@ -410,10 +492,16 @@ async function saveEntry() {
       folder_id: form.folderId || null,
       tags: form.tags.split(/[,，]/).map((item) => item.trim()).filter(Boolean),
       pinned: form.pinned,
-      expires_at: null,
+      expires_at: form.expiresAt || null,
       notes: form.notes || null,
-      secret: secretPayload(),
-    });
+      ...(editing.value ? { expected_updated_at: selected.value?.updated_at } : {}),
+    };
+    if (form.port && (!Number.isInteger(Number(form.port)) || Number(form.port) < 0 || Number(form.port) > 65535)) throw new Error('端口必须为 0–65535 的整数');
+    if (form.kind === 'client_cert' && (!editing.value || certDocument.value || keyDocument.value) && (!certDocument.value || !keyDocument.value)) throw new Error('请选择证书与私钥文件');
+    const saved = form.kind === 'client_cert'
+      ? await api.importClientCert(input, certDocument.value?.uri ?? null, keyDocument.value?.uri ?? null, clearCertPassphrase.value ? '' : form.passphrase || null)
+      : await api.save({ ...input, secret: secretPayload() });
+    clearEdit();
     await loadVault();
     await openDetail(saved);
   } catch (caught) {
@@ -447,6 +535,76 @@ async function addFolder() {
   if (!name) return;
   const folder = await api.createFolder(name);
   await pickFolder(folder.id);
+}
+
+async function chooseCert(which: 'cert' | 'key') {
+  try {
+    const doc = await api.documentOpen(['application/x-pem-file', 'application/pkix-cert', 'application/octet-stream']);
+    if (doc) (which === 'cert' ? certDocument : keyDocument).value = doc;
+  } catch (caught) { showError(caught); }
+}
+async function chooseTransfer() {
+  try {
+    const doc = await api.documentOpen(management.value === 'csv-import' ? ['text/csv', 'text/plain', 'application/octet-stream'] : ['application/octet-stream']);
+    if (!doc) return;
+    transferDocument.value = doc; backupPreview.value = null; csvPreview.value = null;
+    if (management.value === 'csv-import') csvPreview.value = await api.csvPreview(doc.uri);
+  } catch (caught) { showError(caught); }
+}
+async function inspectBackup() {
+  error.value = ''; busy.value = true; backupPreview.value = null;
+  try {
+    if (!transferDocument.value) throw new Error('请先选择 .svbak 备份');
+    backupPreview.value = await api.backupInspect(transferDocument.value.uri, transferPassword.value);
+    transferPassword.value = '';
+  } catch (caught) { showError(caught); } finally { busy.value = false; }
+}
+async function runTransfer() {
+  error.value = ''; busy.value = true;
+  try {
+    if (management.value === 'backup-restore') {
+      if (!backupPreview.value) throw new Error('请先校验并预览备份');
+      if (!initialized.value && !reuseBackupPassword.value && (newMaster.value.length < 10 || newMaster.value !== repeatMaster.value)) throw new Error('新主密码至少 10 位，且两次输入必须一致');
+      const result = initialized.value
+        ? await api.backupRestore(backupPreview.value.token, overwrite.value, restoreSettings.value)
+        : await api.backupRestoreNew(backupPreview.value.token, reuseBackupPassword.value ? null : newMaster.value, restoreSettings.value);
+      clearManagement(); await refreshStatus();
+      // A restored new vault must be opened with its master password, never an implicit unlocked session.
+      if (page.value !== 'lock') await loadVault();
+      showToast(`恢复 ${result.imported} 条，跳过 ${result.skipped} 条`);
+    } else if (management.value === 'csv-import') {
+      if (!csvPreview.value || !riskConfirmed.value || !transferPassword.value) throw new Error('请先预览、输入主密码并确认明文风险');
+      const result = await api.csvCommit(csvPreview.value.token, transferPassword.value, riskConfirmed.value, overwrite.value);
+      clearManagement(); await loadVault(); showToast(`新增 ${result.inserted}，更新 ${result.updated}，跳过 ${result.skipped_existing + result.skipped_invalid}`);
+    } else {
+      if (!transferPassword.value || !riskConfirmed.value) throw new Error('请输入主密码并确认导出风险');
+      const isCsv = management.value === 'csv-export';
+      const doc = await api.documentSave(isCsv ? 'sealbox-websites.csv' : 'sealbox.svbak', isCsv ? 'text/csv' : 'application/octet-stream');
+      if (!doc) return;
+      if (isCsv) await api.csvExport(doc.uri, transferPassword.value, riskConfirmed.value);
+      else await api.backupExport(doc.uri, transferPassword.value, includeSettings.value);
+      clearManagement(); showToast('导出完成，请妥善保管文件');
+    }
+  } catch (caught) { showError(caught); transferPassword.value = ''; }
+  finally { busy.value = false; }
+}
+async function organize(action: 'rename' | 'delete' | 'merge', kind: 'folder' | 'tag', id: string, name: string) {
+  try {
+    if (action === 'rename') {
+      const next = window.prompt('新名称', name)?.trim(); if (!next || next === name) return;
+      if (kind === 'folder') await api.renameFolder(id, next); else await api.renameTag(name, next);
+    } else {
+      const target = categoryTargets[id];
+      if (action === 'merge' && (!target || target === id)) throw new Error('请选择不同的合并目标');
+      if (!window.confirm(`${action === 'delete' ? '删除分类只解除关联，不会删除条目' : '合并后保留目标分类，条目不会删除'}。操作不可撤销，是否继续？`)) return;
+      if (kind === 'folder') {
+        if (action === 'delete') await api.deleteFolder(id); else await api.mergeFolders(id, target);
+      } else {
+        if (action === 'delete') await api.deleteTag(name); else await api.mergeTags(name, target);
+      }
+    }
+    folderId.value = ''; tag.value = ''; await loadVault(); showToast('分类已更新；条目未删除');
+  } catch (caught) { showError(caught); }
 }
 
 async function pickFolder(id: string) {
@@ -643,11 +801,13 @@ async function lockNow() {
   selected.value = null;
   fields.value = [];
   revealed.value = "";
+  notes.value = ''; clearEdit(); clearManagement(); syncForm.secret = '';
 }
 
 onMounted(async () => {
   await refreshStatus();
   await listen("lock-now", () => {
+    clearEdit(); clearManagement(); notes.value = ''; selected.value = null; syncForm.secret = '';
     clearQueryTimer();
     fields.value = [];
     revealed.value = "";
@@ -679,7 +839,136 @@ onMounted(async () => {
 
 <template>
   <div class="app">
-    <section v-if="page === 'lock'" class="view lock">
+    <section v-if="management" class="view">
+      <div class="top">
+        <button class="link" type="button" @click="clearManagement()">返回</button>
+        <h1>{{ management === 'password' ? '修改主密码' : management === 'backup-export' ? '导出加密备份' : management === 'backup-restore' ? '恢复加密备份' : management === 'csv-import' ? 'CSV 网站导入' : management === 'csv-export' ? 'CSV 网站导出' : '文件夹与标签' }}</h1>
+      </div>
+      <div class="scroll">
+        <div v-if="error" class="pad"><p class="error">{{ error }}</p></div>
+
+        <div v-if="management === 'password'" class="pad">
+          <p class="hint">至少 10 位，完成后重新解锁；指纹凭据会失效。</p>
+          <div class="field"><label>旧主密码</label><input v-model="transferPassword" type="password" /></div>
+          <div class="field"><label>新密码</label><input v-model="newMaster" type="password" /></div>
+          <div class="field"><label>重复</label><input v-model="repeatMaster" type="password" /></div>
+          <button class="primary" type="button" :disabled="busy" @click="changeMaster">修改主密码</button>
+        </div>
+
+        <div v-else-if="management === 'backup-export'" class="pad">
+          <p class="hint">.svbak 仍是加密备份，但文件本身要保管好。保存位置由导出流程里的系统对话框决定。</p>
+          <div class="field"><label>主密码</label><input v-model="transferPassword" type="password" /></div>
+          <div class="group" style="margin:0 0 14px">
+            <label class="set"><span class="t">同时备份空闲锁定和剪贴板秒数（不含设备、指纹、同步凭据）</span><input v-model="includeSettings" type="checkbox" /></label>
+            <label class="set"><span class="t">我了解 .svbak 仍是加密备份，但文件本身要保管好</span><input v-model="riskConfirmed" type="checkbox" /></label>
+          </div>
+          <button class="primary" type="button" :disabled="busy" @click="runTransfer">导出</button>
+        </div>
+
+        <div v-else-if="management === 'backup-restore'" class="pad">
+          <button class="ghost" type="button" @click="chooseTransfer">选择文件</button>
+          <p class="hint">{{ transferDocument?.name || '未选择文件' }}</p>
+          <div class="gap"></div>
+          <div class="field"><label>主密码</label><input v-model="transferPassword" type="password" /></div>
+          <button class="ghost" type="button" :disabled="busy" @click="inspectBackup">校验并预览</button>
+          <div v-if="backupPreview" class="group" style="margin:14px 0">
+            <div class="set"><span class="t">版本</span><span>{{ backupPreview.summary.version }}</span></div>
+            <div class="set"><span class="t">条目</span><span>{{ backupPreview.summary.entries }}</span></div>
+            <div class="set"><span class="t">回收站</span><span>{{ backupPreview.summary.trash }}</span></div>
+            <div class="set"><span class="t">文件夹</span><span>{{ backupPreview.summary.folders }}</span></div>
+            <div class="set"><span class="t">标签</span><span>{{ backupPreview.summary.tags }}</span></div>
+            <div class="set"><span class="t">墓碑</span><span>{{ backupPreview.summary.tombstones }}</span></div>
+            <div class="set"><span class="t">包含设置</span><span>{{ backupPreview.summary.includes_settings ? '是' : '否' }}</span></div>
+          </div>
+          <p v-for="(warning, index) in backupPreview?.summary.warnings || []" :key="index" class="error">{{ warning }}</p>
+          <div class="group" style="margin:0 0 14px">
+            <label class="set"><span class="t">覆盖已有条目</span><input v-model="overwrite" type="checkbox" /></label>
+            <label class="set"><span class="t">同时恢复空闲锁定和剪贴板秒数</span><input v-model="restoreSettings" type="checkbox" /></label>
+            <label v-if="!initialized" class="set"><span class="t">继续使用备份中的主密码</span><input v-model="reuseBackupPassword" type="checkbox" /></label>
+          </div>
+          <template v-if="!initialized && !reuseBackupPassword">
+            <div class="field"><label>新主密码</label><input v-model="newMaster" type="password" /></div>
+            <div class="field"><label>重复</label><input v-model="repeatMaster" type="password" /></div>
+            <p class="hint">至少 10 位，且两次输入必须一致。</p>
+          </template>
+          <button class="primary" type="button" :disabled="!backupPreview || busy" @click="runTransfer">恢复</button>
+        </div>
+
+        <div v-else-if="management === 'csv-import'" class="pad">
+          <p class="hint">这是明文网站迁移，不含证书、SSH、服务器，不要用表格软件打开。</p>
+          <button class="ghost" type="button" @click="chooseTransfer">选择文件</button>
+          <p class="hint">{{ transferDocument?.name || '未选择文件' }}</p>
+          <div v-if="csvPreview" class="group" style="margin:14px 0">
+            <div class="set"><span class="t">总计</span><span>{{ csvPreview.summary.total }}</span></div>
+            <div class="set"><span class="t">可导入</span><span>{{ csvPreview.summary.importable }}</span></div>
+            <div class="set"><span class="t">已存在跳过</span><span>{{ csvPreview.summary.skipped_existing }}</span></div>
+            <div class="set"><span class="t">无效跳过</span><span>{{ csvPreview.summary.skipped_invalid }}</span></div>
+          </div>
+          <div v-for="(row, index) in csvPreview?.summary.sample || []" :key="index" class="group" style="margin:0 0 14px">
+            <div class="set"><span class="t">标题</span><span>{{ row.title }}</span></div>
+            <div class="set"><span class="t">网址</span><span>{{ row.url }}</span></div>
+            <div class="set"><span class="t">用户名</span><span>{{ row.username }}</span></div>
+            <div class="set"><span class="t">有密码</span><span>{{ row.has_password ? '是' : '否' }}</span></div>
+            <div class="set"><span class="t">有 TOTP</span><span>{{ row.has_totp ? '是' : '否' }}</span></div>
+          </div>
+          <div class="field"><label>主密码</label><input v-model="transferPassword" type="password" /></div>
+          <div class="group" style="margin:0 0 14px">
+            <label class="set"><span class="t">我确认这是明文网站迁移，文件含网站密码，不要用表格软件打开</span><input v-model="riskConfirmed" type="checkbox" /></label>
+            <label class="set"><span class="t">覆盖已有网站条目</span><input v-model="overwrite" type="checkbox" /></label>
+          </div>
+          <button class="primary" type="button" :disabled="busy" @click="runTransfer">导入</button>
+        </div>
+
+        <div v-else-if="management === 'csv-export'" class="pad">
+          <p class="hint">这是明文网站迁移，不含证书、SSH、服务器，不要用表格软件打开。保存位置由导出流程里的系统对话框决定。</p>
+          <div class="field"><label>主密码</label><input v-model="transferPassword" type="password" /></div>
+          <div class="group" style="margin:0 0 14px">
+            <label class="set"><span class="t">我确认这是明文网站迁移，文件含网站密码，不要用表格软件打开</span><input v-model="riskConfirmed" type="checkbox" /></label>
+          </div>
+          <button class="primary" type="button" :disabled="busy" @click="runTransfer">导出</button>
+        </div>
+
+        <div v-else class="pad">
+          <p class="hint">删除和合并都不删除条目。</p>
+          <div class="lbl">文件夹</div>
+          <p v-if="!folders.length" class="hint">还没有文件夹。</p>
+          <div v-for="folder in folders" :key="folder.id" class="group" style="margin:0 0 14px">
+            <div class="set"><span class="t">{{ folder.name }}</span></div>
+            <div class="pad">
+              <div class="field">
+                <label>合并目标</label>
+                <select v-model="categoryTargets[folder.id]">
+                  <option value="">选择其他文件夹</option>
+                  <option v-for="other in folders.filter(item => item.id !== folder.id)" :key="other.id" :value="other.id">{{ other.name }}</option>
+                </select>
+              </div>
+            </div>
+            <button class="set" type="button" @click="organize('rename', 'folder', folder.id, folder.name)"><span class="t">重命名</span></button>
+            <button class="set" type="button" @click="organize('delete', 'folder', folder.id, folder.name)"><span class="t">删除</span></button>
+            <button class="set" type="button" @click="organize('merge', 'folder', folder.id, folder.name)"><span class="t">合并</span></button>
+          </div>
+          <div class="lbl">标签</div>
+          <p v-if="!tags.length" class="hint">还没有标签。</p>
+          <div v-for="name in tags" :key="name" class="group" style="margin:0 0 14px">
+            <div class="set"><span class="t">{{ name }}</span></div>
+            <div class="pad">
+              <div class="field">
+                <label>合并目标</label>
+                <select v-model="categoryTargets[name]">
+                  <option value="">选择其他标签</option>
+                  <option v-for="other in tags.filter(item => item !== name)" :key="other" :value="other">{{ other }}</option>
+                </select>
+              </div>
+            </div>
+            <button class="set" type="button" @click="organize('rename', 'tag', name, name)"><span class="t">重命名</span></button>
+            <button class="set" type="button" @click="organize('delete', 'tag', name, name)"><span class="t">删除</span></button>
+            <button class="set" type="button" @click="organize('merge', 'tag', name, name)"><span class="t">合并</span></button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section v-else-if="page === 'lock'" class="view lock">
       <div class="mark">印</div>
       <h1>{{ initialized ? "打开印盒" : "设置主密码" }}</h1>
       <p class="hint">主密码至少 10 位。指纹只在这台手机上生效。</p>
@@ -690,6 +979,7 @@ onMounted(async () => {
       <button class="primary" :disabled="busy" @click="submitPassword">{{ initialized ? "解锁" : "创建保险库" }}</button>
       <div class="gap"></div>
       <button v-if="biometryReady" class="ghost" @click="unlockFingerprint">用指纹解锁</button>
+      <button v-if="!initialized" class="ghost" @click="openManagement('backup-restore')">从 .svbak 备份恢复，无需先建库</button>
     </section>
 
     <template v-else-if="page === 'vault'">
@@ -763,7 +1053,7 @@ onMounted(async () => {
           </button>
         </div>
       </div>
-      <button class="fab" @click="page = 'edit'; Object.assign(form, blankForm())">+</button>
+      <button class="fab" @click="startCreate('website')">+</button>
     </template>
 
     <section v-else-if="page === 'detail' && selected" class="view">
@@ -798,7 +1088,7 @@ onMounted(async () => {
     </section>
 
     <section v-else-if="page === 'edit'" class="view">
-      <div class="top"><button class="link" @click="page = editing ? 'detail' : 'vault'">返回</button><h1>{{ editing ? "编辑" : "新建" }}</h1></div>
+      <div class="top"><button class="link" @click="goBack">返回</button><h1>{{ editing ? "编辑" : "新建" }}</h1></div>
       <div class="scroll pad">
         <div v-if="!editing" class="kinds">
           <button v-for="item in KINDS" :key="item.id" class="kind" :class="{ on: form.kind === item.id }" @click="startCreate(item.id)"><b>{{ kindLabel(item.id) }}</b></button>
@@ -827,17 +1117,20 @@ onMounted(async () => {
           <div v-else class="field"><label>授权码</label><input v-model="form.authCode" type="password" /></div>
         </template>
         <template v-else-if="form.kind === 'server' || form.kind === 'database'">
-          <div v-if="form.kind === 'database'" class="field"><label>引擎</label><input v-model="form.engine" /></div>
-          <div class="field"><label>主机</label><input v-model="form.host" /></div>
-          <div class="field"><label>端口</label><input v-model="form.port" /></div>
-          <div v-if="form.kind === 'database'" class="field"><label>库名</label><input v-model="form.database" /></div>
-          <div class="field"><label>用户名</label><input v-model="form.username" /></div>
+          <div v-if="form.kind === 'database'" class="field"><label>引擎</label><select v-model="form.engine" @change="changeConnectionType"><option v-for="option in engineOptions" :key="option.id" :value="option.id">{{ option.label }}</option></select></div>
+          <div v-else class="field"><label>协议</label><select v-model="form.protocol" @change="changeConnectionType"><option v-for="option in protocolOptions" :key="option.id" :value="option.id">{{ option.label }}</option></select></div>
+          <div v-if="form.kind === 'server' || dbFields.host" class="field"><label>主机</label><input v-model="form.host" /></div>
+          <div v-if="form.kind === 'server' || dbFields.port" class="field"><label>端口</label><input v-model="form.port" type="number" min="0" max="65535" /></div>
+          <div v-if="form.kind === 'database'" class="field"><label>{{ dbFields.databaseLabel }}</label><input v-model="form.database" /></div>
+          <div v-if="form.kind === 'server' || dbFields.username" class="field"><label>{{ form.engine === 'redis' && form.kind === 'database' ? '用户名，可选' : '用户名' }}</label><input v-model="form.username" /></div>
           <div class="field"><label>密码</label><input v-model="form.password" type="password" /></div>
         </template>
         <template v-else>
-          <div class="field"><label>证书 PEM</label><textarea v-model="form.certPem"></textarea></div>
-          <div class="field"><label>私钥 PEM</label><textarea v-model="form.keyPem"></textarea></div>
-          <p class="hint">用粘贴，不从文件管理器导入。编辑已有证书时不回显私钥。</p>
+          <div class="field"><label>证书文件</label><button class="ghost" @click="chooseCert('cert')">{{ certDocument?.name || '从系统文档选择证书' }}</button></div>
+          <div class="field"><label>私钥文件</label><button class="ghost" @click="chooseCert('key')">{{ keyDocument?.name || '从系统文档选择私钥' }}</button></div>
+          <div class="field"><label>私钥口令，可选；留空保留</label><input v-model="form.passphrase" type="password" :disabled="clearCertPassphrase" /></div>
+          <label v-if="editing" class="set"><span>明确清除已保存口令</span><input v-model="clearCertPassphrase" type="checkbox" /></label>
+          <p class="hint">私钥由原生端读取和校验，不回显。编辑时不选择替换文件则保留原证书及私钥。</p>
         </template>
         <div class="field"><label>文件夹</label>
           <select v-model="form.folderId"><option value="">未归类</option><option v-for="folder in folders" :key="folder.id" :value="folder.id">{{ folder.name }}</option></select>
@@ -860,6 +1153,12 @@ onMounted(async () => {
           </div>
           <p v-if="error" class="error" style="padding:0 18px">{{ error }}</p>
           <div class="group">
+            <button class="set" @click="openManagement('password')"><span class="t">修改主密码<small>至少 10 位，完成后重新用主密码解锁</small></span><span>›</span></button>
+            <button class="set" @click="openManagement('organization')"><span class="t">文件夹与标签<small>重命名、删除与合并，不删除条目</small></span><span>›</span></button>
+            <button class="set" @click="openManagement('backup-export')"><span class="t">导出加密备份<small>完整金库 .svbak</small></span><span>›</span></button>
+            <button class="set" @click="openManagement('backup-restore')"><span class="t">恢复加密备份<small>先校验预览，再选择恢复策略</small></span><span>›</span></button>
+            <button class="set" @click="openManagement('csv-import')"><span class="t">CSV 网站导入<small>明文迁移，仅网站账号</small></span><span>›</span></button>
+            <button class="set" @click="openManagement('csv-export')"><span class="t">CSV 网站导出<small>明文迁移，仅网站账号</small></span><span>›</span></button>
             <button class="set" @click="openSync"><span class="t">数据同步<small>WebDAV / S3</small></span><span>›</span></button>
             <button class="set" @click="lockNow"><span class="t">立即锁定</span></button>
           </div>
@@ -925,13 +1224,33 @@ onMounted(async () => {
           <button class="ghost" :disabled="busy" @click="saveSync(false)">仅保存</button>
           <button class="primary" :disabled="busy" @click="saveSync(true)">{{ busy ? "同步中" : "保存并同步" }}</button>
         </div>
+        <div class="actions">
+          <button class="ghost" type="button" :disabled="busy" @click="verifySync">验证安全同步</button>
+          <button class="ghost" type="button" :disabled="busy" @click="previewSync">预览变更</button>
+        </div>
         <div v-if="report" class="secret">
           <div class="row"><span class="k">拉取</span><span>{{ report.pulled }}</span></div>
           <div class="row"><span class="k">推送</span><span>{{ report.pushed }}</span></div>
           <div class="row"><span class="k">未变</span><span>{{ report.unchanged }}</span></div>
           <div class="row" v-if="report.removed"><span class="k">删除</span><span>{{ report.removed }}</span></div>
-          <p v-if="report.conflicts.length" class="error">两端修改时间相同，已保留本机：{{ report.conflicts.join("、") }}</p>
+          <p v-if="report.blocked" class="error">{{ report.blocked }}</p>
+          <p v-if="report.phase" class="hint">阶段：{{ report.phase }}</p>
         </div>
+        <div v-for="item in syncConflicts" :key="item.id" class="secret">
+          <div class="row"><span class="k">条目</span><span>{{ item.title }}</span></div>
+          <p class="hint">{{ item.kind === 'edit_edit' ? '两边都改过' : '一边删除一边修改' }}</p>
+          <div v-if="syncChoices[item.id]" class="chips flat">
+            <button type="button" class="chip" :class="{ on: syncChoices[item.id].choice === 'local' }" @click="syncChoices[item.id].choice = 'local'">保留本机</button>
+            <button type="button" class="chip" :class="{ on: syncChoices[item.id].choice === 'remote' }" @click="syncChoices[item.id].choice = 'remote'">采用远端</button>
+            <button type="button" class="chip" :class="{ on: syncChoices[item.id].choice === 'both' }" @click="syncChoices[item.id].choice = 'both'">两边都保留</button>
+          </div>
+          <label v-if="item.kind === 'delete_edit' && syncChoices[item.id]" class="set">
+            <span>我确认如何处理删除与修改</span>
+            <input v-model="syncChoices[item.id].confirm_delete_edit" type="checkbox" />
+          </label>
+        </div>
+        <div class="gap"></div>
+        <button class="primary" type="button" :disabled="!syncCanCommit || busy" @click="commitSync">按选择同步</button>
         <p class="hint">远端只有加密快照。同步密钥解不开主密码。</p>
       </div>
     </section>

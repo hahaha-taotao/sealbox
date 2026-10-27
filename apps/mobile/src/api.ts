@@ -79,7 +79,13 @@ export interface SyncView {
   auto_sync_secs: number;
 }
 
+export interface SyncConflict { id: string; title: string; kind: 'edit_edit' | 'delete_edit'; local_deleted: boolean; remote_deleted: boolean }
+export interface SyncPreview { token: string; expires_in_secs: number; report: SyncReport }
 export interface SyncReport {
+  phase?: 'preview' | 'conflicts' | 'committed' | 'local_pending' | 'blocked';
+  blocked?: string | null;
+  retryable?: boolean;
+  conflict_details?: SyncConflict[];
   pulled: number;
   pushed: number;
   unchanged: number;
@@ -137,7 +143,27 @@ export function kindLabel(kind: EntryKind) {
   )[kind];
 }
 
+export interface BackupSummary { version: number; entries: number; trash: number; folders: number; tags: number; tombstones: number; includes_settings: boolean; warnings: string[] }
+export interface BackupPreview { token: string; summary: BackupSummary }
+export interface CsvPreview { token: string; summary: { format: string; total: number; importable: number; skipped_existing: number; skipped_invalid: number; sample: { title: string; url: string; username: string; has_password: boolean; has_totp: boolean }[] } }
+export interface DocumentRef { uri: string; name: string }
+
 export const api = {
+  documentOpen: (mimeTypes: string[]) => invoke<DocumentRef | null>("document_open", { mimeTypes }),
+  documentSave: (suggestedName: string, mime: string) => invoke<DocumentRef | null>("document_save", { suggestedName, mime }),
+  backupInspect: (uri: string, backupPassword: string) => invoke<BackupPreview>("backup_inspect", { uri, backupPassword }),
+  backupRestore: (token: string, overwrite: boolean, restoreSettings: boolean) => invoke<{ imported: number; skipped: number }>("backup_restore", { token, overwrite, restoreSettings }),
+  backupRestoreNew: (token: string, newPassword: string | null, restoreSettings: boolean) => invoke<{ imported: number; skipped: number }>("backup_restore_new", { token, newPassword, restoreSettings }),
+  backupExport: (uri: string, password: string, includeSettings: boolean) => invoke("backup_export", { uri, password, includeSettings }),
+  csvPreview: (uri: string) => invoke<CsvPreview>("csv_preview", { uri }),
+  csvCommit: (token: string, password: string, riskConfirmed: boolean, overwrite: boolean) => invoke<{ inserted: number; updated: number; skipped_existing: number; skipped_invalid: number }>("csv_commit", { token, password, riskConfirmed, overwrite }),
+  csvExport: (uri: string, password: string, riskConfirmed: boolean) => invoke("csv_export", { uri, password, riskConfirmed }),
+  renameFolder: (id: string, name: string) => invoke("rename_folder", { id, name }),
+  mergeFolders: (sourceId: string, targetId: string) => invoke("merge_folders", { sourceId, targetId }),
+  renameTag: (oldName: string, newName: string) => invoke("rename_tag", { oldName, newName }),
+  deleteTag: (name: string) => invoke("delete_tag", { name }),
+  mergeTags: (sourceName: string, targetName: string) => invoke("merge_tags", { sourceName, targetName }),
+  importClientCert: (input: Record<string, unknown>, certUri: string | null, keyUri: string | null, passphrase: string | null) => invoke<EntryDto>("import_client_cert", { input, certUri, keyUri, passphrase }),
   status: () => invoke<Status>("get_status"),
   setup: (password: string) => invoke("setup_vault", { password }),
   unlock: (password: string) => invoke("unlock_vault", { password }),
@@ -167,6 +193,10 @@ export const api = {
   syncStatus: () => invoke<SyncView>("sync_status"),
   syncSave: (input: Record<string, unknown>) => invoke<SyncView>("sync_save", { input }),
   syncClear: () => invoke("sync_clear"),
+  changeMaster: (oldPassword: string, newPassword: string) => invoke<void>('change_master', { oldPassword, newPassword }),
+  syncPreview: () => invoke<SyncPreview>('sync_preview'),
+  syncCommit: (token: string, resolutions: { id: string; choice: string; confirm_delete_edit: boolean }[]) => invoke<SyncReport>('sync_commit', { token, resolutions }),
+  syncVerifyConditional: () => invoke<{ verified: boolean; probe_cleaned: boolean; scope: string }>('sync_verify_conditional'),
   syncNow: () => invoke<SyncReport>("sync_now"),
   appVersion: () => invoke<string>("app_version"),
   checkUpdate: () => invoke<MobileRelease>("check_mobile_update"),

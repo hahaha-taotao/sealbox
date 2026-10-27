@@ -95,7 +95,10 @@ pub fn tick(app: &AppHandle, state: &AppState) {
         // A panic here must not leave `running` stuck, or auto sync dies for the
         // rest of the session.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_once(&session, &path, &dek)
+            let state = handle
+                .try_state::<AppState>()
+                .ok_or_else(|| "应用状态不可用".to_string())?;
+            run_once(&session, &path, &dek, &state.sync_runtime)
         }))
         .unwrap_or_else(|_| Err("自动同步异常中止".into()));
 
@@ -116,13 +119,18 @@ fn run_once(
     session: &Arc<Mutex<Session>>,
     path: &PathBuf,
     dek: &[u8; 32],
+    runtime: &Mutex<sync::SyncRuntime>,
 ) -> Result<sync::SyncReport, String> {
     if !lock_session(session).is_unlocked() {
         return Err(sync::SYNC_ABORTED.into());
     }
     let vault = Vault::open(path.to_str().unwrap_or_default()).map_err(|e| e.to_string())?;
     let still_unlocked = || lock_session(session).is_unlocked();
-    let result = sync::sync_now_guarded(&vault, dek, &still_unlocked);
+    // DEK was copied before this lock. Do not hold the session mutex here.
+    let result = {
+        let mut runtime = crate::lock::recover_lock(runtime);
+        sync::sync_now_with_runtime(&mut runtime, &vault, dek, &still_unlocked)
+    };
     if let Err(error) = &result {
         if error != sync::SYNC_ABORTED {
             let _ = vault.set_setting("sync_last_result", &format!("自动同步失败：{error}"));

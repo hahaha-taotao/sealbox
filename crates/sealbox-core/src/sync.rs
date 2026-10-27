@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Read;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use zeroize::{Zeroize, Zeroizing};
 
 const MAGIC: &[u8; 6] = b"SBOXS1";
 const OBJECT_NAME: &str = "sealbox/vault.sboxsync";
@@ -136,6 +137,36 @@ struct SyncEntry {
     notes: Option<String>,
 }
 
+impl Drop for SyncEntry {
+    fn drop(&mut self) {
+        self.notes.zeroize();
+        self.entry.secret_blob.zeroize();
+        if let Some(blob) = &mut self.entry.notes_blob { blob.zeroize(); }
+        if let Some(secret) = &mut self.secret {
+            match secret {
+                SecretPayload::Website { url, username, password, totp_secret } => {
+                    url.zeroize(); username.zeroize(); password.zeroize(); totp_secret.zeroize();
+                }
+                SecretPayload::ApiToken { service, account, token } => { service.zeroize(); account.zeroize(); token.zeroize(); }
+                SecretPayload::Ssh { key_type, private_key, passphrase, public_fingerprint } => {
+                    key_type.zeroize(); private_key.zeroize(); passphrase.zeroize(); public_fingerprint.zeroize();
+                }
+                SecretPayload::Mailbox { email, password, imap_host, smtp_host, .. } => {
+                    email.zeroize(); password.zeroize(); imap_host.zeroize(); smtp_host.zeroize();
+                }
+                SecretPayload::MailAuth { email, provider, auth_code } => { email.zeroize(); provider.zeroize(); auth_code.zeroize(); }
+                SecretPayload::Server { host, protocol, username, password, .. } => {
+                    host.zeroize(); protocol.zeroize(); username.zeroize(); password.zeroize();
+                }
+                SecretPayload::Database { engine, host, database, username, password, .. } => {
+                    engine.zeroize(); host.zeroize(); database.zeroize(); username.zeroize(); password.zeroize();
+                }
+                SecretPayload::ClientCert { cert_pem, key_pem, passphrase } => { cert_pem.zeroize(); key_pem.zeroize(); passphrase.zeroize(); }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct SyncSnapshot {
     folders: Vec<crate::vault::FolderDto>,
@@ -172,6 +203,370 @@ pub struct SyncReport {
     pub removed: usize,
     pub conflicts: Vec<String>,
     pub remote_missing: bool,
+    pub phase: SyncPhase,
+    pub blocked: Option<String>,
+    pub retryable: bool,
+    pub conflict_details: Vec<SyncConflict>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncPhase { Preview, Conflicts, Committed, LocalPending, Blocked }
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictKind { EditEdit, DeleteEdit }
+
+/// UI-only summary. Never persist titles or payloads in sync audit/settings.
+#[derive(Clone, Debug, Serialize)]
+pub struct SyncConflict {
+    pub id: String,
+    pub title: String,
+    pub kind: ConflictKind,
+    pub local_deleted: bool,
+    pub remote_deleted: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ConflictChoice { Local, Remote, Both }
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SyncResolution {
+    pub id: String,
+    pub choice: ConflictChoice,
+    /// Required for every delete/edit conflict, independently of the choice.
+    pub confirm_delete_edit: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SyncPreview {
+    pub token: String,
+    pub expires_in_secs: u64,
+    pub report: SyncReport,
+}
+
+/// A strong validator, including quotes. Weak/missing validators fail closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StrongEtag(String);
+impl StrongEtag {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let value = value.trim();
+        if value.len() < 2 || !value.starts_with('"') || !value.ends_with('"')
+            || value[1..value.len()-1].bytes().any(|c| c == b'"' || c < 0x21 || c == 0x7f)
+        { return Err("sync_strong_etag_required".into()); }
+        Ok(Self(value.into()))
+    }
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+pub struct RemoteObject { pub body: Vec<u8>, pub etag: StrongEtag }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WriteCondition { Match(StrongEtag), Missing }
+impl WriteCondition {
+    fn header(&self) -> (&'static str, &str) {
+        match self { Self::Match(etag) => ("if-match", etag.as_str()), Self::Missing => ("if-none-match", "*") }
+    }
+}
+
+/// Implementations MUST enforce conditional writes atomically, not GET-then-PUT.
+/// HTTP implementations require an administrator-verified provider capability;
+/// arbitrary WebDAV/S3-compatible servers are not assumed to honor headers.
+pub trait RemoteStore {
+    fn get(&self) -> Result<Option<RemoteObject>, String>;
+    fn put(&self, body: &[u8], condition: &WriteCondition) -> Result<(), String>;
+}
+
+#[derive(Clone)]
+pub struct SyncBaseline {
+    pub snapshot: BackupSnapshot,
+    pub tombstones: Vec<Tombstone>,
+}
+
+/// Atomic compare-and-replace seam; useful for deterministic failure tests too.
+pub trait LocalSyncStore {
+    fn read(&self) -> Result<SyncBaseline, String>;
+    fn apply(&self, dek: &[u8; 32], expected: &SyncBaseline, replacement: &SyncBaseline) -> Result<(), String>;
+}
+impl LocalSyncStore for Vault {
+    fn read(&self) -> Result<SyncBaseline, String> {
+        Ok(SyncBaseline { snapshot: self.snapshot_for_backup().map_err(|e| e.to_string())?,
+            tombstones: self.sync_tombstones().map_err(|e| e.to_string())? })
+    }
+    fn apply(&self, dek: &[u8; 32], expected: &SyncBaseline, replacement: &SyncBaseline) -> Result<(), String> {
+        self.replace_sync_bundle_if_unchanged(dek, &expected.snapshot, &expected.tombstones,
+            &replacement.snapshot, &replacement.tombstones).map_err(|e| e.to_string())
+    }
+}
+
+const PREVIEW_TTL: Duration = Duration::from_secs(600);
+pub const SYNC_TOKEN_EXPIRED: &str = "sync_token_expired";
+pub const SYNC_LOCAL_CHANGED: &str = "sync_local_changed";
+pub const SYNC_REMOTE_CHANGED: &str = "sync_remote_changed";
+
+struct PendingSync {
+    token: String,
+    created: Instant,
+    generation: u64,
+    binding: String,
+    dek_digest: String,
+    key: Zeroizing<[u8; 32]>,
+    baseline: SyncBaseline,
+    local_digest: String,
+    local: SyncSnapshot,
+    remote: Option<SyncSnapshot>,
+    condition: WriteCondition,
+    legacy: bool,
+    report: SyncReport,
+    /// After a successful remote write, retries ONLY apply this local bundle.
+    uploaded: Option<(SyncSnapshot, SyncBaseline)>,
+}
+
+/// Owned by each AppState behind its own mutex. Invalidate before lock, DEK
+/// replacement or configuration changes; a new unlock session uses a new generation.
+#[derive(Default)]
+pub struct SyncRuntime { generation: u64, pending: Option<PendingSync> }
+impl SyncRuntime {
+    pub fn invalidate(&mut self) {
+        self.pending = None;
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    pub fn preview(&mut self, vault: &Vault, dek: &[u8;32]) -> Result<SyncPreview, String> {
+        let (client, key, binding) = configured_client(vault, dek)?;
+        self.preview_with_store(vault, &client, dek, key, &binding)
+    }
+
+    pub fn commit(&mut self, vault: &Vault, dek: &[u8;32], token: &str,
+        choices: &[SyncResolution], still_wanted: &dyn Fn() -> bool) -> Result<SyncReport, String> {
+        if !still_wanted() { self.invalidate(); return Err(SYNC_ABORTED.into()); }
+        if self.pending.as_ref().is_some_and(|p| p.created.elapsed() >= PREVIEW_TTL) {
+            self.invalidate(); return Err(SYNC_TOKEN_EXPIRED.into());
+        }
+        if self.pending.as_ref().is_some_and(|p| p.dek_digest != hex::encode(Sha256::digest(dek))) {
+            self.invalidate(); return Err("sync_session_changed".into());
+        }
+        let (client, _, binding) = configured_client(vault, dek)?;
+        let result = self.commit_with_store(vault, &client, dek, &binding, token, choices, still_wanted);
+        if let Ok(report) = &result {
+            if report.phase == SyncPhase::Committed { persist_report(vault, report); }
+        }
+        result
+    }
+
+    /// `binding` must identify configuration AND credential; never expose it to UI.
+    /// `key` is the derived sync encryption key, NOT a vault DEK.
+    pub fn preview_with_store(&mut self, local_store: &dyn LocalSyncStore, remote_store: &dyn RemoteStore,
+        dek: &[u8;32], key: [u8;32], binding: &str) -> Result<SyncPreview, String> {
+        if self.pending.as_ref().is_some_and(|p| p.created.elapsed() >= PREVIEW_TTL) {
+            self.invalidate();
+        }
+        // A pending remote-success/local-failure must not be silently discarded.
+        if self.pending.as_ref().is_some_and(|p| p.uploaded.is_some()) {
+            return Err("sync_local_retry_pending".into());
+        }
+        self.pending = None;
+        let key = Zeroizing::new(key);
+        let baseline = local_store.read()?;
+        let mut local = SyncSnapshot::from_vault(dek, &baseline.snapshot)?;
+        local.deleted = baseline.tombstones.clone();
+        let object = remote_store.get()?;
+        let (remote, condition, legacy, report) = match object {
+            Some(object) => {
+                let (remote, legacy) = decode_snapshot(&key, Some(dek), &object.body)?;
+                let (_, report) = merge_snapshots(&local, &remote);
+                (Some(remote), WriteCondition::Match(object.etag), legacy, report)
+            }
+            None => (None, WriteCondition::Missing, false, missing_report(&local)),
+        };
+        let token = uuid::Uuid::new_v4().to_string();
+        let mut report = report;
+        report.phase = if report.conflict_details.is_empty() { SyncPhase::Preview } else { SyncPhase::Conflicts };
+        self.pending = Some(PendingSync { token: token.clone(), created: Instant::now(),
+            generation: self.generation, binding: binding.into(), dek_digest: hex::encode(Sha256::digest(dek)),
+            key, local_digest: full_snapshot_digest(&local), baseline, local, remote, condition, legacy,
+            report: report.clone(), uploaded: None });
+        Ok(SyncPreview { token, expires_in_secs: PREVIEW_TTL.as_secs(), report })
+    }
+
+    pub fn commit_with_store(&mut self, local_store: &dyn LocalSyncStore, remote_store: &dyn RemoteStore,
+        dek: &[u8;32], binding: &str, token: &str, choices: &[SyncResolution],
+        still_wanted: &dyn Fn() -> bool) -> Result<SyncReport, String> {
+        if !still_wanted() { self.invalidate(); return Err(SYNC_ABORTED.into()); }
+        let p = self.pending.as_ref().ok_or("sync_token_invalid")?;
+        if p.created.elapsed() >= PREVIEW_TTL { self.invalidate(); return Err(SYNC_TOKEN_EXPIRED.into()); }
+        if p.token != token { return Err("sync_token_invalid".into()); }
+        if p.generation != self.generation || p.binding != binding
+            || p.dek_digest != hex::encode(Sha256::digest(dek)) {
+            self.invalidate(); return Err("sync_session_changed".into());
+        }
+        let p = self.pending.as_mut().expect("checked pending");
+        let current = local_store.read()?;
+        let mut current_open = SyncSnapshot::from_vault(dek, &current.snapshot)?;
+        current_open.deleted = current.tombstones.clone();
+        if full_snapshot_digest(&current_open) != p.local_digest {
+            return Ok(blocked_report(&p.report, SYNC_LOCAL_CHANGED, p.uploaded.is_some()));
+        }
+        if p.uploaded.is_none() {
+            validate_choices(&p.report.conflict_details, choices)?;
+            // Re-read for early feedback; the PUT condition remains mandatory.
+            let latest = remote_store.get()?;
+            let latest_condition = latest.map(|o| WriteCondition::Match(o.etag)).unwrap_or(WriteCondition::Missing);
+            if latest_condition != p.condition { return Ok(blocked_report(&p.report, SYNC_REMOTE_CHANGED, true)); }
+            let merged = match &p.remote {
+                Some(remote) => resolve_snapshots(&p.local, remote, choices)?,
+                None => p.local.clone(),
+            };
+            let changed = p.legacy || p.remote.as_ref().map_or(true, |remote| full_snapshot_digest(&merged) != full_snapshot_digest(remote));
+            let sealed = SyncBaseline { snapshot: merged.seal(dek)?, tombstones: merged.deleted.clone() };
+            if !still_wanted() { self.invalidate(); return Err(SYNC_ABORTED.into()); }
+            if changed {
+                let bytes = encode_snapshot(&p.key, &merged, "sync-runtime").map_err(|e| e.to_string())?;
+                // Errors, including 412/unsupported condition, leave the token intact.
+                remote_store.put(&bytes, &p.condition)?;
+            }
+            p.uploaded = Some((merged, sealed));
+        }
+        if !still_wanted() { self.invalidate(); return Err(SYNC_ABORTED.into()); }
+        let (merged, sealed) = p.uploaded.as_ref().expect("prepared bundle");
+        if full_snapshot_digest(merged) != p.local_digest {
+            if let Err(_error) = local_store.apply(dek, &p.baseline, sealed) {
+                let mut report = blocked_report(&p.report, "sync_local_apply_pending", true);
+                report.phase = SyncPhase::LocalPending;
+                return Ok(report);
+            }
+        }
+        // Even a push-only run must notice a local edit that arrived during PUT.
+        // No replacement is needed in that case, but success must not discard
+        // the pending state or claim this newer local content was synchronized.
+        if full_snapshot_digest(merged) == p.local_digest {
+            let after = local_store.read()?;
+            let mut after_open = SyncSnapshot::from_vault(dek, &after.snapshot)?;
+            after_open.deleted = after.tombstones;
+            if full_snapshot_digest(&after_open) != p.local_digest {
+                return Ok(blocked_report(&p.report, SYNC_LOCAL_CHANGED, true));
+            }
+        }
+        let mut report = p.report.clone();
+        report.phase = SyncPhase::Committed;
+        report.blocked = None;
+        report.retryable = false;
+        self.pending = None;
+        Ok(report)
+    }
+}
+
+fn blocked_report(report: &SyncReport, code: &str, retryable: bool) -> SyncReport {
+    let mut report = report.clone();
+    report.phase = SyncPhase::Blocked;
+    report.blocked = Some(code.into());
+    report.retryable = retryable;
+    report
+}
+
+fn missing_report(local: &SyncSnapshot) -> SyncReport {
+    SyncReport { pulled: 0, pushed: local.entries.len(), unchanged: 0, removed: 0,
+        conflicts: vec![], remote_missing: true, phase: SyncPhase::Preview,
+        blocked: None, retryable: false, conflict_details: vec![] }
+}
+
+fn configured_client(vault: &Vault, dek: &[u8;32]) -> Result<(RemoteClient, [u8;32], String), String> {
+    let config = load_config(vault).map_err(|e| e.to_string())?.ok_or("还没有配置同步")?;
+    let secret = Zeroizing::new(vault.get_secret_setting(dek, "sync_secret").map_err(|e| e.to_string())?
+        .filter(|s| !s.is_empty()).ok_or("同步密钥缺失，请重新保存")?);
+    let key = sync_key(&secret);
+    let mut hash = Sha256::new();
+    hash.update(serde_json::to_vec(&config).map_err(|e| e.to_string())?);
+    hash.update(key);
+    let binding = hex::encode(hash.finalize());
+    let mut client = RemoteClient::new(&config, &secret)?;
+    // Explicit local operator attestation; never infer CAS from a successful PUT.
+    client.conditional_verified = vault.get_setting("sync_conditional_verified").map_err(|e| e.to_string())?.as_deref() == Some(&binding);
+    Ok((client, key, binding))
+}
+
+/// Operator must verify this exact endpoint/credential supports atomic If-Match
+/// and If-None-Match before storing the returned binding as sync_conditional_verified.
+/// Verification must use a disposable probe object, NEVER the vault object.
+pub fn conditional_capability_binding(vault: &Vault, dek: &[u8;32]) -> Result<String, String> {
+    configured_client(vault, dek).map(|(_, _, binding)| binding)
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ConditionalSupportReport {
+    pub verified: bool,
+    pub probe_cleaned: bool,
+    /// Probe exercises this endpoint now, not a universal provider guarantee.
+    pub scope: String,
+}
+
+/// Explicit user-triggered, disposable-object capability probe. No incorrect
+/// precondition is EVER sent to the vault object. Abort still cleans the probe.
+pub fn verify_conditional_support(vault: &Vault, dek: &[u8;32],
+    still_wanted: &dyn Fn() -> bool) -> Result<ConditionalSupportReport, String> {
+    if !still_wanted() { return Err(SYNC_ABORTED.into()); }
+    let (mut client, _, binding) = configured_client(vault, dek)?;
+    client.object_key = format!("{}.probe-{}", client.object_key, uuid::Uuid::new_v4());
+    client.conditional_verified = true; // Only this isolated client, never persisted yet.
+    if client.get()?.is_some() { return Err("sync_probe_collision".into()); }
+    let result = probe_conditions(&client, still_wanted);
+    // Cleanup even after ambiguous network write errors; UUID is owned by this run.
+    let cleanup = client.delete_probe().and_then(|()| {
+        if client.get()?.is_some() { Err("sync_probe_cleanup_failed".into()) } else { Ok(()) }
+    });
+    if let Err(cleanup_error) = cleanup {
+        return Err(format!("sync_probe_cleanup_failed: {cleanup_error}; probe={}; result={}",
+            client.object_key, result.err().unwrap_or_else(|| "conditions_passed".into())));
+    }
+    result?;
+    if !still_wanted() { return Err(SYNC_ABORTED.into()); }
+    // A settings/credential change during the probe cannot attest the new target.
+    if configured_client(vault, dek)?.2 != binding { return Err("sync_session_changed".into()); }
+    vault.set_setting("sync_conditional_verified", &binding).map_err(|e| e.to_string())?;
+    Ok(ConditionalSupportReport { verified: true, probe_cleaned: true,
+        scope: "verified conditional PUT on an isolated object at this endpoint; provider behavior may change".into() })
+}
+
+fn probe_conditions(remote: &dyn RemoteStore, still_wanted: &dyn Fn() -> bool) -> Result<(), String> {
+    let check = || if still_wanted() { Ok(()) } else { Err(SYNC_ABORTED.to_string()) };
+    let first_body = uuid::Uuid::new_v4().to_string().into_bytes();
+    let second_body = uuid::Uuid::new_v4().to_string().into_bytes();
+    check()?;
+    remote.put(&first_body, &WriteCondition::Missing)?;
+    let first = remote.get()?.ok_or("sync_probe_missing")?;
+    if first.body != first_body { return Err("sync_probe_content_changed".into()); }
+    check()?;
+    let bad = StrongEtag::parse(&format!("\"{}\"", uuid::Uuid::new_v4()))?;
+    require_rejected(remote.put(&second_body, &WriteCondition::Match(bad)))?;
+    let unchanged = remote.get()?.ok_or("sync_probe_missing")?;
+    if unchanged.etag != first.etag || unchanged.body != first_body { return Err("sync_conditional_write_unsupported".into()); }
+    check()?;
+    remote.put(&second_body, &WriteCondition::Match(first.etag.clone()))?;
+    let second = remote.get()?.ok_or("sync_probe_missing")?;
+    if second.body != second_body || second.etag == first.etag { return Err("sync_probe_validator_not_updated".into()); }
+    check()?;
+    require_rejected(remote.put(&first_body, &WriteCondition::Match(first.etag)))?;
+    require_rejected(remote.put(&first_body, &WriteCondition::Missing))?;
+    let unchanged = remote.get()?.ok_or("sync_probe_missing")?;
+    if unchanged.etag != second.etag || unchanged.body != second_body { return Err("sync_conditional_write_unsupported".into()); }
+    check()
+}
+
+fn require_rejected(result: Result<(), String>) -> Result<(), String> {
+    match result {
+        Err(error) if error == "sync_precondition_failed" => Ok(()),
+        Err(error) => Err(format!("sync_probe_inconclusive: {error}")),
+        Ok(()) => Err("sync_conditional_write_unsupported".into()),
+    }
+}
+
+fn persist_report(vault: &Vault, report: &SyncReport) {
+    let summary = format!("pulled={} pushed={} unchanged={} removed={} conflicts={}",
+        report.pulled, report.pushed, report.unchanged, report.removed, report.conflicts.len());
+    let _ = vault.set_setting("sync_last_at", &chrono::Utc::now().to_rfc3339());
+    let _ = vault.set_setting("sync_last_result", &summary);
+    let _ = vault.audit("sync", None, &summary);
 }
 
 pub fn view(vault: &Vault) -> Result<SyncView, VaultError> {
@@ -268,83 +663,26 @@ pub fn sync_now_guarded(
     dek: &[u8; 32],
     still_wanted: &dyn Fn() -> bool,
 ) -> Result<SyncReport, String> {
-    let config = load_config(vault)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| "还没有配置同步".to_string())?;
-    let secret = vault
-        .get_secret_setting(dek, "sync_secret")
-        .map_err(|e| e.to_string())?
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "同步密钥缺失，请重新保存".to_string())?;
-    let key = sync_key(&secret);
-    let client = RemoteClient::new(&config, &secret)?;
-    let remote = client.get().map_err(|e| format!("读取远端失败: {e}"))?;
-    let local_raw = vault.snapshot_for_backup().map_err(|e| e.to_string())?;
-    let mut local = SyncSnapshot::from_vault(dek, &local_raw)?;
-    local.deleted = vault.sync_tombstones().map_err(|e| e.to_string())?;
-    let device = device_id(vault).map_err(|e| e.to_string())?;
+    // Legacy callers still retain a remote-success/local-failure bundle. New
+    // AppState callers own a runtime and invalidate it when their session locks.
+    static LEGACY_RUNTIME: std::sync::OnceLock<std::sync::Mutex<SyncRuntime>> = std::sync::OnceLock::new();
+    let mut runtime = LEGACY_RUNTIME.get_or_init(|| std::sync::Mutex::new(SyncRuntime::default()))
+        .lock().map_err(|_| "sync_runtime_unavailable")?;
+    sync_now_with_runtime(&mut runtime, vault, dek, still_wanted)
+}
 
-    let (merged, report, changed) = match remote {
-        None => (
-            local.clone(),
-            SyncReport {
-                pulled: 0,
-                pushed: local.entries.len(),
-                unchanged: 0,
-                removed: 0,
-                conflicts: Vec::new(),
-                remote_missing: true,
-            },
-            true,
-        ),
-        Some(bytes) => {
-            let (remote_snap, legacy) = decode_snapshot(&key, Some(dek), &bytes)?;
-            let (merged, report) = merge_snapshots(&local, &remote_snap);
-            let changed = legacy || snapshot_digest(&merged) != snapshot_digest(&remote_snap);
-            (merged, report, changed)
-        }
-    };
-
-    if changed {
-        if !still_wanted() {
-            return Err(SYNC_ABORTED.into());
-        }
-        let bytes = encode_snapshot(&key, &merged, &device).map_err(|e| e.to_string())?;
-        client
-            .put(&bytes)
-            .map_err(|e| format!("写入远端失败: {e}"))?;
+pub fn sync_now_with_runtime(runtime: &mut SyncRuntime, vault: &Vault, dek: &[u8;32],
+    still_wanted: &dyn Fn() -> bool) -> Result<SyncReport, String> {
+    if !still_wanted() { runtime.invalidate(); return Err(SYNC_ABORTED.into()); }
+    if let Some(p) = runtime.pending.as_ref().filter(|p| p.uploaded.is_some()) {
+        let token = p.token.clone();
+        return runtime.commit(vault, dek, &token, &[], still_wanted);
     }
-    if !still_wanted() {
-        return Err(SYNC_ABORTED.into());
+    let preview = runtime.preview(vault, dek)?;
+    if !preview.report.conflict_details.is_empty() {
+        return Ok(blocked_report(&preview.report, "sync_conflicts_require_resolution", false));
     }
-    // Rewriting an unchanged vault every interval would churn the database and
-    // its WAL for nothing.
-    let local_changed = snapshot_digest(&merged) != snapshot_digest(&local);
-    if local_changed {
-        let sealed = merged.seal(dek)?;
-        vault
-            .replace_snapshot_same_key(dek, &sealed)
-            .map_err(|e| e.to_string())?;
-        vault
-            .replace_sync_tombstones(&merged.deleted)
-            .map_err(|e| e.to_string())?;
-    }
-    let summary = format!(
-        "pulled={} pushed={} unchanged={} removed={} conflicts={}",
-        report.pulled,
-        report.pushed,
-        report.unchanged,
-        report.removed,
-        report.conflicts.len()
-    );
-    let now = chrono::Utc::now().to_rfc3339();
-    let _ = vault.set_setting("sync_last_at", &now);
-    let _ = vault.set_setting("sync_last_result", &summary);
-    // Auto sync runs every minute; only record runs that actually moved data.
-    if changed || local_changed {
-        let _ = vault.audit("sync", None, &summary);
-    }
-    Ok(report)
+    runtime.commit(vault, dek, &preview.token, &[], still_wanted)
 }
 
 fn load_config(vault: &Vault) -> Result<Option<SyncConfig>, VaultError> {
@@ -524,6 +862,105 @@ fn normalized_entry(entry: &SyncEntry) -> SyncEntry {
     copy
 }
 
+/// Full content digest for optimistic concurrency, including usage metadata.
+fn full_snapshot_digest(snapshot: &SyncSnapshot) -> String {
+    let mut snapshot = snapshot.clone();
+    snapshot.entries.sort_by(|a,b| a.entry.id.cmp(&b.entry.id));
+    snapshot.folders.sort_by(|a,b| a.id.cmp(&b.id));
+    snapshot.tags.sort();
+    snapshot.deleted = sorted_tombstones(&snapshot);
+    hex::encode(Sha256::digest(serde_json::to_vec(&snapshot).expect("serializable snapshot")))
+}
+
+fn detect_conflicts(local: &SyncSnapshot, remote: &SyncSnapshot) -> Vec<SyncConflict> {
+    let mut conflicts = Vec::new();
+    for left in &local.entries {
+        if let Some(right) = remote.entries.iter().find(|r| r.entry.id == left.entry.id) {
+            let ld = left.entry.deleted_at.is_some();
+            let rd = right.entry.deleted_at.is_some();
+            if ld != rd || (cmp_time(&left.entry.updated_at, &right.entry.updated_at) == std::cmp::Ordering::Equal
+                && entry_digest(left) != entry_digest(right)) {
+                conflicts.push(SyncConflict { id: left.entry.id.clone(), title: left.entry.title.clone(),
+                    kind: if ld != rd { ConflictKind::DeleteEdit } else { ConflictKind::EditEdit },
+                    local_deleted: ld, remote_deleted: rd });
+            }
+        }
+    }
+    for (deleted_side, edited_side, local_deleted) in [(local, remote, true), (remote, local, false)] {
+        for tomb in &deleted_side.deleted {
+            if tomb.kind != TOMBSTONE_ENTRY { continue; }
+            if let Some(entry) = edited_side.entries.iter().find(|e| e.entry.id == tomb.id && e.entry.deleted_at.is_none()) {
+                if !conflicts.iter().any(|c| c.id == tomb.id) {
+                    conflicts.push(SyncConflict { id: tomb.id.clone(), title: entry.entry.title.clone(),
+                        kind: ConflictKind::DeleteEdit, local_deleted, remote_deleted: !local_deleted });
+                }
+            }
+        }
+    }
+    conflicts.sort_by(|a,b| a.id.cmp(&b.id));
+    conflicts
+}
+
+fn validate_choices(conflicts: &[SyncConflict], choices: &[SyncResolution]) -> Result<(), String> {
+    if choices.len() != conflicts.len() { return Err("sync_all_choices_required".into()); }
+    let mut seen = std::collections::HashSet::new();
+    for choice in choices {
+        if !seen.insert(&choice.id) { return Err("sync_duplicate_choice".into()); }
+        let conflict = conflicts.iter().find(|c| c.id == choice.id).ok_or("sync_unknown_choice")?;
+        if conflict.kind == ConflictKind::DeleteEdit && !choice.confirm_delete_edit {
+            return Err("sync_delete_edit_confirmation_required".into());
+        }
+    }
+    Ok(())
+}
+
+fn resolve_snapshots(local: &SyncSnapshot, remote: &SyncSnapshot, choices: &[SyncResolution]) -> Result<SyncSnapshot, String> {
+    let conflicts = detect_conflicts(local, remote);
+    validate_choices(&conflicts, choices)?;
+    let (mut merged, _) = merge_snapshots(local, remote);
+    for choice in choices {
+        let left = local.entries.iter().find(|e| e.entry.id == choice.id);
+        let right = remote.entries.iter().find(|e| e.entry.id == choice.id);
+        let lt = local.deleted.iter().find(|t| t.kind == TOMBSTONE_ENTRY && t.id == choice.id);
+        let rt = remote.deleted.iter().find(|t| t.kind == TOMBSTONE_ENTRY && t.id == choice.id);
+        merged.entries.retain(|e| e.entry.id != choice.id);
+        merged.deleted.retain(|t| t.kind != TOMBSTONE_ENTRY || t.id != choice.id);
+        let mut add_state = |entry: Option<&SyncEntry>, tomb: Option<&Tombstone>| {
+            if let Some(tomb) = tomb { merged.deleted.push(tomb.clone()); }
+            else if let Some(entry) = entry { merged.entries.push(entry.clone()); }
+        };
+        match choice.choice {
+            ConflictChoice::Local => add_state(left, lt),
+            ConflictChoice::Remote => add_state(right, rt),
+            ConflictChoice::Both => {
+                let left_deleted = lt.is_some() || left.is_some_and(|e| e.entry.deleted_at.is_some());
+                let right_deleted = rt.is_some() || right.is_some_and(|e| e.entry.deleted_at.is_some());
+                if left_deleted || right_deleted {
+                    if left_deleted { add_state(left, lt); } else { add_state(right, rt); }
+                    let edited = if left_deleted { right } else { left };
+                    if let Some(edited) = edited {
+                        let mut copy = edited.clone();
+                        copy.entry.id = uuid::Uuid::new_v4().to_string();
+                        copy.entry.deleted_at = None;
+                        merged.entries.push(copy);
+                    }
+                } else {
+                    add_state(left, None);
+                    if let Some(right) = right {
+                        let mut copy = right.clone();
+                        copy.entry.id = uuid::Uuid::new_v4().to_string();
+                        merged.entries.push(copy);
+                    }
+                }
+            }
+        }
+    }
+    // Reapply folder aliases to newly copied conflict entries too.
+    remap_folders(&mut merged, local, remote);
+    Ok(merged)
+}
+
+#[cfg(test)]
 fn snapshot_digest(snapshot: &SyncSnapshot) -> String {
     let mut entries: Vec<SyncEntry> = snapshot.entries.iter().map(normalized_entry).collect();
     entries.sort_by(|a, b| a.entry.id.cmp(&b.entry.id));
@@ -694,19 +1131,19 @@ fn merge_snapshots(local: &SyncSnapshot, remote: &SyncSnapshot) -> (SyncSnapshot
             folders.push(folder.clone());
         }
     }
+    let folder_aliases: HashMap<String, String> = local.folders.iter().chain(remote.folders.iter())
+        .filter_map(|folder| folders.iter().find(|kept| kept.id == folder.id || kept.name == folder.name)
+            .map(|kept| (folder.id.clone(), kept.id.clone())))
+        .collect();
     for entry in entries.iter_mut() {
-        let Some(folder_id) = entry.entry.folder_id.clone() else {
-            continue;
-        };
-        if folders.iter().any(|folder| folder.id == folder_id) {
-            continue;
-        }
-        entry.entry.folder_id = None;
-        if let Some(at) = tombstones.get(&(TOMBSTONE_FOLDER.to_string(), folder_id)) {
-            if cmp_time(&entry.entry.updated_at, at) == std::cmp::Ordering::Less {
-                entry.entry.updated_at = at.clone();
+        if let Some(id) = entry.entry.folder_id.clone() {
+            if let Some(kept) = folder_aliases.get(&id) { entry.entry.folder_id = Some(kept.clone()); }
+            else if let Some(at) = tombstones.get(&(TOMBSTONE_FOLDER.to_string(), id)) {
+                entry.entry.folder_id = None;
+                if cmp_time(&entry.entry.updated_at, at) == std::cmp::Ordering::Less { entry.entry.updated_at = at.clone(); }
             }
         }
+        entry.entry.tags.retain(|tag| !tombstones.contains_key(&("tag".into(), tag.clone())));
     }
 
     let mut tags = local.tags.clone();
@@ -715,6 +1152,10 @@ fn merge_snapshots(local: &SyncSnapshot, remote: &SyncSnapshot) -> (SyncSnapshot
             tags.push(tag.clone());
         }
     }
+    tags.retain(|tag| !tombstones.contains_key(&("tag".into(), tag.clone())));
+    let conflict_details = detect_conflicts(local, remote);
+    // Legacy summaries retain IDs only. Titles are available in UI-only details.
+    conflicts = conflict_details.iter().map(|c| c.id.clone()).collect();
     (
         SyncSnapshot {
             folders,
@@ -729,8 +1170,28 @@ fn merge_snapshots(local: &SyncSnapshot, remote: &SyncSnapshot) -> (SyncSnapshot
             removed,
             conflicts,
             remote_missing: false,
+            phase: if conflict_details.is_empty() { SyncPhase::Preview } else { SyncPhase::Conflicts },
+            blocked: None,
+            retryable: false,
+            conflict_details,
         },
     )
+}
+
+fn remap_folders(merged: &mut SyncSnapshot, local: &SyncSnapshot, remote: &SyncSnapshot) {
+    for entry in &mut merged.entries {
+        if let Some(id) = entry.entry.folder_id.clone() {
+            if merged.folders.iter().any(|f| f.id == id) { continue; }
+            if let Some(source) = local.folders.iter().chain(remote.folders.iter()).find(|f| f.id == id) {
+                if let Some(target) = merged.folders.iter().find(|f| f.name == source.name) {
+                    entry.entry.folder_id = Some(target.id.clone());
+                } else if merged.deleted.iter().any(|t| t.kind == TOMBSTONE_FOLDER && t.id == id) {
+                    entry.entry.folder_id = None;
+                }
+            }
+        }
+        entry.entry.tags.retain(|tag| !merged.deleted.iter().any(|t| t.kind == "tag" && &t.id == tag));
+    }
 }
 
 fn entry_digest(entry: &SyncEntry) -> String {
@@ -760,6 +1221,17 @@ struct RemoteClient {
     bucket: String,
     region: String,
     object_key: String,
+    conditional_verified: bool,
+}
+
+impl Drop for RemoteClient {
+    fn drop(&mut self) { self.secret.zeroize(); }
+}
+impl RemoteStore for RemoteClient {
+    fn get(&self) -> Result<Option<RemoteObject>, String> { RemoteClient::get(self) }
+    fn put(&self, body: &[u8], condition: &WriteCondition) -> Result<(), String> {
+        RemoteClient::put(self, body, condition)
+    }
 }
 
 impl RemoteClient {
@@ -777,23 +1249,23 @@ impl RemoteClient {
             bucket: config.bucket.clone(),
             region: config.region.clone(),
             object_key,
+            conditional_verified: false,
         })
     }
 
-    fn get(&self) -> Result<Option<Vec<u8>>, String> {
+    fn get(&self) -> Result<Option<RemoteObject>, String> {
         match self.kind {
             SyncKind::Webdav => self.webdav_get(),
             SyncKind::S3 => self.s3_get(),
         }
     }
 
-    fn put(&self, bytes: &[u8]) -> Result<(), String> {
-        if bytes.len() > MAX_REMOTE_BYTES {
-            return Err("sync snapshot exceeds 64MB".into());
-        }
+    fn put(&self, bytes: &[u8], condition: &WriteCondition) -> Result<(), String> {
+        if !self.conditional_verified { return Err("sync_conditional_write_unverified".into()); }
+        if bytes.len() > MAX_REMOTE_BYTES { return Err("sync snapshot exceeds 64MB".into()); }
         match self.kind {
-            SyncKind::Webdav => self.webdav_put(bytes),
-            SyncKind::S3 => self.s3_put(bytes),
+            SyncKind::Webdav => self.webdav_put(bytes, condition),
+            SyncKind::S3 => self.s3_put(bytes, condition),
         }
     }
 
@@ -809,9 +1281,9 @@ impl RemoteClient {
         format!("{}/{}", self.endpoint, self.encoded_key())
     }
 
-    fn webdav_get(&self) -> Result<Option<Vec<u8>>, String> {
+    fn webdav_get(&self) -> Result<Option<RemoteObject>, String> {
         match self.agent().get(&self.webdav_url()).call() {
-            Ok(response) => read_limited(response, MAX_REMOTE_BYTES).map(Some),
+            Ok(response) => read_remote_object(response).map(Some),
             Err(ureq::Error::Status(404, _)) => Ok(None),
             Err(ureq::Error::Status(code, response)) => {
                 Err(format!("WebDAV HTTP {code}: {}", brief(response)))
@@ -820,15 +1292,18 @@ impl RemoteClient {
         }
     }
 
-    fn webdav_put(&self, bytes: &[u8]) -> Result<(), String> {
+    fn webdav_put(&self, bytes: &[u8], condition: &WriteCondition) -> Result<(), String> {
+        let (name, value) = condition.header();
         match self
             .agent()
             .put(&self.webdav_url())
             .set("Content-Type", "application/octet-stream")
+            .set(name, value)
             .send_bytes(bytes)
         {
             Ok(response) if (200..300).contains(&response.status()) => Ok(()),
             Ok(response) => Err(format!("WebDAV write failed: HTTP {}", response.status())),
+            Err(ureq::Error::Status(412, _)) => Err("sync_precondition_failed".into()),
             Err(ureq::Error::Status(code, response)) => Err(format!(
                 "WebDAV write failed: HTTP {code} {}",
                 brief(response)
@@ -850,7 +1325,7 @@ impl RemoteClient {
         format!("{}/{}", base.trim_end_matches('/'), self.encoded_key())
     }
 
-    fn s3_get(&self) -> Result<Option<Vec<u8>>, String> {
+    fn s3_get(&self) -> Result<Option<RemoteObject>, String> {
         let url = self.s3_url();
         let headers = self.s3_headers("GET", &url, &[])?;
         let mut request = self.agent().get(&url);
@@ -858,7 +1333,7 @@ impl RemoteClient {
             request = request.set(name, value);
         }
         match request.call() {
-            Ok(response) => read_limited(response, MAX_REMOTE_BYTES).map(Some),
+            Ok(response) => read_remote_object(response).map(Some),
             Err(ureq::Error::Status(404, _)) => Ok(None),
             Err(ureq::Error::Status(code, response)) => {
                 Err(format!("S3 HTTP {code}: {}", brief(response)))
@@ -867,9 +1342,9 @@ impl RemoteClient {
         }
     }
 
-    fn s3_put(&self, bytes: &[u8]) -> Result<(), String> {
+    fn s3_put(&self, bytes: &[u8], condition: &WriteCondition) -> Result<(), String> {
         let url = self.s3_url();
-        let headers = self.s3_headers("PUT", &url, bytes)?;
+        let headers = self.s3_headers_conditional("PUT", &url, bytes, Some(condition))?;
         let mut request = self.agent().put(&url);
         for (name, value) in &headers {
             request = request.set(name, value);
@@ -877,6 +1352,7 @@ impl RemoteClient {
         match request.send_bytes(bytes) {
             Ok(response) if (200..300).contains(&response.status()) => Ok(()),
             Ok(response) => Err(format!("S3 write failed: HTTP {}", response.status())),
+            Err(ureq::Error::Status(412, _)) => Err("sync_precondition_failed".into()),
             Err(ureq::Error::Status(code, response)) => {
                 Err(format!("S3 write failed: HTTP {code} {}", brief(response)))
             }
@@ -890,15 +1366,25 @@ impl RemoteClient {
         url: &str,
         body: &[u8],
     ) -> Result<Vec<(String, String)>, String> {
+        self.s3_headers_conditional(method, url, body, None)
+    }
+
+    fn s3_headers_conditional(&self, method: &str, url: &str, body: &[u8],
+        condition: Option<&WriteCondition>) -> Result<Vec<(String, String)>, String> {
         let now = chrono::Utc::now();
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date_stamp = now.format("%Y%m%d").to_string();
         let payload_hash = hex::encode(Sha256::digest(body));
         let (host, canonical_uri, _) = split_url(url)?;
-        let canonical_headers = format!(
-            "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
-        );
-        let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+        let mut signing_headers = vec![("host".to_string(), host),
+            ("x-amz-content-sha256".into(), payload_hash.clone()), ("x-amz-date".into(), amz_date.clone())];
+        if let Some(condition) = condition {
+            let (name, value) = condition.header();
+            signing_headers.push((name.into(), value.into()));
+        }
+        signing_headers.sort_by(|a,b| a.0.cmp(&b.0));
+        let canonical_headers = signing_headers.iter().map(|(name,value)| format!("{name}:{value}\n")).collect::<String>();
+        let signed_headers = signing_headers.iter().map(|(name,_)| name.as_str()).collect::<Vec<_>>().join(";");
         let canonical_request = format!(
             "{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
         );
@@ -915,12 +1401,33 @@ impl RemoteClient {
             "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={signed_headers}, Signature={signature}",
             self.username, scope
         );
-        Ok(vec![
+        let mut headers = vec![
             ("Authorization".into(), authorization),
             ("x-amz-date".into(), amz_date),
             ("x-amz-content-sha256".into(), payload_hash),
             ("Content-Type".into(), "application/octet-stream".into()),
-        ])
+        ];
+        if let Some(condition) = condition {
+            let (name,value) = condition.header();
+            headers.push((name.into(), value.into()));
+        }
+        Ok(headers)
+    }
+
+    fn delete_probe(&self) -> Result<(), String> {
+        let (_, suffix) = self.object_key.rsplit_once(".probe-").ok_or("sync_not_probe_object")?;
+        uuid::Uuid::parse_str(suffix).map_err(|_| "sync_not_probe_object")?;
+        let url = match self.kind { SyncKind::Webdav => self.webdav_url(), SyncKind::S3 => self.s3_url() };
+        let mut request = self.agent().delete(&url);
+        if self.kind == SyncKind::S3 {
+            for (name, value) in self.s3_headers("DELETE", &url, &[])? { request = request.set(&name, &value); }
+        }
+        match request.call() {
+            Ok(response) if (200..300).contains(&response.status()) => Ok(()),
+            Err(ureq::Error::Status(404, _)) => Ok(()),
+            Ok(response) => Err(format!("probe DELETE HTTP {}", response.status())),
+            Err(error) => Err(format!("probe DELETE failed: {error}")),
+        }
     }
 
     fn agent(&self) -> ureq::Agent {
@@ -981,6 +1488,11 @@ fn s3_signing_key(secret: &str, date: &str, region: &str) -> Result<Vec<u8>, Str
     hmac_bytes(&service_key, b"aws4_request")
 }
 
+fn read_remote_object(response: ureq::Response) -> Result<RemoteObject, String> {
+    let etag = StrongEtag::parse(response.header("ETag").ok_or("sync_strong_etag_required")?)?;
+    Ok(RemoteObject { body: read_limited(response, MAX_REMOTE_BYTES)?, etag })
+}
+
 fn read_limited(response: ureq::Response, max: usize) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
     let mut reader = response.into_reader().take(max as u64 + 1);
@@ -1005,6 +1517,7 @@ fn brief(response: ureq::Response) -> String {
 mod tests {
     use super::*;
     use crate::vault::{EntryKind, FolderDto, SecretPayload, UpsertEntry};
+    use std::cell::{Cell, RefCell};
 
     fn entry(id: &str, title: &str, updated_at: &str, password: &str) -> SyncEntry {
         SyncEntry {
@@ -1075,12 +1588,30 @@ mod tests {
     }
 
     #[test]
-    fn same_time_different_payload_is_conflict_and_keeps_local() {
+    fn same_time_different_payload_pauses_for_conflict_without_writing() {
         let local = snap(vec![entry("a", "local", "2026-02-02T00:00:00Z", "one")]);
         let remote = snap(vec![entry("a", "remote", "2026-02-02T00:00:00Z", "two")]);
-        let (merged, report) = merge_snapshots(&local, &remote);
+        let (_, report) = merge_snapshots(&local, &remote);
         assert_eq!(report.conflicts.len(), 1);
-        assert_eq!(merged.entries[0].entry.title, "local");
+        assert_eq!(report.conflict_details[0].kind, ConflictKind::EditEdit);
+        assert_eq!(report.phase, SyncPhase::Conflicts);
+        assert!(report.pushed == 0 && report.pulled == 0);
+
+        // Equal timestamps are a conflict: pause, and do not write either side.
+        let (ls, rs) = stores(&local, Some(&remote));
+        let remote_before = rs.bytes();
+        let mut runtime = SyncRuntime::default();
+        let preview = run_preview(&mut runtime, &ls, &rs).unwrap();
+        assert_eq!(preview.report.phase, SyncPhase::Conflicts);
+        assert_eq!(
+            run_commit(&mut runtime, &ls, &rs, &preview.token, &[]).unwrap_err(),
+            "sync_all_choices_required"
+        );
+        assert_no_writes(&ls, &rs);
+        assert_eq!(rs.put_calls.get(), 0);
+        assert_eq!(rs.bytes(), remote_before);
+        assert_eq!(find(&rs.snapshot(), "a").entry.title, "remote");
+        assert_eq!(find(&ls.snapshot(), "a").entry.title, "local");
     }
 
     #[test]
@@ -1129,6 +1660,7 @@ mod tests {
             bucket: "examplebucket".into(),
             region: "us-east-1".into(),
             object_key: "sealbox/vault.sboxsync".into(),
+            conditional_verified: false,
         };
         let headers = client
             .s3_headers(
@@ -1316,7 +1848,7 @@ mod tests {
     }
 
     #[test]
-    fn deleted_side_wins_when_timestamps_match() {
+    fn delete_edit_same_timestamp_requires_explicit_resolution() {
         let at = days_ago(5);
         let local = snap(vec![entry("a", "live", &at, "one")]);
         let mut trashed = entry("a", "trashed", &at, "two");
@@ -1324,8 +1856,10 @@ mod tests {
         let remote = snap(vec![trashed]);
 
         let (merged, report) = merge_snapshots(&local, &remote);
-        assert!(report.conflicts.is_empty());
+        assert_eq!(report.conflict_details.len(), 1);
+        assert_eq!(report.conflict_details[0].kind, ConflictKind::DeleteEdit);
         assert_eq!(merged.entries.len(), 1);
+        // merge is only a provisional candidate; runtime must not write it.
         assert_eq!(merged.entries[0].entry.deleted_at.as_deref(), Some(at.as_str()));
     }
 
@@ -1465,6 +1999,634 @@ mod tests {
         let view = view(&vault).unwrap();
         assert!(!view.auto_sync);
         assert_eq!(view.auto_sync_secs, 120);
+    }
+
+    const SYNC_SECRET: &str = "memory-sync-secret";
+    const BINDING: &str = "memory-binding";
+
+    fn test_dek() -> [u8; 32] {
+        [4u8; 32]
+    }
+
+    fn password(entry: &SyncEntry) -> String {
+        match &entry.secret {
+            Some(SecretPayload::Website { password, .. }) => password.clone(),
+            _ => panic!("expected website secret"),
+        }
+    }
+
+    fn find<'a>(snapshot: &'a SyncSnapshot, id: &str) -> &'a SyncEntry {
+        snapshot
+            .entries
+            .iter()
+            .find(|item| item.entry.id == id)
+            .unwrap_or_else(|| panic!("missing entry {id}"))
+    }
+
+    /// In-memory vault seam. `seal`/`from_vault` round-trip with `test_dek`, so
+    /// tests never touch SQLite. `fail_apply` injects a single local write error.
+    struct MemoryLocal {
+        current: RefCell<SyncSnapshot>,
+        applied: Cell<u32>,
+        fail_apply: Cell<u32>,
+    }
+
+    impl MemoryLocal {
+        fn new(snapshot: SyncSnapshot) -> Self {
+            Self {
+                current: RefCell::new(snapshot),
+                applied: Cell::new(0),
+                fail_apply: Cell::new(0),
+            }
+        }
+
+        fn snapshot(&self) -> SyncSnapshot {
+            self.current.borrow().clone()
+        }
+
+        fn set_snapshot(&self, snapshot: SyncSnapshot) {
+            *self.current.borrow_mut() = snapshot;
+        }
+
+        fn fail_next_apply(&self) {
+            self.fail_apply.set(self.fail_apply.get() + 1);
+        }
+    }
+
+    impl LocalSyncStore for MemoryLocal {
+        fn read(&self) -> Result<SyncBaseline, String> {
+            let snapshot = self.current.borrow().clone();
+            Ok(SyncBaseline {
+                snapshot: snapshot.seal(&test_dek()).map_err(|e| e.to_string())?,
+                tombstones: snapshot.deleted.clone(),
+            })
+        }
+
+        fn apply(
+            &self,
+            dek: &[u8; 32],
+            expected: &SyncBaseline,
+            replacement: &SyncBaseline,
+        ) -> Result<(), String> {
+            if self.fail_apply.get() > 0 {
+                self.fail_apply.set(self.fail_apply.get() - 1);
+                return Err("sync_local_apply_failed".into());
+            }
+            let current = self.current.borrow().clone();
+            let mut expected_open =
+                SyncSnapshot::from_vault(dek, &expected.snapshot).map_err(|e| e.to_string())?;
+            expected_open.deleted = expected.tombstones.clone();
+            if full_snapshot_digest(&current) != full_snapshot_digest(&expected_open) {
+                return Err(SYNC_LOCAL_CHANGED.into());
+            }
+            let mut next =
+                SyncSnapshot::from_vault(dek, &replacement.snapshot).map_err(|e| e.to_string())?;
+            next.deleted = replacement.tombstones.clone();
+            *self.current.borrow_mut() = next;
+            self.applied.set(self.applied.get() + 1);
+            Ok(())
+        }
+    }
+
+    /// In-memory remote. Weak or absent ETag strings fail closed in `get`, the
+    /// same way `read_remote_object` rejects a non-strong validator.
+    struct MemoryRemote {
+        body: RefCell<Option<Vec<u8>>>,
+        etag: RefCell<Option<String>>,
+        gets: Cell<u32>,
+        puts: Cell<u32>,
+        put_calls: Cell<u32>,
+        fail_put: Cell<bool>,
+    }
+
+    impl MemoryRemote {
+        fn new(body: Option<Vec<u8>>) -> Self {
+            Self {
+                body: RefCell::new(body),
+                etag: RefCell::new(Some("\"rev-0\"".to_string())),
+                gets: Cell::new(0),
+                puts: Cell::new(0),
+                put_calls: Cell::new(0),
+                fail_put: Cell::new(false),
+            }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.body.borrow().clone().unwrap_or_default()
+        }
+
+        fn snapshot(&self) -> SyncSnapshot {
+            let body = self.body.borrow().clone().expect("remote object");
+            decode_snapshot(&sync_key(SYNC_SECRET), Some(&test_dek()), &body)
+                .unwrap()
+                .0
+        }
+
+        fn set_etag(&self, etag: Option<&str>) {
+            *self.etag.borrow_mut() = etag.map(str::to_string);
+        }
+
+        fn fail_next_put(&self) {
+            self.fail_put.set(true);
+        }
+
+        fn enforce(&self, condition: &WriteCondition) -> Result<(), String> {
+            match condition {
+                WriteCondition::Match(expected) => {
+                    let current = self
+                        .etag
+                        .borrow()
+                        .clone()
+                        .ok_or("sync_strong_etag_required")?;
+                    if expected.as_str() != current {
+                        return Err("sync_precondition_failed".into());
+                    }
+                }
+                WriteCondition::Missing => {
+                    if self.body.borrow().is_some() {
+                        return Err("sync_precondition_failed".into());
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    impl RemoteStore for MemoryRemote {
+        fn get(&self) -> Result<Option<RemoteObject>, String> {
+            self.gets.set(self.gets.get() + 1);
+            let Some(body) = self.body.borrow().clone() else {
+                return Ok(None);
+            };
+            let raw = self
+                .etag
+                .borrow()
+                .clone()
+                .ok_or("sync_strong_etag_required")?;
+            Ok(Some(RemoteObject {
+                body,
+                etag: StrongEtag::parse(&raw)?,
+            }))
+        }
+
+        fn put(&self, body: &[u8], condition: &WriteCondition) -> Result<(), String> {
+            self.put_calls.set(self.put_calls.get() + 1);
+            self.enforce(condition)?;
+            if self.fail_put.get() {
+                self.fail_put.set(false);
+                return Err("sync_precondition_failed".into());
+            }
+            *self.body.borrow_mut() = Some(body.to_vec());
+            *self.etag.borrow_mut() = Some(format!("\"rev-{}\"", self.put_calls.get()));
+            self.puts.set(self.puts.get() + 1);
+            Ok(())
+        }
+    }
+
+    fn stores(local: &SyncSnapshot, remote: Option<&SyncSnapshot>) -> (MemoryLocal, MemoryRemote) {
+        let body = remote.map(|snapshot| {
+            encode_snapshot(&sync_key(SYNC_SECRET), snapshot, "remote-device").unwrap()
+        });
+        (MemoryLocal::new(local.clone()), MemoryRemote::new(body))
+    }
+
+    fn run_preview(
+        runtime: &mut SyncRuntime,
+        local: &MemoryLocal,
+        remote: &MemoryRemote,
+    ) -> Result<SyncPreview, String> {
+        runtime.preview_with_store(local, remote, &test_dek(), sync_key(SYNC_SECRET), BINDING)
+    }
+
+    fn run_commit(
+        runtime: &mut SyncRuntime,
+        local: &MemoryLocal,
+        remote: &MemoryRemote,
+        token: &str,
+        choices: &[SyncResolution],
+    ) -> Result<SyncReport, String> {
+        runtime.commit_with_store(local, remote, &test_dek(), BINDING, token, choices, &|| true)
+    }
+
+    fn assert_no_writes(local: &MemoryLocal, remote: &MemoryRemote) {
+        assert_eq!(local.applied.get(), 0, "local apply wrote");
+        assert_eq!(remote.puts.get(), 0, "remote put wrote");
+    }
+
+    /// Remote is newer and local has an extra entry, so a real commit must both
+    /// put and apply. Use this whenever a test claims a failure prevented a write.
+    fn push_and_pull() -> (SyncSnapshot, SyncSnapshot) {
+        let local = snap(vec![
+            entry("a", "local-old", "2026-01-01T00:00:00Z", "old"),
+            entry("b", "local-only", "2026-01-02T00:00:00Z", "side"),
+        ]);
+        let remote = snap(vec![entry(
+            "a",
+            "remote-new",
+            "2026-02-01T00:00:00Z",
+            "new",
+        )]);
+        (local, remote)
+    }
+
+    fn choice_for(choice: ConflictChoice, confirm: bool) -> SyncResolution {
+        SyncResolution {
+            id: "a".into(),
+            choice,
+            confirm_delete_edit: confirm,
+        }
+    }
+
+    #[test]
+    fn preview_does_not_write_remote_or_local() {
+        let (local, remote) = push_and_pull();
+        let (ls, rs) = stores(&local, Some(&remote));
+        let remote_before = rs.bytes();
+        let local_before = full_snapshot_digest(&ls.snapshot());
+        let mut runtime = SyncRuntime::default();
+
+        let preview = run_preview(&mut runtime, &ls, &rs).unwrap();
+
+        assert_eq!(preview.report.phase, SyncPhase::Preview);
+        assert!(preview.report.conflict_details.is_empty());
+        assert!(rs.gets.get() >= 1);
+        assert_eq!(rs.put_calls.get(), 0);
+        assert_no_writes(&ls, &rs);
+        assert_eq!(rs.bytes(), remote_before);
+        assert_eq!(full_snapshot_digest(&ls.snapshot()), local_before);
+        assert!(runtime.pending.as_ref().unwrap().uploaded.is_none());
+    }
+
+    #[test]
+    fn conflict_choices_local_remote_and_both_keep_local_id() {
+        let at = "2026-02-02T00:00:00Z";
+        let resolve = |choice: ConflictChoice| {
+            let local = snap(vec![entry("a", "local", at, "one")]);
+            let remote = snap(vec![entry("a", "remote", at, "two")]);
+            let (ls, rs) = stores(&local, Some(&remote));
+            let mut runtime = SyncRuntime::default();
+            let preview = run_preview(&mut runtime, &ls, &rs).unwrap();
+            assert_eq!(preview.report.phase, SyncPhase::Conflicts);
+            let report = run_commit(
+                &mut runtime,
+                &ls,
+                &rs,
+                &preview.token,
+                &[choice_for(choice, false)],
+            )
+            .unwrap();
+            assert_eq!(report.phase, SyncPhase::Committed);
+            (ls.snapshot(), rs.snapshot())
+        };
+
+        let (local_kept, remote_kept) = resolve(ConflictChoice::Local);
+        assert_eq!(local_kept.entries.len(), 1);
+        assert_eq!(find(&local_kept, "a").entry.title, "local");
+        assert_eq!(password(find(&local_kept, "a")), "one");
+        assert_eq!(find(&remote_kept, "a").entry.title, "local");
+        assert_eq!(password(find(&remote_kept, "a")), "one");
+
+        let (local_taken, remote_taken) = resolve(ConflictChoice::Remote);
+        assert_eq!(local_taken.entries.len(), 1);
+        assert_eq!(find(&local_taken, "a").entry.title, "remote");
+        assert_eq!(password(find(&local_taken, "a")), "two");
+        assert_eq!(find(&remote_taken, "a").entry.id, "a");
+        assert_eq!(find(&remote_taken, "a").entry.title, "remote");
+
+        let (local_both, remote_both) = resolve(ConflictChoice::Both);
+        assert_eq!(local_both.entries.len(), 2);
+        assert_eq!(find(&local_both, "a").entry.title, "local");
+        assert_eq!(password(find(&local_both, "a")), "one");
+        let copies: Vec<_> = local_both
+            .entries
+            .iter()
+            .filter(|item| item.entry.id != "a")
+            .collect();
+        assert_eq!(copies.len(), 1);
+        assert!(uuid::Uuid::parse_str(&copies[0].entry.id).is_ok());
+        assert_eq!(copies[0].entry.title, "remote");
+        assert_eq!(password(copies[0]), "two");
+        assert_eq!(remote_both.entries.len(), 2);
+        assert_eq!(find(&remote_both, "a").entry.title, "local");
+        assert_eq!(
+            find(&remote_both, &copies[0].entry.id).entry.title,
+            "remote"
+        );
+    }
+
+    #[test]
+    fn delete_edit_without_confirmation_is_rejected_and_both_keeps_marker() {
+        let mut local = snap(vec![]);
+        local.deleted = vec![tombstone(TOMBSTONE_ENTRY, "a", &days_ago(30))];
+        let remote = snap(vec![entry("a", "edited", &days_ago(1), "two")]);
+        let (ls, rs) = stores(&local, Some(&remote));
+        let remote_before = rs.bytes();
+        let mut runtime = SyncRuntime::default();
+        let preview = run_preview(&mut runtime, &ls, &rs).unwrap();
+        assert_eq!(preview.report.phase, SyncPhase::Conflicts);
+        assert_eq!(
+            preview.report.conflict_details[0].kind,
+            ConflictKind::DeleteEdit
+        );
+
+        for choice in [
+            ConflictChoice::Local,
+            ConflictChoice::Remote,
+            ConflictChoice::Both,
+        ] {
+            assert_eq!(
+                run_commit(
+                    &mut runtime,
+                    &ls,
+                    &rs,
+                    &preview.token,
+                    &[choice_for(choice, false)],
+                )
+                .unwrap_err(),
+                "sync_delete_edit_confirmation_required"
+            );
+        }
+        assert_no_writes(&ls, &rs);
+        assert_eq!(rs.bytes(), remote_before);
+        assert!(ls.snapshot().entries.is_empty());
+
+        let report = run_commit(
+            &mut runtime,
+            &ls,
+            &rs,
+            &preview.token,
+            &[choice_for(ConflictChoice::Both, true)],
+        )
+        .unwrap();
+        assert_eq!(report.phase, SyncPhase::Committed);
+
+        for snapshot in [ls.snapshot(), rs.snapshot()] {
+            assert!(snapshot
+                .deleted
+                .iter()
+                .any(|item| item.kind == TOMBSTONE_ENTRY && item.id == "a"));
+            assert!(snapshot.entries.iter().all(|item| item.entry.id != "a"));
+            let live: Vec<_> = snapshot
+                .entries
+                .iter()
+                .filter(|item| item.entry.deleted_at.is_none())
+                .collect();
+            assert_eq!(live.len(), 1);
+            assert!(uuid::Uuid::parse_str(&live[0].entry.id).is_ok());
+            assert_eq!(live[0].entry.title, "edited");
+            assert_eq!(password(live[0]), "two");
+            assert!(live[0].entry.deleted_at.is_none());
+        }
+    }
+
+    #[test]
+    fn weak_or_missing_etag_fails_commit_without_writes() {
+        assert_eq!(
+            StrongEtag::parse(r#"W/"weak""#).unwrap_err(),
+            "sync_strong_etag_required"
+        );
+        assert_eq!(
+            StrongEtag::parse("").unwrap_err(),
+            "sync_strong_etag_required"
+        );
+
+        for etag in [Some(r#"W/"weak""#), None] {
+            let (local, remote) = push_and_pull();
+            assert_ne!(full_snapshot_digest(&local), full_snapshot_digest(&remote));
+            let (ls, rs) = stores(&local, Some(&remote));
+            let remote_before = rs.bytes();
+            let local_before = full_snapshot_digest(&ls.snapshot());
+            let mut runtime = SyncRuntime::default();
+            let preview = run_preview(&mut runtime, &ls, &rs).unwrap();
+
+            rs.set_etag(etag);
+            assert_eq!(
+                run_commit(&mut runtime, &ls, &rs, &preview.token, &[]).unwrap_err(),
+                "sync_strong_etag_required"
+            );
+            assert_eq!(rs.put_calls.get(), 0);
+            assert_no_writes(&ls, &rs);
+            assert_eq!(rs.bytes(), remote_before);
+            assert_eq!(full_snapshot_digest(&ls.snapshot()), local_before);
+            assert!(runtime.pending.as_ref().unwrap().uploaded.is_none());
+        }
+    }
+
+    #[test]
+    fn conditional_put_failure_does_not_change_local() {
+        let (local, remote) = push_and_pull();
+        let (ls, rs) = stores(&local, Some(&remote));
+        let remote_before = rs.bytes();
+        let mut runtime = SyncRuntime::default();
+        let preview = run_preview(&mut runtime, &ls, &rs).unwrap();
+        rs.fail_next_put();
+
+        assert_eq!(
+            run_commit(&mut runtime, &ls, &rs, &preview.token, &[]).unwrap_err(),
+            "sync_precondition_failed"
+        );
+        assert_eq!(rs.put_calls.get(), 1);
+        assert_no_writes(&ls, &rs);
+        assert_eq!(rs.bytes(), remote_before);
+        assert_eq!(find(&ls.snapshot(), "a").entry.title, "local-old");
+        assert_eq!(find(&rs.snapshot(), "a").entry.title, "remote-new");
+        assert!(rs.snapshot().entries.iter().all(|item| item.entry.id != "b"));
+        let pending = runtime.pending.as_ref().unwrap();
+        assert_eq!(pending.token, preview.token);
+        assert!(pending.uploaded.is_none());
+    }
+
+    #[test]
+    fn expired_token_and_changed_baseline_do_not_overwrite_local_edits() {
+        let fresh = snap(vec![entry(
+            "a",
+            "local-fresh",
+            "2026-03-01T00:00:00Z",
+            "fresh",
+        )]);
+
+        let (local, remote) = push_and_pull();
+        let (ls, rs) = stores(&local, Some(&remote));
+        let remote_before = rs.bytes();
+        let mut runtime = SyncRuntime::default();
+        let preview = run_preview(&mut runtime, &ls, &rs).unwrap();
+        ls.set_snapshot(fresh.clone());
+        runtime.pending.as_mut().unwrap().created =
+            Instant::now() - (PREVIEW_TTL + Duration::from_secs(1));
+
+        assert_eq!(
+            run_commit(&mut runtime, &ls, &rs, &preview.token, &[]).unwrap_err(),
+            SYNC_TOKEN_EXPIRED
+        );
+        assert!(runtime.pending.is_none());
+        assert_no_writes(&ls, &rs);
+        assert_eq!(rs.bytes(), remote_before);
+        assert_eq!(find(&ls.snapshot(), "a").entry.title, "local-fresh");
+        assert_eq!(password(find(&ls.snapshot(), "a")), "fresh");
+        assert_eq!(find(&rs.snapshot(), "a").entry.title, "remote-new");
+
+        let (local, remote) = push_and_pull();
+        let (ls, rs) = stores(&local, Some(&remote));
+        let remote_before = rs.bytes();
+        let mut runtime = SyncRuntime::default();
+        let preview = run_preview(&mut runtime, &ls, &rs).unwrap();
+        ls.set_snapshot(fresh);
+        let report = run_commit(&mut runtime, &ls, &rs, &preview.token, &[]).unwrap();
+
+        assert_eq!(report.phase, SyncPhase::Blocked);
+        assert_eq!(report.blocked.as_deref(), Some(SYNC_LOCAL_CHANGED));
+        assert!(!report.retryable);
+        assert_eq!(rs.put_calls.get(), 0);
+        assert_no_writes(&ls, &rs);
+        assert_eq!(rs.bytes(), remote_before);
+        assert_eq!(find(&ls.snapshot(), "a").entry.title, "local-fresh");
+        assert_eq!(password(find(&ls.snapshot(), "a")), "fresh");
+        assert!(ls
+            .snapshot()
+            .entries
+            .iter()
+            .all(|item| item.entry.id != "b"));
+        assert_eq!(find(&rs.snapshot(), "a").entry.title, "remote-new");
+        assert!(runtime.pending.as_ref().unwrap().uploaded.is_none());
+    }
+
+    #[test]
+    fn uploaded_retry_applies_local_without_second_put() {
+        let (local, remote) = push_and_pull();
+        let (ls, rs) = stores(&local, Some(&remote));
+        let remote_before = rs.bytes();
+        let mut runtime = SyncRuntime::default();
+        let preview = run_preview(&mut runtime, &ls, &rs).unwrap();
+        ls.fail_next_apply();
+
+        let pending = run_commit(&mut runtime, &ls, &rs, &preview.token, &[]).unwrap();
+        assert_eq!(pending.phase, SyncPhase::LocalPending);
+        assert_eq!(pending.blocked.as_deref(), Some("sync_local_apply_pending"));
+        assert!(pending.retryable);
+        assert_eq!(rs.puts.get(), 1);
+        assert_eq!(ls.applied.get(), 0);
+        assert_eq!(find(&ls.snapshot(), "a").entry.title, "local-old");
+        assert_eq!(find(&rs.snapshot(), "a").entry.title, "remote-new");
+        assert_eq!(find(&rs.snapshot(), "b").entry.title, "local-only");
+        assert_ne!(rs.bytes(), remote_before);
+        assert!(runtime.pending.as_ref().unwrap().uploaded.is_some());
+        let remote_after_put = rs.bytes();
+        let puts = rs.put_calls.get();
+
+        let committed = run_commit(&mut runtime, &ls, &rs, &preview.token, &[]).unwrap();
+        assert_eq!(committed.phase, SyncPhase::Committed);
+        assert!(committed.blocked.is_none());
+        assert!(!committed.retryable);
+        assert_eq!(rs.put_calls.get(), puts);
+        assert_eq!(rs.bytes(), remote_after_put);
+        assert_eq!(ls.applied.get(), 1);
+        assert!(runtime.pending.is_none());
+        assert_eq!(find(&ls.snapshot(), "a").entry.title, "remote-new");
+        assert_eq!(password(find(&ls.snapshot(), "a")), "new");
+        assert_eq!(find(&ls.snapshot(), "b").entry.title, "local-only");
+    }
+
+    #[test]
+    fn auto_sync_wrapper_on_conflict_writes_nothing() {
+        // `sync_now_with_runtime` returns this blocked report and does not commit.
+        // That wrapper opens a network client, so the same branch is driven here
+        // through the store seam.
+        let local = snap(vec![entry("a", "local", "2026-02-02T00:00:00Z", "one")]);
+        let remote = snap(vec![entry("a", "remote", "2026-02-02T00:00:00Z", "two")]);
+        let (ls, rs) = stores(&local, Some(&remote));
+        let remote_before = rs.bytes();
+        let mut runtime = SyncRuntime::default();
+        let preview = run_preview(&mut runtime, &ls, &rs).unwrap();
+        let report = if !preview.report.conflict_details.is_empty() {
+            blocked_report(&preview.report, "sync_conflicts_require_resolution", false)
+        } else {
+            run_commit(&mut runtime, &ls, &rs, &preview.token, &[]).unwrap()
+        };
+
+        assert_eq!(report.phase, SyncPhase::Blocked);
+        assert_eq!(
+            report.blocked.as_deref(),
+            Some("sync_conflicts_require_resolution")
+        );
+        assert!(!report.retryable);
+        assert_eq!(report.conflict_details.len(), 1);
+        assert_eq!(rs.put_calls.get(), 0);
+        assert_no_writes(&ls, &rs);
+        assert_eq!(rs.bytes(), remote_before);
+        assert_eq!(find(&ls.snapshot(), "a").entry.title, "local");
+        assert_eq!(find(&rs.snapshot(), "a").entry.title, "remote");
+        assert!(runtime.pending.as_ref().unwrap().uploaded.is_none());
+    }
+
+    #[test]
+    fn same_name_folders_remap_folder_id_instead_of_clearing() {
+        let local = snap(vec![]);
+        let mut remote = snap(vec![entry("e", "item", "2026-02-02T00:00:00Z", "pw")]);
+        remote.folders = vec![FolderDto {
+            id: "f-remote".into(),
+            name: "work".into(),
+        }];
+        remote.entries[0].entry.folder_id = Some("f-remote".into());
+
+        let (merged, report) = merge_snapshots(&local, &remote);
+        assert!(report.conflict_details.is_empty());
+        assert_eq!(merged.folders.len(), 1);
+        assert_eq!(merged.folders[0].id, "f1");
+        assert_eq!(merged.entries[0].entry.folder_id.as_deref(), Some("f1"));
+
+        let (ls, rs) = stores(&local, Some(&remote));
+        let mut runtime = SyncRuntime::default();
+        let preview = run_preview(&mut runtime, &ls, &rs).unwrap();
+        let committed = run_commit(&mut runtime, &ls, &rs, &preview.token, &[]).unwrap();
+        assert_eq!(committed.phase, SyncPhase::Committed);
+        for snapshot in [ls.snapshot(), rs.snapshot()] {
+            assert!(snapshot.folders.iter().all(|folder| folder.id != "f-remote"));
+            assert_eq!(find(&snapshot, "e").entry.folder_id.as_deref(), Some("f1"));
+        }
+    }
+
+    #[test]
+    fn tag_tombstone_blocks_tag_revival() {
+        let mut local = snap(vec![entry("a", "x", "2026-02-01T00:00:00Z", "p")]);
+        local.tags = vec!["mail".into(), "keep".into()];
+        local.entries[0].entry.tags = vec!["mail".into(), "keep".into()];
+        let mut remote = snap(vec![]);
+        remote.tags = vec!["mail".into()];
+        remote.deleted = vec![tombstone("tag", "mail", &days_ago(3))];
+
+        let (ls, rs) = stores(&local, Some(&remote));
+        let mut runtime = SyncRuntime::default();
+        let preview = run_preview(&mut runtime, &ls, &rs).unwrap();
+        assert!(preview.report.conflict_details.is_empty());
+        let committed = run_commit(&mut runtime, &ls, &rs, &preview.token, &[]).unwrap();
+        assert_eq!(committed.phase, SyncPhase::Committed);
+
+        for snapshot in [ls.snapshot(), rs.snapshot()] {
+            assert!(snapshot.tags.iter().all(|tag| tag != "mail"));
+            assert!(snapshot.tags.iter().any(|tag| tag == "keep"));
+            assert!(find(&snapshot, "a")
+                .entry
+                .tags
+                .iter()
+                .all(|tag| tag != "mail"));
+            assert!(find(&snapshot, "a").entry.tags.iter().any(|tag| tag == "keep"));
+            assert!(snapshot
+                .deleted
+                .iter()
+                .any(|item| item.kind == "tag" && item.id == "mail"));
+        }
+
+        let mut revived = local.clone();
+        revived.tags.push("mail".into());
+        revived.entries[0].entry.tags.push("mail".into());
+        let (again, _) = merge_snapshots(&revived, &ls.snapshot());
+        assert!(again.tags.iter().all(|tag| tag != "mail"));
+        assert!(find(&again, "a").entry.tags.iter().all(|tag| tag != "mail"));
+        assert!(again.tags.iter().any(|tag| tag == "keep"));
+        assert!(again
+            .deleted
+            .iter()
+            .any(|item| item.kind == "tag" && item.id == "mail"));
     }
 }
 

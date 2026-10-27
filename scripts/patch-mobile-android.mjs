@@ -1,76 +1,50 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const manifestPath = resolve(root, "src-tauri-mobile/gen/android/app/src/main/AndroidManifest.xml");
-const pathsFile = resolve(root, "src-tauri-mobile/gen/android/app/src/main/res/xml/file_paths.xml");
-const appModuleDir = resolve(root, "src-tauri-mobile/gen/android/app");
-const appGradlePath = resolve(appModuleDir, "build.gradle.kts");
-const androidRootGradlePath = resolve(root, "src-tauri-mobile/gen/android/build.gradle.kts");
-const mobileDir = resolve(root, "src-tauri-mobile");
 
-const installPermission = '    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />';
-const queries = `    <queries>
+// Pure patches are exported for node:test; importing this module never patches a project.
+export function patchManifest(manifest) {
+  const installPermission = '    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />';
+  const queries = `    <queries>
         <intent>
             <action android:name="android.intent.action.VIEW" />
             <data android:mimeType="application/vnd.android.package-archive" />
         </intent>
     </queries>`;
-
-if (!existsSync(manifestPath)) {
-  console.error(`Android project is missing: ${manifestPath}`);
-  process.exit(1);
+  if (!manifest.includes("android.permission.REQUEST_INSTALL_PACKAGES")) {
+    manifest = manifest.replace(
+      '    <uses-permission android:name="android.permission.INTERNET" />',
+      `    <uses-permission android:name="android.permission.INTERNET" />\n${installPermission}`,
+    );
+  }
+  if (!manifest.includes("application/vnd.android.package-archive")) {
+    manifest = manifest.replace("    <application", `${queries}\n\n    <application`);
+  }
+  return manifest;
 }
 
-let manifest = readFileSync(manifestPath, "utf8");
-if (!manifest.includes("android.permission.REQUEST_INSTALL_PACKAGES")) {
-  manifest = manifest.replace(
-    '    <uses-permission android:name="android.permission.INTERNET" />',
-    `    <uses-permission android:name="android.permission.INTERNET" />\n${installPermission}`,
+export function patchFilePaths(paths) {
+  return paths.includes('name="updates"') ? paths : paths.replace(
+    "</paths>", '  <cache-path name="updates" path="." />\n</paths>',
   );
 }
-if (!manifest.includes("application/vnd.android.package-archive")) {
-  manifest = manifest.replace("    <application", `${queries}\n\n    <application`);
-}
-writeFileSync(manifestPath, manifest);
 
-if (existsSync(pathsFile)) {
-  let paths = readFileSync(pathsFile, "utf8");
-  if (!paths.includes('name="updates"')) {
-    paths = paths.replace(
-      "</paths>",
-      '  <cache-path name="updates" path="." />\n</paths>',
-    );
-    writeFileSync(pathsFile, paths);
+export function patchAppGradle(appGradle, rootDirRel) {
+  // Tauri derives the Gradle working directory from the Cargo workspace root.
+  // Point rustBuild at the mobile crate instead of the desktop configuration.
+  if (!/rootDirRel = "[^"]*"/.test(appGradle)) {
+    throw new Error("Could not find rootDirRel in Android app Gradle module");
   }
-}
-
-// Tauri derives the Gradle working directory from the Cargo workspace root, so the
-// rustBuild task runs the CLI at the repo root and resolves src-tauri/tauri.conf.json.
-// Point it at the mobile crate so the CLI reads the address file the outer build wrote.
-if (!existsSync(appGradlePath)) {
-  console.error(`Android Gradle module is missing: ${appGradlePath}`);
-  process.exit(1);
-}
-const rootDirRel = relative(appModuleDir, mobileDir).split(sep).join("/");
-let appGradle = readFileSync(appGradlePath, "utf8");
-if (!/rootDirRel = "[^"]*"/.test(appGradle)) {
-  console.error(`Could not find rootDirRel in ${appGradlePath}`);
-  process.exit(1);
-}
-appGradle = appGradle.replace(/rootDirRel = "[^"]*"/, `rootDirRel = "${rootDirRel}"`);
-
-// The Tauri template leaves release builds unsigned; sign them when CI writes
-// keystore.properties next to the generated project.
-if (!appGradle.includes("signingConfigs")) {
-  if (!appGradle.includes("    buildTypes {")) {
-    console.error(`Could not find the build types block in ${appGradlePath}`);
-    process.exit(1);
-  }
-  appGradle = appGradle.replace(
-    "    buildTypes {",
-    `    signingConfigs {
+  appGradle = appGradle.replace(/rootDirRel = "[^"]*"/, `rootDirRel = "${rootDirRel}"`);
+  if (!appGradle.includes("signingConfigs")) {
+    if (!appGradle.includes("    buildTypes {")) {
+      throw new Error("Could not find the Android build types block");
+    }
+    appGradle = appGradle.replace(
+      "    buildTypes {",
+      `    signingConfigs {
         if (rootProject.file("keystore.properties").exists()) {
             create("release") {
                 val keystorePropertiesFile = rootProject.file("keystore.properties")
@@ -84,34 +58,69 @@ if (!appGradle.includes("signingConfigs")) {
         }
     }
     buildTypes {`,
-  );
+    );
+  }
+  if (!appGradle.includes("signingConfig =")) {
+    appGradle = appGradle.replace(
+      /(getByName\("release"\) \{\r?\n)/,
+      `$1            signingConfigs.findByName("release")?.let { signingConfig = it }\n`,
+    );
+  }
+  if (!appGradle.includes("import java.io.FileInputStream")) {
+    appGradle = appGradle.replace(
+      "import java.util.Properties",
+      "import java.io.FileInputStream\nimport java.util.Properties",
+    );
+  }
+  return appGradle;
 }
-if (!appGradle.includes("signingConfig =")) {
-  appGradle = appGradle.replace(
-    /(getByName\("release"\) \{\r?\n)/,
-    `$1            signingConfigs.findByName("release")?.let { signingConfig = it }\n`,
-  );
-}
-if (!appGradle.includes("import java.io.FileInputStream")) {
-  appGradle = appGradle.replace(
-    "import java.util.Properties",
-    "import java.io.FileInputStream\nimport java.util.Properties",
-  );
-}
-writeFileSync(appGradlePath, appGradle);
 
-// The biometry plugin depends on kotlinx-coroutines 1.10.2, which requires a
-// Kotlin 2.x compiler; the Tauri 2.11 template still pins 1.9.25.
-const kotlinGradlePlugin = /org\.jetbrains\.kotlin:kotlin-gradle-plugin:[^"]+/;
-let rootGradle = readFileSync(androidRootGradlePath, "utf8");
-if (!kotlinGradlePlugin.test(rootGradle)) {
-  console.error(`Could not find the Kotlin Gradle plugin in ${androidRootGradlePath}`);
-  process.exit(1);
+export function patchRootGradle(rootGradle) {
+  // Biometry's kotlinx-coroutines 1.10.2 requires Kotlin 2.x, not template 1.9.25.
+  const kotlinGradlePlugin = /org\.jetbrains\.kotlin:kotlin-gradle-plugin:[^"]+/;
+  if (!kotlinGradlePlugin.test(rootGradle)) {
+    throw new Error("Could not find the Kotlin Gradle plugin in Android root Gradle module");
+  }
+  return rootGradle.replace(kotlinGradlePlugin, "org.jetbrains.kotlin:kotlin-gradle-plugin:2.2.10");
 }
-rootGradle = rootGradle.replace(
-  kotlinGradlePlugin,
-  "org.jetbrains.kotlin:kotlin-gradle-plugin:2.2.10",
-);
-writeFileSync(androidRootGradlePath, rootGradle);
 
-console.log("patched Android install permission, Gradle working directory and Kotlin version");
+function writeChanged(path, text) {
+  if (!existsSync(path) || readFileSync(path, "utf8") !== text) writeFileSync(path, text);
+}
+
+export function applyAndroidPatches(projectRoot = root) {
+  const mobileDir = resolve(projectRoot, "src-tauri-mobile");
+  const appModuleDir = resolve(mobileDir, "gen/android/app");
+  const manifestPath = resolve(appModuleDir, "src/main/AndroidManifest.xml");
+  const pathsFile = resolve(appModuleDir, "src/main/res/xml/file_paths.xml");
+  const appGradlePath = resolve(appModuleDir, "build.gradle.kts");
+  const rootGradlePath = resolve(mobileDir, "gen/android/build.gradle.kts");
+  const templatePath = resolve(mobileDir, "android/DocumentsPlugin.kt");
+  const targetPath = resolve(appModuleDir, "src/main/java/com/sealbox/mobile/DocumentsPlugin.kt");
+  for (const path of [manifestPath, appGradlePath, rootGradlePath, templatePath]) {
+    if (!existsSync(path)) throw new Error(`Android project or SAF template is missing: ${path}`);
+  }
+  // Read and validate all inputs before writing. No MainActivity modification is necessary.
+  const manifest = patchManifest(readFileSync(manifestPath, "utf8"));
+  const paths = existsSync(pathsFile) ? patchFilePaths(readFileSync(pathsFile, "utf8")) : null;
+  const rootDirRel = relative(appModuleDir, mobileDir).split(sep).join("/");
+  const appGradle = patchAppGradle(readFileSync(appGradlePath, "utf8"), rootDirRel);
+  const rootGradle = patchRootGradle(readFileSync(rootGradlePath, "utf8"));
+  const template = readFileSync(templatePath, "utf8");
+  writeChanged(manifestPath, manifest);
+  if (paths !== null) writeChanged(pathsFile, paths);
+  writeChanged(appGradlePath, appGradle);
+  writeChanged(rootGradlePath, rootGradle);
+  mkdirSync(dirname(targetPath), { recursive: true });
+  writeChanged(targetPath, template);
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  try {
+    applyAndroidPatches();
+    console.log("patched Android install permission, Gradle working directory, Kotlin version and SAF template");
+  } catch (error) {
+    console.error(error.message);
+    process.exitCode = 1;
+  }
+}

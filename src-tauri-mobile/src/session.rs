@@ -12,6 +12,10 @@ pub struct Session {
     clipboard_deadline: Option<Instant>,
     clipboard_hash: Option<[u8; 32]>,
     failed_unlocks: u32,
+    /// Set only when a live DEK is discarded. Callers clear transfer and the
+    /// sync runtime after releasing this mutex. A lock with no DEK — the
+    /// uninitialized restore screen — must not look like one.
+    lock_event: bool,
 }
 
 impl Default for Session {
@@ -25,6 +29,7 @@ impl Default for Session {
             clipboard_deadline: None,
             clipboard_hash: None,
             failed_unlocks: 0,
+            lock_event: false,
         }
     }
 }
@@ -42,13 +47,23 @@ impl Session {
         false
     }
 
-    pub fn lock(&mut self) {
+    /// Returns whether a DEK was actually discarded.
+    pub fn lock(&mut self) -> bool {
         self.clear_owned_clipboard();
+        let had_dek = self.dek.is_some();
         if let Some(mut key) = self.dek.take() {
             key.zeroize();
+            self.lock_event = true;
         }
         self.vault = None;
         self.failed_unlocks = 0;
+        had_dek
+    }
+
+    pub fn take_lock_event(&mut self) -> bool {
+        let happened = self.lock_event;
+        self.lock_event = false;
+        happened
     }
 
     pub fn unlock_delay_ms(&self) -> u64 {
@@ -140,5 +155,17 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.lock();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_without_dek_does_not_signal_wipe() {
+        let mut session = Session::default();
+        assert!(!session.lock());
+        assert!(!session.take_lock_event());
     }
 }

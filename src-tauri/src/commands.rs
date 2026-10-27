@@ -1,5 +1,8 @@
 use crate::assistant;
-use crate::backup::{export_envelope, import_envelope};
+use crate::backup::{
+    export, export_envelope, import_envelope, inspect, restore_into_with_options,
+    restore_new_with_options, BackupInspection, RestoreOptions, MAX_BACKUP_BYTES,
+};
 use crate::clipboard;
 use crate::lock::{idle_lock_if_needed, lock_everything, lock_session, recover_lock};
 use crate::mcp::{self, McpState};
@@ -14,12 +17,15 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
+use zeroize::Zeroizing;
 
 pub struct AppState {
     pub session: Arc<Mutex<Session>>,
     pub mcp: McpState,
     pub auto: Mutex<crate::auto_sync::AutoSync>,
     pub db_path: Mutex<Option<PathBuf>>,
+    pub transfer: Mutex<crate::transfer::TransferCache>,
+    pub sync_runtime: Mutex<crate::sync::SyncRuntime>,
 }
 
 impl AppState {
@@ -33,8 +39,38 @@ impl AppState {
             mcp,
             auto: Mutex::new(crate::auto_sync::AutoSync::default()),
             db_path: Mutex::new(None),
+            transfer: Mutex::new(crate::transfer::TransferCache::default()),
+            sync_runtime: Mutex::new(crate::sync::SyncRuntime::default()),
         }
     }
+}
+
+/// Drop cached backup/CSV bytes and any in-memory sync preview. Call only after
+/// the session mutex has been released, so auto-sync can lock the session from
+/// inside the runtime without deadlocking.
+pub(crate) fn clear_transfer_and_runtime(state: &AppState) {
+    recover_lock(&state.transfer).clear();
+    recover_lock(&state.sync_runtime).invalidate();
+}
+
+fn unlocked_dek(state: &AppState) -> Result<[u8; 32], String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    Ok(*session.dek().map_err(map_err)?)
+}
+
+fn open_unlocked_vault(app: &AppHandle, state: &AppState) -> Result<(Vault, [u8; 32]), String> {
+    let dek = unlocked_dek(state)?;
+    let vault = require_existing_vault(&vault_path(app)?)?;
+    Ok((vault, dek))
+}
+
+fn confirm_master_password(vault: &Vault, dek: &[u8; 32], password: &str) -> Result<(), String> {
+    let unlocked = vault.unlock(password).map_err(map_err)?;
+    if unlocked != *dek {
+        return Err("主密码不正确".into());
+    }
+    Ok(())
 }
 
 pub fn vault_path_for(app: &AppHandle) -> Result<PathBuf, String> {
@@ -340,6 +376,7 @@ fn copy_untracked_text(session: &mut Session, text: &str) -> Result<(), String> 
 #[tauri::command]
 pub fn lock_vault(state: State<AppState>) -> Result<(), String> {
     lock_everything(&state.session, &state.mcp);
+    clear_transfer_and_runtime(&state);
     Ok(())
 }
 
@@ -878,12 +915,18 @@ pub fn entry_profile(state: State<AppState>, id: String) -> Result<EntryProfile,
 /// Clipboard wipe and idle lock. Runs on the Rust clock, not a webview listener,
 /// so hiding the main window to the tray cannot stall either invariant.
 pub fn tick_security(state: &AppState) -> bool {
-    let mut session = lock_session(&state.session);
-    if session.clipboard_should_clear(&clipboard::read_text().unwrap_or_default()) {
-        let _ = clipboard::clear();
-        session.clear_clipboard_mark();
+    let locked = {
+        let mut session = lock_session(&state.session);
+        if session.clipboard_should_clear(&clipboard::read_text().unwrap_or_default()) {
+            let _ = clipboard::clear();
+            session.clear_clipboard_mark();
+        }
+        idle_lock_if_needed(&mut session, &state.mcp)
+    };
+    if locked {
+        clear_transfer_and_runtime(state);
     }
-    idle_lock_if_needed(&mut session, &state.mcp)
+    locked
 }
 
 #[tauri::command]
@@ -975,16 +1018,36 @@ pub fn import_backup(
 ) -> Result<(usize, usize), String> {
     let bytes = std::fs::read(Path::new(&path)).map_err(|e| e.to_string())?;
     let db = vault_path(&app)?;
-    let mut session = lock_session(&state.session);
-    if !Vault::is_initialized(db.to_str().unwrap_or_default()) {
-        let dek = Vault::create(db.to_str().unwrap(), &password).map_err(map_err)?;
-        let vault = Vault::open(db.to_str().unwrap()).map_err(map_err)?;
-        let n = import_envelope(&vault, &dek, &bytes, &password, overwrite).map_err(map_err)?;
-        session.set_unlocked(vault, dek);
-        drop(session);
+    let db_str = db.to_str().ok_or_else(|| "金库路径无效".to_string())?;
+    if !Vault::is_initialized(db_str) {
+        // A failed backup must not leave an empty vault behind.
+        let dek = restore_new_with_options(
+            db_str,
+            &bytes,
+            &password,
+            None,
+            RestoreOptions {
+                overwrite,
+                restore_settings: false,
+            },
+        )
+        .map_err(map_err)?;
+        let vault = Vault::open(db_str).map_err(map_err)?;
+        let counts = vault.counts().map_err(map_err)?;
+        let imported = counts.total.saturating_add(counts.trash).max(0) as usize;
+        {
+            let mut session = lock_session(&state.session);
+            session.set_unlocked(vault, dek);
+            if let Ok(vault) = session.vault() {
+                crate::auto_sync::refresh_from_vault(&state, vault);
+            }
+        }
+        hydrate_bridge_tokens(&state);
+        let _ = mcp::start(&state.mcp, state.session.clone());
         notify_vault_unlocked(&app);
-        return Ok(n);
+        return Ok((imported, 0));
     }
+    let mut session = lock_session(&state.session);
     session.require_unlocked().map_err(map_err)?;
     let dek = *session.dek().map_err(map_err)?;
     let vault = session.vault().map_err(map_err)?;
@@ -996,11 +1059,8 @@ pub fn import_csv_preview(
     state: State<AppState>,
     path: String,
 ) -> Result<crate::csv_import::CsvImportPreview, String> {
-    let mut session = lock_session(&state.session);
-    session.require_unlocked().map_err(map_err)?;
-    let vault = session.vault().map_err(map_err)?;
-    let dek = session.dek().map_err(map_err)?;
-    crate::csv_import::preview_file(vault, dek, &path).map_err(map_err)
+    let _ = (state, path);
+    Err("请先预览并确认明文风险".into())
 }
 
 #[tauri::command]
@@ -1009,11 +1069,161 @@ pub fn import_csv_commit(
     path: String,
     overwrite: bool,
 ) -> Result<crate::csv_import::CsvImportResult, String> {
-    let mut session = lock_session(&state.session);
-    session.require_unlocked().map_err(map_err)?;
-    let vault = session.vault().map_err(map_err)?;
-    let dek = *session.dek().map_err(map_err)?;
-    let result = crate::csv_import::commit_file(vault, &dek, &path, overwrite).map_err(map_err)?;
+    let _ = (state, path, overwrite);
+    Err("请先预览并确认明文风险".into())
+}
+
+#[derive(Serialize)]
+pub struct BackupPreview {
+    pub token: String,
+    pub summary: BackupInspection,
+}
+
+#[derive(Serialize)]
+pub struct RestoreReport {
+    pub imported: usize,
+    pub skipped: usize,
+}
+
+#[derive(Serialize)]
+pub struct CsvPreview {
+    pub token: String,
+    pub summary: crate::csv_import::CsvImportPreview,
+}
+
+#[tauri::command]
+pub fn backup_inspect(
+    state: State<AppState>,
+    path: String,
+    backup_password: String,
+) -> Result<BackupPreview, String> {
+    let bytes = crate::transfer::read_bounded(&path, MAX_BACKUP_BYTES)?;
+    let summary = inspect(&bytes, &backup_password).map_err(map_err)?;
+    let token = recover_lock(&state.transfer).put(
+        crate::transfer::Kind::Backup,
+        bytes,
+        Zeroizing::new(backup_password),
+    );
+    Ok(BackupPreview { token, summary })
+}
+
+#[tauri::command]
+pub fn backup_restore(
+    app: AppHandle,
+    state: State<AppState>,
+    token: String,
+    overwrite: bool,
+    restore_settings: bool,
+) -> Result<RestoreReport, String> {
+    let (vault, dek) = open_unlocked_vault(&app, &state)?;
+    let pending = recover_lock(&state.transfer).take(&token, crate::transfer::Kind::Backup)?;
+    let (imported, skipped) = restore_into_with_options(
+        &vault,
+        &dek,
+        &pending.bytes,
+        &pending.password,
+        RestoreOptions {
+            overwrite,
+            restore_settings,
+        },
+    )
+    .map_err(map_err)?;
+    recover_lock(&state.sync_runtime).invalidate();
+    Ok(RestoreReport { imported, skipped })
+}
+
+#[tauri::command]
+pub fn backup_restore_new(
+    app: AppHandle,
+    state: State<AppState>,
+    token: String,
+    new_password: Option<String>,
+    restore_settings: bool,
+) -> Result<RestoreReport, String> {
+    let db = vault_path(&app)?;
+    let db_str = db.to_str().ok_or_else(|| "金库路径无效".to_string())?;
+    if Vault::is_initialized(db_str) {
+        return Err("金库已存在".into());
+    }
+    let pending = recover_lock(&state.transfer).take(&token, crate::transfer::Kind::Backup)?;
+    let new_password = new_password.as_deref().filter(|password| !password.is_empty());
+    // Publish the restored database directly. Never Vault::create an empty file first.
+    let dek = restore_new_with_options(
+        db_str,
+        &pending.bytes,
+        &pending.password,
+        new_password,
+        RestoreOptions {
+            overwrite: true,
+            restore_settings,
+        },
+    )
+    .map_err(map_err)?;
+    let vault = Vault::open(db_str).map_err(map_err)?;
+    let counts = vault.counts().map_err(map_err)?;
+    let imported = counts.total.saturating_add(counts.trash).max(0) as usize;
+    {
+        let mut session = lock_session(&state.session);
+        session.set_unlocked(vault, dek);
+        if let Ok(vault) = session.vault() {
+            crate::auto_sync::refresh_from_vault(&state, vault);
+        }
+    }
+    clear_transfer_and_runtime(&state);
+    hydrate_bridge_tokens(&state);
+    let _ = mcp::start(&state.mcp, state.session.clone());
+    notify_vault_unlocked(&app);
+    Ok(RestoreReport {
+        imported,
+        skipped: 0,
+    })
+}
+
+#[tauri::command]
+pub fn backup_export(
+    app: AppHandle,
+    state: State<AppState>,
+    path: String,
+    password: String,
+    include_settings: bool,
+) -> Result<(), String> {
+    let (vault, dek) = open_unlocked_vault(&app, &state)?;
+    let bytes = export(&vault, &dek, &password, include_settings).map_err(map_err)?;
+    crate::transfer::write_atomic(&path, &bytes)?;
+    let _ = vault.audit("export", None, "ok");
+    Ok(())
+}
+
+#[tauri::command]
+pub fn csv_preview(app: AppHandle, state: State<AppState>, path: String) -> Result<CsvPreview, String> {
+    let (vault, dek) = open_unlocked_vault(&app, &state)?;
+    let bytes = crate::transfer::read_bounded(&path, crate::transfer::CSV_LIMIT)?;
+    let summary = crate::csv_import::preview_bytes(&vault, &dek, &bytes)?;
+    let token = recover_lock(&state.transfer).put(
+        crate::transfer::Kind::Csv,
+        bytes,
+        Zeroizing::new(String::new()),
+    );
+    Ok(CsvPreview { token, summary })
+}
+
+#[tauri::command]
+pub fn csv_commit(
+    app: AppHandle,
+    state: State<AppState>,
+    token: String,
+    password: String,
+    risk_confirmed: bool,
+    overwrite: bool,
+) -> Result<crate::csv_import::CsvImportResult, String> {
+    if !risk_confirmed {
+        return Err("请先预览并确认明文风险".into());
+    }
+    let (vault, dek) = open_unlocked_vault(&app, &state)?;
+    confirm_master_password(&vault, &dek, &password)?;
+    let pending = recover_lock(&state.transfer).take(&token, crate::transfer::Kind::Csv)?;
+    let result = crate::csv_import::commit_rows(&vault, &dek, &pending.bytes, overwrite).map_err(map_err)?;
+    recover_lock(&state.sync_runtime).invalidate();
     let _ = vault.audit(
         "import_csv",
         None,
@@ -1023,6 +1233,25 @@ pub fn import_csv_commit(
         ),
     );
     Ok(result)
+}
+
+#[tauri::command]
+pub fn csv_export(
+    app: AppHandle,
+    state: State<AppState>,
+    path: String,
+    password: String,
+    risk_confirmed: bool,
+) -> Result<(), String> {
+    if !risk_confirmed {
+        return Err("请先预览并确认明文风险".into());
+    }
+    let (vault, dek) = open_unlocked_vault(&app, &state)?;
+    confirm_master_password(&vault, &dek, &password)?;
+    let bytes = crate::csv_import::export_websites(&vault, &dek, &password).map_err(map_err)?;
+    crate::transfer::write_atomic(&path, &bytes)?;
+    let _ = vault.audit("export_csv", None, "ok");
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1062,16 +1291,25 @@ pub fn settings_set(
     settings: Settings,
 ) -> Result<(), String> {
     let settings = normalize_settings(settings);
-    let mut s = lock_session(&state.session);
-    idle_lock_if_needed(&mut s, &state.mcp);
-    if !s.is_unlocked() || s.vault().is_err() {
+    let (idle_locked, saved) = {
+        let mut s = lock_session(&state.session);
+        let idle_locked = idle_lock_if_needed(&mut s, &state.mcp);
+        if idle_locked || !s.is_unlocked() || s.vault().is_err() {
+            (idle_locked, false)
+        } else {
+            s.idle_secs = settings.idle_secs;
+            s.clipboard_secs = settings.clipboard_secs;
+            s.hotkey = settings.hotkey.clone();
+            persist_session_settings(&s)?;
+            (false, true)
+        }
+    };
+    if idle_locked {
+        clear_transfer_and_runtime(&state);
+    }
+    if !saved {
         return Err("请先解锁金库再保存设置".into());
     }
-    s.idle_secs = settings.idle_secs;
-    s.clipboard_secs = settings.clipboard_secs;
-    s.hotkey = settings.hotkey.clone();
-    persist_session_settings(&s)?;
-    drop(s);
     register_hotkey(&app, &settings.hotkey)
 }
 
@@ -1171,6 +1409,7 @@ pub fn sync_save(state: State<AppState>, input: SyncSaveInput) -> Result<SyncVie
             sync::save_auto(vault, input.auto_sync, input.auto_sync_secs).map_err(map_err)?;
         (sync::view(vault).map_err(map_err)?, auto)
     };
+    clear_transfer_and_runtime(&state);
     crate::auto_sync::apply(&state, auto.enabled, auto.secs);
     Ok(view)
 }
@@ -1182,16 +1421,48 @@ pub fn sync_clear(state: State<AppState>) -> Result<(), String> {
         session.require_unlocked().map_err(map_err)?;
         sync::clear_config(session.vault().map_err(map_err)?).map_err(map_err)?;
     }
+    clear_transfer_and_runtime(&state);
     crate::auto_sync::apply(&state, false, sync::DEFAULT_AUTO_SYNC_SECS);
     Ok(())
 }
 
 #[tauri::command]
-pub fn sync_now(state: State<AppState>) -> Result<SyncReport, String> {
-    let mut session = lock_session(&state.session);
-    session.require_unlocked().map_err(map_err)?;
-    let dek = *session.dek().map_err(map_err)?;
-    sync::sync_now(session.vault().map_err(map_err)?, &dek)
+pub fn sync_now(app: AppHandle, state: State<AppState>) -> Result<SyncReport, String> {
+    let (vault, dek) = open_unlocked_vault(&app, &state)?;
+    let still_unlocked = || lock_session(&state.session).is_unlocked();
+    let mut runtime = recover_lock(&state.sync_runtime);
+    sync::sync_now_with_runtime(&mut runtime, &vault, &dek, &still_unlocked)
+}
+
+#[tauri::command]
+pub fn sync_preview(app: AppHandle, state: State<AppState>) -> Result<sync::SyncPreview, String> {
+    let (vault, dek) = open_unlocked_vault(&app, &state)?;
+    let mut runtime = recover_lock(&state.sync_runtime);
+    runtime.preview(&vault, &dek)
+}
+
+#[tauri::command]
+pub fn sync_commit(
+    app: AppHandle,
+    state: State<AppState>,
+    token: String,
+    resolutions: Vec<sync::SyncResolution>,
+) -> Result<SyncReport, String> {
+    let (vault, dek) = open_unlocked_vault(&app, &state)?;
+    let still_unlocked = || lock_session(&state.session).is_unlocked();
+    let mut runtime = recover_lock(&state.sync_runtime);
+    runtime.commit(&vault, &dek, &token, &resolutions, &still_unlocked)
+}
+
+#[tauri::command]
+pub fn sync_verify_conditional(
+    app: AppHandle,
+    state: State<AppState>,
+) -> Result<sync::ConditionalSupportReport, String> {
+    let (vault, dek) = open_unlocked_vault(&app, &state)?;
+    let still_unlocked = || lock_session(&state.session).is_unlocked();
+    let _runtime = recover_lock(&state.sync_runtime);
+    sync::verify_conditional_support(&vault, &dek, &still_unlocked)
 }
 
 #[tauri::command]
@@ -1200,13 +1471,16 @@ pub fn change_master(
     old_password: String,
     new_password: String,
 ) -> Result<(), String> {
-    let mut session = lock_session(&state.session);
-    session.require_unlocked().map_err(map_err)?;
-    let dek = *session.dek().map_err(map_err)?;
-    let vault = session.vault().map_err(map_err)?;
-    vault
-        .change_master_password(&dek, &old_password, &new_password)
-        .map_err(map_err)?;
+    {
+        let mut session = lock_session(&state.session);
+        session.require_unlocked().map_err(map_err)?;
+        let dek = *session.dek().map_err(map_err)?;
+        let vault = session.vault().map_err(map_err)?;
+        vault
+            .change_master_password(&dek, &old_password, &new_password)
+            .map_err(map_err)?;
+    }
+    clear_transfer_and_runtime(&state);
     Ok(())
 }
 
@@ -1806,6 +2080,8 @@ mod tests {
             mcp: McpState::default(),
             auto: Mutex::new(crate::auto_sync::AutoSync::default()),
             db_path: Mutex::new(None),
+            transfer: Mutex::new(crate::transfer::TransferCache::default()),
+            sync_runtime: Mutex::new(crate::sync::SyncRuntime::default()),
         };
         *recover_lock(&state.mcp.fill_token) = "fill_ephemeral_boot".into();
         *recover_lock(&state.mcp.token) = "sbx_ephemeral_boot".into();
@@ -1835,6 +2111,8 @@ mod tests {
             mcp: McpState::default(),
             auto: Mutex::new(crate::auto_sync::AutoSync::default()),
             db_path: Mutex::new(None),
+            transfer: Mutex::new(crate::transfer::TransferCache::default()),
+            sync_runtime: Mutex::new(crate::sync::SyncRuntime::default()),
         };
         load_bridge_tokens(&state, &session);
         assert!(recover_lock(&state.mcp.token).is_empty());
@@ -1858,6 +2136,8 @@ mod tests {
             mcp: McpState::default(),
             auto: Mutex::new(crate::auto_sync::AutoSync::default()),
             db_path: Mutex::new(None),
+            transfer: Mutex::new(crate::transfer::TransferCache::default()),
+            sync_runtime: Mutex::new(crate::sync::SyncRuntime::default()),
         };
         load_bridge_tokens(&state, &session);
         assert_eq!(recover_lock(&state.mcp.token).as_str(), "mcp_legacy_plain");
@@ -1879,6 +2159,8 @@ mod tests {
             mcp: McpState::default(),
             auto: Mutex::new(crate::auto_sync::AutoSync::default()),
             db_path: Mutex::new(None),
+            transfer: Mutex::new(crate::transfer::TransferCache::default()),
+            sync_runtime: Mutex::new(crate::sync::SyncRuntime::default()),
         };
         *recover_lock(&state.mcp.token) = "sbx_should_not_serialize".into();
         *recover_lock(&state.mcp.fill_token) = "fill_should_not_serialize".into();
@@ -1950,9 +2232,14 @@ mod tests {
             mcp: McpState::default(),
             auto: Mutex::new(crate::auto_sync::AutoSync::default()),
             db_path: Mutex::new(None),
+            transfer: Mutex::new(crate::transfer::TransferCache::default()),
+            sync_runtime: Mutex::new(crate::sync::SyncRuntime::default()),
         };
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let _ = clipboard::write_text(&secret);
+        if clipboard::write_text(&secret).is_err() || clipboard::read_text().ok().as_deref() != Some(secret.as_str()) {
+            eprintln!("skip: clipboard is unavailable");
+            return;
+        }
         assert!(!tick_security(&state));
         assert!(!lock_session(&state.session).clipboard_owned(&secret));
         assert!(!lock_session(&state.session).clipboard_should_clear(&secret));
@@ -1970,6 +2257,8 @@ mod tests {
             mcp: McpState::default(),
             auto: Mutex::new(crate::auto_sync::AutoSync::default()),
             db_path: Mutex::new(None),
+            transfer: Mutex::new(crate::transfer::TransferCache::default()),
+            sync_runtime: Mutex::new(crate::sync::SyncRuntime::default()),
         };
         state.mcp.open_pairing();
         assert!(tick_security(&state));

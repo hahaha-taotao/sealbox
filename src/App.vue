@@ -4,7 +4,9 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import packageJson from "../package.json";
+import { DB_ENGINES } from "./lib/entry-options";
 import { auditDateBounds, createAuditRequestGuard } from "./lib/audit-request";
+import { buildResolutions, completeChoices, type SyncChoice } from "./lib/sync-choice.mjs";
 import {
   checkForUpdate,
   download,
@@ -23,8 +25,9 @@ import {
   type AssistantMcpProbe,
   type AssistantToolTrace,
   type ClientCertInfo,
+  type BackupPreview,
   type Counts,
-  type CsvImportPreview,
+  type CsvPreview,
   type EntryDto,
   type EntryKind,
   type EntryProfile,
@@ -36,7 +39,9 @@ import {
   type SecretPayload,
   type Status,
   type SyncKind,
+  type SyncPreview,
   type SyncReport,
+  type SyncVerifyResult,
   type SyncView,
   type UpsertEntry,
   type WebsiteDuplicate,
@@ -142,11 +147,22 @@ const backupMode = ref<"export" | "import">("export");
 const backupPath = ref("");
 const backupPassword = ref("");
 const backupOverwrite = ref(false);
+const backupIncludeSettings = ref(false);
+const backupRestoreSettings = ref(false);
+const backupBusy = ref(false);
+const backupPreview = ref<BackupPreview | null>(null);
+const backupNewPassword = ref("");
+const backupNewPassword2 = ref("");
+const backupExporting = computed(() => backupMode.value === "export" && Boolean(status.value?.initialized));
 const csvImportOpen = ref(false);
+const csvMode = ref<"import" | "export">("import");
 const csvImportPath = ref("");
-const csvImportPreview = ref<CsvImportPreview | null>(null);
+const csvImportPreview = ref<CsvPreview | null>(null);
 const csvImportOverwrite = ref(false);
 const csvImportBusy = ref(false);
+const csvRiskConfirmed = ref(false);
+const csvPassword = ref("");
+const CSV_RISK_TEXT = "这是明文网站迁移，不含证书/SSH/服务器，不要用表格软件打开";
 const organizationOpen = ref(false);
 const organizationBusy = ref(false);
 const organizationTab = ref<"folders" | "tags">("folders");
@@ -208,19 +224,7 @@ function kindCount(k: EntryKind) {
 const allFilterActive = computed(
   () => !filter.trash && !filter.folder_id && !filter.uncategorized && !filter.tag,
 );
-const DB_ENGINES: { id: string; label: string; port: number }[] = [
-  { id: "mysql", label: "MySQL / MariaDB", port: 3306 },
-  { id: "postgres", label: "PostgreSQL", port: 5432 },
-  { id: "sqlserver", label: "SQL Server", port: 1433 },
-  { id: "oracle", label: "Oracle", port: 1521 },
-  { id: "mongodb", label: "MongoDB", port: 27017 },
-  { id: "redis", label: "Redis", port: 6379 },
-  { id: "sqlite", label: "SQLite", port: 0 },
-  { id: "clickhouse", label: "ClickHouse", port: 8123 },
-  { id: "elasticsearch", label: "Elasticsearch", port: 9200 },
-  { id: "dameng", label: "达梦 DM", port: 5236 },
-  { id: "custom", label: "其他", port: 0 },
-];
+
 function onEngineChange() {
   const e = DB_ENGINES.find((x) => x.id === form.engine);
   if (e && e.port) form.port = e.port;
@@ -1421,27 +1425,117 @@ async function mergeTagFromManager(tag: string) {
   if (!confirm(`将标签“${tag}”合并到“${target}”？重复关联会自动去重。`)) return;
   await runOrganization(() => api.mergeTags(tag, target), "标签已合并");
 }
-async function runBackup() {
+function resetBackupPreview() {
+  backupPreview.value = null;
+  backupRestoreSettings.value = false;
+  backupNewPassword.value = "";
+  backupNewPassword2.value = "";
+}
+
+function closeBackup() {
+  backupOpen.value = false;
+  backupPassword.value = "";
+  backupNewPassword.value = "";
+  backupNewPassword2.value = "";
+  backupPreview.value = null;
+}
+
+function openBackup(mode: "export" | "import") {
+  backupMode.value = status.value?.initialized ? mode : "import";
+  backupPassword.value = "";
+  backupIncludeSettings.value = false;
+  backupOverwrite.value = false;
+  resetBackupPreview();
+  backupOpen.value = true;
+}
+
+async function inspectBackup() {
+  if (backupBusy.value) return;
+  if (!backupPath.value || !backupPassword.value) {
+    showToast("请填写路径和备份密码");
+    return;
+  }
+  backupBusy.value = true;
+  resetBackupPreview();
+  try {
+    backupPreview.value = await api.backupInspect({ path: backupPath.value, backupPassword: backupPassword.value });
+    backupPassword.value = "";
+  } catch (e) {
+    showToast(String(e));
+  } finally {
+    backupBusy.value = false;
+  }
+}
+
+async function runBackupExport() {
+  if (backupBusy.value) return;
+  if (!status.value?.unlocked) {
+    showToast("请先解锁再导出");
+    return;
+  }
   if (!backupPath.value || !backupPassword.value) {
     showToast("请填写路径和主密码");
     return;
   }
+  backupBusy.value = true;
   try {
-    if (backupMode.value === "export") {
-      await api.exportBackup(backupPassword.value, backupPath.value);
-      showToast("已导出备份");
-    } else {
-      if (backupOverwrite.value && !confirm("覆盖导入会替换同 id 的现有条目，且无法撤销。确定继续？")) {
-        return;
-      }
-      const [n, skip] = await api.importBackup(backupPassword.value, backupPath.value, backupOverwrite.value);
-      showToast(`导入 ${n} 条，跳过 ${skip} 条`);
-      await refreshVault();
-    }
-    backupOpen.value = false;
-    backupPassword.value = "";
+    await api.backupExport({
+      path: backupPath.value,
+      password: backupPassword.value,
+      includeSettings: backupIncludeSettings.value,
+    });
+    showToast("已导出备份");
+    closeBackup();
   } catch (e) {
     showToast(String(e));
+  } finally {
+    backupBusy.value = false;
+    backupPassword.value = "";
+  }
+}
+
+async function runBackupRestore() {
+  if (backupBusy.value) return;
+  const preview = backupPreview.value;
+  if (!preview) {
+    showToast("请先校验并查看备份摘要");
+    return;
+  }
+  const initialized = Boolean(status.value?.initialized);
+  if (initialized && backupOverwrite.value && !confirm("覆盖导入会替换同 id 的现有条目，且无法撤销。确定继续？")) {
+    return;
+  }
+  if (!initialized) {
+    if (backupNewPassword.value.length < 10) {
+      showToast("新主密码至少 10 位");
+      return;
+    }
+    if (backupNewPassword.value !== backupNewPassword2.value) {
+      showToast("两次新主密码不一致");
+      return;
+    }
+  }
+  const restoreSettings = Boolean(preview.summary.includes_settings && backupRestoreSettings.value);
+  backupBusy.value = true;
+  try {
+    const result = initialized
+      ? await api.backupRestore({ token: preview.token, overwrite: backupOverwrite.value, restoreSettings })
+      : await api.backupRestoreNew({ token: preview.token, newPassword: backupNewPassword.value, restoreSettings });
+    showToast(`导入 ${result.imported} 条，跳过 ${result.skipped} 条`);
+    closeBackup();
+    await refreshStatus();
+    if (status.value?.unlocked) {
+      await refreshVault();
+      await loadSettings().catch(() => undefined);
+    }
+  } catch (e) {
+    backupPreview.value = null;
+    showToast(String(e));
+  } finally {
+    backupBusy.value = false;
+    backupPassword.value = "";
+    backupNewPassword.value = "";
+    backupNewPassword2.value = "";
   }
 }
 const settingsIdle = ref(15);
@@ -1462,6 +1556,17 @@ const syncBusy = ref(false);
 const syncReport = ref<SyncReport | null>(null);
 const syncAuto = ref(true);
 const syncAutoSecs = ref(60);
+const syncToken = ref("");
+const syncExpiresSecs = ref(0);
+const syncChoices = reactive<Record<string, SyncChoice>>({});
+const syncVerifyResult = ref<SyncVerifyResult | null>(null);
+const syncConflicts = computed(() => syncReport.value?.conflict_details ?? []);
+const syncCanCommit = computed(() => {
+  const phase = syncReport.value?.phase;
+  if (!syncToken.value) return false;
+  if (phase === "local_pending") return true;
+  return (phase === "preview" || phase === "conflicts") && completeChoices(syncConflicts.value, syncChoices);
+});
 
 async function loadSync() {
   syncView.value = await api.syncStatus();
@@ -1474,6 +1579,57 @@ async function loadSync() {
   syncPrefix.value = syncView.value.prefix;
   syncAuto.value = syncView.value.auto_sync;
   syncAutoSecs.value = syncView.value.auto_sync_secs;
+}
+
+function clearSyncChoices() {
+  for (const id of Object.keys(syncChoices)) delete syncChoices[id];
+}
+
+function clearSyncPreview() {
+  syncToken.value = "";
+  syncExpiresSecs.value = 0;
+  clearSyncChoices();
+}
+
+function adoptSyncPreview(result: SyncPreview) {
+  clearSyncChoices();
+  syncToken.value = result.token;
+  syncExpiresSecs.value = result.expires_in_secs;
+  syncReport.value = result.report;
+  for (const item of result.report.conflict_details ?? []) {
+    syncChoices[item.id] = { choice: "", confirm_delete_edit: false };
+  }
+}
+
+function syncPhaseLabel(phase: string | undefined) {
+  switch (phase) {
+    case "preview": return "预览";
+    case "conflicts": return "待解决冲突";
+    case "committed": return "已提交";
+    case "local_pending": return "本地待完成";
+    case "blocked": return "已阻塞";
+    default: return "未知";
+  }
+}
+
+async function fetchSyncPreview() {
+  clearSyncPreview();
+  const result = await api.syncPreview();
+  adoptSyncPreview(result);
+  return result;
+}
+
+async function previewSync() {
+  if (syncBusy.value) return null;
+  syncBusy.value = true;
+  try {
+    return await fetchSyncPreview();
+  } catch (e) {
+    showToast(String(e));
+    return null;
+  } finally {
+    syncBusy.value = false;
+  }
 }
 
 async function saveSync() {
@@ -1491,6 +1647,8 @@ async function saveSync() {
       auto_sync_secs: Number(syncAutoSecs.value) || 60,
     });
     syncSecret.value = "";
+    clearSyncPreview();
+    syncReport.value = null;
     showToast("同步配置已保存");
   } catch (e) {
     showToast(String(e));
@@ -1499,20 +1657,81 @@ async function saveSync() {
   }
 }
 
-async function runSync() {
+async function commitSync() {
+  if (syncBusy.value || !syncCanCommit.value || !syncToken.value) return;
   syncBusy.value = true;
-  syncReport.value = null;
+  const token = syncToken.value;
+  const pendingLocal = syncReport.value?.phase === "local_pending";
   try {
-    const report = await api.syncNow();
+    const resolutions = pendingLocal && !completeChoices(syncConflicts.value, syncChoices)
+      ? []
+      : buildResolutions(syncConflicts.value, syncChoices);
+    const report = await api.syncCommit({ token, resolutions });
     syncReport.value = report;
-    await loadSync();
-    await refreshVault();
-    const removed = report.removed ? `，删除 ${report.removed}` : "";
-    const conflict = report.conflicts.length
-      ? `，修改时间相同 ${report.conflicts.length} 条，已保留本地`
-      : "";
-    showToast(`已同步：拉取 ${report.pulled}，推送 ${report.pushed}${removed}${conflict}`);
+    if (report.phase === "local_pending") {
+      showToast(report.blocked || "远端已写入，本地尚未完成。请重试提交，不要重新预览。");
+      return;
+    }
+    clearSyncPreview();
+    syncReport.value = report;
+    if (report.phase === "committed") {
+      await loadSync();
+      await refreshVault();
+      const removed = report.removed ? `，删除 ${report.removed}` : "";
+      showToast(`已同步：拉取 ${report.pulled}，推送 ${report.pushed}${removed}`);
+      return;
+    }
+    showToast(report.blocked || "同步未提交，正在重新预览");
+    try {
+      await fetchSyncPreview();
+    } catch (again) {
+      showToast(String(again));
+    }
   } catch (e) {
+    const message = String(e);
+    showToast(message);
+    if (pendingLocal || message.includes("sync_local_retry_pending")) return;
+    clearSyncPreview();
+    try {
+      await fetchSyncPreview();
+    } catch (again) {
+      showToast(String(again));
+    }
+  } finally {
+    syncBusy.value = false;
+  }
+}
+
+async function runSync() {
+  if (syncReport.value?.phase === "local_pending" && syncToken.value) {
+    await commitSync();
+    return;
+  }
+  const result = await previewSync();
+  if (!result) return;
+  if (result.report.phase === "blocked") {
+    showToast(result.report.blocked || "同步已阻塞");
+    return;
+  }
+  if (result.report.phase === "local_pending") {
+    showToast(result.report.blocked || "本地尚未完成，请重试提交");
+    return;
+  }
+  if (result.report.conflict_details.length > 0 || result.report.phase === "conflicts") {
+    showToast(`有 ${result.report.conflict_details.length} 条冲突，请逐条选择后再提交`);
+    return;
+  }
+  await commitSync();
+}
+
+async function verifySync() {
+  if (syncBusy.value) return;
+  syncBusy.value = true;
+  try {
+    syncVerifyResult.value = await api.syncVerifyConditional();
+    showToast(syncVerifyResult.value.verified ? "安全条件写入已验证" : "服务端未通过安全验证");
+  } catch (e) {
+    syncVerifyResult.value = null;
     showToast(String(e));
   } finally {
     syncBusy.value = false;
@@ -1526,6 +1745,8 @@ async function clearSync() {
     syncView.value = null;
     syncSecret.value = "";
     syncReport.value = null;
+    syncVerifyResult.value = null;
+    clearSyncPreview();
     showToast("已清除同步配置");
   } catch (e) {
     showToast(String(e));
@@ -1603,10 +1824,18 @@ function clearSecrets() {
   certInfoFor.value = null;
   closeForm();
   backupPassword.value = "";
+  backupNewPassword.value = "";
+  backupNewPassword2.value = "";
+  backupPreview.value = null;
   csvImportOpen.value = false;
   csvImportPath.value = "";
   csvImportPreview.value = null;
   csvImportOverwrite.value = false;
+  csvRiskConfirmed.value = false;
+  csvPassword.value = "";
+  syncReport.value = null;
+  syncVerifyResult.value = null;
+  clearSyncPreview();
   assistantApiKey.value = "";
   assistantInput.value = "";
   assistantMessages.value = [];
@@ -1817,29 +2046,47 @@ async function loadHome() {
   expiring.value = h.expiring;
   status.value = { ...(status.value as Status), counts: h.counts };
 }
-function openCsvImport() {
+function closeCsv() {
+  csvImportOpen.value = false;
+  csvPassword.value = "";
+  csvRiskConfirmed.value = false;
+  csvImportPreview.value = null;
+}
+
+function openCsv(mode: "import" | "export") {
+  csvMode.value = mode;
   csvImportPath.value = "";
   csvImportPreview.value = null;
   csvImportOverwrite.value = false;
+  csvRiskConfirmed.value = false;
+  csvPassword.value = "";
   csvImportOpen.value = true;
 }
 
 async function pickCsvImportFile() {
   try {
     const picked = await withNativeDialog(async () => {
-      const { open } = await import("@tauri-apps/plugin-dialog");
+      const { open, save } = await import("@tauri-apps/plugin-dialog");
+      if (csvMode.value === "export") {
+        return save({
+          defaultPath: "sealbox-websites.csv",
+          filters: [{ name: "CSV", extensions: ["csv"] }],
+        });
+      }
       return open({
         multiple: false,
         title: "选择 CSV 文件",
         filters: [{ name: "CSV", extensions: ["csv"] }],
       });
     });
-    if (typeof picked !== "string") return;
+    if (typeof picked !== "string" || !picked) return;
     csvImportPath.value = picked;
     csvImportPreview.value = null;
+    csvPassword.value = "";
+    if (csvMode.value !== "import") return;
     csvImportBusy.value = true;
     try {
-      csvImportPreview.value = await api.importCsvPreview(picked);
+      csvImportPreview.value = await api.csvPreview({ path: picked });
     } catch (e) {
       showToast(String(e));
     } finally {
@@ -1850,20 +2097,59 @@ async function pickCsvImportFile() {
   }
 }
 
+function csvRiskReady() {
+  return csvRiskConfirmed.value && csvPassword.value.length > 0;
+}
+
 async function runCsvImport() {
-  if (!csvImportPath.value || !csvImportPreview.value || csvImportBusy.value) return;
+  if (!csvImportPreview.value || csvImportBusy.value) return;
+  if (!csvRiskReady()) {
+    showToast("请勾选明文迁移确认，并再次输入主密码");
+    return;
+  }
   csvImportBusy.value = true;
   try {
-    const result = await api.importCsvCommit(csvImportPath.value, csvImportOverwrite.value);
+    const result = await api.csvCommit({
+      token: csvImportPreview.value.token,
+      password: csvPassword.value,
+      riskConfirmed: true,
+      overwrite: csvImportOverwrite.value,
+    });
     const skipped = result.skipped_existing + result.skipped_invalid;
     showToast(`导入 ${result.inserted + result.updated} 条，跳过 ${skipped} 条`);
-    csvImportOpen.value = false;
-    csvImportPreview.value = null;
+    closeCsv();
+    csvImportPath.value = "";
+    csvImportOverwrite.value = false;
     await refreshVault();
   } catch (e) {
     showToast(String(e));
   } finally {
     csvImportBusy.value = false;
+    csvPassword.value = "";
+  }
+}
+
+async function runCsvExport() {
+  if (csvImportBusy.value) return;
+  if (!csvImportPath.value || !csvRiskReady()) {
+    showToast("请选择路径、勾选明文迁移确认，并再次输入主密码");
+    return;
+  }
+  csvImportBusy.value = true;
+  try {
+    await api.csvExport({
+      path: csvImportPath.value,
+      password: csvPassword.value,
+      riskConfirmed: true,
+    });
+    showToast("已导出 CSV。这是明文网站数据，用完请删除，不要用表格软件打开。");
+    closeCsv();
+    csvImportPath.value = "";
+  } catch (e) {
+    showToast(String(e));
+  } finally {
+    csvImportBusy.value = false;
+    csvPassword.value = "";
   }
 }
 
@@ -1877,7 +2163,10 @@ async function pickBackupFile(mode: "export" | "import") {
           filters: [{ name: "Sealbox backup", extensions: ["svbak"] }],
         });
       });
-      if (picked) backupPath.value = picked;
+      if (picked) {
+        backupPath.value = picked;
+        resetBackupPreview();
+      }
       return;
     }
     const picked = await withNativeDialog(async () => {
@@ -1887,7 +2176,10 @@ async function pickBackupFile(mode: "export" | "import") {
         filters: [{ name: "Sealbox backup", extensions: ["svbak"] }],
       });
     });
-    if (typeof picked === "string") backupPath.value = picked;
+    if (typeof picked === "string") {
+      backupPath.value = picked;
+      resetBackupPreview();
+    }
   } catch (e) {
     showToast(`打开文件选择框失败：${String(e)}`);
   }
@@ -1931,7 +2223,22 @@ onMounted(async () => {
     async (event) => {
       if (!status.value?.unlocked) return;
       const report = event.payload.report;
-      if (report && (report.pulled > 0 || report.removed > 0)) await refreshVault();
+      if (report) {
+        const keepLocalToken = syncReport.value?.phase === "local_pending" && Boolean(syncToken.value) && report.phase === "local_pending";
+        if (!keepLocalToken) clearSyncPreview();
+        syncReport.value = report;
+        if (report.phase === "committed") {
+          if (report.pulled > 0 || report.removed > 0) await refreshVault();
+        } else if (report.phase === "local_pending") {
+          showToast(report.blocked || "自动同步的本地提交尚未完成");
+        } else if (report.phase === "blocked") {
+          showToast(report.blocked || "自动同步已阻塞");
+        } else if (report.phase === "conflicts" || (report.conflict_details?.length ?? 0) > 0) {
+          showToast("自动同步因冲突暂停。请重新预览并逐条选择，不能沿用旧结果。");
+        } else if (report.pulled > 0 || report.removed > 0) {
+          await refreshVault();
+        }
+      }
       if (!syncView.value) return;
       try {
         const fresh = await api.syncStatus();
@@ -1987,7 +2294,7 @@ onMounted(async () => {
         <p class="crumb" v-if="passwordHint">{{ passwordHint }}</p>
         <input v-model="password2" type="password" placeholder="再输入一次" @keyup.enter="doSetup" />
         <button class="btn primary" style="width:100%" @click="doSetup">创建</button>
-        <button class="btn" style="width:100%;margin-top:8px" @click="backupMode = 'import'; backupOpen = true">从备份导入</button>
+        <button class="btn" style="width:100%;margin-top:8px" @click="openBackup('import')">从备份导入</button>
       </div>
     </div>
 
@@ -2177,11 +2484,14 @@ onMounted(async () => {
             <button class="side-item" type="button" :class="{ active: filter.trash }" @click="setFilter({ trash: true })">
               <span>回收站</span><span class="count">{{ status.counts?.trash ?? 0 }}</span>
             </button>
-            <button class="side-item" type="button" @click="backupMode = 'export'; backupOpen = true">
+            <button class="side-item" type="button" @click="openBackup('export')">
               <span>备份 / 还原</span>
             </button>
-            <button class="side-item" type="button" :disabled="!status?.unlocked" @click="openCsvImport">
+            <button class="side-item" type="button" :disabled="!status?.unlocked" @click="openCsv('import')">
               <span>从 CSV 导入</span>
+            </button>
+            <button class="side-item" type="button" :disabled="!status?.unlocked" @click="openCsv('export')">
+              <span>导出 CSV</span>
             </button>
           </div>
         </aside>
@@ -2775,7 +3085,7 @@ onMounted(async () => {
           </div>
           <div class="mcp-card settings-master">
             <h3>数据同步</h3>
-            <p class="crumb">支持 WebDAV 和 S3。上传的是用同步密钥再加密的快照，服务器看不到明文，也解不开主密码。两端修改时间相同、内容却不同时，会保留本机版本并记为冲突；其中一边是删除时以删除为准，避免已删条目复活。解锁后按设定间隔自动同步，默认 60 秒；改完点「保存配置」生效。</p>
+            <p class="crumb">支持 WebDAV 和 S3。上传的是用同步密钥再加密的快照，服务器看不到明文，也解不开主密码。有冲突时必须逐条选择保留本地、采用远端或两者都留；删除与编辑冲突要单独确认后才能提交。不会因为修改时间相同就自动保留某一边。冲突或阻塞之后会重新预览，不能沿用旧令牌。本地尚未落盘时只重试提交。解锁后按设定间隔自动同步，默认 60 秒；改完点「保存配置」生效。</p>
             <div class="settings-fields">
               <div class="field">
                 <label>类型</label>
@@ -2819,10 +3129,36 @@ onMounted(async () => {
               </div>
             </div>
             <p v-if="syncView?.last_sync_at" class="crumb">上次同步 {{ fmtTime(syncView.last_sync_at) }}<span v-if="syncView.last_result"> · {{ syncView.last_result }}</span></p>
-            <p v-if="syncReport?.conflicts.length" class="error">两端修改时间相同，已保留本地版本：{{ syncReport.conflicts.join('、') }}</p>
+            <div v-if="syncReport" class="crumb">
+              <p>阶段：{{ syncPhaseLabel(syncReport.phase) }}</p>
+              <p>阻塞：{{ syncReport.blocked || "无" }}</p>
+              <p>可重试：{{ syncReport.retryable ? "是" : "否" }}</p>
+              <p v-if="syncToken">本次预览约 {{ syncExpiresSecs }} 秒内有效。</p>
+              <p v-if="syncReport.phase === 'committed'">拉取 {{ syncReport.pulled }}，推送 {{ syncReport.pushed }}，未变 {{ syncReport.unchanged }}<span v-if="syncReport.removed">，删除 {{ syncReport.removed }}</span></p>
+            </div>
+            <div v-if="syncVerifyResult" class="crumb">
+              安全同步：{{ syncVerifyResult.verified ? "已验证" : "未通过" }}；探测对象已清理：{{ syncVerifyResult.probe_cleaned ? "是" : "否" }}。{{ syncVerifyResult.scope }}
+            </div>
+            <template v-if="syncToken && syncConflicts.length">
+              <div class="field" v-for="item in syncConflicts" :key="item.id">
+                <template v-if="syncChoices[item.id]">
+                  <label>{{ item.title || item.id }}</label>
+                  <p class="crumb">{{ item.kind === 'delete_edit' ? '删除与编辑' : '两端都已修改' }}<span v-if="item.local_deleted"> · 本地已删</span><span v-if="item.remote_deleted"> · 远端已删</span></p>
+                  <label class="check"><input type="radio" :name="'sync-choice-' + item.id" value="local" v-model="syncChoices[item.id].choice" /> 保留本地</label>
+                  <label class="check"><input type="radio" :name="'sync-choice-' + item.id" value="remote" v-model="syncChoices[item.id].choice" /> 采用远端</label>
+                  <label class="check"><input type="radio" :name="'sync-choice-' + item.id" value="both" v-model="syncChoices[item.id].choice" /> 两者都留</label>
+                  <label v-if="item.kind === 'delete_edit'" class="check">
+                    <input type="checkbox" v-model="syncChoices[item.id].confirm_delete_edit" />
+                    确认处理这条删除与编辑冲突
+                  </label>
+                </template>
+              </div>
+            </template>
             <div class="mcp-actions">
               <button class="btn primary" type="button" :disabled="syncBusy" @click="saveSync">保存配置</button>
               <button class="btn" type="button" :disabled="syncBusy || !syncView?.configured" @click="runSync">{{ syncBusy ? '同步中…' : '立即同步' }}</button>
+              <button class="btn primary" type="button" :disabled="syncBusy || !syncCanCommit" @click="commitSync">{{ syncReport?.phase === 'local_pending' ? '重试本地提交' : '提交选择' }}</button>
+              <button class="btn" type="button" :disabled="syncBusy || !syncView?.configured" @click="verifySync">验证安全同步</button>
               <button class="btn" type="button" :disabled="syncBusy || !syncView?.configured" @click="clearSync">清除配置</button>
             </div>
           </div>
@@ -3073,34 +3409,76 @@ onMounted(async () => {
       </div>
     </div>
     </div>
-    <div class="dialog-mask" v-if="backupOpen && status && (status.unlocked || !status.initialized)" @click.self="backupOpen = false">
+    <div class="dialog-mask" v-if="backupOpen && status && (status.unlocked || !status.initialized)" @click.self="closeBackup">
       <div class="dialog">
         <h3>备份 / 还原</h3>
-        <div class="field">
+        <div class="field" v-if="status.initialized">
           <label>操作</label>
-          <select v-model="backupMode">
+          <select v-model="backupMode" @change="backupPassword = ''; resetBackupPreview()">
             <option value="export">导出加密备份</option>
             <option value="import">导入备份</option>
           </select>
         </div>
+        <p class="crumb" v-else>金库尚未创建。校验通过后直接从备份建立新库，不会先建空库。</p>
         <div class="field"><label>文件路径（.svbak）</label>
           <div style="display:flex;gap:8px">
-            <input v-model="backupPath" placeholder="选择或输入路径" style="flex:1" />
-            <button class="btn" @click="pickBackupFile(backupMode)">浏览</button>
+            <input v-model="backupPath" placeholder="选择或输入路径" style="flex:1" @input="resetBackupPreview()" />
+            <button class="btn" type="button" @click="pickBackupFile(backupExporting ? 'export' : 'import')">浏览</button>
           </div>
         </div>
-        <div class="field"><label>主密码</label><input v-model="backupPassword" type="password" /></div>
-        <div class="field" v-if="backupMode === 'import'">
-          <label class="check">
-            <input type="checkbox" v-model="backupOverwrite" />
-            覆盖已有同 id 条目
-          </label>
-          <p class="crumb" v-if="backupOverwrite" style="margin:6px 0 0 23px">会替换本地同 id 条目。确定时还会再确认一次。</p>
-        </div>
-        <div style="display:flex;gap:8px;justify-content:flex-end">
-          <button class="btn" @click="backupOpen = false">取消</button>
-          <button class="btn primary" @click="runBackup">确定</button>
-        </div>
+        <template v-if="backupExporting">
+          <div class="field"><label>主密码</label><input v-model="backupPassword" type="password" /></div>
+          <div class="field">
+            <label class="check">
+              <input type="checkbox" v-model="backupIncludeSettings" />
+              包含本机设置（空闲锁定、剪贴板）
+            </label>
+          </div>
+          <div style="display:flex;gap:8px;justify-content:flex-end">
+            <button class="btn" type="button" @click="closeBackup">取消</button>
+            <button class="btn primary" type="button" :disabled="backupBusy" @click="runBackupExport">{{ backupBusy ? "导出中…" : "导出" }}</button>
+          </div>
+        </template>
+        <template v-else>
+          <div class="field"><label>备份密码</label><input v-model="backupPassword" type="password" /></div>
+          <div style="display:flex;gap:8px;justify-content:flex-end">
+            <button class="btn" type="button" :disabled="backupBusy" @click="inspectBackup">{{ backupBusy ? "校验中…" : "校验并查看摘要" }}</button>
+          </div>
+          <template v-if="backupPreview">
+            <p class="crumb">
+              版本 {{ backupPreview.summary.version }}；条目 {{ backupPreview.summary.entries }}；回收站 {{ backupPreview.summary.trash }}；
+              文件夹 {{ backupPreview.summary.folders }}；标签 {{ backupPreview.summary.tags }}；墓碑 {{ backupPreview.summary.tombstones }}；
+              含设置 {{ backupPreview.summary.includes_settings ? "是" : "否" }}。
+            </p>
+            <p class="crumb" v-if="!backupPreview.summary.warnings.length">警告：无</p>
+            <p class="error" v-for="(warning, index) in backupPreview.summary.warnings" :key="index">{{ warning }}</p>
+            <div class="field" v-if="status.initialized">
+              <label class="check">
+                <input type="checkbox" v-model="backupOverwrite" />
+                覆盖已有同 id 条目
+              </label>
+              <p class="crumb" v-if="backupOverwrite">会替换本地同 id 条目。确定时还会再确认一次。</p>
+            </div>
+            <div class="field">
+              <label class="check">
+                <input type="checkbox" v-model="backupRestoreSettings" :disabled="!backupPreview.summary.includes_settings" />
+                恢复备份中的设置
+              </label>
+            </div>
+            <template v-if="!status.initialized">
+              <div class="field"><label>新主密码</label><input v-model="backupNewPassword" type="password" /></div>
+              <div class="field"><label>确认新主密码</label><input v-model="backupNewPassword2" type="password" /></div>
+              <p class="crumb">至少 10 位。用它创建金库，不会先建空库；可以与备份密码相同。</p>
+            </template>
+            <div style="display:flex;gap:8px;justify-content:flex-end">
+              <button class="btn" type="button" @click="closeBackup">取消</button>
+              <button class="btn primary" type="button" :disabled="backupBusy" @click="runBackupRestore">{{ backupBusy ? "恢复中…" : "恢复" }}</button>
+            </div>
+          </template>
+          <div v-else style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+            <button class="btn" type="button" @click="closeBackup">取消</button>
+          </div>
+        </template>
       </div>
     </div>
     <div class="dialog-mask" v-if="organizationOpen && status?.unlocked" @click.self="organizationOpen = false">
@@ -3148,44 +3526,71 @@ onMounted(async () => {
         </template>
       </div>
     </div>
-    <div class="dialog-mask" v-if="csvImportOpen && status?.unlocked" @click.self="csvImportOpen = false">
+    <div class="dialog-mask" v-if="csvImportOpen && status?.unlocked" @click.self="closeCsv">
       <div class="dialog">
-        <h3>从 CSV 导入</h3>
-        <p class="crumb">支持 Chrome / Edge、Bitwarden 和 1Password 导出的 CSV。预览仅显示账号元数据，不会显示密码或 TOTP 密钥。</p>
+        <h3>{{ csvMode === 'export' ? '导出 CSV' : '从 CSV 导入' }}</h3>
+        <p class="crumb">只迁移网站账号，不含证书、SSH 或服务器。预览不显示密码或 TOTP 密钥。</p>
         <div class="field">
           <label>CSV 文件</label>
           <div style="display:flex;gap:8px">
-            <input :value="csvImportPath || '请选择 CSV 文件'" readonly style="flex:1" />
+            <input :value="csvImportPath || (csvMode === 'export' ? '请选择导出路径' : '请选择 CSV 文件')" readonly style="flex:1" />
             <button class="btn" type="button" :disabled="csvImportBusy" @click="pickCsvImportFile">浏览</button>
           </div>
         </div>
-        <p class="crumb" v-if="csvImportBusy">正在读取并预览…</p>
-        <template v-if="csvImportPreview">
+        <p class="crumb" v-if="csvImportBusy && csvMode === 'import'">正在读取并预览…</p>
+        <template v-if="csvMode === 'import' && csvImportPreview">
           <p class="crumb">
-            格式：{{ csvImportPreview.format }}；共 {{ csvImportPreview.total }} 条；可导入 {{ csvImportPreview.importable }} 条；
-            已有 {{ csvImportPreview.skipped_existing }} 条；无效 {{ csvImportPreview.skipped_invalid }} 条。
+            格式：{{ csvImportPreview.summary.format }}；共 {{ csvImportPreview.summary.total }} 条；可导入 {{ csvImportPreview.summary.importable }} 条；
+            已有 {{ csvImportPreview.summary.skipped_existing }} 条；无效 {{ csvImportPreview.summary.skipped_invalid }} 条。
           </p>
-          <div class="table" v-if="csvImportPreview.sample.length">
+          <div class="table" v-if="csvImportPreview.summary.sample.length">
             <table>
-              <thead><tr><th>名称</th><th>网址</th><th>账号</th><th>密码</th><th>TOTP</th></tr></thead>
+              <thead><tr><th>名称</th><th>网址</th><th>账号</th><th>有密码</th><th>有 TOTP</th></tr></thead>
               <tbody>
-                <tr v-for="(row, index) in csvImportPreview.sample.slice(0, 20)" :key="`${row.title}-${index}`">
+                <tr v-for="(row, index) in csvImportPreview.summary.sample.slice(0, 20)" :key="`${row.title}-${index}`">
                   <td>{{ row.title }}</td><td>{{ row.url }}</td><td>{{ row.username }}</td>
-                  <td>{{ row.has_password ? '已设置' : '—' }}</td><td>{{ row.has_totp ? '已设置' : '—' }}</td>
+                  <td>{{ row.has_password ? '有' : '无' }}</td><td>{{ row.has_totp ? '有' : '无' }}</td>
                 </tr>
               </tbody>
             </table>
           </div>
           <p class="crumb" v-else>没有可预览的有效条目。</p>
-          <label class="check" style="margin:12px 0">
-            <input type="checkbox" v-model="csvImportOverwrite" />
-            覆盖已有同站同账号
-          </label>
+          <div class="field">
+            <label class="check">
+              <input type="checkbox" v-model="csvImportOverwrite" />
+              覆盖已有同站同账号
+            </label>
+          </div>
         </template>
+        <div class="field" v-if="csvMode === 'export' || csvImportPreview">
+          <label class="check">
+            <input type="checkbox" v-model="csvRiskConfirmed" />
+            <span style="min-width:0;white-space:normal">{{ CSV_RISK_TEXT }}</span>
+          </label>
+        </div>
+        <div class="field" v-if="csvMode === 'export' || csvImportPreview">
+          <label>再次输入主密码</label>
+          <input v-model="csvPassword" type="password" autocomplete="current-password" />
+        </div>
         <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
-          <button class="btn" type="button" @click="csvImportOpen = false">取消</button>
-          <button class="btn primary" type="button" :disabled="csvImportBusy || !csvImportPreview || (csvImportPreview.importable === 0 && !(csvImportOverwrite && csvImportPreview.skipped_existing > 0))" @click="runCsvImport">
+          <button class="btn" type="button" @click="closeCsv">取消</button>
+          <button
+            v-if="csvMode === 'import'"
+            class="btn primary"
+            type="button"
+            :disabled="csvImportBusy || !csvRiskConfirmed || !csvPassword || !csvImportPreview || (csvImportPreview.summary.importable === 0 && !(csvImportOverwrite && csvImportPreview.summary.skipped_existing > 0))"
+            @click="runCsvImport"
+          >
             {{ csvImportBusy ? "导入中…" : "确认导入" }}
+          </button>
+          <button
+            v-else
+            class="btn primary"
+            type="button"
+            :disabled="csvImportBusy || !csvRiskConfirmed || !csvPassword || !csvImportPath"
+            @click="runCsvExport"
+          >
+            {{ csvImportBusy ? "导出中…" : "确认导出" }}
           </button>
         </div>
       </div>
