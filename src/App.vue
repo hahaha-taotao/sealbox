@@ -19,11 +19,6 @@ import {
 import {
   api,
   type AuditEvent,
-  type AssistantChatResponse,
-  type AssistantConfigView,
-  type AssistantMessage,
-  type AssistantMcpProbe,
-  type AssistantToolTrace,
   type ClientCertInfo,
   type BackupPreview,
   type Counts,
@@ -50,7 +45,7 @@ import {
 } from "./lib/tauri";
 
 const status = ref<Status | null>(null);
-  type Page = "home" | "vault" | "audit" | "settings" | "mcp" | "plugin" | "assistant";
+  type Page = "home" | "vault" | "audit" | "settings" | "mcp" | "plugin";
 const page = ref<Page>("vault");
 const history = ref<Page[]>(["vault"]);
 const historyIndex = ref(0);
@@ -192,7 +187,6 @@ const crumb = computed(() => {
   if (page.value === "settings") return "设置";
   if (page.value === "mcp") return "MCP";
   if (page.value === "plugin") return "插件";
-  if (page.value === "assistant") return "助手";
   if (filter.trash) return "回收站";
   const selectedKinds = selectedKindIds.value;
   if (selectedKinds.length === 1) {
@@ -464,19 +458,6 @@ const zoomkeyCandidates = ref<ZoomkeyCandidates>({
 const zoomkeyBusy = ref(false);
 const zoomkeyTestBusy = ref("");
 const zoomkeyTestResult = ref<{ endpoint: string; ok: boolean; text: string } | null>(null);
-const assistantConfig = ref<AssistantConfigView | null>(null);
-const assistantModel = ref("gpt-4o-mini");
-const assistantBaseUrl = ref("https://api.openai.com/v1");
-const assistantApiKey = ref("");
-const assistantClearApiKey = ref(false);
-const assistantConfigBusy = ref(false);
-const assistantProbeBusy = ref(false);
-const assistantChatBusy = ref(false);
-const assistantError = ref("");
-const assistantInput = ref("");
-const assistantMcp = ref<AssistantMcpProbe | null>(null);
-const assistantMessages = ref<AssistantMessage[]>([]);
-const assistantTraces = ref<AssistantToolTrace[]>([]);
 let pairingTimer: ReturnType<typeof setInterval> | null = null;
 function hideBridgeTokens() {
   revealedFillToken.value = "";
@@ -789,97 +770,6 @@ async function openPlugin() {
   await refreshMcp();
   await refreshPairing();
   await refreshExtensionInstall();
-}
-
-async function refreshAssistantConfig() {
-  assistantError.value = "";
-  try {
-    const config = await api.assistantConfigGet();
-    assistantConfig.value = config;
-    assistantModel.value = config.model;
-    assistantBaseUrl.value = config.baseUrl;
-    assistantApiKey.value = "";
-    assistantClearApiKey.value = false;
-  } catch (e) {
-    assistantError.value = String(e);
-  }
-}
-
-async function openAssistant() {
-  goPage("assistant");
-  await refreshAssistantConfig();
-  if (!assistantMcp.value) await probeAssistantMcp();
-}
-
-async function saveAssistantConfig() {
-  if (assistantConfigBusy.value) return;
-  assistantConfigBusy.value = true;
-  assistantError.value = "";
-  try {
-    const config = await api.assistantConfigSet({
-      model: assistantModel.value,
-      baseUrl: assistantBaseUrl.value,
-      apiKey: assistantApiKey.value || undefined,
-      clearApiKey: assistantClearApiKey.value,
-    });
-    assistantConfig.value = config;
-    assistantApiKey.value = "";
-    assistantClearApiKey.value = false;
-    showToast("助手配置已保存");
-  } catch (e) {
-    assistantError.value = String(e);
-    showToast(assistantError.value);
-  } finally {
-    assistantConfigBusy.value = false;
-  }
-}
-
-async function probeAssistantMcp() {
-  if (assistantProbeBusy.value) return;
-  assistantProbeBusy.value = true;
-  assistantError.value = "";
-  try {
-    assistantMcp.value = await api.assistantMcpProbe();
-    showToast(`MCP 已连接，发现 ${assistantMcp.value.tools.length} 个只读工具`);
-  } catch (e) {
-    assistantMcp.value = null;
-    assistantError.value = String(e);
-    showToast(assistantError.value);
-  } finally {
-    assistantProbeBusy.value = false;
-  }
-}
-
-function clearAssistantChat() {
-  assistantMessages.value = [];
-  assistantTraces.value = [];
-  assistantInput.value = "";
-  assistantError.value = "";
-}
-
-async function sendAssistantMessage() {
-  const message = assistantInput.value.trim();
-  if (!message || assistantChatBusy.value) return;
-  assistantChatBusy.value = true;
-  assistantError.value = "";
-  assistantInput.value = "";
-  const history = [...assistantMessages.value];
-  assistantMessages.value.push({ role: "user", content: message });
-  try {
-    const response: AssistantChatResponse = await api.assistantChat({
-      history,
-      message,
-    });
-    assistantMessages.value.push({ role: "assistant", content: response.content });
-    assistantTraces.value.push(...response.traces);
-  } catch (e) {
-    assistantError.value = String(e);
-    assistantMessages.value.pop();
-    assistantInput.value = message;
-    showToast(assistantError.value);
-  } finally {
-    assistantChatBusy.value = false;
-  }
 }
 
 function goPage(next: Page) {
@@ -1836,12 +1726,6 @@ function clearSecrets() {
   syncReport.value = null;
   syncVerifyResult.value = null;
   clearSyncPreview();
-  assistantApiKey.value = "";
-  assistantInput.value = "";
-  assistantMessages.value = [];
-  assistantTraces.value = [];
-  assistantMcp.value = null;
-  assistantError.value = "";
   pairing.value = null;
   pairingError.value = "";
   stopPairingTimer();
@@ -2358,15 +2242,6 @@ onMounted(async () => {
             </svg>
           </span>
           <span>插件</span>
-        </button>
-        <button class="rail-btn" :class="{ active: page === 'assistant' }" @click="openAssistant">
-          <span class="icon" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M4 5.5A2.5 2.5 0 0 1 6.5 3h11A2.5 2.5 0 0 1 20 5.5v8a2.5 2.5 0 0 1-2.5 2.5H12l-4.5 4v-4h-1A2.5 2.5 0 0 1 4 13.5z" />
-              <path d="M8 8h8M8 11h5" />
-            </svg>
-          </span>
-          <span>助手</span>
         </button>
         <div class="spacer" />
         <button class="rail-btn" :class="{ active: page === 'settings' }" @click="goPage('settings')">
@@ -2888,127 +2763,6 @@ onMounted(async () => {
                 <button class="btn" type="button" :disabled="!mcp?.has_fill_token" @click="toggleFillToken">{{ revealedFillToken ? "隐藏" : "显示" }}</button>
                 <button class="btn" type="button" :disabled="!mcp?.has_fill_token" @click="copyFillToken">复制</button>
               </div>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <section class="main" v-else-if="page === 'assistant'">
-        <div class="content content-page assistant-page">
-          <div class="mcp-head assistant-head">
-            <div>
-              <h2>助手</h2>
-              <p class="crumb">用 OpenAI 兼容接口聊天，并通过本机 MCP 只读工具验证连通性。API Key 只保存在加密金库中。</p>
-            </div>
-            <div class="mcp-status">
-              <span class="mcp-dot" :class="{ on: assistantConfig?.hasApiKey }" />
-              <span>{{ assistantConfig?.hasApiKey ? "模型已配置" : "待配置模型" }}</span>
-              <span class="assistant-connection" :class="{ connected: assistantMcp?.connected }">
-                {{ assistantMcp?.connected ? `MCP · ${assistantMcp.tools.length} 工具` : "MCP 未测试" }}
-              </span>
-            </div>
-          </div>
-          <p class="error" v-if="assistantError">{{ assistantError }}</p>
-          <div class="assistant-layout">
-            <div class="assistant-side">
-              <div class="mcp-card assistant-card">
-                <div class="assistant-card-heading">
-                  <div>
-                    <h3>模型配置</h3>
-                    <p class="crumb">兼容 Chat Completions 的服务均可使用。</p>
-                  </div>
-                  <span class="tool-risk" :class="{ safe: assistantConfig?.hasApiKey }">{{ assistantConfig?.hasApiKey ? "已配置" : "未配置" }}</span>
-                </div>
-                <div class="field">
-                  <label>Base URL</label>
-                  <input v-model="assistantBaseUrl" placeholder="https://api.openai.com/v1" />
-                </div>
-                <div class="field">
-                  <label>模型</label>
-                  <input v-model="assistantModel" placeholder="gpt-4o-mini" />
-                </div>
-                <div class="field">
-                  <label>API Key <span class="crumb">（留空保持原值）</span></label>
-                  <input v-model="assistantApiKey" type="password" autocomplete="off" placeholder="不会回显或返回前端" />
-                </div>
-                <label class="checkbox-row assistant-check">
-                  <input v-model="assistantClearApiKey" type="checkbox" />
-                  <span>清除已保存的 API Key</span>
-                </label>
-                <button class="btn primary" type="button" :disabled="assistantConfigBusy" @click="saveAssistantConfig">
-                  {{ assistantConfigBusy ? "保存中…" : "保存配置" }}
-                </button>
-              </div>
-
-              <div class="mcp-card assistant-card">
-                <div class="assistant-card-heading">
-                  <div>
-                    <h3>MCP 连通性</h3>
-                    <p class="crumb">助手会连接当前 Sealbox 的本机 MCP，不把 Token 交给网页。</p>
-                  </div>
-                  <span class="tool-risk" :class="{ safe: assistantMcp?.connected }">{{ assistantMcp?.connected ? "在线" : "待测试" }}</span>
-                </div>
-                <div class="assistant-endpoint" v-if="assistantMcp?.url || mcp?.url">{{ assistantMcp?.url || mcp?.url }}</div>
-                <button class="btn" type="button" :disabled="assistantProbeBusy" @click="probeAssistantMcp">
-                  {{ assistantProbeBusy ? "测试中…" : "测试 MCP" }}
-                </button>
-                <div class="tool-list assistant-tool-list" v-if="assistantMcp?.tools.length">
-                  <div class="tool-item" v-for="tool in assistantMcp.tools" :key="tool.name">
-                    <div class="tool-heading">
-                      <code class="tool-name">{{ tool.name }}</code>
-                      <span class="tool-risk safe">只读</span>
-                    </div>
-                    <p class="crumb">{{ tool.description }}</p>
-                  </div>
-                </div>
-                <p class="crumb" v-else>点击“测试 MCP”发现当前可用工具。</p>
-              </div>
-            </div>
-
-            <div class="mcp-card assistant-card assistant-chat-card">
-              <div class="assistant-card-heading">
-                <div>
-                  <h3>对话</h3>
-                  <p class="crumb">工具结果会标记为外部资料，不会改变助手权限。</p>
-                </div>
-                <div class="mcp-actions assistant-chat-actions">
-                  <span class="crumb">助手只调用只读工具；git 写入需在 Cursor 里使用</span>
-                  <button class="btn" type="button" :disabled="assistantChatBusy || !assistantMessages.length" @click="clearAssistantChat">清空</button>
-                </div>
-              </div>
-              <div class="assistant-messages" aria-live="polite">
-                <div class="assistant-empty" v-if="!assistantMessages.length">
-                  <div class="assistant-empty-mark">✦</div>
-                  <strong>开始一次 MCP 连通性测试</strong>
-                  <p class="crumb">例如：“列出当前可用的 GitHub 工具”，或直接问一个普通问题。</p>
-                </div>
-                <div class="assistant-message" :class="message.role" v-for="(message, index) in assistantMessages" :key="`${index}-${message.role}`">
-                  <span class="assistant-message-role">{{ message.role === 'user' ? '你' : '助手' }}</span>
-                  <div class="assistant-message-content">{{ message.content }}</div>
-                </div>
-                <div class="assistant-thinking" v-if="assistantChatBusy"><span></span><span></span><span></span> 正在思考…</div>
-              </div>
-              <div class="assistant-traces" v-if="assistantTraces.length">
-                <div class="assistant-trace-title">工具调用记录</div>
-                <details class="assistant-tool-trace" v-for="(trace, index) in assistantTraces" :key="`${trace.name}-${index}`">
-                  <summary>
-                    <span class="assistant-trace-dot" :class="{ ok: trace.success }" />
-                    <code>{{ trace.name }}</code>
-                    <span>{{ trace.success ? "完成" : "失败" }}</span>
-                  </summary>
-                  <div class="assistant-trace-body">
-                    <div><strong>参数</strong><pre>{{ trace.arguments }}</pre></div>
-                    <div><strong>结果预览</strong><pre>{{ trace.resultPreview }}</pre></div>
-                  </div>
-                </details>
-              </div>
-              <form class="assistant-composer" @submit.prevent="sendAssistantMessage">
-                <textarea v-model="assistantInput" rows="3" :disabled="assistantChatBusy" placeholder="输入消息，Enter 发送，Shift+Enter 换行" @keydown.enter.exact.prevent="sendAssistantMessage" />
-                <div class="assistant-composer-foot">
-                  <span class="crumb">助手不会调用 commit / push / 开 PR / 发 Release 等写工具</span>
-                  <button class="btn primary" type="submit" :disabled="assistantChatBusy || !assistantInput.trim()">{{ assistantChatBusy ? "发送中…" : "发送" }}</button>
-                </div>
-              </form>
             </div>
           </div>
         </div>

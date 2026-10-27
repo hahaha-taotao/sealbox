@@ -63,7 +63,6 @@ npm run tauri build
 - **备份与导入 Backup & import** — 加密 `.svbak` 导出 / 导入（默认合并，覆盖需确认）；可从 Chrome / Edge、Bitwarden、1Password 导出的 UTF-8 CSV 导入网站账号，默认跳过已有同站同账号
 - **MCP** — 本机 `127.0.0.1` 服务；GitHub MCP 提供只读 API、本地 git 和工作区短名；Issue、PR、Release、文件、ref、Actions 和 secret 写入另有独立开关，且每次弹出桌面确认。ZoomKey 提供受限的 JIRA / CRM 只读工具。模型可用 Token 标题或默认凭据，不必先抄 UUID
 - **客户端证书 Client cert** — 保险库里可以导入 mTLS 用的客户端证书与私钥（PEM），由 Rust 侧限长、解析并校验证书/私钥匹配后加密保存，随金库一起备份；列表和速查不会显示或复制私钥，锁定时会清理 TLS 运行时缓存
-- **助手 Assistant** — 位于「插件」下方的 OpenAI 兼容对话页；可测试本机 MCP 连通性，并让模型调用当前暴露的低风险只读工具
 - **插件 Plugin** — Chrome / Edge 从客户端安装后按当前网址填充、填 TOTP 或一键登记；在侧栏「插件」页配对
 
 ## 安全模型 Security
@@ -141,19 +140,9 @@ On first launch, set a master password (at least 10 characters). Closing the win
 - `github_pr` — `action` 为 `list` / `get` / `create` / `merge`。`create` 默认草稿，`merge` 必须带编号
 - `github_issue` — `action` 为 `list` / `get` / `create` / `comment` / `close`
 
-GitHub MCP 默认停用。启用后只开放上面这些工具。凭据可传标题（`credential="agentos"`）；金库里只有一条 GitHub Token 时自动选用。仓库用 `repo="owner/repo"`，本地 git 用本机绝对路径。写入每次弹出桌面确认。不提供搜索仓库、读远端文件、Actions、变量、secret、下载产物、建仓、改 ref 或删仓库。侧栏助手只调用只读低风险工具。Token 不会返回给模型。
+GitHub MCP 默认停用。启用后只开放上面这些工具。凭据可传标题（`credential="agentos"`）；金库里只有一条 GitHub Token 时自动选用。仓库用 `repo="owner/repo"`，本地 git 用本机绝对路径。写入每次弹出桌面确认。不提供搜索仓库、读远端文件、Actions、变量、secret、下载产物、建仓、改 ref 或删仓库。Token 不会返回给模型。
 
 停用时这些工具都不会出现在 `tools/list`，直接调用也会被拒绝。模型收到的是结构化字段或截断后的 git 输出，不包含 Token、请求头、Release body 或完整远端响应。金库锁定时工具会失败。后续接口规划见 [`docs/superpowers/specs/2026-09-20-github-mcp-roadmap.md`](docs/superpowers/specs/2026-09-20-github-mcp-roadmap.md)。MCP Token 可在页面轮换。
-
-## 助手 Assistant
-
-「助手」位于侧栏「插件」下方。它使用 OpenAI Chat Completions 兼容协议，可填写 Base URL、模型和 API Key；API Key 使用加密金库存储，前端不会读取或回显明文。API Key 可以留空，用于不需要密钥的本地兼容服务。
-
-点击「测试 MCP」会通过真实的本机 HTTP MCP 接口执行初始化和工具发现。GitHub MCP 启用时，助手自动使用当前 MCP 暴露的低风险 GitHub 工具；停用时不会发现或调用这些工具。首版使用非流式请求，不支持外部 MCP Server、stdio 或 SSE transport。
-
-The Assistant page is below Plugin in the sidebar. It uses an OpenAI Chat Completions-compatible endpoint, stores the API key encrypted in the vault, probes the real local MCP HTTP endpoint, and automatically follows the single GitHub MCP enable/disable switch. The first version is non-streaming and does not support external MCP servers or stdio/SSE transports.
-
-GitHub MCP is disabled by default. When enabled, the assistant discovers the low-risk read-only tools. Writes for local git, releases, pull requests, and issues stay behind desktop confirmation and are not offered to the assistant. The server does not search repositories, read remote files, control Actions, manage variables or secrets, download artifacts, create repositories, or edit refs.
 
 ## 插件 Plugin（Chrome / Edge）
 

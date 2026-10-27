@@ -308,50 +308,6 @@ export interface McpToolInfo {
   risk: string;
 }
 
-export interface AssistantConfigView {
-  model: string;
-  baseUrl: string;
-  hasApiKey: boolean;
-}
-
-export interface AssistantConfigInput {
-  model: string;
-  baseUrl: string;
-  apiKey?: string;
-  clearApiKey?: boolean;
-}
-
-export interface AssistantToolSummary {
-  name: string;
-  description: string;
-  inputSchema: Record<string, unknown>;
-  readOnly: boolean;
-  risk: string;
-}
-
-export interface AssistantMcpProbe {
-  connected: boolean;
-  url: string;
-  tools: AssistantToolSummary[];
-}
-
-export interface AssistantMessage {
-  role: "user" | "assistant";
-  content: string;
-}
-
-export interface AssistantToolTrace {
-  name: string;
-  arguments: string;
-  success: boolean;
-  resultPreview: string;
-}
-
-export interface AssistantChatResponse {
-  content: string;
-  traces: AssistantToolTrace[];
-}
-
 export type SecretPayload =
   | { type: "website"; url?: string | null; username?: string | null; password: string; totp_secret?: string | null }
   | { type: "api_token"; service: string; account?: string | null; token: string }
@@ -502,12 +458,4 @@ export const api = {
   zoomkeyPolicySet: (policy: ZoomkeyMcpPolicy) => invoke<ZoomkeyMcpPolicy>("zoomkey_policy_set", { policy }),
   zoomkeyCandidates: () => invoke<ZoomkeyCandidates>("zoomkey_candidates"),
   zoomkeyTest: (endpoint: "jira" | "crm") => invoke<string>("zoomkey_test_connection", { endpoint }),
-  assistantConfigGet: () => invoke<AssistantConfigView>("assistant_config_get"),
-  assistantConfigSet: (input: AssistantConfigInput) =>
-    invoke<AssistantConfigView>("assistant_config_set", { input }),
-  assistantMcpProbe: () => invoke<AssistantMcpProbe>("assistant_mcp_probe"),
-  assistantChat: (request: {
-    history: AssistantMessage[];
-    message: string;
-  }) => invoke<AssistantChatResponse>("assistant_chat", { request }),
 };
