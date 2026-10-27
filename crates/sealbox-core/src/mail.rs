@@ -583,6 +583,184 @@ pub fn parse_fetch(raw: &str) -> Result<Vec<MailMessage>, MailFailure> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailBody {
+    pub text: String,
+    pub truncated: bool,
+}
+
+/// One IMAP round trip. `command` is a single tagged command line without the trailing CRLF;
+/// the implementation sends it and returns everything the server replied, up to and including
+/// the tagged completion line.
+pub trait ImapIo {
+    fn transact(&mut self, command: &str) -> Result<String, MailFailure>;
+}
+
+const MAX_BODY_BYTES: usize = 200 * 1024;
+
+/// IMAP quoted string. CR, LF and NUL cannot appear in a quoted string, so callers reject them first.
+fn quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        if ch == '\\' || ch == '"' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
+/// Checks the tagged completion line for `tag`. The completion is the last line of the reply,
+/// so the search runs backwards and message content earlier in the reply cannot spoof it.
+fn check_completion(response: &str, tag: &str, failure: MailFailure) -> Result<(), MailFailure> {
+    for line in response.lines().rev() {
+        let Some((line_tag, status)) = status_of(line) else { continue };
+        if line_tag == tag {
+            return match status.as_str() {
+                "OK" => Ok(()),
+                "NO" | "BAD" => Err(failure),
+                _ => Err(MailFailure::Protocol),
+            };
+        }
+    }
+    Err(MailFailure::Protocol)
+}
+
+/// Sends `A1 LOGIN` and `A2 EXAMINE INBOX`. EXAMINE opens the mailbox read-only so nothing is marked seen.
+fn open_inbox(io: &mut impl ImapIo, email: &str, auth: &str) -> Result<(), MailFailure> {
+    let unsafe_char = |ch: char| matches!(ch, '\r' | '\n' | '\0');
+    if email.contains(unsafe_char) || auth.contains(unsafe_char) {
+        return Err(MailFailure::Login);
+    }
+    let login = io.transact(&format!("A1 LOGIN {} {}", quote(email), quote(auth)))?;
+    check_completion(&login, "A1", MailFailure::Login)?;
+    let examine = io.transact("A2 EXAMINE INBOX")?;
+    check_completion(&examine, "A2", MailFailure::Protocol)
+}
+
+pub fn list_inbox(
+    io: &mut impl ImapIo,
+    email: &str,
+    auth: &str,
+    before: Option<u32>,
+    limit: usize,
+) -> Result<Vec<MailMessage>, MailFailure> {
+    open_inbox(io, email, auth)?;
+    let search = io.transact("A3 UID SEARCH ALL")?;
+    check_completion(&search, "A3", MailFailure::Protocol)?;
+    let uids = recent_uids(parse_search(&search)?, before, limit);
+    if uids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let set = uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+    let fetch = io.transact(&format!("A4 UID FETCH {set} (UID ENVELOPE BODYSTRUCTURE)"))?;
+    check_completion(&fetch, "A4", MailFailure::Protocol)?;
+    parse_fetch(&fetch)
+}
+
+/// Returns the `BODY[]` value of the FETCH response for `uid`.
+fn body_literal(raw: &str, uid: u32) -> Result<Vec<u8>, MailFailure> {
+    let mut cursor = Cursor { buf: raw.as_bytes(), pos: 0 };
+    while cursor.pos < cursor.buf.len() {
+        let Some(items) = cursor.fetch_list()? else {
+            cursor.rest_of_line();
+            continue;
+        };
+        if items.len() % 2 != 0 {
+            return Err(MailFailure::Protocol);
+        }
+        let mut found_uid = None;
+        let mut body = None;
+        for pair in items.chunks(2) {
+            let Item::Str(key) = &pair[0] else {
+                return Err(MailFailure::Protocol);
+            };
+            if key.eq_ignore_ascii_case(b"UID") {
+                found_uid = std::str::from_utf8(&text(&pair[1]).into_bytes())
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok());
+            } else if key.eq_ignore_ascii_case(b"BODY[]") {
+                body = Some(match &pair[1] {
+                    Item::Str(bytes) => bytes.clone(),
+                    Item::Nil => Vec::new(),
+                    Item::List(_) => return Err(MailFailure::Protocol),
+                });
+            }
+        }
+        // Skip unsolicited updates for other messages.
+        if found_uid.is_some_and(|found| found != uid) {
+            continue;
+        }
+        if let Some(body) = body {
+            return Ok(body);
+        }
+    }
+    Err(MailFailure::Protocol)
+}
+
+/// Splits a raw message on the first blank line into (headers, body).
+fn split_message(message: &[u8]) -> (&[u8], &[u8]) {
+    if let Some(body) = message.strip_prefix(b"\r\n").or_else(|| message.strip_prefix(b"\n")) {
+        return (&[], body);
+    }
+    let find = |needle: &[u8]| message.windows(needle.len()).position(|window| window == needle);
+    let split = match (find(b"\r\n\r\n"), find(b"\n\n")) {
+        (Some(crlf), Some(lf)) if lf < crlf => Some((lf, 2)),
+        (Some(crlf), _) => Some((crlf, 4)),
+        (None, Some(lf)) => Some((lf, 2)),
+        (None, None) => None,
+    };
+    match split {
+        Some((at, gap)) => (&message[..at], &message[at + gap..]),
+        None => (message, &[]),
+    }
+}
+
+/// True when the (possibly folded) Content-Type header names text/html.
+fn is_html(headers: &str) -> bool {
+    let mut fields: Vec<String> = Vec::new();
+    for line in headers.lines() {
+        match fields.last_mut() {
+            Some(last) if line.starts_with([' ', '\t']) => last.push_str(line),
+            _ => fields.push(line.to_string()),
+        }
+    }
+    fields.iter().any(|field| {
+        field.split_once(':').is_some_and(|(name, value)| {
+            name.trim().eq_ignore_ascii_case("content-type") && value.to_ascii_lowercase().contains("text/html")
+        })
+    })
+}
+
+pub fn fetch_body(io: &mut impl ImapIo, email: &str, auth: &str, uid: u32) -> Result<MailBody, MailFailure> {
+    open_inbox(io, email, auth)?;
+    let fetch = io.transact(&format!("A3 UID FETCH {uid} (BODY.PEEK[])"))?;
+    check_completion(&fetch, "A3", MailFailure::Protocol)?;
+    let message = body_literal(&fetch, uid)?;
+    let (headers, body) = split_message(&message);
+    let body = String::from_utf8_lossy(body);
+    let mut text = if is_html(&String::from_utf8_lossy(headers)) {
+        html_to_text(&body)
+    } else {
+        body.trim_end().to_string()
+    };
+    if text.trim().is_empty() {
+        return Err(MailFailure::EmptyText);
+    }
+    let truncated = text.len() > MAX_BODY_BYTES;
+    if truncated {
+        let mut end = MAX_BODY_BYTES;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    Ok(MailBody { text, truncated })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -650,5 +828,65 @@ mod tests {
         let messages = parse_fetch(raw).unwrap();
         assert!(messages[0].has_attachment);
         assert_eq!(messages[0].from, "Ada <ada@ex.com>");
+    }
+
+    struct ScriptIo {
+        steps: Vec<(&'static str, &'static str)>,
+        seen: Vec<String>,
+    }
+
+    impl ImapIo for ScriptIo {
+        fn transact(&mut self, command: &str) -> Result<String, MailFailure> {
+            self.seen.push(command.to_string());
+            let (expect, response) = self.steps.remove(0);
+            assert!(command.contains(expect), "{command}");
+            Ok(response.to_string())
+        }
+    }
+
+    #[test]
+    fn list_examines_inbox_and_fetches_only_the_newest_uids() {
+        let mut io = ScriptIo {
+            steps: vec![
+                ("LOGIN", "A1 OK\r\n"),
+                ("EXAMINE INBOX", "* FLAGS (\\Seen)\r\nA2 OK [READ-ONLY]\r\n"),
+                ("UID SEARCH ALL", "* SEARCH 1 2 3\r\nA3 OK\r\n"),
+                ("UID FETCH 2,3 (", "* 1 FETCH (UID 2 ENVELOPE (NIL \"One\" ((NIL NIL \"a\" \"b.com\")) NIL NIL NIL NIL NIL NIL) BODYSTRUCTURE (\"TEXT\" \"PLAIN\" NIL NIL NIL \"8BIT\" 1 1 NIL NIL NIL NIL))\r\n* 2 FETCH (UID 3 ENVELOPE (NIL \"Two\" ((NIL NIL \"c\" \"d.com\")) NIL NIL NIL NIL NIL NIL) BODYSTRUCTURE (\"TEXT\" \"PLAIN\" NIL NIL NIL \"8BIT\" 1 1 NIL NIL NIL NIL))\r\nA4 OK\r\n"),
+            ],
+            seen: vec![],
+        };
+        let page = list_inbox(&mut io, "me@qq.com", "auth-SECRET", None, 2).unwrap();
+        assert_eq!(page.iter().map(|message| message.uid).collect::<Vec<_>>(), vec![2, 3]);
+        assert!(io.seen.iter().all(|line| !line.contains("SELECT")));
+        assert!(io.seen[0].starts_with("A1 LOGIN"));
+        assert!(io.seen[1].contains("EXAMINE INBOX"));
+    }
+
+    #[test]
+    fn body_peeks_and_strips_html() {
+        let mut io = ScriptIo {
+            steps: vec![
+                ("LOGIN", "A1 OK\r\n"),
+                ("EXAMINE INBOX", "A2 OK [READ-ONLY]\r\n"),
+                ("BODY.PEEK[]", "* 1 FETCH (UID 9 BODY[] {40}\r\nContent-Type: text/html\r\n\r\n<p>你好</p>)\r\nA3 OK\r\n"),
+            ],
+            seen: vec![],
+        };
+        let body = fetch_body(&mut io, "me@gmail.com", "auth-SECRET", 9).unwrap();
+        assert_eq!(body.text, "你好");
+        assert!(!body.truncated);
+        assert!(io.seen.iter().any(|line| line.contains("BODY.PEEK[]")));
+        assert!(io.seen.iter().all(|line| !line.contains("BODY[]")));
+    }
+
+    #[test]
+    fn login_no_becomes_the_fixed_login_message() {
+        let mut io = ScriptIo {
+            steps: vec![("LOGIN", "A1 NO [AUTHENTICATIONFAILED]\r\n")],
+            seen: vec![],
+        };
+        let err = list_inbox(&mut io, "me@qq.com", "auth-SECRET", None, 50).unwrap_err();
+        assert_eq!(failure_message(err), "登录失败，请检查授权码和 IMAP 是否已开启");
+        assert!(!failure_message(err).contains("auth-SECRET"));
     }
 }
