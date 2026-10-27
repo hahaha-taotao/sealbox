@@ -2237,6 +2237,7 @@ mod tests {
 
     #[test]
     fn copy_owned_text_marks_clipboard_for_timed_clear() {
+        let _clipboard = clipboard::test_clipboard_lock();
         let secret = format!("sealbox-copy-token-{}", uuid::Uuid::new_v4());
         let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
         let mut session = Session::default();
@@ -2263,6 +2264,7 @@ mod tests {
 
     #[test]
     fn copy_untracked_text_works_while_locked_and_clears_secret_mark() {
+        let _clipboard = clipboard::test_clipboard_lock();
         let secret = format!("sealbox-copy-secret-{}", uuid::Uuid::new_v4());
         let path = format!(
             "C:\\\\Users\\\\sealbox\\\\extension-{}",
@@ -2284,6 +2286,7 @@ mod tests {
 
     #[test]
     fn security_tick_clears_owned_clipboard_without_a_window() {
+        let _clipboard = clipboard::test_clipboard_lock();
         let secret = format!("sealbox-tick-clipboard-{}", uuid::Uuid::new_v4());
         let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
         let mut session = Session::default();

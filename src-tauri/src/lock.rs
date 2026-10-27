@@ -123,6 +123,7 @@ mod tests {
 
     #[test]
     fn emergency_lock_zeroizes_registered_session() {
+        let _clipboard = crate::clipboard::test_clipboard_lock();
         let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
@@ -135,6 +136,7 @@ mod tests {
 
     #[test]
     fn emergency_lock_does_not_deadlock_when_session_is_held() {
+        let _clipboard = crate::clipboard::test_clipboard_lock();
         let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
         let mut session = Session::default();
         session.set_unlocked(vault, dek);

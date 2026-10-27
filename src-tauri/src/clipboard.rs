@@ -34,3 +34,10 @@ pub fn read_text() -> Result<String, String> {
 pub fn clear() -> Result<(), String> {
     write_text("")
 }
+
+/// 测试里会真实读写系统剪贴板，必须串行执行，否则并行测试互相覆盖剪贴板内容会随机失败。
+#[cfg(test)]
+pub(crate) fn test_clipboard_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}

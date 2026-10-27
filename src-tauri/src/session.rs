@@ -265,6 +265,7 @@ mod tests {
 
     #[test]
     fn lock_clears_owned_os_clipboard_before_deadline() {
+        let _clipboard = crate::clipboard::test_clipboard_lock();
         let secret = format!("sealbox-lock-clipboard-test-{}", std::process::id());
         match crate::clipboard::write_text(&secret) {
             Ok(()) => {}
@@ -298,6 +299,7 @@ mod tests {
 
     #[test]
     fn lock_does_not_clear_unrelated_clipboard() {
+        let _clipboard = crate::clipboard::test_clipboard_lock();
         let ours = "sealbox-owned-secret";
         let theirs = "user-copied-other-text";
         match crate::clipboard::write_text(theirs) {
