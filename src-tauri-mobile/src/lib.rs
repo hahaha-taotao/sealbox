@@ -85,6 +85,8 @@ pub fn run() {
             commands::mail_accounts,
             commands::mail_list,
             commands::mail_body,
+            commands::mail_attachments,
+            commands::mail_save_attachment,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

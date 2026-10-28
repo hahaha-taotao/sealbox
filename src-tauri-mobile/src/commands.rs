@@ -1107,6 +1107,22 @@ pub fn mail_list(state: State<AppState>, request: MailListRequest) -> Result<Vec
     Ok(messages)
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailAttachmentRequest {
+    pub entry_id: String,
+    pub uid: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailSaveAttachmentRequest {
+    pub entry_id: String,
+    pub uid: u32,
+    pub part: String,
+    pub path: String,
+}
+
 #[tauri::command]
 pub fn mail_body(state: State<AppState>, request: MailBodyRequest) -> Result<sealbox_core::mail::MailBody, String> {
     let (email, provider, auth_code) = load_mail_auth(&state, &request.entry_id)?;
@@ -1121,6 +1137,46 @@ pub fn mail_body(state: State<AppState>, request: MailBodyRequest) -> Result<sea
     let session = lock_session(&state.session);
     session.vault().map_err(map_err)?.audit("mail_body", Some(&request.entry_id), "").map_err(map_err)?;
     Ok(body)
+}
+
+#[tauri::command]
+pub fn mail_attachments(
+    state: State<AppState>,
+    request: MailAttachmentRequest,
+) -> Result<Vec<sealbox_core::mail::MailAttachment>, String> {
+    let (email, provider, auth_code) = load_mail_auth(&state, &request.entry_id)?;
+    let Some((host, port)) = sealbox_core::mail::endpoint(&provider) else {
+        return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
+    };
+    let mut io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
+        .map_err(sealbox_core::mail::failure_message)?;
+    let attachments = sealbox_core::mail::list_attachments(&mut io, &email, &auth_code, request.uid)
+        .map_err(sealbox_core::mail::failure_message)?;
+    drop(auth_code);
+    let session = lock_session(&state.session);
+    session.vault().map_err(map_err)?.audit("mail_attachments", Some(&request.entry_id), "").map_err(map_err)?;
+    Ok(attachments)
+}
+
+#[tauri::command]
+pub fn mail_save_attachment(state: State<AppState>, request: MailSaveAttachmentRequest) -> Result<u64, String> {
+    let (email, provider, auth_code) = load_mail_auth(&state, &request.entry_id)?;
+    let Some((host, port)) = sealbox_core::mail::endpoint(&provider) else {
+        return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
+    };
+    let mut io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
+        .map_err(sealbox_core::mail::failure_message)?;
+    let bytes = sealbox_core::mail::fetch_attachment(&mut io, &email, &auth_code, request.uid, &request.part)
+        .map_err(sealbox_core::mail::failure_message)?;
+    drop(auth_code);
+    let saved = sealbox_core::mail::write_exclusive(&request.path, &bytes).map_err(str::to_string)?;
+    let session = lock_session(&state.session);
+    session
+        .vault()
+        .map_err(map_err)?
+        .audit("mail_save_attachment", Some(&request.entry_id), &format!("part={}", request.part))
+        .map_err(map_err)?;
+    Ok(saved)
 }
 
 #[tauri::command]

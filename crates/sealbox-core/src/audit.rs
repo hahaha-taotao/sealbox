@@ -41,6 +41,10 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("mcp_github_denied", "GitHub 调用未成功"),
     ("mcp_zoomkey", "ZoomKey 调用"),
     ("mcp_zoomkey_denied", "ZoomKey 调用未成功"),
+    ("mail_attachments", "查看邮件附件"),
+    ("mail_save_attachment", "保存邮件附件"),
+    ("mcp_mail", "邮箱 MCP 调用"),
+    ("mcp_mail_denied", "邮箱 MCP 调用未成功"),
 ];
 
 const TOOLS: &[(&str, &str)] = &[
@@ -266,6 +270,13 @@ pub fn format_event(raw: AuditEvent) -> AuditDisplay {
                     description.push_str(&format!("；{name}：{value}"));
                 }
             }
+        }
+    } else if matches!(raw.action.as_str(), "mcp_mail" | "mcp_mail_denied") {
+        description = operation.clone();
+        if raw.detail.contains("decision=allow") && raw.action == "mcp_mail" {
+            result = "success";
+        } else if raw.detail.contains("decision=deny") && raw.action == "mcp_mail_denied" {
+            result = "failure";
         }
     } else {
         let d = raw.detail.as_str();

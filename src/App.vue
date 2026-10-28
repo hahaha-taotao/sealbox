@@ -31,6 +31,7 @@ import {
   type FolderDto,
   type ListFilter,
   type MailAccount,
+  type MailAttachment,
   type MailMessage,
   type McpStatus,
   type McpToolInfo,
@@ -63,6 +64,8 @@ const mailBusy = ref(false);
 const mailBodyBusy = ref(false);
 const mailError = ref("");
 const mailOlderError = ref("");
+const mailAttachments = ref<MailAttachment[]>([]);
+const mailAttachmentBusy = ref("");
 let mailSeq = 0;
 let mailBodySeq = 0;
 // 每个 srcdoc 文档只挂一次链接转发监听；文档换掉后自然失效。
@@ -1792,6 +1795,8 @@ function applyLockedUi() {
   mailRemoteImages.value = false;
   mailImagesAllowed.value = false;
   mailTruncated.value = false;
+  mailAttachments.value = [];
+  mailAttachmentBusy.value = "";
   mailBodyBusy.value = false;
   mailError.value = "";
   mailOlderError.value = "";
@@ -1839,6 +1844,8 @@ async function openMail() {
       mailHtmlSource.value = "";
       mailRemoteImages.value = false;
       mailImagesAllowed.value = false;
+      mailAttachments.value = [];
+      mailAttachmentBusy.value = "";
     }
   } catch (e) {
     if (seq === mailSeq) mailError.value = String(e);
@@ -1860,6 +1867,8 @@ async function loadMail(entryId: string, seq = ++mailSeq) {
   mailRemoteImages.value = false;
   mailImagesAllowed.value = false;
   mailTruncated.value = false;
+  mailAttachments.value = [];
+  mailAttachmentBusy.value = "";
   try {
     const messages = await api.mailList(entryId);
     if (seq !== mailSeq) return;
@@ -1903,21 +1912,64 @@ async function openMailMessage(uid: number) {
   mailRemoteImages.value = false;
   mailImagesAllowed.value = false;
   mailTruncated.value = false;
+  mailAttachments.value = [];
+  mailAttachmentBusy.value = "";
   mailError.value = "";
   mailBodyBusy.value = true;
   try {
-    const body = await api.mailBody(entryId, uid);
+    const [bodyResult, attachmentResult] = await Promise.allSettled([
+      api.mailBody(entryId, uid),
+      api.mailAttachments(entryId, uid),
+    ]);
     if (seq !== mailBodySeq) return;
-    mailBody.value = body.text;
-    mailHtmlSource.value = body.html ?? "";
-    mailRemoteImages.value = body.html ? hasRemoteImages(body.html) : false;
-    mailImagesAllowed.value = false;
-    mailHtml.value = body.html ? buildMailDocument(body.html) : "";
-    mailTruncated.value = body.truncated;
+    if (bodyResult.status === "fulfilled") {
+      const body = bodyResult.value;
+      mailBody.value = body.text;
+      mailHtmlSource.value = body.html ?? "";
+      mailRemoteImages.value = body.html ? hasRemoteImages(body.html) : false;
+      mailImagesAllowed.value = false;
+      mailHtml.value = body.html ? buildMailDocument(body.html) : "";
+      mailTruncated.value = body.truncated;
+    } else {
+      mailError.value = String(bodyResult.reason);
+    }
+    if (attachmentResult.status === "fulfilled") {
+      mailAttachments.value = attachmentResult.value;
+    } else if (!mailError.value) {
+      mailError.value = String(attachmentResult.reason);
+    }
   } catch (e) {
     if (seq === mailBodySeq) mailError.value = String(e);
   } finally {
     if (seq === mailBodySeq) mailBodyBusy.value = false;
+  }
+}
+
+function formatMailSize(size: number | null): string {
+  if (size == null) return "大小未知";
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+async function downloadMailAttachment(item: MailAttachment) {
+  const entryId = mailAccountId.value;
+  const uid = mailSelectedUid.value;
+  if (!entryId || uid == null || mailAttachmentBusy.value) return;
+  const seq = mailBodySeq;
+  const filename = item.filename.split(/[/\\]/).filter(Boolean).pop() || "attachment";
+  try {
+    const picked = await withNativeDialog(async () => {
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      return save({ defaultPath: filename });
+    });
+    if (!picked || seq !== mailBodySeq) return;
+    mailAttachmentBusy.value = item.part;
+    await api.mailSaveAttachment(entryId, uid, item.part, picked);
+  } catch (e) {
+    if (seq === mailBodySeq) mailError.value = String(e);
+  } finally {
+    if (seq === mailBodySeq) mailAttachmentBusy.value = "";
   }
 }
 
@@ -3012,9 +3064,18 @@ onMounted(async () => {
                   <dd>{{ mailSelected?.date || "(未知时间)" }}</dd>
                   <dt>收件人</dt>
                   <dd>{{ mailRecipient || "(当前授权码)" }}</dd>
-                  <template v-if="mailSelected?.hasAttachment">
+                  <template v-if="mailAttachments.length">
                     <dt>附件</dt>
-                    <dd>有附件（只读，不下载）</dd>
+                    <dd>
+                      <ul class="mail-attachments">
+                        <li v-for="item in mailAttachments" :key="item.part">
+                          <span>{{ item.filename }}</span>
+                          <span>{{ item.mime }}</span>
+                          <span>{{ formatMailSize(item.size) }}</span>
+                          <button class="btn" type="button" :disabled="mailAttachmentBusy === item.part" @click="downloadMailAttachment(item)">下载</button>
+                        </li>
+                      </ul>
+                    </dd>
                   </template>
                 </dl>
                 <p v-if="mailTruncated" class="crumb">正文过长，已截断。</p>

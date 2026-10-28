@@ -64,7 +64,7 @@ npm run tauri build
 - **MCP** — 本机 `127.0.0.1` 服务；GitHub MCP 提供只读 API、本地 git 和工作区短名；Issue、PR、Release、文件、ref、Actions 和 secret 写入另有独立开关，且每次弹出桌面确认。ZoomKey 提供受限的 JIRA / CRM 只读工具。模型可用 Token 标题或默认凭据，不必先抄 UUID
 - **客户端证书 Client cert** — 保险库里可以导入 mTLS 用的客户端证书与私钥（PEM），由 Rust 侧限长、解析并校验证书/私钥匹配后加密保存，随金库一起备份；列表和速查不会显示或复制私钥，锁定时会清理 TLS 运行时缓存
 - **插件 Plugin** — Chrome / Edge 从客户端安装后按当前网址填充、填 TOTP 或一键登记；在侧栏「插件」页配对
-- **邮箱 Mail** — 用已保存的 QQ / Gmail 授权码只读打开 INBOX，默认最近 50 封，可继续加载更早；正文按需读取并转成纯文本。不发信、不删信、不标已读、不下载附件。163、Outlook 和自定义邮箱只显示、不连接。
+- **邮箱 Mail** — 用已保存的 QQ / Gmail 授权码只读打开 INBOX，默认最近 50 封，可继续加载更早；正文按需读取并转成纯文本。可以下载附件。金库解锁后，MCP 提供 mail_accounts、mail_list、mail_read、mail_download_attachment。仍不发信、不删信、不标已读。163、Outlook 和自定义邮箱只显示、不连接。
 
 ## 安全模型 Security
 

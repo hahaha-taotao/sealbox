@@ -187,7 +187,268 @@ fn tools_list(session: &Mutex<Session>) -> Value {
         tools.extend(github_mcp::tool_definitions_for_mcp());
     }
     tools.extend(zoomkey_tools);
+    tools.extend(mail_tool_definitions());
     json!({ "tools": tools })
+}
+
+fn mail_tool_definitions() -> Vec<Value> {
+    let annotations = github_mcp::annotations(true, false);
+    let entry = json!({"type": "string", "minLength": 1, "maxLength": 128});
+    let uid = json!({"type": "integer", "minimum": 1, "maximum": 4294967295u64});
+    vec![
+        json!({
+            "name": "mail_accounts",
+            "description": "列出已保存的邮箱账号（id、标题、地址、服务商、是否支持）。不含授权码。",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
+            "readOnly": true,
+            "risk": "low",
+            "annotations": annotations.clone()
+        }),
+        json!({
+            "name": "mail_list",
+            "description": "只读列出邮箱收件箱，最多 50 封。beforeUid 表示只取比它更早的邮件。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"entryId": entry.clone(), "beforeUid": uid.clone()},
+                "required": ["entryId"],
+                "additionalProperties": false
+            },
+            "readOnly": true,
+            "risk": "low",
+            "annotations": annotations.clone()
+        }),
+        json!({
+            "name": "mail_read",
+            "description": "只读读取一封邮件的纯文本和附件清单。不返回 HTML，不下载附件。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"entryId": entry.clone(), "uid": uid.clone()},
+                "required": ["entryId", "uid"],
+                "additionalProperties": false
+            },
+            "readOnly": true,
+            "risk": "low",
+            "annotations": annotations.clone()
+        }),
+        json!({
+            "name": "mail_download_attachment",
+            "description": "把一封邮件的一个附件保存到已有目录中的新文件。不覆盖已有文件。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "entryId": entry,
+                    "uid": uid.clone(),
+                    "part": {"type": "string", "minLength": 1, "maxLength": 32},
+                    "path": {"type": "string", "minLength": 1, "maxLength": 1024}
+                },
+                "required": ["entryId", "uid", "part", "path"],
+                "additionalProperties": false
+            },
+            "readOnly": true,
+            "risk": "low",
+            "annotations": annotations
+        }),
+    ]
+}
+
+fn mail_audit_detail(operation: &str, decision: &str, reason: &str, entry: &str, uid: &str, part: &str) -> String {
+    fn token(value: &str) -> String {
+        let cleaned: String = value
+            .chars()
+            .filter(|ch| !ch.is_whitespace() && *ch != '=')
+            .take(64)
+            .collect();
+        if cleaned.is_empty() { "-".into() } else { cleaned }
+    }
+    format!(
+        "operation={} decision={} reason={} entry={} uid={} part={}",
+        token(operation),
+        token(decision),
+        token(reason),
+        token(entry),
+        token(uid),
+        token(part)
+    )
+}
+
+fn mail_reason(message: &str) -> &'static str {
+    match message {
+        "登录失败，请检查授权码和 IMAP 是否已开启" => "login",
+        "连接超时，请稍后重试" => "protocol",
+        "这封邮件没有可显示的文本" => "empty",
+        "首版不支持" => "unsupported",
+        "附件过大，已拒绝下载" => "too_large",
+        "无法保存附件" => "save",
+        "不是邮箱授权码" => "not_mail",
+        "参数无效" => "validation",
+        _ if message.contains("锁定") => "locked",
+        _ => "error",
+    }
+}
+
+fn mail_arg_str<'a>(args: &'a Value, key: &str, required: bool) -> Result<Option<&'a str>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) if !required => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() => Ok(Some(value)),
+        _ => Err("参数无效".into()),
+    }
+}
+
+fn mail_arg_u32(args: &Value, key: &str, required: bool) -> Result<Option<u32>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) if !required => Ok(None),
+        Some(Value::Number(number)) => {
+            let value = number.as_u64().filter(|value| (1..=u32::MAX as u64).contains(value));
+            value.map(|value| Some(value as u32)).ok_or_else(|| "参数无效".into())
+        }
+        _ => Err("参数无效".into()),
+    }
+}
+
+fn ensure_mail_keys(args: &Value, allowed: &[&str]) -> Result<(), String> {
+    let object = args.as_object().ok_or("参数无效")?;
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err("参数无效".into());
+    }
+    Ok(())
+}
+
+fn load_mail_secret(session: &crate::session::Session, entry_id: &str) -> Result<(String, String, zeroize::Zeroizing<String>), String> {
+    let dek = *session.dek().map_err(|error| error.to_string())?;
+    let payload = session
+        .vault()
+        .map_err(|error| error.to_string())?
+        .get_active_secret(&dek, entry_id)
+        .map_err(|error| error.to_string())?;
+    match payload {
+        crate::vault::SecretPayload::MailAuth { email, provider, auth_code } => {
+            Ok((email, provider, zeroize::Zeroizing::new(auth_code)))
+        }
+        _ => Err("不是邮箱授权码".into()),
+    }
+}
+
+fn call_mail_tool(session: &Mutex<Session>, name: &str, args: Value) -> Result<String, String> {
+    let entry = args.get("entryId").and_then(Value::as_str).unwrap_or("-").to_string();
+    let uid = args
+        .get("uid")
+        .and_then(Value::as_u64)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".into());
+    let part = args.get("part").and_then(Value::as_str).unwrap_or("-").to_string();
+    let result = call_mail_inner(session, name, &args);
+    if let Ok(vault) = lock_session(session).vault() {
+        let (decision, reason, action) = match &result {
+            Ok(_) => ("allow", "ok", "mcp_mail"),
+            Err(error) => ("deny", mail_reason(error), "mcp_mail_denied"),
+        };
+        let _ = vault.audit(
+            action,
+            None,
+            &mail_audit_detail(name, decision, reason, &entry, &uid, &part),
+        );
+    }
+    result
+}
+
+fn call_mail_inner(session: &Mutex<Session>, name: &str, args: &Value) -> Result<String, String> {
+    match name {
+        "mail_accounts" => {
+            ensure_mail_keys(args, &[])?;
+            let session = lock_session(session);
+            let dek = *session.dek().map_err(|error| error.to_string())?;
+            let vault = session.vault().map_err(|error| error.to_string())?;
+            let entries = vault
+                .list_entries(&crate::vault::ListFilter {
+                    kind: Some(crate::vault::EntryKind::MailAuth),
+                    ..crate::vault::ListFilter::default()
+                })
+                .map_err(|error| error.to_string())?;
+            let mut accounts = Vec::new();
+            for entry in entries {
+                let payload = vault.get_active_secret(&dek, &entry.id).map_err(|error| error.to_string())?;
+                let crate::vault::SecretPayload::MailAuth { email, provider, auth_code } = payload else {
+                    return Err("不是邮箱授权码".into());
+                };
+                drop(auth_code);
+                accounts.push(sealbox_core::mail::MailAccount {
+                    id: entry.id,
+                    title: entry.title,
+                    email,
+                    provider: provider.clone(),
+                    supported: sealbox_core::mail::endpoint(&provider).is_some(),
+                });
+            }
+            serde_json::to_string(&accounts).map_err(|_| "参数无效".into())
+        }
+        "mail_list" => {
+            ensure_mail_keys(args, &["entryId", "beforeUid"])?;
+            let entry_id = mail_arg_str(args, "entryId", true)?.unwrap_or("");
+            let before = mail_arg_u32(args, "beforeUid", false)?;
+            let (email, provider, auth_code) = {
+                let session = lock_session(session);
+                load_mail_secret(&session, entry_id)?
+            };
+            let Some((host, port)) = sealbox_core::mail::endpoint(&provider) else {
+                return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
+            };
+            let mut io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
+                .map_err(sealbox_core::mail::failure_message)?;
+            let messages = sealbox_core::mail::list_inbox(&mut io, &email, &auth_code, before, 50)
+                .map_err(sealbox_core::mail::failure_message)?;
+            drop(auth_code);
+            serde_json::to_string(&messages).map_err(|_| "参数无效".into())
+        }
+        "mail_read" => {
+            ensure_mail_keys(args, &["entryId", "uid"])?;
+            let entry_id = mail_arg_str(args, "entryId", true)?.unwrap_or("");
+            let uid = mail_arg_u32(args, "uid", true)?.ok_or("参数无效")?;
+            let (email, provider, auth_code) = {
+                let session = lock_session(session);
+                load_mail_secret(&session, entry_id)?
+            };
+            let Some((host, port)) = sealbox_core::mail::endpoint(&provider) else {
+                return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
+            };
+            let mut text_io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
+                .map_err(sealbox_core::mail::failure_message)?;
+            let body = sealbox_core::mail::fetch_body(&mut text_io, &email, &auth_code, uid)
+                .map_err(sealbox_core::mail::failure_message)?;
+            let mut list_io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
+                .map_err(sealbox_core::mail::failure_message)?;
+            let attachments = sealbox_core::mail::list_attachments(&mut list_io, &email, &auth_code, uid)
+                .map_err(sealbox_core::mail::failure_message)?;
+            drop(auth_code);
+            serde_json::to_string(&json!({
+                "text": body.text,
+                "truncated": body.truncated,
+                "attachments": attachments
+            }))
+            .map_err(|_| "参数无效".into())
+        }
+        "mail_download_attachment" => {
+            ensure_mail_keys(args, &["entryId", "uid", "part", "path"])?;
+            let entry_id = mail_arg_str(args, "entryId", true)?.unwrap_or("");
+            let uid = mail_arg_u32(args, "uid", true)?.ok_or("参数无效")?;
+            let part = mail_arg_str(args, "part", true)?.unwrap_or("").to_string();
+            let path = mail_arg_str(args, "path", true)?.unwrap_or("").to_string();
+            let (email, provider, auth_code) = {
+                let session = lock_session(session);
+                load_mail_secret(&session, entry_id)?
+            };
+            let Some((host, port)) = sealbox_core::mail::endpoint(&provider) else {
+                return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
+            };
+            let mut io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
+                .map_err(sealbox_core::mail::failure_message)?;
+            let bytes = sealbox_core::mail::fetch_attachment(&mut io, &email, &auth_code, uid, &part)
+                .map_err(sealbox_core::mail::failure_message)?;
+            drop(auth_code);
+            let saved = sealbox_core::mail::write_exclusive(&path, &bytes).map_err(str::to_string)?;
+            serde_json::to_string(&json!({"bytes": saved, "path": path})).map_err(|_| "参数无效".into())
+        }
+        _ => Err(format!("未知工具 {name}")),
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -445,6 +706,12 @@ fn call_tool(
         return result
             .map(|result| result.text)
             .map_err(|error| error.message);
+    }
+    if matches!(
+        name,
+        "mail_accounts" | "mail_list" | "mail_read" | "mail_download_attachment"
+    ) {
+        return call_mail_tool(session, name, args);
     }
     if crate::zoomkey::is_zoomkey_tool(name) {
         let result = {
@@ -784,6 +1051,9 @@ mod tests {
             .filter_map(|tool| tool["name"].as_str())
             .collect::<Vec<_>>();
         assert!(!names.iter().any(|name| name.starts_with("github_")));
+        for name in ["mail_accounts", "mail_list", "mail_read", "mail_download_attachment"] {
+            assert!(names.contains(&name), "missing {name}");
+        }
     }
 
     fn github_tool_names(enabled: bool) -> Vec<String> {

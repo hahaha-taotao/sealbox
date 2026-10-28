@@ -118,6 +118,8 @@ pub fn run() {
             commands::mail_accounts,
             commands::mail_list,
             commands::mail_body,
+            commands::mail_attachments,
+            commands::mail_save_attachment,
             commands::window_control,
             commands::confirm_payload,
             commands::confirm_respond,

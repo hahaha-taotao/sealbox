@@ -12,6 +12,7 @@ pub enum MailFailure {
     EmptyText,
     Protocol,
     Unsupported,
+    TooLarge,
 }
 
 pub fn endpoint(provider: &str) -> Option<(&'static str, u16)> {
@@ -38,6 +39,7 @@ pub fn failure_message(failure: MailFailure) -> &'static str {
         MailFailure::Timeout | MailFailure::Protocol => "连接超时，请稍后重试",
         MailFailure::EmptyText => "这封邮件没有可显示的文本",
         MailFailure::Unsupported => "首版不支持",
+        MailFailure::TooLarge => "附件过大，已拒绝下载",
     }
 }
 
@@ -607,6 +609,15 @@ pub struct MailBody {
     /// in a sandboxed frame, so it must not be flattened here.
     pub html: Option<String>,
     pub truncated: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailAttachment {
+    pub part: String,
+    pub filename: String,
+    pub mime: String,
+    pub size: Option<u32>,
 }
 
 /// One IMAP round trip. `command` is a single tagged command line without the trailing CRLF;
@@ -1299,6 +1310,322 @@ pub fn fetch_body(io: &mut impl ImapIo, email: &str, auth: &str, uid: u32) -> Re
     let html_limit = MAX_BODY_BYTES.saturating_add(inlined);
     let html_cut = html.as_mut().is_some_and(|value| truncate_at_boundary(value, html_limit));
     Ok(MailBody { text, html, truncated: text_cut || html_cut })
+}
+
+const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
+
+fn child_part(parent: &str, index: u32) -> String {
+    if parent.is_empty() {
+        index.to_string()
+    } else {
+        format!("{parent}.{index}")
+    }
+}
+
+fn media_pair(fields: &[Item]) -> Option<(String, String)> {
+    let Item::Str(_) = fields.first()? else {
+        return None;
+    };
+    let kind = text(&fields[0]);
+    if kind.is_empty() {
+        return None;
+    }
+    let subtype = fields.get(1).map(text).unwrap_or_default();
+    Some((kind, subtype))
+}
+
+fn octets(fields: &[Item]) -> Option<u32> {
+    let Item::Str(bytes) = fields.get(6)? else {
+        return None;
+    };
+    std::str::from_utf8(bytes).ok()?.parse().ok()
+}
+
+fn param_value(item: &Item, name: &str) -> Option<String> {
+    let Item::List(pairs) = item else {
+        return None;
+    };
+    let mut index = 0;
+    while index + 1 < pairs.len() {
+        if text(&pairs[index]).eq_ignore_ascii_case(name) {
+            let value = decode_header(&text(&pairs[index + 1]));
+            if !value.is_empty() {
+                return Some(value);
+            }
+        }
+        index += 2;
+    }
+    None
+}
+
+fn find_disposition(fields: &[Item]) -> Option<(String, Item)> {
+    for field in fields {
+        let Item::List(pair) = field else {
+            continue;
+        };
+        let Some(Item::Str(kind)) = pair.first() else {
+            continue;
+        };
+        let kind = String::from_utf8_lossy(kind).to_ascii_lowercase();
+        if kind == "attachment" || kind == "inline" {
+            let params = pair.get(1).map(clone_item).unwrap_or(Item::Nil);
+            return Some((kind, params));
+        }
+    }
+    None
+}
+
+fn attachment_filename(part: &str, fields: &[Item], disposition: Option<&(String, Item)>) -> String {
+    let from_disposition = disposition.and_then(|(_, params)| param_value(params, "filename"));
+    let from_type = fields.get(2).and_then(|params| param_value(params, "name"));
+    from_disposition
+        .filter(|name| !name.trim().is_empty())
+        .or(from_type)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| format!("attachment-{part}"))
+}
+
+fn attachment_of(part: &str, fields: &[Item]) -> Option<MailAttachment> {
+    let (kind, subtype) = media_pair(fields)?;
+    let kind_up = kind.to_ascii_uppercase();
+    let subtype_l = subtype.to_ascii_lowercase();
+    if kind_up == "TEXT" && matches!(subtype_l.as_str(), "plain" | "html") {
+        return None;
+    }
+    let disposition = find_disposition(fields);
+    let marked = disposition.as_ref().is_some_and(|(kind, _)| kind == "attachment");
+    let typed = matches!(kind_up.as_str(), "APPLICATION" | "IMAGE" | "AUDIO" | "VIDEO");
+    if !marked && !typed {
+        return None;
+    }
+    Some(MailAttachment {
+        part: part.to_string(),
+        filename: attachment_filename(part, fields, disposition.as_ref()),
+        mime: format!("{}/{}", kind.to_ascii_lowercase(), subtype_l),
+        size: octets(fields),
+    })
+}
+
+fn each_leaf(item: &Item, part: &str, visit: &mut dyn FnMut(&str, &[Item])) {
+    let Item::List(fields) = item else {
+        return;
+    };
+    if matches!(fields.first(), Some(Item::List(_))) {
+        let mut index = 0u32;
+        for field in fields {
+            if !matches!(field, Item::List(_)) {
+                break;
+            }
+            index += 1;
+            let child = child_part(part, index);
+            each_leaf(field, &child, visit);
+        }
+        return;
+    }
+    if let Some((kind, subtype)) = media_pair(fields) {
+        if kind.eq_ignore_ascii_case("message") && subtype.eq_ignore_ascii_case("rfc822") {
+            if let Some(nested) = fields.get(8) {
+                let nested_is_multipart = matches!(nested, Item::List(inner) if matches!(inner.first(), Some(Item::List(_))));
+                if nested_is_multipart {
+                    each_leaf(nested, part, visit);
+                } else {
+                    let child = child_part(part, 1);
+                    each_leaf(nested, &child, visit);
+                }
+            }
+        }
+    }
+    if !part.is_empty() {
+        visit(part, fields);
+    }
+}
+
+fn walk_body(body: &Item, visit: &mut dyn FnMut(&str, &[Item])) {
+    let Item::List(fields) = body else {
+        return;
+    };
+    let root = if matches!(fields.first(), Some(Item::List(_))) {
+        ""
+    } else {
+        "1"
+    };
+    each_leaf(body, root, visit);
+}
+
+fn clone_item(item: &Item) -> Item {
+    match item {
+        Item::Nil => Item::Nil,
+        Item::Str(bytes) => Item::Str(bytes.clone()),
+        Item::List(items) => Item::List(items.iter().map(clone_item).collect()),
+    }
+}
+
+fn fetch_item(raw: &str, uid: u32, mut key_is: impl FnMut(&[u8]) -> bool) -> Result<Option<Item>, MailFailure> {
+    let mut cursor = Cursor { buf: raw.as_bytes(), pos: 0 };
+    while cursor.pos < cursor.buf.len() {
+        let Some(items) = cursor.fetch_list()? else {
+            cursor.rest_of_line();
+            continue;
+        };
+        if items.len() % 2 != 0 {
+            return Err(MailFailure::Protocol);
+        }
+        let mut found_uid = None;
+        let mut matched = None;
+        for pair in items.chunks(2) {
+            let Item::Str(key) = &pair[0] else {
+                return Err(MailFailure::Protocol);
+            };
+            if key.eq_ignore_ascii_case(b"UID") {
+                found_uid = std::str::from_utf8(&text(&pair[1]).into_bytes())
+                    .ok()
+                    .and_then(|value| value.parse::<u32>().ok());
+            } else if key_is(key) {
+                matched = Some(clone_item(&pair[1]));
+            }
+        }
+        if found_uid.is_some_and(|found| found != uid) {
+            continue;
+        }
+        if matched.is_some() {
+            return Ok(matched);
+        }
+    }
+    Ok(None)
+}
+
+fn item_bytes(item: Item) -> Result<Vec<u8>, MailFailure> {
+    match item {
+        Item::Str(bytes) => Ok(bytes),
+        Item::Nil => Ok(Vec::new()),
+        Item::List(_) => Err(MailFailure::Protocol),
+    }
+}
+
+fn read_structure(io: &mut impl ImapIo, email: &str, auth: &str, uid: u32) -> Result<Item, MailFailure> {
+    open_inbox(io, email, auth)?;
+    let response = io.transact(&format!("A3 UID FETCH {uid} (BODYSTRUCTURE)"))?;
+    check_completion(&response, "A3", MailFailure::Protocol)?;
+    fetch_item(&response, uid, |key| key.eq_ignore_ascii_case(b"BODYSTRUCTURE"))?
+        .ok_or(MailFailure::Protocol)
+}
+
+pub fn list_attachments(
+    io: &mut impl ImapIo,
+    email: &str,
+    auth: &str,
+    uid: u32,
+) -> Result<Vec<MailAttachment>, MailFailure> {
+    let structure = read_structure(io, email, auth, uid)?;
+    let mut attachments = Vec::new();
+    walk_body(&structure, &mut |part, fields| {
+        if let Some(attachment) = attachment_of(part, fields) {
+            attachments.push(attachment);
+        }
+    });
+    Ok(attachments)
+}
+
+fn valid_section(part: &str) -> bool {
+    let mut segments = 0usize;
+    if part.is_empty() {
+        return false;
+    }
+    for segment in part.split('.') {
+        segments += 1;
+        let bytes = segment.as_bytes();
+        if !(1..=4).contains(&bytes.len()) || bytes[0] == b'0' || !bytes.iter().all(u8::is_ascii_digit) {
+            return false;
+        }
+    }
+    (1..=6).contains(&segments)
+}
+
+fn leaf_size(body: &Item, part: &str) -> Option<u32> {
+    let mut found = None;
+    walk_body(body, &mut |current, fields| {
+        if current == part {
+            found = octets(fields);
+        }
+    });
+    found
+}
+
+fn ensure_attachment_len(len: usize) -> Result<(), MailFailure> {
+    if len > MAX_ATTACHMENT_BYTES {
+        Err(MailFailure::TooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+pub fn fetch_attachment(
+    io: &mut impl ImapIo,
+    email: &str,
+    auth: &str,
+    uid: u32,
+    part: &str,
+) -> Result<Vec<u8>, MailFailure> {
+    if !valid_section(part) {
+        return Err(MailFailure::Protocol);
+    }
+    let structure = read_structure(io, email, auth, uid)?;
+    if leaf_size(&structure, part).is_some_and(|size| size as usize > MAX_ATTACHMENT_BYTES) {
+        return Err(MailFailure::TooLarge);
+    }
+    let response = io.transact(&format!(
+        "A4 UID FETCH {uid} (BODY.PEEK[{part}] BODY.PEEK[{part}.MIME])"
+    ))?;
+    check_completion(&response, "A4", MailFailure::Protocol)?;
+    let body_key = format!("BODY[{part}]");
+    let mime_key = format!("BODY[{part}.MIME]");
+    let body = fetch_item(&response, uid, |key| key.eq_ignore_ascii_case(body_key.as_bytes()))?
+        .ok_or(MailFailure::Protocol)?;
+    let bytes = item_bytes(body)?;
+    ensure_attachment_len(bytes.len())?;
+    let headers = match fetch_item(&response, uid, |key| key.eq_ignore_ascii_case(mime_key.as_bytes()))? {
+        Some(item) => item_bytes(item)?,
+        None => Vec::new(),
+    };
+    let fields = parse_header_fields(&String::from_utf8_lossy(&headers));
+    let encoding = header_value(&fields, "content-transfer-encoding").unwrap_or_default();
+    let decoded = decode_transfer_encoding(&bytes, &encoding);
+    ensure_attachment_len(decoded.len())?;
+    Ok(decoded)
+}
+
+/// Writes `bytes` to a new absolute file. The parent must already exist and the destination must not.
+/// Bytes land in a sibling temporary file first and are renamed into place. Failures use a fixed
+/// sentence so the caller never sees a path or an OS error.
+pub fn write_exclusive(path: &str, bytes: &[u8]) -> Result<u64, &'static str> {
+    let path = std::path::Path::new(path);
+    if !path.is_absolute() || path.components().any(|component| matches!(component, std::path::Component::ParentDir)) {
+        return Err("无法保存附件");
+    }
+    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).ok_or("无法保存附件")?;
+    if !parent.is_dir() || path.exists() || path.file_name().is_none() {
+        return Err("无法保存附件");
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let tmp = parent.join(format!(".{nonce}.{}.sealbox-part", std::process::id()));
+    let write_result = (|| {
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok::<(), std::io::Error>(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err("无法保存附件");
+    }
+    if path.exists() || std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err("无法保存附件");
+    }
+    Ok(bytes.len() as u64)
 }
 
 fn map_io(err: std::io::Error) -> MailFailure {
@@ -2070,5 +2397,111 @@ mod tests {
             html.ends_with(&format!("src=\"data:image/png;base64,{}\">", base64_of(&payload))),
             "{html}"
         );
+    }
+
+    struct OwnedIo {
+        steps: Vec<(String, String)>,
+        seen: Vec<String>,
+    }
+
+    impl ImapIo for OwnedIo {
+        fn transact(&mut self, command: &str) -> Result<String, MailFailure> {
+            self.seen.push(command.to_string());
+            let (expect, response) = self.steps.remove(0);
+            assert!(command.contains(&expect), "{command} vs {expect}");
+            Ok(response)
+        }
+    }
+
+    fn logged_in(extra: Vec<(&str, &str)>) -> OwnedIo {
+        let mut steps = vec![
+            ("LOGIN".to_string(), "A1 OK\r\n".to_string()),
+            ("EXAMINE INBOX".to_string(), "A2 OK [READ-ONLY]\r\n".to_string()),
+        ];
+        for (expect, response) in extra {
+            steps.push((expect.to_string(), response.to_string()));
+        }
+        OwnedIo { steps, seen: Vec::new() }
+    }
+
+    #[test]
+    fn multipart_pdf_lists_and_decodes_the_attachment() {
+        let original = b"Hello PDF";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(original);
+        let structure = "* 1 FETCH (UID 9 BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 2 1 NIL NIL NIL NIL)(\"APPLICATION\" \"PDF\" (\"NAME\" \"other.pdf\") NIL NIL \"BASE64\" 4 NIL (\"ATTACHMENT\" (\"FILENAME\" \"note.pdf\")) NIL NIL) \"MIXED\"))\r\nA3 OK\r\n";
+        let mut listed = logged_in(vec![("BODYSTRUCTURE", structure)]);
+        let attachments = list_attachments(&mut listed, "me@qq.com", "auth-SECRET", 9).unwrap();
+        assert_eq!(
+            attachments,
+            vec![MailAttachment {
+                part: "2".into(),
+                filename: "note.pdf".into(),
+                mime: "application/pdf".into(),
+                size: Some(4),
+            }]
+        );
+        assert!(listed.seen.iter().all(|line| !line.contains("SELECT")));
+        let mime = b"Content-Transfer-Encoding: base64\r\n\r\n";
+        let fetch = format!(
+            "* 1 FETCH (UID 9 BODY[2] {{{}}}\r\n{encoded} BODY[2.MIME] {{{mime_len}}}\r\n{mime_text})\r\nA4 OK\r\n",
+            encoded.len(),
+            mime_len = mime.len(),
+            mime_text = std::str::from_utf8(mime).unwrap(),
+        );
+        let mut io = logged_in(vec![
+            ("BODYSTRUCTURE", structure),
+            ("BODY.PEEK[2]", &fetch),
+        ]);
+        let bytes = fetch_attachment(&mut io, "me@qq.com", "auth-SECRET", 9, "2").unwrap();
+        assert_eq!(bytes, original);
+        assert!(io.seen.iter().all(|line| !line.contains("SELECT") && !line.contains("STORE")));
+        assert!(!failure_message(MailFailure::TooLarge).contains("auth-SECRET"));
+    }
+
+    #[test]
+    fn nested_attachment_part_is_dotted() {
+        let structure = "* 1 FETCH (UID 9 BODYSTRUCTURE (((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 1 1 NIL NIL NIL NIL)(\"APPLICATION\" \"PDF\" NIL NIL NIL \"BASE64\" 4 NIL (\"ATTACHMENT\" (\"FILENAME\" \"inner.pdf\")) NIL NIL) \"MIXED\") \"MIXED\"))\r\nA3 OK\r\n";
+        let mut io = logged_in(vec![("BODYSTRUCTURE", structure)]);
+        let attachments = list_attachments(&mut io, "me@qq.com", "auth-SECRET", 9).unwrap();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].part, "1.2");
+        assert_eq!(attachments[0].filename, "inner.pdf");
+    }
+
+    #[test]
+    fn illegal_attachment_parts_are_rejected() {
+        for part in ["", "0", "..", "a", "1.02", "01"] {
+            let mut io = OwnedIo { steps: Vec::new(), seen: Vec::new() };
+            let err = fetch_attachment(&mut io, "me@qq.com", "auth-SECRET", 1, part).unwrap_err();
+            assert_eq!(err, MailFailure::Protocol, "{part}");
+            assert!(io.seen.is_empty(), "{part}");
+        }
+    }
+
+    #[test]
+    fn attachment_over_20_mib_is_rejected() {
+        let structure = "* 1 FETCH (UID 9 BODYSTRUCTURE (\"APPLICATION\" \"PDF\" NIL NIL NIL \"BASE64\" 20971521 NIL (\"ATTACHMENT\" (\"FILENAME\" \"big.pdf\")) NIL NIL))\r\nA3 OK\r\n";
+        let mut io = logged_in(vec![("BODYSTRUCTURE", structure)]);
+        let err = fetch_attachment(&mut io, "me@qq.com", "auth-SECRET", 9, "1").unwrap_err();
+        assert_eq!(failure_message(err), "附件过大，已拒绝下载");
+        assert!(!failure_message(err).contains("auth-SECRET"));
+        assert!(io.seen.iter().all(|line| !line.contains("BODY.PEEK") && !line.contains("SELECT")));
+    }
+
+    #[test]
+    fn write_exclusive_refuses_to_replace_or_escape() {
+        let dir = std::env::temp_dir().join(format!("sealbox-attach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("note.pdf");
+        let path = dest.to_str().unwrap();
+        assert_eq!(write_exclusive(path, b"Hello PDF").unwrap(), 9);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"Hello PDF");
+        assert_eq!(write_exclusive(path, b"nope").unwrap_err(), "无法保存附件");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"Hello PDF");
+        let escaped = dir.join("..").join("escaped.bin");
+        assert_eq!(write_exclusive(escaped.to_str().unwrap(), b"x").unwrap_err(), "无法保存附件");
+        assert_eq!(write_exclusive("note.pdf", b"x").unwrap_err(), "无法保存附件");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

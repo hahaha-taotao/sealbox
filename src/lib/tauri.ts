@@ -322,6 +322,13 @@ export interface MailBody {
   truncated: boolean;
 }
 
+export interface MailAttachment {
+  part: string;
+  filename: string;
+  mime: string;
+  size: number | null;
+}
+
 export interface McpToolInfo {
   name: string;
   description: string;
@@ -485,4 +492,8 @@ export const api = {
     invoke<MailMessage[]>("mail_list", { request: { entryId, beforeUid: beforeUid ?? null } }),
   mailBody: (entryId: string, uid: number) =>
     invoke<MailBody>("mail_body", { request: { entryId, uid } }),
+  mailAttachments: (entryId: string, uid: number) =>
+    invoke<MailAttachment[]>("mail_attachments", { request: { entryId, uid } }),
+  mailSaveAttachment: (entryId: string, uid: number, part: string, path: string) =>
+    invoke<number>("mail_save_attachment", { request: { entryId, uid, part, path } }),
 };
