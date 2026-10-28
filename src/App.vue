@@ -6,6 +6,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import packageJson from "../package.json";
 import { DB_ENGINES } from "./lib/entry-options";
 import { auditDateBounds, createAuditRequestGuard } from "./lib/audit-request";
+import { buildMailDocument } from "./lib/mail-html";
 import { buildResolutions, completeChoices, type SyncChoice } from "./lib/sync-choice.mjs";
 import {
   checkForUpdate,
@@ -52,11 +53,16 @@ const mailAccountId = ref("");
 const mailMessages = ref<MailMessage[]>([]);
 const mailSelectedUid = ref<number | null>(null);
 const mailBody = ref("");
+const mailHtml = ref("");
+const mailSelected = ref<MailMessage | null>(null);
 const mailTruncated = ref(false);
 const mailBusy = ref(false);
+const mailBodyBusy = ref(false);
 const mailError = ref("");
 const mailOlderError = ref("");
 let mailSeq = 0;
+let mailBodySeq = 0;
+const mailRecipient = computed(() => mailAccounts.value.find((account) => account.id === mailAccountId.value)?.email ?? "");
   type Page = "home" | "vault" | "audit" | "settings" | "mcp" | "plugin" | "mail";
 const page = ref<Page>("vault");
 const history = ref<Page[]>(["vault"]);
@@ -1769,12 +1775,16 @@ function applyLockedUi() {
   selected.value = new Set();
   mcp.value = null;
   mailSeq += 1;
+  mailBodySeq += 1;
   mailAccounts.value = [];
   mailAccountId.value = "";
   mailMessages.value = [];
   mailSelectedUid.value = null;
+  mailSelected.value = null;
   mailBody.value = "";
+  mailHtml.value = "";
   mailTruncated.value = false;
+  mailBodyBusy.value = false;
   mailError.value = "";
   mailOlderError.value = "";
 }
@@ -1812,8 +1822,12 @@ async function openMail() {
     mailAccountId.value = next?.id ?? "";
     if (next) await loadMail(next.id, seq);
     else {
+      mailBodySeq += 1;
+      mailBodyBusy.value = false;
       mailMessages.value = [];
+      mailSelected.value = null;
       mailBody.value = "";
+      mailHtml.value = "";
     }
   } catch (e) {
     if (seq === mailSeq) mailError.value = String(e);
@@ -1824,9 +1838,13 @@ async function loadMail(entryId: string, seq = ++mailSeq) {
   mailBusy.value = true;
   mailError.value = "";
   mailOlderError.value = "";
+  mailBodySeq += 1;
+  mailBodyBusy.value = false;
   mailMessages.value = [];
   mailSelectedUid.value = null;
+  mailSelected.value = null;
   mailBody.value = "";
+  mailHtml.value = "";
   mailTruncated.value = false;
   try {
     const messages = await api.mailList(entryId);
@@ -1861,21 +1879,38 @@ async function loadOlderMail() {
 
 async function openMailMessage(uid: number) {
   const entryId = mailAccountId.value;
-  const seq = mailSeq;
+  // 列表序号与正文序号分开：列表不被正文请求作废，正文也不覆盖新选中邮件。
+  const seq = ++mailBodySeq;
   mailSelectedUid.value = uid;
+  mailSelected.value = mailMessages.value.find((message) => message.uid === uid) ?? null;
   mailBody.value = "";
+  mailHtml.value = "";
   mailTruncated.value = false;
   mailError.value = "";
-  mailBusy.value = true;
+  mailBodyBusy.value = true;
   try {
     const body = await api.mailBody(entryId, uid);
-    if (seq !== mailSeq) return;
+    if (seq !== mailBodySeq) return;
     mailBody.value = body.text;
+    mailHtml.value = body.html ? buildMailDocument(body.html) : "";
     mailTruncated.value = body.truncated;
   } catch (e) {
-    if (seq === mailSeq) mailError.value = String(e);
+    if (seq === mailBodySeq) mailError.value = String(e);
   } finally {
-    if (seq === mailSeq) mailBusy.value = false;
+    if (seq === mailBodySeq) mailBodyBusy.value = false;
+  }
+}
+
+/** iframe 只给了 allow-same-origin（脚本仍禁用），父页面可以量高度做自适应。 */
+function fitMailFrame(event: Event) {
+  const target = event.currentTarget;
+  if (!(target instanceof HTMLIFrameElement)) return;
+  try {
+    const height = target.contentDocument?.documentElement?.scrollHeight ?? 0;
+    if (height <= 0) return;
+    target.style.height = `${Math.min(1600, Math.max(240, height + 8))}px`;
+  } catch {
+    // 读不到文档时保留默认高度。
   }
 }
 
@@ -2890,7 +2925,6 @@ onMounted(async () => {
         <div class="content content-page mail-page">
           <div class="mail-head">
             <h2>邮箱</h2>
-            <p class="crumb">只读收件箱。不会发信、删信、标已读或下载附件。</p>
           </div>
           <div class="mail-layout">
             <aside class="card mail-accounts">
@@ -2917,10 +2951,35 @@ onMounted(async () => {
               </button>
             </div>
             <article class="card mail-body">
-              <h3>正文</h3>
-              <p v-if="mailTruncated" class="crumb">正文过长，已截断。</p>
-              <pre v-if="mailBody">{{ mailBody }}</pre>
-              <p v-else class="crumb">选择一封邮件后显示纯文本正文。</p>
+              <template v-if="mailSelected">
+                <h3 class="mail-subject">{{ mailSelected?.subject || "(无主题)" }}</h3>
+                <dl class="mail-meta">
+                  <dt>发件人</dt>
+                  <dd>{{ mailSelected?.from || "(未知发件人)" }}</dd>
+                  <dt>时间</dt>
+                  <dd>{{ mailSelected?.date || "(未知时间)" }}</dd>
+                  <dt>收件人</dt>
+                  <dd>{{ mailRecipient || "(当前授权码)" }}</dd>
+                  <template v-if="mailSelected?.hasAttachment">
+                    <dt>附件</dt>
+                    <dd>有附件（只读，不下载）</dd>
+                  </template>
+                </dl>
+                <p v-if="mailTruncated" class="crumb">正文过长，已截断。</p>
+                <iframe
+                  v-if="mailHtml"
+                  class="mail-html"
+                  :srcdoc="mailHtml"
+                  sandbox="allow-same-origin"
+                  referrerpolicy="no-referrer"
+                  title="邮件正文"
+                  @load="fitMailFrame"
+                />
+                <pre v-else-if="mailBody">{{ mailBody }}</pre>
+                <p v-else-if="mailBodyBusy" class="crumb">正在读取正文…</p>
+                <p v-else class="crumb">这封邮件没有可显示的正文。</p>
+              </template>
+              <p v-else class="crumb">选择一封邮件后显示正文。</p>
             </article>
           </div>
         </div>

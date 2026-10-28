@@ -777,8 +777,19 @@ html:has(.confirm-win), body:has(.confirm-win) {
 .mail-account.active, .mail-row.active { border-color: #dfe2ff; background: #eef0ff; }
 .mail-account.disabled { color: var(--muted); background: #f6f7f9; }
 .mail-list-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.mail-body pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 640px; overflow: auto; line-height: 1.6; }
-@media (max-width: 1100px) { .mail-layout { grid-template-columns: 1fr; } }
+.mail-body { display: grid; gap: 12px; align-content: start; }
+.mail-body h3.mail-subject { margin-bottom: 0; font-size: 16px; font-weight: 600; line-height: 1.45; overflow-wrap: anywhere; word-break: break-word; }
+.mail-meta { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; margin: 0; padding-bottom: 12px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.mail-meta dt { color: var(--muted); white-space: nowrap; }
+.mail-meta dd { margin: 0; overflow-wrap: anywhere; word-break: break-word; }
+.mail-html { width: 100%; min-height: 240px; border: 1px solid var(--line); display: block; background: var(--surface); border-radius: 8px; }
+.mail-body pre { margin: 0; padding: 14px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; font-family: ui-monospace, "Cascadia Mono", "Consolas", "SFMono-Regular", monospace; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 640px; overflow: auto; line-height: 1.7; }
+@media (max-width: 1100px) {
+  .mail-layout { grid-template-columns: 1fr; }
+  .mail-meta { grid-template-columns: 1fr; gap: 2px; }
+  .mail-meta dd + dt { margin-top: 6px; }
+  .mail-html { min-height: 200px; }
+}
 .audit-filter-actions { display: flex; gap: 8px; flex: 0 0 auto; }
 .audit-table td { white-space: normal; overflow-wrap: anywhere; vertical-align: top; }
 .audit-table pre { white-space: pre-wrap; max-width: 400px; overflow-wrap: anywhere; }

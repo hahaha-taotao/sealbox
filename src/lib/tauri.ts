@@ -318,6 +318,7 @@ export interface MailMessage {
 
 export interface MailBody {
   text: string;
+  html: string | null;
   truncated: boolean;
 }
 

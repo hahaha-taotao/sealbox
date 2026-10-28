@@ -601,7 +601,11 @@ pub struct MailAccount {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MailBody {
+    /// Always populated: the decoded text/plain part, or the HTML part flattened to text.
     pub text: String,
+    /// The decoded text/html part, verbatim, when the message had one. The desktop renders it
+    /// in a sandboxed frame, so it must not be flattened here.
+    pub html: Option<String>,
     pub truncated: bool,
 }
 
@@ -734,20 +738,328 @@ fn split_message(message: &[u8]) -> (&[u8], &[u8]) {
     }
 }
 
-/// True when the (possibly folded) Content-Type header names text/html.
-fn is_html(headers: &str) -> bool {
-    let mut fields: Vec<String> = Vec::new();
+/// Mail is untrusted input, so nesting is capped: a hostile message cannot recurse the stack away.
+const MAX_MIME_DEPTH: usize = 8;
+
+/// Header block split into `(lower-case name, unfolded value)` pairs. A continuation line keeps
+/// its leading whitespace, which is what MIME unfolding is specified to leave behind, so
+/// `boundary=` split across two lines still parses.
+fn parse_header_fields(headers: &str) -> Vec<(String, String)> {
+    let mut fields: Vec<(String, String)> = Vec::new();
     for line in headers.lines() {
-        match fields.last_mut() {
-            Some(last) if line.starts_with([' ', '\t']) => last.push_str(line),
-            _ => fields.push(line.to_string()),
+        if line.starts_with([' ', '\t']) {
+            if let Some(last) = fields.last_mut() {
+                last.1.push_str(line);
+                continue;
+            }
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            fields.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
         }
     }
-    fields.iter().any(|field| {
-        field.split_once(':').is_some_and(|(name, value)| {
-            name.trim().eq_ignore_ascii_case("content-type") && value.to_ascii_lowercase().contains("text/html")
-        })
+    fields
+}
+
+fn header_value(fields: &[(String, String)], name: &str) -> Option<String> {
+    fields
+        .iter()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.clone())
+}
+
+/// `(type, subtype)` of a Content-Type value, lower-cased. RFC 2045 makes text/plain the default,
+/// which is also what a message without a Content-Type header means.
+fn media_type(value: &str) -> (String, String) {
+    let head = value.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    match head.split_once('/') {
+        Some((kind, subtype)) => (kind.trim().to_string(), subtype.trim().to_string()),
+        None => ("text".to_string(), "plain".to_string()),
+    }
+}
+
+/// A MIME parameter such as `boundary` or `charset`, with quotes and backslash escapes removed.
+fn media_param(value: &str, name: &str) -> Option<String> {
+    for segment in value.split(';').skip(1) {
+        let Some((key, raw)) = segment.split_once('=') else { continue };
+        if !key.trim().eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let raw = raw.trim();
+        let inner = raw
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap_or(raw);
+        let mut out = String::with_capacity(inner.len());
+        let mut escaped = false;
+        for ch in inner.chars() {
+            match (escaped, ch) {
+                (true, ch) => {
+                    out.push(ch);
+                    escaped = false;
+                }
+                (false, '\\') => escaped = true,
+                (false, ch) => out.push(ch),
+            }
+        }
+        if !out.is_empty() {
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// Parts marked as attachments are file payloads; they are never shown as body text.
+fn is_attachment(fields: &[(String, String)]) -> bool {
+    header_value(fields, "content-disposition").is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("attachment"))
     })
+}
+
+/// The byte ranges of every body part between `--boundary` lines. The preamble before the first
+/// delimiter and the `--boundary--` epilogue are not parts. A truncated message (no closing
+/// delimiter) still yields its last fragment so a half-downloaded body is readable.
+fn split_multipart<'a>(body: &'a [u8], boundary: &str) -> Vec<&'a [u8]> {
+    let marker = format!("--{boundary}");
+    let marker = marker.as_bytes();
+    let mut parts = Vec::new();
+    let mut open: Option<usize> = None;
+    let mut search = 0;
+    loop {
+        let Some(at) = find_boundary_line(body, marker, search) else { break };
+        let line_end = line_end_after(body, at + marker.len());
+        if let Some(start) = open.take() {
+            parts.push(trim_trailing_newline(&body[start..at]));
+        }
+        // `--boundary--` closes the multipart; anything after it is the epilogue.
+        if body[at + marker.len()..line_end].starts_with(b"--") {
+            return parts;
+        }
+        open = Some(line_end);
+        search = line_end;
+        if search >= body.len() {
+            break;
+        }
+    }
+    if let Some(start) = open {
+        if start < body.len() {
+            parts.push(trim_trailing_newline(&body[start..]));
+        }
+    }
+    parts
+}
+
+fn find_boundary_line(body: &[u8], marker: &[u8], from: usize) -> Option<usize> {
+    let mut index = from;
+    while index + marker.len() <= body.len() {
+        // A delimiter only counts at the start of a line, so quoted `--boundary` text in a body
+        // cannot fabricate a part.
+        if body[index..].starts_with(marker) && (index == 0 || body[index - 1] == b'\n') {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn line_end_after(body: &[u8], from: usize) -> usize {
+    match body.get(from..) {
+        Some(rest) => rest.iter().position(|byte| *byte == b'\n').map_or(body.len(), |at| from + at + 1),
+        None => body.len(),
+    }
+}
+
+/// The newline that terminates the delimiter line belongs to the delimiter, not to the part.
+fn trim_trailing_newline(part: &[u8]) -> &[u8] {
+    let part = part.strip_suffix(b"\n").unwrap_or(part);
+    part.strip_suffix(b"\r").unwrap_or(part)
+}
+
+fn decode_base64(body: &[u8]) -> Vec<u8> {
+    let filtered: Vec<u8> = body
+        .iter()
+        .copied()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    let engine = base64::engine::general_purpose::STANDARD;
+    if let Ok(decoded) = engine.decode(&filtered) {
+        return decoded;
+    }
+    // A truncated payload: keep the whole quanta that do decode, so most of the body survives
+    // instead of the whole part disappearing.
+    let usable = filtered.len() - filtered.len() % 4;
+    engine.decode(&filtered[..usable]).unwrap_or_default()
+}
+
+fn decode_quoted_printable(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut index = 0;
+    while index < body.len() {
+        if body[index] != b'=' {
+            out.push(body[index]);
+            index += 1;
+            continue;
+        }
+        // `=` right before a line break is a soft break: the pair joins two logical lines.
+        // `index < body.len()`, so `index + 1` is still a valid slice start.
+        let rest = &body[index + 1..];
+        if rest.starts_with(b"\r\n") {
+            index += 3;
+            continue;
+        }
+        if rest.starts_with(b"\n") {
+            index += 2;
+            continue;
+        }
+        let decoded = rest
+            .first()
+            .copied()
+            .and_then(hex_digit)
+            .zip(rest.get(1).copied().and_then(hex_digit));
+        match decoded {
+            Some((high, low)) => {
+                out.push((high << 4) | low);
+                index += 3;
+            }
+            // A stray `=` is literal text in lenient decoders; keeping it beats dropping the tail.
+            None => {
+                out.push(b'=');
+                index += 1;
+            }
+        }
+    }
+    out
+}
+
+/// `Content-Transfer-Encoding` handling. Unknown encodings (7bit/8bit/binary included) mean the
+/// body is already the literal bytes.
+fn decode_transfer_encoding(body: &[u8], encoding: &str) -> Vec<u8> {
+    let encoding = encoding.trim().trim_matches('"').to_ascii_lowercase();
+    match encoding.as_str() {
+        "base64" => decode_base64(body),
+        "quoted-printable" => decode_quoted_printable(body),
+        _ => body.to_vec(),
+    }
+}
+
+/// Converts the decoded octets into a Rust string. Real mail carries every charset there is, and
+/// an unknown label must not lose the message: UTF-8 lossy is always readable-ish.
+fn decode_charset(bytes: &[u8], charset: Option<&str>) -> String {
+    let Some(label) = charset.map(str::trim).filter(|label| !label.is_empty()) else {
+        return String::from_utf8_lossy(bytes).into_owned();
+    };
+    let label = label.to_ascii_lowercase();
+    if matches!(label.as_str(), "utf-8" | "utf8" | "us-ascii" | "ascii") {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    match encoding_rs::Encoding::for_label(label.as_bytes()) {
+        Some(encoding) => encoding.decode(bytes).0.into_owned(),
+        None => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
+/// The two renderings of one message. `plain` is only used for the text field; `html` is what the
+/// desktop renders, and is present only when the message really had a text/html part.
+#[derive(Default)]
+struct TextParts {
+    plain: Option<String>,
+    html: Option<String>,
+}
+
+/// Fills one text slot. `prefer_later` is set for multipart/alternative, where each part is a
+/// richer version of the previous one; in every other multipart the first text part is the body
+/// itself and any later one is a footer or a forwarded copy.
+fn merge_slot(slot: &mut Option<String>, value: Option<String>, prefer_later: bool) {
+    let Some(value) = value else { return };
+    if slot.is_none() || prefer_later {
+        *slot = Some(value);
+    }
+}
+
+fn merge_parts(into: &mut TextParts, from: TextParts, prefer_later: bool) {
+    merge_slot(&mut into.plain, from.plain, prefer_later);
+    merge_slot(&mut into.html, from.html, prefer_later);
+}
+
+/// Walks the MIME tree and records the leaf text parts.
+fn collect_text_parts(part: &[u8], depth: usize, out: &mut TextParts) {
+    if depth > MAX_MIME_DEPTH {
+        return;
+    }
+    let (headers, body) = split_message(part);
+    let fields = parse_header_fields(&String::from_utf8_lossy(headers));
+    if is_attachment(&fields) {
+        return;
+    }
+    let content_type = header_value(&fields, "content-type").unwrap_or_default();
+    let (kind, subtype) = media_type(&content_type);
+    if kind == "multipart" {
+        let boundary = media_param(&content_type, "boundary").unwrap_or_default();
+        let children = if boundary.is_empty() {
+            Vec::new()
+        } else {
+            split_multipart(body, &boundary)
+        };
+        if !children.is_empty() {
+            let prefer_later = subtype == "alternative";
+            for child in children {
+                let mut child_parts = TextParts::default();
+                collect_text_parts(child, depth + 1, &mut child_parts);
+                merge_parts(out, child_parts, prefer_later);
+            }
+            return;
+        }
+        // A multipart header we cannot honour (no boundary, or a truncated one). The body is
+        // still the only text there is, so fall through and decode it as one leaf part.
+    } else if kind != "text" || !matches!(subtype.as_str(), "plain" | "html") {
+        // Attachments (`image/*`, `application/*`, `message/*`) and exotic `text/*` subtypes are
+        // not body text.
+        return;
+    }
+    let encoding = header_value(&fields, "content-transfer-encoding").unwrap_or_default();
+    let bytes = decode_transfer_encoding(body, &encoding);
+    let decoded = decode_charset(&bytes, media_param(&content_type, "charset").as_deref());
+    if decoded.trim().is_empty() {
+        return;
+    }
+    if subtype == "html" {
+        out.html = Some(decoded);
+    } else {
+        out.plain = Some(decoded);
+    }
+}
+
+/// Cuts `value` to `limit` bytes without splitting a character. Returns whether anything was cut.
+fn truncate_at_boundary(value: &mut String, limit: usize) -> bool {
+    if value.len() <= limit {
+        return false;
+    }
+    let mut end = limit;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value.truncate(end);
+    true
+}
+
+/// Decodes a whole RFC 822 message into `(text, html)`; `html` stays `None` when no text/html
+/// part exists, so the desktop can fall back to the plain rendering.
+fn extract_body(message: &[u8]) -> (String, Option<String>) {
+    let mut parts = TextParts::default();
+    collect_text_parts(message, 0, &mut parts);
+    let html = parts
+        .html
+        // A body that ends at the end of the message keeps its final CRLF; the frame does not need it.
+        .map(|html| html.trim_end().to_string())
+        .filter(|html| !html.is_empty());
+    let text = match parts.plain {
+        // Plain mail is shown as written, minus the CRLFs that would otherwise double up.
+        Some(plain) => plain.replace("\r\n", "\n").replace('\r', "\n").trim_end().to_string(),
+        None => html.as_deref().map(html_to_text).unwrap_or_default(),
+    };
+    (text, html)
 }
 
 pub fn fetch_body(io: &mut impl ImapIo, email: &str, auth: &str, uid: u32) -> Result<MailBody, MailFailure> {
@@ -755,25 +1067,15 @@ pub fn fetch_body(io: &mut impl ImapIo, email: &str, auth: &str, uid: u32) -> Re
     let fetch = io.transact(&format!("A3 UID FETCH {uid} (BODY.PEEK[])"))?;
     check_completion(&fetch, "A3", MailFailure::Protocol)?;
     let message = body_literal(&fetch, uid)?;
-    let (headers, body) = split_message(&message);
-    let body = String::from_utf8_lossy(body);
-    let mut text = if is_html(&String::from_utf8_lossy(headers)) {
-        html_to_text(&body)
-    } else {
-        body.trim_end().to_string()
-    };
-    if text.trim().is_empty() {
+    let (mut text, mut html) = extract_body(&message);
+    if text.trim().is_empty() && html.is_none() {
         return Err(MailFailure::EmptyText);
     }
-    let truncated = text.len() > MAX_BODY_BYTES;
-    if truncated {
-        let mut end = MAX_BODY_BYTES;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        text.truncate(end);
-    }
-    Ok(MailBody { text, truncated })
+    let text_cut = truncate_at_boundary(&mut text, MAX_BODY_BYTES);
+    let html_cut = html
+        .as_mut()
+        .is_some_and(|value| truncate_at_boundary(value, MAX_BODY_BYTES));
+    Ok(MailBody { text, html, truncated: text_cut || html_cut })
 }
 
 fn map_io(err: std::io::Error) -> MailFailure {
@@ -1070,5 +1372,303 @@ mod tests {
             connect_tls("imap.163.com", 993, Duration::from_millis(50)).err(),
             Some(MailFailure::Unsupported)
         );
+    }
+
+    /// Assembles a CRLF-terminated message from its logical lines, so MIME fixtures read like the wire.
+    fn wire(lines: &[&str]) -> Vec<u8> {
+        let mut out = String::new();
+        for line in lines {
+            out.push_str(line);
+            out.push_str("\r\n");
+        }
+        out.into_bytes()
+    }
+
+    fn base64_of(text: &str) -> String {
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, text.as_bytes())
+    }
+
+    /// The FETCH response for `uid` carrying `message` as one `BODY[]` literal.
+    fn fetch_response(message: &str, uid: u32) -> &'static str {
+        let response = format!("* 1 FETCH (UID {uid} BODY[] {{{}}}\r\n{message})\r\nA3 OK\r\n", message.len());
+        Box::leak(response.into_boxed_str())
+    }
+
+    fn peek_response(message: &str) -> ScriptIo {
+        ScriptIo {
+            steps: vec![
+                ("LOGIN", "A1 OK\r\n"),
+                ("EXAMINE INBOX", "A2 OK [READ-ONLY]\r\n"),
+                ("BODY.PEEK[]", fetch_response(message, 9)),
+            ],
+            seen: vec![],
+        }
+    }
+
+    #[test]
+    fn multipart_alternative_decodes_quoted_printable_html_and_base64_plain() {
+        let plain = base64_of("纯文本正文\n第二行");
+        let raw = wire(&[
+            "Content-Type: multipart/alternative; boundary=\"part-1\"",
+            "",
+            "preamble that must be ignored",
+            "--part-1",
+            "Content-Type: text/plain; charset=utf-8",
+            "Content-Transfer-Encoding: base64",
+            "",
+            plain.as_str(),
+            "--part-1",
+            "Content-Type: text/html; charset=utf-8",
+            "Content-Transfer-Encoding: quoted-printable",
+            "",
+            "<p>=E4=BD=A0=E5=A5=BD =3D ok</p>",
+            "--part-1--",
+        ]);
+        let (text, html) = extract_body(&raw);
+        assert_eq!(html.as_deref(), Some("<p>你好 = ok</p>"));
+        assert_eq!(text, "纯文本正文\n第二行");
+    }
+
+    #[test]
+    fn nested_mixed_and_alternative_reach_the_text_leaves() {
+        let raw = wire(&[
+            "Content-Type: multipart/mixed; boundary=mixed-b",
+            "",
+            "This is a multi-part message in MIME format.",
+            "--mixed-b",
+            "Content-Type: multipart/alternative; boundary=alt-b",
+            "",
+            "--alt-b",
+            "Content-Type: text/plain; charset=us-ascii",
+            "",
+            "plain body",
+            "--alt-b",
+            "Content-Type: text/html; charset=utf-8",
+            "Content-Transfer-Encoding: quoted-printable",
+            "",
+            "<b>=E4=BD=A0</b>",
+            "--alt-b--",
+            "--mixed-b--",
+        ]);
+        let (text, html) = extract_body(&raw);
+        assert_eq!(html.as_deref(), Some("<b>你</b>"));
+        assert_eq!(text, "plain body");
+    }
+
+    #[test]
+    fn a_plain_footer_does_not_replace_the_real_body() {
+        let raw = wire(&[
+            "Content-Type: multipart/mixed; boundary=m",
+            "",
+            "--m",
+            "Content-Type: multipart/alternative; boundary=a",
+            "",
+            "--a",
+            "Content-Type: text/plain",
+            "",
+            "the real body",
+            "--a",
+            "Content-Type: text/html",
+            "",
+            "<p>the real body</p>",
+            "--a--",
+            "--m",
+            "Content-Type: text/plain",
+            "",
+            "footer",
+            "--m--",
+        ]);
+        let (text, html) = extract_body(&raw);
+        assert_eq!(text, "the real body");
+        assert_eq!(html.as_deref(), Some("<p>the real body</p>"));
+    }
+
+    #[test]
+    fn attachment_parts_are_ignored() {
+        let raw = wire(&[
+            "Content-Type: multipart/mixed; boundary=b1",
+            "",
+            "--b1",
+            "Content-Type: text/plain",
+            "",
+            "正文在这里",
+            "--b1",
+            "Content-Type: application/pdf; name=\"a.pdf\"",
+            "Content-Disposition: attachment; filename=\"a.pdf\"",
+            "Content-Transfer-Encoding: base64",
+            "",
+            "JVBERi0xLjQK",
+            "--b1--",
+        ]);
+        let (text, html) = extract_body(&raw);
+        assert_eq!(text, "正文在这里");
+        assert!(html.is_none());
+        assert!(!text.contains("JVBERi0xLjQK"));
+    }
+
+    #[test]
+    fn gbk_charset_body_decodes_to_chinese() {
+        let (encoded, _, unencodable) = encoding_rs::GBK.encode("你好，仓库盘点完成");
+        assert!(!unencodable);
+        let mut raw = wire(&[
+            "Content-Type: text/plain; charset=gbk",
+            "Content-Transfer-Encoding: 8bit",
+            "",
+        ]);
+        raw.extend_from_slice(&encoded);
+        let (text, html) = extract_body(&raw);
+        assert_eq!(text, "你好，仓库盘点完成");
+        assert!(html.is_none());
+    }
+
+    #[test]
+    fn folded_content_type_header_keeps_its_boundary() {
+        let raw = wire(&[
+            "Content-Type: multipart/alternative;",
+            "\tboundary=\"folded\"",
+            "",
+            "--folded",
+            "Content-Type: text/plain; charset=utf-8",
+            "",
+            "只有纯文本",
+            "--folded--",
+        ]);
+        let (text, html) = extract_body(&raw);
+        assert_eq!(text, "只有纯文本");
+        assert!(html.is_none());
+    }
+
+    #[test]
+    fn single_html_part_still_becomes_text_and_html() {
+        let raw = wire(&["Content-Type: text/html; charset=utf-8", "", "<p>你好&nbsp;<b>报销</b></p>"]);
+        let (text, html) = extract_body(&raw);
+        assert_eq!(text, "你好 报销");
+        assert_eq!(html.as_deref(), Some("<p>你好&nbsp;<b>报销</b></p>"));
+    }
+
+    #[test]
+    fn body_json_keeps_camel_case_and_nulls_html() {
+        let plain = MailBody { text: "hi".to_string(), html: None, truncated: false };
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"text":"hi","html":null,"truncated":false}"#
+        );
+        let rich = MailBody { text: "hi".to_string(), html: Some("<b>hi</b>".to_string()), truncated: true };
+        assert_eq!(
+            serde_json::to_string(&rich).unwrap(),
+            r#"{"text":"hi","html":"<b>hi</b>","truncated":true}"#
+        );
+    }
+
+    #[test]
+    fn truncated_multipart_keeps_the_fragment_it_has() {
+        let raw = wire(&[
+            "Content-Type: multipart/mixed; boundary=x",
+            "",
+            "--x",
+            "Content-Type: text/plain",
+            "",
+            "half a message",
+        ]);
+        let (text, html) = extract_body(&raw);
+        assert_eq!(text, "half a message");
+        assert!(html.is_none());
+    }
+
+    #[test]
+    fn malformed_messages_never_panic() {
+        let mut cases: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"\r\n\r\n".to_vec(),
+            b"Content-Type: multipart/mixed\r\n\r\nno boundary anywhere".to_vec(),
+            b"Content-Type: multipart/mixed; boundary=\"\"\r\n\r\n--\r\n--".to_vec(),
+            b"Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\n\r\n--x--\r\n--x--".to_vec(),
+            b"Content-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\n!!!not base64!!!".to_vec(),
+            b"Content-Type: text/plain\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n=ZZ=3".to_vec(),
+            b"Content-Type: text/plain; charset=no-such-charset\r\n\r\nhello".to_vec(),
+            b"\xff\xfe\x00binary junk".to_vec(),
+            b"Content-Disposition: attachment\r\n\r\nfile payload".to_vec(),
+        ];
+        // Nested deeper than MAX_MIME_DEPTH: the cap must stop the walk instead of recursing.
+        let mut deep = String::new();
+        for level in 0..24 {
+            deep.push_str(&format!("Content-Type: multipart/mixed; boundary=b{level}\r\n\r\n--b{level}\r\n"));
+        }
+        deep.push_str("Content-Type: text/plain\r\n\r\ndeep\r\n");
+        for level in (0..24).rev() {
+            deep.push_str(&format!("--b{level}--\r\n"));
+        }
+        cases.push(deep.into_bytes());
+        for case in cases {
+            // The contract is only "no panic": no MIME framing may leak into the rendered text.
+            let (text, html) = extract_body(&case);
+            assert!(!text.contains("Content-Type"), "{text}");
+            assert!(!text.contains("Content-Transfer-Encoding"), "{text}");
+            assert!(html.map_or(true, |html| !html.contains("Content-Type")));
+        }
+    }
+
+    #[test]
+    fn truncation_never_splits_a_character() {
+        let mut text = "你".repeat(MAX_BODY_BYTES);
+        assert!(truncate_at_boundary(&mut text, MAX_BODY_BYTES));
+        assert!(text.len() <= MAX_BODY_BYTES);
+        assert!(text.len() > MAX_BODY_BYTES - 3);
+        assert!(text.chars().all(|ch| ch == '你'));
+        let mut short = String::from("短");
+        assert!(!truncate_at_boundary(&mut short, MAX_BODY_BYTES));
+    }
+
+    #[test]
+    fn oversized_body_sets_truncated_through_fetch_body() {
+        let filler = "a".repeat(MAX_BODY_BYTES + 16);
+        let message = format!("Content-Type: text/plain\r\n\r\n{filler}");
+        let mut io = peek_response(&message);
+        let body = fetch_body(&mut io, "me@qq.com", "auth-SECRET", 9).unwrap();
+        assert!(body.truncated);
+        assert_eq!(body.text.len(), MAX_BODY_BYTES);
+        assert!(body.html.is_none());
+
+        // The html part is capped on its own, so an oversized body cannot inflate the render.
+        let message = format!("Content-Type: text/html\r\n\r\n<p>{filler}</p>");
+        let mut io = peek_response(&message);
+        let body = fetch_body(&mut io, "me@qq.com", "auth-SECRET", 9).unwrap();
+        assert!(body.truncated);
+        assert_eq!(body.html.as_deref().map(str::len), Some(MAX_BODY_BYTES));
+        assert!(body.text.len() <= MAX_BODY_BYTES);
+    }
+
+    #[test]
+    fn body_peeks_multipart_and_returns_text_plus_html() {
+        let message = String::from_utf8(wire(&[
+            "Content-Type: multipart/alternative; boundary=bb",
+            "",
+            "--bb",
+            "Content-Type: text/plain; charset=utf-8",
+            "",
+            "纯文本",
+            "--bb",
+            "Content-Type: text/html; charset=utf-8",
+            "Content-Transfer-Encoding: quoted-printable",
+            "",
+            "<p>=E4=BD=A0=E5=A5=BD</p>",
+            "--bb--",
+        ]))
+        .unwrap();
+        let mut io = peek_response(&message);
+        let body = fetch_body(&mut io, "me@gmail.com", "auth-SECRET", 9).unwrap();
+        assert_eq!(body.text, "纯文本");
+        assert_eq!(body.html.as_deref(), Some("<p>你好</p>"));
+        assert!(!body.truncated);
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains(r#""html":"<p>你好</p>""#), "{json}");
+        assert!(json.contains(r#""truncated":false"#), "{json}");
+    }
+
+    #[test]
+    fn empty_message_is_still_empty_text() {
+        let mut io = peek_response("Content-Type: text/plain\r\n\r\n   \r\n");
+        let err = fetch_body(&mut io, "me@qq.com", "auth-SECRET", 9).unwrap_err();
+        assert_eq!(failure_message(err), "这封邮件没有可显示的文本");
     }
 }
