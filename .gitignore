@@ -24,9 +24,6 @@ target/
 src-tauri-mobile/gen/
 src-tauri-mobile/target/
 apps/mobile/dist/
-!dist/
-dist/*
-!dist/Sealbox-mobile-0.1.0-arm64.apk
 vite.config.ts.bak
 OH-Works/
 .superpowers/brainstorm/*/state
