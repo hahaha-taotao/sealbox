@@ -966,6 +966,29 @@ fn decode_charset(bytes: &[u8], charset: Option<&str>) -> String {
 struct TextParts {
     plain: Option<String>,
     html: Option<String>,
+    /// `multipart/related` payloads the html cites with `cid:`, already turned into `data:` URLs so
+    /// the render never needs the network (the desktop frame only allows `data:` images).
+    resources: Vec<InlineResource>,
+}
+
+/// One inline part the html may cite by `Content-ID`. `cid` is the folded key both sides compare
+/// on: angle brackets and surrounding whitespace gone, percent escapes decoded, lower-cased.
+struct InlineResource {
+    cid: String,
+    url: String,
+}
+
+/// Inlining is bounded: a message must not be able to inflate the render without limit. Parts past
+/// either cap are not inlined at all, and their `cid:` reference in the html stays as it was.
+const MAX_INLINE_IMAGES: usize = 32;
+const MAX_INLINE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Running total for those caps. It is shared by the whole MIME walk, so a nested multipart cannot
+/// reset what its siblings already spent.
+#[derive(Default)]
+struct InlineBudget {
+    images: usize,
+    bytes: usize,
 }
 
 /// Fills one text slot. `prefer_later` is set for multipart/alternative, where each part is a
@@ -981,10 +1004,13 @@ fn merge_slot(slot: &mut Option<String>, value: Option<String>, prefer_later: bo
 fn merge_parts(into: &mut TextParts, from: TextParts, prefer_later: bool) {
     merge_slot(&mut into.plain, from.plain, prefer_later);
     merge_slot(&mut into.html, from.html, prefer_later);
+    // Every inline part is usable whatever branch it came from: a reference is resolved by cid, so
+    // the alternative that wins the html slot can still cite a payload collected elsewhere.
+    into.resources.extend(from.resources);
 }
 
-/// Walks the MIME tree and records the leaf text parts.
-fn collect_text_parts(part: &[u8], depth: usize, out: &mut TextParts) {
+/// Walks the MIME tree and records the leaf text parts, plus the inline images the html may cite.
+fn collect_text_parts(part: &[u8], depth: usize, out: &mut TextParts, budget: &mut InlineBudget) {
     if depth > MAX_MIME_DEPTH {
         return;
     }
@@ -1006,16 +1032,18 @@ fn collect_text_parts(part: &[u8], depth: usize, out: &mut TextParts) {
             let prefer_later = subtype == "alternative";
             for child in children {
                 let mut child_parts = TextParts::default();
-                collect_text_parts(child, depth + 1, &mut child_parts);
+                collect_text_parts(child, depth + 1, &mut child_parts, budget);
                 merge_parts(out, child_parts, prefer_later);
             }
             return;
         }
         // A multipart header we cannot honour (no boundary, or a truncated one). The body is
         // still the only text there is, so fall through and decode it as one leaf part.
+    } else if kind == "image" {
+        collect_inline_resource(&fields, &subtype, body, out, budget);
+        return;
     } else if kind != "text" || !matches!(subtype.as_str(), "plain" | "html") {
-        // Attachments (`image/*`, `application/*`, `message/*`) and exotic `text/*` subtypes are
-        // not body text.
+        // Attachments (`application/*`, `message/*`) and exotic `text/*` subtypes are not body text.
         return;
     }
     let encoding = header_value(&fields, "content-transfer-encoding").unwrap_or_default();
@@ -1029,6 +1057,185 @@ fn collect_text_parts(part: &[u8], depth: usize, out: &mut TextParts) {
     } else {
         out.plain = Some(decoded);
     }
+}
+
+/// The raster formats the desktop frame may inline, mapped to their canonical label; `jpeg` and
+/// `jpg` are the same format. `image/svg+xml` is deliberately absent: it is a scriptable document,
+/// not a picture, and the frame only whitelists `data:` images.
+fn inline_image_mime(subtype: &str) -> Option<&'static str> {
+    match subtype {
+        "png" => Some("image/png"),
+        "jpeg" | "jpg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+/// Turns one `image/*` leaf into a `data:` URL filed under its `Content-ID`, unless the caps are
+/// already spent. A part without a usable id is dropped: nothing in the html could cite it.
+fn collect_inline_resource(
+    fields: &[(String, String)],
+    subtype: &str,
+    body: &[u8],
+    out: &mut TextParts,
+    budget: &mut InlineBudget,
+) {
+    if budget.images >= MAX_INLINE_IMAGES {
+        return;
+    }
+    let Some(mime) = inline_image_mime(subtype) else { return };
+    let Some(cid) = header_value(fields, "content-id")
+        .map(|value| normalize_cid(&value))
+        .filter(|cid| !cid.is_empty())
+    else {
+        return;
+    };
+    let encoding = header_value(fields, "content-transfer-encoding").unwrap_or_default();
+    let bytes = decode_transfer_encoding(body, &encoding);
+    if bytes.is_empty() || budget.bytes.saturating_add(bytes.len()) > MAX_INLINE_BYTES {
+        return;
+    }
+    budget.images += 1;
+    budget.bytes += bytes.len();
+    let payload = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    out.resources.push(InlineResource { cid, url: format!("data:{mime};base64,{payload}") });
+}
+
+/// Folds a `Content-ID` header value or a `cid:` reference to the key both sides compare on: the
+/// angle brackets around an id are not part of it, and `cid:` values may be percent-escaped.
+fn normalize_cid(raw: &str) -> String {
+    let mut inner = raw.trim();
+    if let Some(rest) = inner.strip_prefix('<') {
+        inner = rest;
+    }
+    if let Some(rest) = inner.strip_suffix('>') {
+        inner = rest;
+    }
+    percent_decode(inner.trim()).trim().to_ascii_lowercase()
+}
+
+/// `%xx` escapes in a `cid:` reference, decoded as bytes; anything malformed stays literal.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let pair = bytes
+                .get(index + 1..index + 3)
+                .and_then(|pair| hex_digit(pair[0]).zip(hex_digit(pair[1])));
+            if let Some((high, low)) = pair {
+                out.push((high << 4) | low);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The attributes that may point at an inline part.
+const INLINE_ATTRIBUTES: [&str; 2] = ["src", "background"];
+
+/// Characters that make up an attribute name. A match has to be a whole name, so `srcset` and
+/// `data-src` are not mistaken for `src`.
+fn is_attribute_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':')
+}
+
+/// Whether `at` starts the attribute `name` rather than the tail or head of a longer one.
+fn attribute_name_matches(bytes: &[u8], at: usize, name: &str) -> bool {
+    let end = at.saturating_add(name.len());
+    if end > bytes.len() || !bytes[at..end].eq_ignore_ascii_case(name.as_bytes()) {
+        return false;
+    }
+    let starts_name = at == 0 || !is_attribute_name_byte(bytes[at - 1]);
+    let ends_name = !matches!(bytes.get(end), Some(&byte) if is_attribute_name_byte(byte));
+    starts_name && ends_name
+}
+
+/// The byte range of one `src`/`background` value at or after `at`, plus where the scan may resume.
+/// `lowercase` must be a case-folded copy of the html being rewritten, which keeps the offsets
+/// valid for both. A value that cannot be delimited cleanly yields `None`.
+fn cid_value_at(lowercase: &str, at: usize) -> Option<(usize, usize, usize)> {
+    let bytes = lowercase.as_bytes();
+    let name_len = INLINE_ATTRIBUTES
+        .iter()
+        .find(|name| attribute_name_matches(bytes, at, name))?
+        .len();
+    let mut cursor = at + name_len;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    if bytes.get(cursor) != Some(&b'=') {
+        return None;
+    }
+    cursor += 1;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    match bytes.get(cursor).copied() {
+        Some(quote) if quote == b'"' || quote == b'\'' => {
+            let start = cursor + 1;
+            let len = bytes.get(start..)?.iter().position(|byte| *byte == quote)?;
+            Some((start, start + len, start + len + 1))
+        }
+        // An unquoted value ends at whitespace or at the end of the tag.
+        Some(_) => {
+            let start = cursor;
+            let len = bytes[start..]
+                .iter()
+                .position(|byte| byte.is_ascii_whitespace() || *byte == b'>')
+                .unwrap_or(bytes.len() - start);
+            Some((start, start + len, start + len))
+        }
+        None => None,
+    }
+}
+
+/// Rewrites every `src="cid:..."` / `background='cid:...'` that names a collected part into its
+/// `data:` URL. Only the attribute value changes: quotes and every other byte are copied through,
+/// and a reference with no matching part is left exactly as it was. Returns the rewritten html and
+/// how many bytes of `data:` URLs were spliced in.
+fn inline_cid_references(html: &str, resources: &[InlineResource]) -> (String, usize) {
+    if resources.is_empty() || html.is_empty() {
+        return (html.to_string(), 0);
+    }
+    // Folding only ASCII keeps every byte offset addressing the original, so the scan can be
+    // case-insensitive while the rewrite still slices the untouched html.
+    let lowercase = html.to_ascii_lowercase();
+    let bytes = lowercase.as_bytes();
+    let mut out = String::with_capacity(html.len());
+    let mut copied = 0;
+    let mut inlined = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        let Some((value_start, value_end, resume)) = cid_value_at(&lowercase, index) else {
+            index += 1;
+            continue;
+        };
+        index = resume.max(index + 1);
+        let value = &html[value_start..value_end];
+        let trimmed = value.trim();
+        // `get(..4)` rejects both a shorter value and one whose fourth byte is mid-character.
+        if !trimmed.get(..4).is_some_and(|scheme| scheme.eq_ignore_ascii_case("cid:")) {
+            continue;
+        }
+        let key = normalize_cid(&trimmed[4..]);
+        let Some(resource) = resources.iter().find(|resource| resource.cid == key) else {
+            continue;
+        };
+        out.push_str(&html[copied..value_start]);
+        out.push_str(&resource.url);
+        copied = value_end;
+        inlined += resource.url.len();
+    }
+    out.push_str(&html[copied..]);
+    (out, inlined)
 }
 
 /// Cuts `value` to `limit` bytes without splitting a character. Returns whether anything was cut.
@@ -1045,21 +1252,36 @@ fn truncate_at_boundary(value: &mut String, limit: usize) -> bool {
 }
 
 /// Decodes a whole RFC 822 message into `(text, html)`; `html` stays `None` when no text/html
-/// part exists, so the desktop can fall back to the plain rendering.
+/// part exists, so the desktop can fall back to the plain rendering. Only the tests want the body
+/// without a render cap to apply, so the inline-byte count is dropped here.
+#[cfg(test)]
 fn extract_body(message: &[u8]) -> (String, Option<String>) {
+    let (text, html, _) = extract_body_with_inline(message);
+    (text, html)
+}
+
+/// Like `extract_body`, plus how many bytes of `data:` URLs were spliced into the html, so the
+/// caller can widen its render cap by exactly that much instead of truncating the images away.
+fn extract_body_with_inline(message: &[u8]) -> (String, Option<String>, usize) {
     let mut parts = TextParts::default();
-    collect_text_parts(message, 0, &mut parts);
+    collect_text_parts(message, 0, &mut parts, &mut InlineBudget::default());
+    let resources = parts.resources.as_slice();
+    let mut inlined = 0;
     let html = parts
         .html
         // A body that ends at the end of the message keeps its final CRLF; the frame does not need it.
-        .map(|html| html.trim_end().to_string())
+        .map(|html| {
+            let (html, bytes) = inline_cid_references(html.trim_end(), resources);
+            inlined = bytes;
+            html
+        })
         .filter(|html| !html.is_empty());
     let text = match parts.plain {
         // Plain mail is shown as written, minus the CRLFs that would otherwise double up.
         Some(plain) => plain.replace("\r\n", "\n").replace('\r', "\n").trim_end().to_string(),
         None => html.as_deref().map(html_to_text).unwrap_or_default(),
     };
-    (text, html)
+    (text, html, inlined)
 }
 
 pub fn fetch_body(io: &mut impl ImapIo, email: &str, auth: &str, uid: u32) -> Result<MailBody, MailFailure> {
@@ -1067,14 +1289,15 @@ pub fn fetch_body(io: &mut impl ImapIo, email: &str, auth: &str, uid: u32) -> Re
     let fetch = io.transact(&format!("A3 UID FETCH {uid} (BODY.PEEK[])"))?;
     check_completion(&fetch, "A3", MailFailure::Protocol)?;
     let message = body_literal(&fetch, uid)?;
-    let (mut text, mut html) = extract_body(&message);
+    let (mut text, mut html, inlined) = extract_body_with_inline(&message);
     if text.trim().is_empty() && html.is_none() {
         return Err(MailFailure::EmptyText);
     }
     let text_cut = truncate_at_boundary(&mut text, MAX_BODY_BYTES);
-    let html_cut = html
-        .as_mut()
-        .is_some_and(|value| truncate_at_boundary(value, MAX_BODY_BYTES));
+    // The inline images are already capped by their own budget, so their bytes ride on top of the
+    // text limit. Otherwise a mail with pictures would be cut in the middle of a `data:` URL.
+    let html_limit = MAX_BODY_BYTES.saturating_add(inlined);
+    let html_cut = html.as_mut().is_some_and(|value| truncate_at_boundary(value, html_limit));
     Ok(MailBody { text, html, truncated: text_cut || html_cut })
 }
 
@@ -1670,5 +1893,182 @@ mod tests {
         let mut io = peek_response("Content-Type: text/plain\r\n\r\n   \r\n");
         let err = fetch_body(&mut io, "me@qq.com", "auth-SECRET", 9).unwrap_err();
         assert_eq!(failure_message(err), "这封邮件没有可显示的文本");
+    }
+
+    /// A `multipart/related` message: one text/html part plus the image parts it may cite.
+    fn related_message(html: &str, images: &[(&str, &str)]) -> Vec<u8> {
+        let mut out = String::from("Content-Type: multipart/related; boundary=rel\r\n\r\n--rel\r\n");
+        out.push_str("Content-Type: text/html; charset=utf-8\r\n\r\n");
+        out.push_str(html);
+        out.push_str("\r\n");
+        for (cid, payload) in images {
+            out.push_str("--rel\r\nContent-Type: image/png\r\n");
+            out.push_str(&format!("Content-ID: <{cid}>\r\n"));
+            out.push_str("Content-Transfer-Encoding: base64\r\n\r\n");
+            out.push_str(&base64_of(payload));
+            out.push_str("\r\n");
+        }
+        out.push_str("--rel--\r\n");
+        out.into_bytes()
+    }
+
+    #[test]
+    fn multipart_related_inlines_a_cid_image_as_a_data_url() {
+        let logo = base64_of("png-logo-bytes");
+        let raw = wire(&[
+            "Content-Type: multipart/related; boundary=rel",
+            "",
+            "--rel",
+            "Content-Type: text/html; charset=utf-8",
+            "",
+            "<p>活动预告</p><img src=\"cid:logo@x\">",
+            "--rel",
+            "Content-Type: image/png; name=\"logo.png\"",
+            "Content-ID: <logo@x>",
+            "Content-Transfer-Encoding: base64",
+            "",
+            logo.as_str(),
+            "--rel--",
+        ]);
+        let (text, html) = extract_body(&raw);
+        // Only the attribute value is rewritten; the rest of the html is byte-identical.
+        let expected = format!("<p>活动预告</p><img src=\"data:image/png;base64,{logo}\">");
+        assert_eq!(html.as_deref(), Some(expected.as_str()));
+        assert_eq!(text, "活动预告");
+    }
+
+    #[test]
+    fn every_cid_spelling_hits_the_same_part_but_data_src_is_ignored() {
+        let logo = base64_of("logo-bytes");
+        let raw = wire(&[
+            "Content-Type: multipart/related; boundary=rel",
+            "",
+            "--rel",
+            "Content-Type: text/html",
+            "",
+            "<IMG SRC=\"CID:Logo@X\"><td background='cid:logo@x'></td><img src= cid:logo%40x><img data-src=\"cid:logo@x\">",
+            "--rel",
+            "Content-Type: image/png",
+            "Content-ID: <LOGO@x>",
+            "Content-Transfer-Encoding: base64",
+            "",
+            logo.as_str(),
+            "--rel--",
+        ]);
+        let (_, html) = extract_body(&raw);
+        let url = format!("data:image/png;base64,{logo}");
+        let expected = format!(
+            "<IMG SRC=\"{url}\"><td background='{url}'></td><img src= {url}><img data-src=\"cid:logo@x\">"
+        );
+        assert_eq!(html.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn an_unmatched_cid_reference_is_left_as_it_was() {
+        let raw = related_message("<img src=\"cid:missing@x\"><p>正文</p>", &[("other@x", "bytes")]);
+        let (_, html) = extract_body(&raw);
+        assert_eq!(html.as_deref(), Some("<img src=\"cid:missing@x\"><p>正文</p>"));
+    }
+
+    #[test]
+    fn svg_and_other_types_are_never_inlined() {
+        let svg = base64_of("<svg xmlns=\"http://www.w3.org/2000/svg\"/>");
+        let raw = wire(&[
+            "Content-Type: multipart/related; boundary=rel",
+            "",
+            "--rel",
+            "Content-Type: text/html",
+            "",
+            "<img src=\"cid:icon@x\">",
+            "--rel",
+            "Content-Type: image/svg+xml",
+            "Content-ID: <icon@x>",
+            "Content-Transfer-Encoding: base64",
+            "",
+            svg.as_str(),
+            "--rel--",
+        ]);
+        let (_, html) = extract_body(&raw);
+        assert_eq!(html.as_deref(), Some("<img src=\"cid:icon@x\">"));
+    }
+
+    #[test]
+    fn the_image_count_cap_keeps_the_first_thirty_two() {
+        let images: Vec<(String, String)> =
+            (0..33).map(|index| (format!("img{index}@x"), format!("payload-{index}"))).collect();
+        let refs: Vec<(&str, &str)> =
+            images.iter().map(|(cid, payload)| (cid.as_str(), payload.as_str())).collect();
+        let mut html = String::new();
+        for index in 0..33 {
+            html.push_str(&format!("<img src=\"cid:img{index}@x\">"));
+        }
+        let raw = related_message(&html, &refs);
+        let (_, html) = extract_body(&raw);
+        let html = html.unwrap_or_default();
+        assert_eq!(html.matches("data:image/png;base64,").count(), MAX_INLINE_IMAGES);
+        assert!(html.contains("src=\"cid:img32@x\""), "{html}");
+        assert!(!html.contains("src=\"cid:img31@x\""));
+    }
+
+    #[test]
+    fn the_byte_cap_stops_inlining_without_panicking() {
+        // Two 2 MiB parts fill the 4 MiB budget; the third would overflow it and is skipped.
+        let chunk = "a".repeat(2 * 1024 * 1024);
+        let refs = [("a@x", chunk.as_str()), ("b@x", chunk.as_str()), ("c@x", chunk.as_str())];
+        let raw = related_message("<img src=\"cid:a@x\"><img src=\"cid:b@x\"><img src=\"cid:c@x\">", &refs);
+        let (_, html) = extract_body(&raw);
+        let html = html.unwrap_or_default();
+        assert_eq!(html.matches("data:image/png;base64,").count(), 2);
+        assert!(html.contains("src=\"cid:c@x\""));
+
+        // One part larger than the whole budget cannot be inlined either.
+        let huge = "b".repeat(MAX_INLINE_BYTES + 1);
+        let raw = related_message("<img src=\"cid:big@x\">", &[("big@x", huge.as_str())]);
+        let (_, html) = extract_body(&raw);
+        assert_eq!(html.as_deref(), Some("<img src=\"cid:big@x\">"));
+    }
+
+    #[test]
+    fn quoted_printable_html_is_decoded_before_the_cid_substitution() {
+        let logo = base64_of("logo");
+        let raw = wire(&[
+            "Content-Type: multipart/related; boundary=rel",
+            "",
+            "--rel",
+            "Content-Type: text/html; charset=utf-8",
+            "Content-Transfer-Encoding: quoted-printable",
+            "",
+            "<p>=E4=BD=A0=E5=A5=BD</p><img src=3D\"cid:logo@x\">",
+            "--rel",
+            "Content-Type: image/png",
+            "Content-ID: <logo@x>",
+            "Content-Transfer-Encoding: base64",
+            "",
+            logo.as_str(),
+            "--rel--",
+        ]);
+        let (_, html) = extract_body(&raw);
+        let expected = format!("<p>你好</p><img src=\"data:image/png;base64,{logo}\">");
+        assert_eq!(html.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn inlined_images_do_not_eat_the_html_budget() {
+        let payload = "x".repeat(3 * 1024);
+        let filler = "y".repeat(MAX_BODY_BYTES - 1024);
+        let html = format!("<p>{filler}</p><img src=\"cid:logo@x\">");
+        let message = format!(
+            "Content-Type: multipart/related; boundary=rel\r\n\r\n--rel\r\nContent-Type: text/html\r\n\r\n{html}\r\n--rel\r\nContent-Type: image/png\r\nContent-ID: <logo@x>\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n--rel--\r\n",
+            base64_of(&payload)
+        );
+        let mut io = peek_response(&message);
+        let body = fetch_body(&mut io, "me@qq.com", "auth-SECRET", 9).unwrap();
+        assert!(!body.truncated);
+        let html = body.html.unwrap_or_default();
+        // The data URL is complete: the body cap must not cut it in the middle.
+        assert!(
+            html.ends_with(&format!("src=\"data:image/png;base64,{}\">", base64_of(&payload))),
+            "{html}"
+        );
     }
 }

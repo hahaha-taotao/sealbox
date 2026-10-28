@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildMailDocument, sanitizeMailHtml } from './mail-html.ts';
+import { buildMailDocument, hasRemoteImages, sanitizeMailHtml } from './mail-html.ts';
 
 test('script/noscript 连内容一起删掉，style 保留', () => {
   const output = sanitizeMailHtml('<style>.a{color:red}</style><script>alert(1)</script><noscript>fallback</noscript><p>正文</p>');
@@ -144,4 +144,93 @@ test('畸形输入不抛异常', () => {
   }
   assert.equal(sanitizeMailHtml(''), '');
   assert.equal(buildMailDocument(''), '');
+});
+
+test('hasRemoteImages 认得 http(s) 与协议相对的图片引用', () => {
+  assert.equal(hasRemoteImages('<img src="https://tracker.test/pixel.gif">'), true);
+  assert.equal(hasRemoteImages('<img src="http://cdn.test/a.png" width="10">'), true);
+  assert.equal(hasRemoteImages('<img src="//cdn.test/a.png">'), true);
+  assert.equal(hasRemoteImages('<img srcset="https://cdn.test/a.png 1x, https://cdn.test/b.png 2x">'), true);
+  assert.equal(hasRemoteImages('<img srcset="data:image/png;base64,AAA 1x">'), false);
+  assert.equal(hasRemoteImages('<table><tr><td background="https://cdn.test/bg.png">x</td></tr></table>'), true);
+  assert.equal(hasRemoteImages('<body background="https://cdn.test/bg.png">'), true);
+});
+
+test('hasRemoteImages 不把 data:/cid:/普通正文当远程图片', () => {
+  assert.equal(hasRemoteImages('<img src="data:image/png;base64,AAAA" alt="logo">'), false);
+  assert.equal(hasRemoteImages('<img src="cid:inline-01">'), false);
+  assert.equal(hasRemoteImages('<a href="https://example.com">链接不是图片</a>'), false);
+  assert.equal(hasRemoteImages('<p>纯文本</p>'), false);
+  assert.equal(hasRemoteImages(''), false);
+  assert.equal(hasRemoteImages('   '), false);
+});
+
+test('hasRemoteImages 对畸形输入不抛异常', () => {
+  const inputs = ['<img src=', '<img "https://a/b.png', '<<<>>>', '<img srcset="', '<img src=https://a.b/c.png', '<style>background:url('];
+  for (const input of inputs) {
+    assert.doesNotThrow(() => hasRemoteImages(input), input);
+  }
+  // 未闭合的标签浏览器也不会解析成元素，按无远程图片处理。
+  assert.equal(hasRemoteImages('<img src=https://a.b/c.png'), false);
+  // 无引号的合法属性仍要认得。
+  assert.equal(hasRemoteImages('<img src=https://a.b/c.png>'), true);
+});
+
+test('CSS 背景图也算远程图片（style 属性与 <style> 块）', () => {
+  assert.equal(hasRemoteImages(`<div style="background-image:url('https://cdn.test/a.png')">x</div>`), true);
+  assert.equal(hasRemoteImages('<div style="background:url( https://cdn.test/a.png )">x</div>'), true);
+  assert.equal(hasRemoteImages('<div style="background-image:url(&quot;https://cdn.test/a.png&quot;)">x</div>'), true);
+  assert.equal(hasRemoteImages('<style>.hero{background:url(//cdn.test/x.png) no-repeat}</style>'), true);
+  assert.equal(
+    hasRemoteImages('<html><head><style>.hero { background-image: url("https://cdn.test/x.png"); }</style></head><body><p>x</p></body></html>'),
+    true,
+  );
+});
+
+test('CSS 里的 data:/cid:/相对路径/片段引用不算远程图片', () => {
+  assert.equal(hasRemoteImages('<style>.a{background:url(data:image/png;base64,AAA)}</style>'), false);
+  assert.equal(hasRemoteImages('<style>.a{background:url(cid:inline-01)}</style>'), false);
+  assert.equal(hasRemoteImages('<style>.a{background:url(assets/a.png)}</style>'), false);
+  assert.equal(hasRemoteImages('<div style="background-image:url(#grad)">x</div>'), false);
+  assert.equal(hasRemoteImages('<div style="background-image:url(images/bg.png)">x</div>'), false);
+});
+
+test('@import 与 @font-face 里的 url() 不算远程图片', () => {
+  assert.equal(hasRemoteImages('<style>@import url(https://x.test/a.css);</style>'), false);
+  assert.equal(hasRemoteImages('<style>@import "https://x.test/a.css";</style>'), false);
+  assert.equal(hasRemoteImages('<style>@import url(//x.test/a.css) screen;</style>'), false);
+  assert.equal(hasRemoteImages('<style>@font-face{src:url(https://x.test/f.woff)}</style>'), false);
+  assert.equal(
+    hasRemoteImages('<style>@font-face { font-family: F; src: url("https://x.test/f.woff2") format("woff2"); }</style>'),
+    false,
+  );
+});
+
+test('剥掉 @import/@font-face 后，剩下的 background url() 仍然命中', () => {
+  assert.equal(
+    hasRemoteImages('<style>@font-face{src:url(https://x.test/f.woff)} .hero{background:url(https://x.test/bg.png)}</style>'),
+    true,
+  );
+  assert.equal(
+    hasRemoteImages('<style>@import url(https://x.test/a.css); .hero{background-image:url(//cdn.test/bg.png)}</style>'),
+    true,
+  );
+  // 未闭合的 @font-face 按 CSS 恢复规则吞到块尾，后面的规则不算数。
+  assert.equal(
+    hasRemoteImages('<style>@font-face{src:url(https://x.test/f.woff) .hero{background:url(https://x.test/bg.png)}</style>'),
+    false,
+  );
+});
+
+test('默认 CSP 只允许 data: 图片，放开远程图片后允许 http(s)', () => {
+  const strict = buildMailDocument('<p><img src="https://cdn.test/a.png"></p>');
+  assert.ok(strict.includes("default-src 'none'; img-src data:; style-src 'unsafe-inline'"));
+  assert.ok(!strict.includes('img-src data: https:'));
+
+  const relaxed = buildMailDocument('<p><img src="https://cdn.test/a.png"></p>', { allowRemoteImages: true });
+  assert.ok(relaxed.includes("default-src 'none'; img-src data: https: http:; style-src 'unsafe-inline'"));
+  assert.ok(relaxed.includes('<img src="https://cdn.test/a.png">'));
+
+  assert.equal(strict.match(/default-src 'none'/g)?.length, 1);
+  assert.equal(relaxed.match(/default-src 'none'/g)?.length, 1);
 });

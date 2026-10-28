@@ -227,14 +227,19 @@ function extractDocumentParts(content: string): { body: string; headStyles: stri
   return { body: raw.replace(/<\/?(?:html|body)\b[^>]*>/gi, "").trim(), headStyles };
 }
 
-function wrapDocument(body: string, headStyles: string[]): string {
+function contentSecurityPolicy(allowRemoteImages: boolean): string {
+  const imageSources = allowRemoteImages ? "img-src data: https: http:" : "img-src data:";
+  return `default-src 'none'; ${imageSources}; style-src 'unsafe-inline'`;
+}
+
+function wrapDocument(body: string, headStyles: string[], allowRemoteImages: boolean): string {
   return [
     "<!DOCTYPE html>",
     '<html lang="zh-CN">',
     "<head>",
     '<meta charset="utf-8">',
     '<meta name="referrer" content="no-referrer">',
-    "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'\">",
+    `<meta http-equiv="Content-Security-Policy" content="${contentSecurityPolicy(allowRemoteImages)}">`,
     `<style>${BASE_STYLE}</style>`,
     ...headStyles,
     "</head>",
@@ -245,20 +250,106 @@ function wrapDocument(body: string, headStyles: string[]): string {
   ].join("\n");
 }
 
+export interface MailDocumentOptions {
+  /** 只有用户在提示条上点了「显示图片」才放开远程图片，默认仍只允许 data: 图片。 */
+  allowRemoteImages?: boolean;
+}
+
 /**
  * 把邮件 HTML 片段包装成可放进 sandbox iframe srcdoc 的完整文档。
  * 完整文档（带 <html>/<body>）会抽出 body 内容并合并 head 里的 <style>。
  * 没有可显示内容时返回空字符串，调用方据此退回纯文本。
  * 对畸形输入不抛异常。
  */
-export function buildMailDocument(html: string): string {
+export function buildMailDocument(html: string, options: MailDocumentOptions = {}): string {
+  const allowRemoteImages = options.allowRemoteImages === true;
   const safe = sanitizeMailHtml(html);
   if (safe === "") return "";
   try {
     const parts = extractDocumentParts(safe);
     if (parts.body.trim() === "") return "";
-    return wrapDocument(parts.body, parts.headStyles);
+    return wrapDocument(parts.body, parts.headStyles, allowRemoteImages);
   } catch {
-    return wrapDocument(safe, []);
+    return wrapDocument(safe, [], allowRemoteImages);
+  }
+}
+
+function isRemoteImageUrl(value: string): boolean {
+  const trimmed = decodeEntities(value).trim();
+  // 协议相对地址（//host/x.png）同样是远程图片。
+  return /^(?:https?:)?\/\//i.test(trimmed);
+}
+
+function srcsetHasRemoteImage(value: string): boolean {
+  return value.split(",").some((candidate) => {
+    const url = candidate.trim().split(/\s+/)[0] ?? "";
+    return url !== "" && isRemoteImageUrl(url);
+  });
+}
+
+// CSS 里的 url(https://…)/url(//cdn/…) 同样受 img-src 管辖（营销邮件的铺底图常用它）。
+const CSS_REMOTE_URL_PATTERN = /url\(\s*['"]?\s*(?:https?:)?\/\//i;
+
+/**
+ * @import 的样式表与 @font-face 的字体都不受 img-src 管辖（点了「显示图片」也不会生效），
+ * 先把它们剥掉，避免凭空多出一条假提示。未闭合的 @font-face 按 CSS 恢复规则吃到结尾。
+ */
+function stripNonImageCssRules(css: string): string {
+  return css
+    .replace(/@import\b[^;]*;?/gi, " ")
+    .replace(/@font-face\b[^{]*\{[^}]*\}/gi, " ")
+    .replace(/@font-face\b[\s\S]*$/i, " ");
+}
+
+function cssHasRemoteImage(css: string): boolean {
+  return CSS_REMOTE_URL_PATTERN.test(stripNonImageCssRules(decodeEntities(css)));
+}
+
+function tagHasRemoteImage(tagName: string, attributeSource: string): boolean {
+  const isImageTag = tagName === "img" || tagName === "image";
+  ATTRIBUTE_PATTERN.lastIndex = 0;
+  let match = ATTRIBUTE_PATTERN.exec(attributeSource);
+  while (match !== null) {
+    const name = match[1].toLowerCase();
+    const rawValue = match[2];
+    if (rawValue !== undefined) {
+      const plain = stripQuotes(rawValue);
+      if ((name === "background" || name === "poster") && isRemoteImageUrl(plain)) return true;
+      if (name === "style" && cssHasRemoteImage(plain)) return true;
+      if (isImageTag && (name === "src" || name === "href" || name === "xlink:href") && isRemoteImageUrl(plain)) return true;
+      if (isImageTag && (name === "srcset" || name === "imagesrcset") && srcsetHasRemoteImage(plain)) return true;
+    }
+    match = ATTRIBUTE_PATTERN.exec(attributeSource);
+  }
+  return false;
+}
+
+function styleBlockHasRemoteImage(html: string): boolean {
+  const stylePattern = /<style\b[^>]*>([\s\S]*?)<\/style\s*>/gi;
+  let match = stylePattern.exec(html);
+  while (match !== null) {
+    if (cssHasRemoteImage(match[1] ?? "")) return true;
+    match = stylePattern.exec(html);
+  }
+  return false;
+}
+
+/**
+ * 正文里是否存在 http(s) 来源的图片引用：img 的 src/srcset、任意标签的 background/poster，
+ * 以及 style 属性与 <style> 块里的 url(http…)/url(//…)。
+ * data:、cid:、相对路径与 url(#id) 不算远程图片。对畸形输入不抛异常。
+ */
+export function hasRemoteImages(html: string): boolean {
+  if (typeof html !== "string" || html === "") return false;
+  try {
+    const tagPattern = /<([a-zA-Z][a-zA-Z0-9:_-]*)((?:"[^"]*"|'[^']*'|[^>"'])*)>/g;
+    let match = tagPattern.exec(html);
+    while (match !== null) {
+      if (tagHasRemoteImage(match[1].toLowerCase(), match[2])) return true;
+      match = tagPattern.exec(html);
+    }
+    return styleBlockHasRemoteImage(html);
+  } catch {
+    return false;
   }
 }

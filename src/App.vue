@@ -6,7 +6,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import packageJson from "../package.json";
 import { DB_ENGINES } from "./lib/entry-options";
 import { auditDateBounds, createAuditRequestGuard } from "./lib/audit-request";
-import { buildMailDocument } from "./lib/mail-html";
+import { buildMailDocument, hasRemoteImages } from "./lib/mail-html";
 import { buildResolutions, completeChoices, type SyncChoice } from "./lib/sync-choice.mjs";
 import {
   checkForUpdate,
@@ -54,6 +54,9 @@ const mailMessages = ref<MailMessage[]>([]);
 const mailSelectedUid = ref<number | null>(null);
 const mailBody = ref("");
 const mailHtml = ref("");
+const mailHtmlSource = ref("");
+const mailRemoteImages = ref(false);
+const mailImagesAllowed = ref(false);
 const mailSelected = ref<MailMessage | null>(null);
 const mailTruncated = ref(false);
 const mailBusy = ref(false);
@@ -62,6 +65,8 @@ const mailError = ref("");
 const mailOlderError = ref("");
 let mailSeq = 0;
 let mailBodySeq = 0;
+// 每个 srcdoc 文档只挂一次链接转发监听；文档换掉后自然失效。
+const mailLinkedDocuments = new WeakSet<Document>();
 const mailRecipient = computed(() => mailAccounts.value.find((account) => account.id === mailAccountId.value)?.email ?? "");
   type Page = "home" | "vault" | "audit" | "settings" | "mcp" | "plugin" | "mail";
 const page = ref<Page>("vault");
@@ -1783,6 +1788,9 @@ function applyLockedUi() {
   mailSelected.value = null;
   mailBody.value = "";
   mailHtml.value = "";
+  mailHtmlSource.value = "";
+  mailRemoteImages.value = false;
+  mailImagesAllowed.value = false;
   mailTruncated.value = false;
   mailBodyBusy.value = false;
   mailError.value = "";
@@ -1828,6 +1836,9 @@ async function openMail() {
       mailSelected.value = null;
       mailBody.value = "";
       mailHtml.value = "";
+      mailHtmlSource.value = "";
+      mailRemoteImages.value = false;
+      mailImagesAllowed.value = false;
     }
   } catch (e) {
     if (seq === mailSeq) mailError.value = String(e);
@@ -1845,6 +1856,9 @@ async function loadMail(entryId: string, seq = ++mailSeq) {
   mailSelected.value = null;
   mailBody.value = "";
   mailHtml.value = "";
+  mailHtmlSource.value = "";
+  mailRemoteImages.value = false;
+  mailImagesAllowed.value = false;
   mailTruncated.value = false;
   try {
     const messages = await api.mailList(entryId);
@@ -1885,6 +1899,9 @@ async function openMailMessage(uid: number) {
   mailSelected.value = mailMessages.value.find((message) => message.uid === uid) ?? null;
   mailBody.value = "";
   mailHtml.value = "";
+  mailHtmlSource.value = "";
+  mailRemoteImages.value = false;
+  mailImagesAllowed.value = false;
   mailTruncated.value = false;
   mailError.value = "";
   mailBodyBusy.value = true;
@@ -1892,6 +1909,9 @@ async function openMailMessage(uid: number) {
     const body = await api.mailBody(entryId, uid);
     if (seq !== mailBodySeq) return;
     mailBody.value = body.text;
+    mailHtmlSource.value = body.html ?? "";
+    mailRemoteImages.value = body.html ? hasRemoteImages(body.html) : false;
+    mailImagesAllowed.value = false;
     mailHtml.value = body.html ? buildMailDocument(body.html) : "";
     mailTruncated.value = body.truncated;
   } catch (e) {
@@ -1901,12 +1921,44 @@ async function openMailMessage(uid: number) {
   }
 }
 
+/** 用户点「显示图片」后按放开远程图片的 CSP 重建文档；只对当前这封邮件生效。 */
+function showMailImages() {
+  if (mailImagesAllowed.value || mailHtmlSource.value === "") return;
+  mailImagesAllowed.value = true;
+  mailHtml.value = buildMailDocument(mailHtmlSource.value, { allowRemoteImages: true });
+}
+
+/**
+ * 正文 iframe 没有 allow-popups，链接点了不会动；这里统一拦下并转发到系统浏览器。
+ * 事件目标来自 iframe 自己的 realm，不能用父页面的 instanceof Element 判断，改用 closest 鸭子判定。
+ */
+function handleMailFrameClick(event: MouseEvent) {
+  const target = event.target;
+  if (target === null) return;
+  const element = target as Element;
+  if (typeof element.closest !== "function") return;
+  const anchor = element.closest("a");
+  if (anchor === null) return;
+  const href = anchor.getAttribute("href") ?? "";
+  // 无论能否转发都拦掉 iframe 内的默认跳转，避免点了没反应又触发沙箱拦截。
+  event.preventDefault();
+  const url = href.trim();
+  const lower = url.toLowerCase();
+  if (!(lower.startsWith("http://") || lower.startsWith("https://") || lower.startsWith("mailto:"))) return;
+  void openUrl(url).catch(() => showToast("无法用系统浏览器打开这个链接。"));
+}
+
 /** iframe 只给了 allow-same-origin（脚本仍禁用），父页面可以量高度做自适应。 */
 function fitMailFrame(event: Event) {
   const target = event.currentTarget;
   if (!(target instanceof HTMLIFrameElement)) return;
+  const doc = target.contentDocument;
+  if (doc !== null && !mailLinkedDocuments.has(doc)) {
+    mailLinkedDocuments.add(doc);
+    doc.addEventListener("click", handleMailFrameClick, true);
+  }
   try {
-    const height = target.contentDocument?.documentElement?.scrollHeight ?? 0;
+    const height = doc?.documentElement?.scrollHeight ?? 0;
     if (height <= 0) return;
     target.style.height = `${Math.min(1600, Math.max(240, height + 8))}px`;
   } catch {
@@ -2966,6 +3018,10 @@ onMounted(async () => {
                   </template>
                 </dl>
                 <p v-if="mailTruncated" class="crumb">正文过长，已截断。</p>
+                <div v-if="mailHtml && mailRemoteImages && !mailImagesAllowed" class="mail-images-note">
+                  <span>远程图片已屏蔽，避免发件人通过追踪像素得知你已读。</span>
+                  <button class="btn" type="button" @click="showMailImages">显示图片</button>
+                </div>
                 <iframe
                   v-if="mailHtml"
                   class="mail-html"
