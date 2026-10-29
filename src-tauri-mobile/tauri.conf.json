@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/mobile-schema.json",
   "productName": "Sealbox",
-  "version": "0.14.0",
+  "version": "0.14.1",
   "identifier": "com.sealbox.mobile",
   "build": {
     "frontendDist": "../apps/mobile/dist",
