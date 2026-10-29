@@ -37,6 +37,7 @@ export function patchProguard(rules) {
     "-keep class com.sealbox.mobile.NdkContext { *; }",
     "-keep class com.sealbox.mobile.MobileContextPlugin { *; }",
     "-keep class com.sealbox.mobile.DocumentsPlugin { *; }",
+    "-keep class com.sealbox.mobile.ApkInstaller { *; }",
   ];
   const missing = bridge.filter((rule) => !rules.includes(rule));
   if (missing.length === 0) return rules;
@@ -110,7 +111,7 @@ export function applyAndroidPatches(projectRoot = root) {
   const proguardPath = resolve(appModuleDir, "proguard-rules.pro");
   const kotlinTargetDir = resolve(appModuleDir, "src/main/java/com/sealbox/mobile");
   // Every tracked Kotlin template is copied verbatim; the generated project is disposable.
-  const kotlinTemplates = ["DocumentsPlugin.kt", "MobileContext.kt"].map((name) => ({
+  const kotlinTemplates = ["DocumentsPlugin.kt", "MobileContext.kt", "ApkInstaller.kt"].map((name) => ({
     source: resolve(mobileDir, "android", name),
     target: resolve(kotlinTargetDir, name),
   }));
@@ -147,7 +148,7 @@ export function applyAndroidPatches(projectRoot = root) {
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     applyAndroidPatches();
-    console.log("patched Android install permission, Gradle working directory, Kotlin version, SAF template and the Android context bridge");
+    console.log("patched Android install permission, Gradle working directory, Kotlin version, SAF template, APK installer and the Android context bridge");
   } catch (error) {
     console.error(error.message);
     process.exitCode = 1;

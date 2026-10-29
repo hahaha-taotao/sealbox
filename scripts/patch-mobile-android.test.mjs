@@ -52,6 +52,7 @@ test("pure Android patches are idempotent and retain existing activity configura
   assert.match(proguard, /-keep class com\.sealbox\.mobile\.NdkContext \{ \*; \}/);
   assert.match(proguard, /-keep class com\.sealbox\.mobile\.MobileContextPlugin \{ \*; \}/);
   assert.match(proguard, /-keep class com\.sealbox\.mobile\.DocumentsPlugin \{ \*; \}/);
+  assert.match(proguard, /-keep class com\.sealbox\.mobile\.ApkInstaller \{ \*; \}/);
 });
 
 test("invalid Gradle inputs fail explicitly instead of silently omitting patches", () => {
@@ -68,6 +69,8 @@ test("generated projects sync the authoritative Kotlin template without editing 
   const target = join(java, "DocumentsPlugin.kt");
   const contextTemplate = join(root, "src-tauri-mobile/android/MobileContext.kt");
   const contextTarget = join(java, "MobileContext.kt");
+  const installerTemplate = join(root, "src-tauri-mobile/android/ApkInstaller.kt");
+  const installerTarget = join(java, "ApkInstaller.kt");
   const activity = join(java, "MainActivity.kt");
   const put = (path, data) => { mkdirSync(dirname(path), { recursive: true }); writeFileSync(path, data); };
   try {
@@ -81,11 +84,14 @@ test("generated projects sync the authoritative Kotlin template without editing 
     // Use the actual tracked template, not a fixture that could drift from production.
     const actualTemplate = readFileSync(new URL("../src-tauri-mobile/android/DocumentsPlugin.kt", import.meta.url), "utf8");
     const actualContextTemplate = readFileSync(new URL("../src-tauri-mobile/android/MobileContext.kt", import.meta.url), "utf8");
+    const actualInstallerTemplate = readFileSync(new URL("../src-tauri-mobile/android/ApkInstaller.kt", import.meta.url), "utf8");
     put(template, actualTemplate);
     put(contextTemplate, actualContextTemplate);
+    put(installerTemplate, actualInstallerTemplate);
     applyAndroidPatches(root);
     assert.equal(readFileSync(target, "utf8"), actualTemplate);
     assert.equal(readFileSync(contextTarget, "utf8"), actualContextTemplate);
+    assert.equal(readFileSync(installerTarget, "utf8"), actualInstallerTemplate);
     assert.equal(readFileSync(activity, "utf8"), mainActivity);
     const proguard = readFileSync(join(app, "proguard-rules.pro"), "utf8");
     assert.match(proguard, /# project rules/);
@@ -95,11 +101,14 @@ test("generated projects sync the authoritative Kotlin template without editing 
     assert.equal(readFileSync(join(app, "build.gradle.kts"), "utf8"), first);
     assert.equal(readFileSync(target, "utf8"), actualTemplate);
     assert.equal(readFileSync(contextTarget, "utf8"), actualContextTemplate);
+    assert.equal(readFileSync(installerTarget, "utf8"), actualInstallerTemplate);
     put(template, `${actualTemplate}\n// new template revision\n`);
     put(contextTemplate, `${actualContextTemplate}\n// new context template revision\n`);
+    put(installerTemplate, `${actualInstallerTemplate}\n// new installer template revision\n`);
     applyAndroidPatches(root);
     assert.equal(readFileSync(target, "utf8"), readFileSync(template, "utf8"));
     assert.equal(readFileSync(contextTarget, "utf8"), readFileSync(contextTemplate, "utf8"));
+    assert.equal(readFileSync(installerTarget, "utf8"), readFileSync(installerTemplate, "utf8"));
     assert.equal(readFileSync(activity, "utf8"), mainActivity);
   } finally {
     // This test owns this mkdtemp directory only.
@@ -125,6 +134,16 @@ test("SAF template keeps bytes outside commands and uses document intents plus b
   assert.match(kotlin, /pending !== invoke/);
   assert.doesNotMatch(kotlin, /@Command\s+fun (readBytes|writeNewBytes)/);
   assert.doesNotMatch(kotlin, /Base64|File\(uri|\.path\b/);
+});
+
+test("APK installer template opens FileProvider on the UI thread", () => {
+  const kotlin = readFileSync(new URL("../src-tauri-mobile/android/ApkInstaller.kt", import.meta.url), "utf8");
+  assert.match(kotlin, /@Keep/);
+  assert.match(kotlin, /@JvmStatic/);
+  assert.match(kotlin, /fun open/);
+  assert.match(kotlin, /FileProvider\.getUriForFile/);
+  assert.match(kotlin, /FLAG_ACTIVITY_NEW_TASK/);
+  assert.match(kotlin, /runOnUiThread/);
 });
 
 test("Android context bridge publishes the application context before commands can run", () => {

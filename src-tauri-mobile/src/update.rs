@@ -212,107 +212,91 @@ mod install {
 
 #[cfg(target_os = "android")]
 mod install {
-    use jni::objects::{JObject, JValue};
+    use jni::objects::{JClass, JObject, JString};
     use jni::JNIEnv;
     use std::path::Path;
 
-    fn with_env<T>(f: impl FnOnce(&mut JNIEnv) -> Result<T, String>) -> Result<T, String> {
+    fn with_env(f: impl FnOnce(&mut JNIEnv) -> Result<(), String>) -> Result<(), String> {
         if !crate::mobile_context::is_ready() {
             return Err("Android 上下文未就绪，无法打开安装器".into());
         }
         let context = ndk_context::android_context();
         let vm = unsafe { jni::JavaVM::from_raw(context.vm() as *mut _) }.map_err(|error| error.to_string())?;
         let mut env = vm.attach_current_thread().map_err(|error| error.to_string())?;
-        f(&mut env)
+        // jni 0.21 reports JavaException without clearing it. The JavaBridge
+        // postMessage caller then surfaces that pending exception instead of this Result.
+        let outcome = env.with_local_frame(32, |env| -> jni::errors::Result<Result<(), String>> {
+            let result = f(env);
+            if env.exception_check().unwrap_or(false) {
+                return Ok(Err(pending_exception_message(env)));
+            }
+            Ok(result)
+        });
+        match outcome {
+            Ok(inner) => inner,
+            Err(error) => {
+                if env.exception_check().unwrap_or(false) {
+                    let _ = env.exception_clear();
+                }
+                Err(format!("无法打开安装器：{error}"))
+            }
+        }
     }
 
-    fn check(env: &mut JNIEnv) -> Result<(), String> {
-        if env.exception_check().map_err(|error| error.to_string())? {
-            env.exception_describe().ok();
-            env.exception_clear().ok();
-            return Err("系统拒绝打开安装界面".into());
+    fn pending_exception_message(env: &mut JNIEnv) -> String {
+        let Ok(exception) = env.exception_occurred() else {
+            let _ = env.exception_clear();
+            return "系统拒绝打开安装界面".into();
+        };
+        let _ = env.exception_clear();
+        let message = env
+            .call_method(&exception, "toString", "()Ljava/lang/String;", &[])
+            .and_then(|value| value.l())
+            .ok()
+            .filter(|value| !value.is_null())
+            .and_then(|value| {
+                env.get_string(&JString::from(value))
+                    .ok()
+                    .map(|text| String::from(text.to_str().unwrap_or_default()))
+            })
+            .filter(|text| !text.is_empty());
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
         }
-        Ok(())
+        message.unwrap_or_else(|| "系统拒绝打开安装界面".into())
     }
 
     pub fn install_apk(path: &Path) -> Result<(), String> {
         let path_text = path.to_str().ok_or("安装包路径无效")?;
         with_env(|env| {
             let context = unsafe { JObject::from_raw(ndk_context::android_context().context() as _) };
-            let package = env
-                .call_method(&context, "getPackageName", "()Ljava/lang/String;", &[])
+            let loader = env
+                .call_method(&context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])
                 .map_err(|error| error.to_string())?
                 .l()
                 .map_err(|error| error.to_string())?;
-            let value = jni::objects::JString::from(package);
-            let package_name = {
-                let text = env.get_string(&value).map_err(|error| error.to_string())?;
-                String::from(text.to_str().unwrap_or_default())
-            };
-            let authority = env
-                .new_string(format!("{package_name}.fileprovider"))
+            let class_name = env
+                .new_string("com.sealbox.mobile.ApkInstaller")
                 .map_err(|error| error.to_string())?;
-            let file_class = env
-                .find_class("java/io/File")
-                .map_err(|error| error.to_string())?;
-            let file_path = env.new_string(path_text).map_err(|error| error.to_string())?;
-            let file = env
-                .new_object(file_class, "(Ljava/lang/String;)V", &[(&file_path).into()])
-                .map_err(|error| error.to_string())?;
-            let uri = env
-                .call_static_method(
-                    "androidx/core/content/FileProvider",
-                    "getUriForFile",
-                    "(Landroid/content/Context;Ljava/lang/String;Ljava/io/File;)Landroid/net/Uri;",
-                    &[(&context).into(), (&authority).into(), (&file).into()],
+            let class = env
+                .call_method(
+                    &loader,
+                    "loadClass",
+                    "(Ljava/lang/String;)Ljava/lang/Class;",
+                    &[(&class_name).into()],
                 )
-                .map_err(|error| error.to_string())?
+                .map_err(|error| format!("安装器未安装：{error}"))?
                 .l()
                 .map_err(|error| error.to_string())?;
-            check(env)?;
-            let action = env
-                .new_string("android.intent.action.VIEW")
-                .map_err(|error| error.to_string())?;
-            let intent = env
-                .new_object(
-                    "android/content/Intent",
-                    "(Ljava/lang/String;)V",
-                    &[(&action).into()],
-                )
-                .map_err(|error| error.to_string())?;
-            let mime = env
-                .new_string("application/vnd.android.package-archive")
-                .map_err(|error| error.to_string())?;
-            env.call_method(
-                &intent,
-                "setDataAndType",
-                "(Landroid/net/Uri;Ljava/lang/String;)Landroid/content/Intent;",
-                &[(&uri).into(), (&mime).into()],
+            let class = JClass::from(class);
+            let path = env.new_string(path_text).map_err(|error| error.to_string())?;
+            env.call_static_method(
+                &class,
+                "open",
+                "(Landroid/content/Context;Ljava/lang/String;)V",
+                &[(&context).into(), (&path).into()],
             )
-            .map_err(|error| error.to_string())?;
-            env.call_method(
-                &intent,
-                "addFlags",
-                "(I)Landroid/content/Intent;",
-                &[JValue::Int(0x00000001)],
-            )
-            .map_err(|error| error.to_string())?;
-            env.call_method(
-                &intent,
-                "addFlags",
-                "(I)Landroid/content/Intent;",
-                &[JValue::Int(0x10000000)],
-            )
-            .map_err(|error| error.to_string())?;
-            check(env)?;
-            env.call_method(
-                &context,
-                "startActivity",
-                "(Landroid/content/Intent;)V",
-                &[(&intent).into()],
-            )
-            .map_err(|error| error.to_string())?;
-            check(env)?;
+            .map_err(|error| format!("无法打开安装界面：{error}"))?;
             Ok(())
         })
     }
