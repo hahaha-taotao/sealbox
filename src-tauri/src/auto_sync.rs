@@ -17,6 +17,11 @@ pub struct AutoSync {
     secs: u64,
     last_run: Option<Instant>,
     running: bool,
+    /// A missing/stale capability attestation pauses automatic retries until
+    /// the operator verifies the target or saves the configuration again.
+    blocked: bool,
+    /// Invalidates completion updates from an older in-flight run.
+    epoch: u64,
 }
 
 pub fn state_of(state: &AppState) -> MutexGuard<'_, AutoSync> {
@@ -27,6 +32,18 @@ pub fn apply(state: &AppState, enabled: bool, secs: u64) {
     let mut auto = state_of(state);
     auto.enabled = enabled;
     auto.secs = secs.max(1);
+    auto.blocked = false;
+    auto.last_run = None;
+    auto.epoch = auto.epoch.wrapping_add(1);
+}
+
+/// Resume automatic scheduling after the operator successfully verifies the
+/// current endpoint and credentials.
+pub fn resume(state: &AppState) {
+    let mut auto = state_of(state);
+    auto.blocked = false;
+    auto.last_run = None;
+    auto.epoch = auto.epoch.wrapping_add(1);
 }
 
 pub fn refresh_from_vault(state: &AppState, vault: &Vault) {
@@ -54,15 +71,20 @@ fn is_due(last_run: Option<Instant>, now: Instant, secs: u64) -> bool {
     }
 }
 
+fn should_run(auto: &AutoSync, now: Instant) -> bool {
+    auto.enabled && !auto.running && !auto.blocked && is_due(auto.last_run, now, auto.secs)
+}
+
+fn epoch_is_current(current: u64, run: u64) -> bool {
+    current == run
+}
+
 /// Runs once a second from the security tick. The network round trip happens on
 /// its own thread, so idle lock and clipboard cleanup keep their cadence.
 pub fn tick(app: &AppHandle, state: &AppState) {
     {
         let auto = state_of(state);
-        if !auto.enabled || auto.running {
-            return;
-        }
-        if !is_due(auto.last_run, Instant::now(), auto.secs) {
+        if !should_run(&auto, Instant::now()) {
             return;
         }
     }
@@ -82,13 +104,14 @@ pub fn tick(app: &AppHandle, state: &AppState) {
         return;
     };
 
-    {
+    let run_epoch = {
         let mut auto = state_of(state);
-        if auto.running {
+        if !should_run(&auto, Instant::now()) {
             return;
         }
         auto.running = true;
-    }
+        auto.epoch
+    };
 
     let handle = app.clone();
     std::thread::spawn(move || {
@@ -105,7 +128,15 @@ pub fn tick(app: &AppHandle, state: &AppState) {
         if let Some(state) = handle.try_state::<AppState>() {
             let mut auto = state_of(&state);
             auto.running = false;
-            auto.last_run = Some(Instant::now());
+            if epoch_is_current(auto.epoch, run_epoch) {
+                if matches!(
+                    result.as_ref(),
+                    Err(error) if error == sync::SYNC_CONDITIONAL_WRITE_UNVERIFIED
+                ) {
+                    auto.blocked = true;
+                }
+                auto.last_run = Some(Instant::now());
+            }
         }
         let payload = match &result {
             Ok(report) => serde_json::json!({ "ok": true, "error": null, "report": report }),
@@ -160,5 +191,27 @@ mod tests {
         let now = Instant::now();
         assert!(!is_due(Some(now), now, 0));
         assert!(is_due(Some(now), now + Duration::from_secs(1), 0));
+    }
+
+    #[test]
+    fn capability_block_pauses_until_resumed() {
+        let now = Instant::now();
+        let mut auto = AutoSync {
+            enabled: true,
+            secs: 60,
+            last_run: None,
+            running: false,
+            blocked: true,
+            epoch: 0,
+        };
+        assert!(!should_run(&auto, now));
+        auto.blocked = false;
+        assert!(should_run(&auto, now));
+    }
+
+    #[test]
+    fn stale_run_epoch_cannot_update_scheduler_state() {
+        assert!(epoch_is_current(7, 7));
+        assert!(!epoch_is_current(8, 7));
     }
 }

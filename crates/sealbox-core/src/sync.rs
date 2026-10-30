@@ -25,6 +25,9 @@ pub const MIN_AUTO_SYNC_SECS: u64 = 15;
 pub const MAX_AUTO_SYNC_SECS: u64 = 86_400;
 /// Returned when a background sync notices the vault locked mid-flight.
 pub const SYNC_ABORTED: &str = "已锁定，本次同步已中止";
+/// Conditional writes stay fail-closed until this exact endpoint/credential binding
+/// has been explicitly verified by the operator.
+pub const SYNC_CONDITIONAL_WRITE_UNVERIFIED: &str = "sync_conditional_write_unverified";
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -193,6 +196,7 @@ pub struct SyncView {
     pub last_result: Option<String>,
     pub auto_sync: bool,
     pub auto_sync_secs: u64,
+    pub conditional_verified: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -347,6 +351,9 @@ impl SyncRuntime {
         if self.pending.as_ref().is_some_and(|p| p.dek_digest != hex::encode(Sha256::digest(dek))) {
             self.invalidate(); return Err("sync_session_changed".into());
         }
+        if !self.pending.as_ref().is_some_and(|p| p.uploaded.is_some()) {
+            require_conditional_support(vault, dek)?;
+        }
         let (client, _, binding) = configured_client(vault, dek)?;
         let result = self.commit_with_store(vault, &client, dek, &binding, token, choices, still_wanted);
         if let Ok(report) = &result {
@@ -493,6 +500,27 @@ pub fn conditional_capability_binding(vault: &Vault, dek: &[u8;32]) -> Result<St
     configured_client(vault, dek).map(|(_, _, binding)| binding)
 }
 
+/// Check the attestation for the current normalized config and sync secret.
+/// Missing or stale markers are simply unverified; no network request is made.
+pub fn conditional_support_verified(vault: &Vault, dek: &[u8; 32]) -> Result<bool, String> {
+    match configured_client(vault, dek) {
+        Ok((client, _, _)) => Ok(client.conditional_verified),
+        Err(error) if error == "还没有配置同步" || error == "同步密钥缺失，请重新保存" => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Keep background callers away from RemoteClient::put until the operator has
+/// explicitly verified the exact endpoint/credential binding.
+pub fn require_conditional_support(vault: &Vault, dek: &[u8; 32]) -> Result<(), String> {
+    let (client, _, _) = configured_client(vault, dek)?;
+    if client.conditional_verified {
+        Ok(())
+    } else {
+        Err(SYNC_CONDITIONAL_WRITE_UNVERIFIED.into())
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ConditionalSupportReport {
     pub verified: bool,
@@ -595,7 +623,21 @@ pub fn view(vault: &Vault) -> Result<SyncView, VaultError> {
         last_result: vault.get_setting("sync_last_result")?,
         auto_sync: auto.enabled,
         auto_sync_secs: auto.secs,
+        // `view` has no DEK, so this is only a cheap hint. Commands that have
+        // the unlocked DEK replace it with `view_with_dek`'s exact binding check.
+        conditional_verified: vault.get_setting("sync_conditional_verified")?.is_some(),
     })
+}
+
+/// Build a sync view with the binding checked against the current config and
+/// secret. A marker alone is never treated as proof of provider capability.
+pub fn view_with_dek(vault: &Vault, dek: &[u8; 32]) -> Result<SyncView, String> {
+    // Resolve/migrate the secret before building the view so legacy plaintext
+    // settings do not make `has_secret` look false for this response.
+    let conditional_verified = conditional_support_verified(vault, dek)?;
+    let mut view = view(vault).map_err(|error| error.to_string())?;
+    view.conditional_verified = conditional_verified;
+    Ok(view)
 }
 
 pub fn save_config(
@@ -606,22 +648,27 @@ pub fn save_config(
 ) -> Result<(), String> {
     let config = config.normalize()?;
     let secret = secret.map(str::trim).filter(|s| !s.is_empty());
-    if secret.is_none()
-        && vault
-            .get_setting("sync_secret_enc")
-            .map_err(|e| e.to_string())?
-            .is_none()
-    {
+    // Read through the migration-aware accessor before deciding whether a
+    // secret is missing. Legacy databases may only have `sync_secret`.
+    let has_existing_secret = vault
+        .get_secret_setting(dek, "sync_secret")
+        .map_err(|e| e.to_string())?
+        .is_some();
+    if secret.is_none() && !has_existing_secret {
         return Err("第一次保存需要填写同步密钥".into());
+    }
+    // Validate before changing the config so a rejected replacement cannot
+    // leave a valid old attestation paired with a partially saved config.
+    if let Some(secret) = secret {
+        if secret.len() < 8 {
+            return Err("同步密钥至少 8 位".into());
+        }
     }
     let json = serde_json::to_string(&config).map_err(|e| e.to_string())?;
     vault
         .set_setting("sync_config", &json)
         .map_err(|e| e.to_string())?;
     if let Some(secret) = secret {
-        if secret.len() < 8 {
-            return Err("同步密钥至少 8 位".into());
-        }
         let key = sync_key(secret);
         let check = encrypt(&key, b"sealbox-sync-v1").map_err(|e| e.to_string())?;
         vault
@@ -630,6 +677,21 @@ pub fn save_config(
         vault
             .set_setting("sync_key_check", &hex::encode(check.to_bytes()))
             .map_err(|e| e.to_string())?;
+    }
+
+    // The binding includes the normalized config and derived sync key. Preserve
+    // it only when both are unchanged; any changed endpoint/credential must be
+    // explicitly re-verified by the operator.
+    let previous_binding = vault
+        .get_setting("sync_conditional_verified")
+        .map_err(|e| e.to_string())?;
+    if let Some(previous_binding) = previous_binding {
+        let current_binding = conditional_capability_binding(vault, dek)?;
+        if previous_binding != current_binding {
+            vault
+                .delete_setting("sync_conditional_verified")
+                .map_err(|e| e.to_string())?;
+        }
     }
     let _ = vault.audit("sync_config", None, "saved");
     Ok(())
@@ -645,6 +707,7 @@ pub fn clear_config(vault: &Vault) -> Result<(), VaultError> {
         "sync_last_result",
         "sync_auto",
         "sync_auto_secs",
+        "sync_conditional_verified",
     ] {
         vault.delete_setting(key)?;
     }
@@ -678,6 +741,9 @@ pub fn sync_now_with_runtime(runtime: &mut SyncRuntime, vault: &Vault, dek: &[u8
         let token = p.token.clone();
         return runtime.commit(vault, dek, &token, &[], still_wanted);
     }
+    // This single-stage entry is also used by both auto-sync implementations.
+    // Reject before preview/GET so an unverified target never reaches PUT.
+    require_conditional_support(vault, dek)?;
     let preview = runtime.preview(vault, dek)?;
     if !preview.report.conflict_details.is_empty() {
         return Ok(blocked_report(&preview.report, "sync_conflicts_require_resolution", false));
@@ -1261,7 +1327,9 @@ impl RemoteClient {
     }
 
     fn put(&self, bytes: &[u8], condition: &WriteCondition) -> Result<(), String> {
-        if !self.conditional_verified { return Err("sync_conditional_write_unverified".into()); }
+        if !self.conditional_verified {
+            return Err(SYNC_CONDITIONAL_WRITE_UNVERIFIED.into());
+        }
         if bytes.len() > MAX_REMOTE_BYTES { return Err("sync snapshot exceeds 64MB".into()); }
         match self.kind {
             SyncKind::Webdav => self.webdav_put(bytes, condition),
@@ -1648,6 +1716,167 @@ mod tests {
             prefix: String::new(),
         };
         assert!(local.normalize().is_err());
+    }
+
+    fn test_sync_config(endpoint: &str) -> SyncConfig {
+        SyncConfig {
+            kind: SyncKind::Webdav,
+            endpoint: endpoint.into(),
+            username: "user".into(),
+            bucket: String::new(),
+            region: "us-east-1".into(),
+            prefix: String::new(),
+        }
+    }
+
+    fn fresh_sync_vault() -> (Vault, [u8; 32]) {
+        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        save_config(
+            &vault,
+            &dek,
+            test_sync_config("https://dav.example.com"),
+            Some("memory-sync-secret"),
+        )
+        .unwrap();
+        (vault, dek)
+    }
+
+    #[test]
+    fn saving_legacy_sync_secret_migrates_before_missing_check() {
+        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        let config = test_sync_config("https://dav.example.com");
+        vault
+            .set_setting("sync_config", &serde_json::to_string(&config).unwrap())
+            .unwrap();
+        vault
+            .set_setting("sync_secret", "legacy-sync-secret")
+            .unwrap();
+
+        save_config(&vault, &dek, config, None).unwrap();
+
+        assert!(vault.get_setting("sync_secret_enc").unwrap().is_some());
+        assert!(vault.get_setting("sync_secret").unwrap().is_none());
+    }
+
+    #[test]
+    fn conditional_support_requires_an_exact_binding() {
+        let (vault, dek) = fresh_sync_vault();
+        assert!(!conditional_support_verified(&vault, &dek).unwrap());
+
+        vault
+            .set_setting("sync_conditional_verified", "wrong-binding")
+            .unwrap();
+        assert!(!conditional_support_verified(&vault, &dek).unwrap());
+
+        let binding = conditional_capability_binding(&vault, &dek).unwrap();
+        vault
+            .set_setting("sync_conditional_verified", &binding)
+            .unwrap();
+        assert!(conditional_support_verified(&vault, &dek).unwrap());
+    }
+
+    #[test]
+    fn unverified_configuration_is_rejected_before_auto_sync_network_work() {
+        let (vault, dek) = fresh_sync_vault();
+        assert_eq!(
+            require_conditional_support(&vault, &dek).unwrap_err(),
+            SYNC_CONDITIONAL_WRITE_UNVERIFIED
+        );
+    }
+
+    #[test]
+    fn sync_now_with_runtime_rejects_unverified_before_remote_get() {
+        let (vault, dek) = fresh_sync_vault();
+        let mut runtime = SyncRuntime::default();
+        assert_eq!(
+            sync_now_with_runtime(&mut runtime, &vault, &dek, &|| true).unwrap_err(),
+            SYNC_CONDITIONAL_WRITE_UNVERIFIED
+        );
+    }
+
+    #[test]
+    fn changing_sync_config_clears_conditional_binding() {
+        let (vault, dek) = fresh_sync_vault();
+        let binding = conditional_capability_binding(&vault, &dek).unwrap();
+        vault
+            .set_setting("sync_conditional_verified", &binding)
+            .unwrap();
+
+        save_config(
+            &vault,
+            &dek,
+            test_sync_config("https://other-dav.example.com"),
+            None,
+        )
+        .unwrap();
+
+        assert!(vault
+            .get_setting("sync_conditional_verified")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn saving_unchanged_sync_config_preserves_conditional_binding() {
+        let (vault, dek) = fresh_sync_vault();
+        let binding = conditional_capability_binding(&vault, &dek).unwrap();
+        vault
+            .set_setting("sync_conditional_verified", &binding)
+            .unwrap();
+
+        save_config(
+            &vault,
+            &dek,
+            test_sync_config("https://dav.example.com"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            vault
+                .get_setting("sync_conditional_verified")
+                .unwrap()
+                .as_deref(),
+            Some(binding.as_str())
+        );
+    }
+
+    #[test]
+    fn changing_sync_secret_clears_conditional_binding() {
+        let (vault, dek) = fresh_sync_vault();
+        let binding = conditional_capability_binding(&vault, &dek).unwrap();
+        vault
+            .set_setting("sync_conditional_verified", &binding)
+            .unwrap();
+
+        save_config(
+            &vault,
+            &dek,
+            test_sync_config("https://dav.example.com"),
+            Some("changed-sync-secret"),
+        )
+        .unwrap();
+
+        assert!(vault
+            .get_setting("sync_conditional_verified")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn clearing_sync_config_clears_conditional_binding() {
+        let (vault, dek) = fresh_sync_vault();
+        let binding = conditional_capability_binding(&vault, &dek).unwrap();
+        vault
+            .set_setting("sync_conditional_verified", &binding)
+            .unwrap();
+
+        clear_config(&vault).unwrap();
+
+        assert!(vault
+            .get_setting("sync_conditional_verified")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

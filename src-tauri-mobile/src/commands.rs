@@ -546,7 +546,8 @@ pub fn settings_set(state: State<AppState>, idle_secs: u64, clipboard_secs: u64)
 pub fn sync_status(state: State<AppState>) -> Result<SyncView, String> {
     let mut session = lock_session(&state.session);
     session.require_unlocked().map_err(map_err)?;
-    sync::view(session.vault().map_err(map_err)?).map_err(map_err)
+    let dek = *session.dek().map_err(map_err)?;
+    sync::view_with_dek(session.vault().map_err(map_err)?, &dek)
 }
 
 #[derive(Deserialize)]
@@ -586,7 +587,7 @@ pub fn sync_save(state: State<AppState>, input: SyncSaveInput) -> Result<SyncVie
         )?;
         let auto =
             sync::save_auto(vault, input.auto_sync, input.auto_sync_secs).map_err(map_err)?;
-        (sync::view(vault).map_err(map_err)?, auto)
+        (sync::view_with_dek(vault, &dek)?, auto)
     };
     invalidate_runtime(&state);
     crate::auto_sync::apply(&state, auto.enabled, auto.secs);
@@ -1183,5 +1184,7 @@ pub fn mail_save_attachment(state: State<AppState>, request: MailSaveAttachmentR
 pub fn sync_verify_conditional(app: AppHandle, state: State<AppState>) -> Result<sync::ConditionalSupportReport, String> {
     let (vault, dek) = open_unlocked_copy(&app, &state)?;
     let still_unlocked = || lock_session(&state.session).is_unlocked();
-    sync::verify_conditional_support(&vault, &dek, &still_unlocked)
+    let result = sync::verify_conditional_support(&vault, &dek, &still_unlocked)?;
+    crate::auto_sync::resume(&state);
+    Ok(result)
 }

@@ -1646,6 +1646,7 @@ async function verifySync() {
   syncBusy.value = true;
   try {
     syncVerifyResult.value = await api.syncVerifyConditional();
+    await loadSync();
     showToast(syncVerifyResult.value.verified ? "安全条件写入已验证" : "服务端未通过安全验证");
   } catch (e) {
     syncVerifyResult.value = null;
@@ -3173,7 +3174,7 @@ onMounted(async () => {
           </div>
           <div class="mcp-card settings-master">
             <h3>数据同步</h3>
-            <p class="crumb">支持 WebDAV 和 S3。上传的是用同步密钥再加密的快照，服务器看不到明文，也解不开主密码。有冲突时必须逐条选择保留本地、采用远端或两者都留；删除与编辑冲突要单独确认后才能提交。不会因为修改时间相同就自动保留某一边。冲突或阻塞之后会重新预览，不能沿用旧令牌。本地尚未落盘时只重试提交。解锁后按设定间隔自动同步，默认 60 秒；改完点「保存配置」生效。</p>
+            <p class="crumb">支持 WebDAV 和 S3。上传的是用同步密钥再加密的快照，服务器看不到明文，也解不开主密码。有冲突时必须逐条选择保留本地、采用远端或两者都留；删除与编辑冲突要单独确认后才能提交。不会因为修改时间相同就自动保留某一边。冲突或阻塞之后会重新预览，不能沿用旧令牌。本地尚未落盘时只重试提交。解锁后按设定间隔自动同步，默认 60 秒；改完点「保存配置」生效。安全条件写入未验证时不会上传，自动同步会暂停；升级后的旧配置请先点击「验证安全同步」。</p>
             <div class="settings-fields">
               <div class="field">
                 <label>类型</label>
@@ -3216,6 +3217,7 @@ onMounted(async () => {
                 <input v-model.number="syncAutoSecs" type="number" min="15" max="86400" :disabled="!syncAuto" />
               </div>
             </div>
+            <p v-if="syncView?.configured && !syncView.conditional_verified" class="error">安全条件写入尚未验证；自动同步已暂停。请点击「验证安全同步」完成 If-Match / If-None-Match 验证，验证失败时不会上传。</p>
             <p v-if="syncView?.last_sync_at" class="crumb">上次同步 {{ fmtTime(syncView.last_sync_at) }}<span v-if="syncView.last_result"> · {{ syncView.last_result }}</span></p>
             <div v-if="syncReport" class="crumb">
               <p>阶段：{{ syncPhaseLabel(syncReport.phase) }}</p>

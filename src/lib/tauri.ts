@@ -56,6 +56,7 @@ export interface SyncView {
   last_result: string | null;
   auto_sync: boolean;
   auto_sync_secs: number;
+  conditional_verified: boolean;
 }
 
 export interface SyncSaveInput {
