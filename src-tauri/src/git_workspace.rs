@@ -92,8 +92,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 ("message", string_schema(1, 2000)),
                 ("limit", json!({"type":"integer","minimum":1,"maximum":100,"default":20,"description":"仅 log"})),
                 ("remote", json!({"type":"string","minLength":1,"maxLength":64,"description":"fetch/pull/push 的远程名，默认 origin。必须是 https://github.com"})),
-                ("branch", string_schema(1, 200)),
-                ("tag", json!({"type":"string","minLength":1,"maxLength":200,"description":"仅 push：只推这个标签。与 branch / tags 互斥"})),
+                ("branch", json!({"type":"string","minLength":0,"maxLength":200,"description":"仅 push：目标分支；空字符串表示当前分支。与 tag 互斥"})),
+                ("tag", json!({"type":"string","minLength":0,"maxLength":200,"description":"仅 push：只推这个标签；空字符串表示不指定标签。与 branch / tags 互斥"})),
                 ("tags", json!({"type":"boolean","default":false,"description":"仅 push：推送分支时带上全部标签"})),
                 ("force_with_lease", json!({"type":"boolean","default":false,"description":"仅 push：先 ls-remote 再 --force-with-lease。不推标签时不能用"})),
                 ("repo", json!({"type":"string","minLength":1,"maxLength":201,"description":"仅 clone：owner/repo"})),
@@ -425,9 +425,10 @@ fn prepare_push(session: &Session, args: &Value) -> Result<PreparedGitOp, String
     let root = repo_root(session, args)?;
     let remote = remote_name(args)?;
     require_github_https_remote(&root, &remote)?;
+    let requested_branch = requested_branch(args)?;
     let tag = requested_tag(args)?;
     let tags = args.get("tags").and_then(Value::as_bool).unwrap_or(false);
-    if tag.is_some() && (tags || args.get("branch").is_some()) {
+    if tag.is_some() && (tags || requested_branch.is_some()) {
         return Err("tag 与 branch / tags=true 不能同时使用。只推某个标签时只传 tag。".into());
     }
     let force_with_lease = args
@@ -446,7 +447,7 @@ fn prepare_push(session: &Session, args: &Value) -> Result<PreparedGitOp, String
         target_label = format!("refs/tags/{tag_name}");
         cmd.push(format!("refs/tags/{tag_name}"));
     } else {
-        let name = match requested_branch(args)? {
+        let name = match requested_branch {
             Some(name) => name,
             None => current_branch(&root)?,
         };
@@ -615,6 +616,9 @@ fn requested_branch(args: &Value) -> Result<Option<String>, String> {
     let Some(raw) = args.get("branch").and_then(Value::as_str) else {
         return Ok(None);
     };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
     Ok(Some(validate_branch(raw)?))
 }
 
@@ -779,6 +783,9 @@ fn requested_tag(args: &Value) -> Result<Option<String>, String> {
     let Some(raw) = args.get("tag").and_then(Value::as_str) else {
         return Ok(None);
     };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
     Ok(Some(validate_ref_name(raw, "tag")?))
 }
 
@@ -1274,6 +1281,108 @@ mod tests {
         assert!(!definitions
             .iter()
             .any(|tool| tool["name"] == "github_git_workspace_register"));
+    }
+
+    #[test]
+    fn push_schema_allows_branch_without_branch_or_tag_requirement() {
+        let definition = crate::github_mcp::tool_definitions_for_mcp()
+            .into_iter()
+            .find(|tool| tool["name"] == "github_git")
+            .expect("github_git must be exposed by the MCP catalog");
+        let schema = &definition["inputSchema"];
+        let required = schema["required"]
+            .as_array()
+            .expect("github_git schema must expose required");
+        assert!(required.iter().any(|value| value == "action"));
+        assert!(required.iter().any(|value| value == "path"));
+        assert!(!required.iter().any(|value| value == "branch"));
+        assert!(!required.iter().any(|value| value == "tag"));
+
+        crate::github_mcp::validate_tool_arguments(
+            schema,
+            &json!({
+                "action": "push",
+                "path": "/tmp/repo",
+                "branch": "master"
+            }),
+        )
+        .expect("push with only branch must pass schema validation");
+    }
+
+    #[test]
+    fn empty_branch_and_tag_are_treated_as_unspecified() {
+        assert_eq!(requested_branch(&json!({"branch": ""})).unwrap(), None);
+        assert_eq!(requested_branch(&json!({"branch": "   "})).unwrap(), None);
+        assert_eq!(requested_tag(&json!({"tag": ""})).unwrap(), None);
+        assert_eq!(requested_tag(&json!({"tag": "\t"})).unwrap(), None);
+    }
+
+    #[test]
+    fn prepare_push_uses_branch_when_tag_is_empty() {
+        let repo = temp_git_repo();
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["remote", "add", "origin", "https://github.com/octocat/hello.git"])
+            .status()
+            .unwrap();
+        let mut session = enabled_session();
+        let prepared = prepare_tool(
+            &mut session,
+            "github_git",
+            json!({
+                "action": "push",
+                "path": repo.to_string_lossy(),
+                "branch": "master",
+                "tag": ""
+            }),
+        )
+        .unwrap();
+        let PreparedGitOp::Pending { payload, .. } = prepared else {
+            panic!("push must wait for confirmation");
+        };
+        let target = payload
+            .fields
+            .iter()
+            .find(|field| field.label == "目标")
+            .map(|field| field.value.as_str())
+            .unwrap_or_default();
+        assert_eq!(target, "origin/master");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn prepare_push_uses_tag_when_branch_is_empty() {
+        let repo = temp_git_repo();
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["remote", "add", "origin", "https://github.com/octocat/hello.git"])
+            .status()
+            .unwrap();
+        let mut session = enabled_session();
+        let prepared = prepare_tool(
+            &mut session,
+            "github_git",
+            json!({
+                "action": "push",
+                "path": repo.to_string_lossy(),
+                "branch": "",
+                "tag": "v0.1.7"
+            }),
+        )
+        .unwrap();
+        let PreparedGitOp::Pending { payload, .. } = prepared else {
+            panic!("push must wait for confirmation");
+        };
+        let target = payload
+            .fields
+            .iter()
+            .find(|field| field.label == "目标")
+            .map(|field| field.value.as_str())
+            .unwrap_or_default();
+        assert_eq!(target, "refs/tags/v0.1.7");
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
