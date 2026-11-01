@@ -1228,7 +1228,7 @@ onMounted(async () => {
             <input v-model.number="syncForm.autoSecs" type="number" min="15" max="86400" :disabled="!syncForm.auto" style="width:96px" />
           </div>
         </div>
-        <p v-if="sync?.configured && !sync.conditional_verified" class="error">安全条件写入尚未验证；自动同步已暂停。请点击「验证安全同步」完成 If-Match / If-None-Match 验证，验证失败时不会上传。</p>
+        <p v-if="sync?.configured && !sync.conditional_verified" class="error">安全条件写入尚未验证；自动同步已暂停。请点击「验证安全同步」完成安全条件验证，验证失败时不会上传。</p>
         <p v-if="sync?.last_result" class="hint">上次：{{ sync.last_result }}</p>
         <p v-if="error" class="error">{{ error }}</p>
         <div class="actions">

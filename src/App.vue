@@ -3217,7 +3217,7 @@ onMounted(async () => {
                 <input v-model.number="syncAutoSecs" type="number" min="15" max="86400" :disabled="!syncAuto" />
               </div>
             </div>
-            <p v-if="syncView?.configured && !syncView.conditional_verified" class="error">安全条件写入尚未验证；自动同步已暂停。请点击「验证安全同步」完成 If-Match / If-None-Match 验证，验证失败时不会上传。</p>
+            <p v-if="syncView?.configured && !syncView.conditional_verified" class="error">安全条件写入尚未验证；自动同步已暂停。请点击「验证安全同步」完成安全条件验证，验证失败时不会上传。</p>
             <p v-if="syncView?.last_sync_at" class="crumb">上次同步 {{ fmtTime(syncView.last_sync_at) }}<span v-if="syncView.last_result"> · {{ syncView.last_result }}</span></p>
             <div v-if="syncReport" class="crumb">
               <p>阶段：{{ syncPhaseLabel(syncReport.phase) }}</p>

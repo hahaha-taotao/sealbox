@@ -305,6 +305,10 @@ impl LocalSyncStore for Vault {
 }
 
 const PREVIEW_TTL: Duration = Duration::from_secs(600);
+/// How long a COS lease survives a crash before another device may steal it.
+const COS_LEASE_TTL_SECS: i64 = 180;
+/// Ignore an expiry that is this close to now: clocks on two devices drift.
+const COS_LEASE_SKEW_SECS: i64 = 30;
 pub const SYNC_TOKEN_EXPIRED: &str = "sync_token_expired";
 pub const SYNC_LOCAL_CHANGED: &str = "sync_local_changed";
 pub const SYNC_REMOTE_CHANGED: &str = "sync_remote_changed";
@@ -507,6 +511,36 @@ pub fn conditional_support_verified(vault: &Vault, dek: &[u8; 32]) -> Result<boo
         Ok((client, _, _)) => Ok(client.conditional_verified),
         Err(error) if error == "还没有配置同步" || error == "同步密钥缺失，请重新保存" => Ok(false),
         Err(error) => Err(error),
+    }
+}
+
+/// Tencent COS implements PUT Object as an unconditional replacement for a
+/// same-named object and ignores If-Match/If-None-Match, so writes go through
+/// the create-only lease in `cos_put` instead.
+fn is_tencent_cos_endpoint(endpoint: &str) -> bool {
+    let Ok(target) = parse_http_url(endpoint, true) else {
+        return false;
+    };
+    let host = target.host.trim_end_matches('.').to_ascii_lowercase();
+    host == "myqcloud.com"
+        || host
+            .strip_suffix(".myqcloud.com")
+            .is_some_and(|prefix| !prefix.is_empty())
+}
+
+/// An unreadable lease is treated as stale: a broken holder must not block sync
+/// forever, and the probe rejects endpoints that cannot create objects atomically.
+fn cos_lease_expired(body: &[u8]) -> bool {
+    let expires_at = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("expires_at").and_then(|v| v.as_str()).map(str::to_string))
+        .and_then(|text| chrono::DateTime::parse_from_rfc3339(&text).ok());
+    match expires_at {
+        Some(at) => {
+            chrono::Utc::now()
+                > at.with_timezone(&chrono::Utc) + chrono::Duration::seconds(COS_LEASE_SKEW_SECS)
+        }
+        None => true,
     }
 }
 
@@ -1288,6 +1322,9 @@ struct RemoteClient {
     region: String,
     object_key: String,
     conditional_verified: bool,
+    /// Tencent COS ignores If-Match/If-None-Match on PUT; writes go through a
+    /// create-only lease instead. See `cos_put`.
+    cos: bool,
 }
 
 impl Drop for RemoteClient {
@@ -1316,6 +1353,7 @@ impl RemoteClient {
             region: config.region.clone(),
             object_key,
             conditional_verified: false,
+            cos: config.kind == SyncKind::S3 && is_tencent_cos_endpoint(&config.endpoint),
         })
     }
 
@@ -1381,6 +1419,23 @@ impl RemoteClient {
     }
 
     fn s3_url(&self) -> String {
+        self.s3_url_for(&self.object_key)
+    }
+
+    fn s3_url_for(&self, key: &str) -> String {
+        let encoded = key
+            .split('/')
+            .map(encode_path_segment)
+            .collect::<Vec<_>>()
+            .join("/");
+        if is_eos_endpoint(&self.endpoint) {
+            return format!(
+                "{}/{}/{}",
+                self.endpoint.trim_end_matches('/'),
+                encode_path_segment(&self.bucket),
+                encoded
+            );
+        }
         let host = self
             .endpoint
             .trim_start_matches("https://")
@@ -1390,11 +1445,15 @@ impl RemoteClient {
         } else {
             format!("https://{}.{}", self.bucket, host)
         };
-        format!("{}/{}", base.trim_end_matches('/'), self.encoded_key())
+        format!("{}/{}", base.trim_end_matches('/'), encoded)
     }
 
     fn s3_get(&self) -> Result<Option<RemoteObject>, String> {
-        let url = self.s3_url();
+        self.s3_get_key(&self.object_key)
+    }
+
+    fn s3_get_key(&self, key: &str) -> Result<Option<RemoteObject>, String> {
+        let url = self.s3_url_for(key);
         let headers = self.s3_headers("GET", &url, &[])?;
         let mut request = self.agent().get(&url);
         for (name, value) in &headers {
@@ -1411,16 +1470,120 @@ impl RemoteClient {
     }
 
     fn s3_put(&self, bytes: &[u8], condition: &WriteCondition) -> Result<(), String> {
+        if self.cos {
+            return self.cos_put(bytes, condition);
+        }
+        self.s3_put_key(&self.s3_url(), bytes, Some(condition), &[])
+    }
+
+    /// Tencent COS ignores `If-Match`/`If-None-Match` on PUT Object, so sync has
+    /// to build the same guarantees from `x-cos-forbid-overwrite`, which COS
+    /// honors atomically (200 when absent, 409 when the key already exists).
+    ///
+    /// Create (missing remote) is directly a conditional write. Replace takes a
+    /// create-only lease on `<object>.lease`, re-reads the ETag under that lease,
+    /// and only then overwrites. Two devices can no longer interleave a
+    /// read-modify-write; a holder that pauses past the TTL can still write after
+    /// its lease was stolen, which narrows to roughly one request.
+    fn cos_put(&self, bytes: &[u8], condition: &WriteCondition) -> Result<(), String> {
         let url = self.s3_url();
-        let headers = self.s3_headers_conditional("PUT", &url, bytes, Some(condition))?;
-        let mut request = self.agent().put(&url);
+        match condition {
+            WriteCondition::Missing => self.cos_create_only(&url, bytes),
+            WriteCondition::Match(expected) => {
+                let nonce = self.cos_lease_acquire(&self.object_key)?;
+                let result = match self.s3_get_key(&self.object_key) {
+                    Ok(Some(object)) if &object.etag == expected => self.s3_put_key(&url, bytes, None, &[]),
+                    Ok(_) => Err("sync_precondition_failed".into()),
+                    Err(error) => Err(error),
+                };
+                self.cos_lease_release(&self.object_key, &nonce);
+                result
+            }
+        }
+    }
+
+    fn cos_create_only(&self, url: &str, bytes: &[u8]) -> Result<(), String> {
+        self.s3_put_key(url, bytes, None, &[("x-cos-forbid-overwrite", "true")])
+    }
+
+    /// Returns the nonce this device now owns. A lease left behind by a crash is
+    /// stolen only after its expiry plus a clock-skew margin.
+    fn cos_lease_acquire(&self, key: &str) -> Result<String, String> {
+        let lease_key = format!("{key}.lease");
+        let lease_url = self.s3_url_for(&lease_key);
+        let expires_at = chrono::Utc::now() + chrono::Duration::seconds(COS_LEASE_TTL_SECS);
+        for _ in 0..3 {
+            let nonce = uuid::Uuid::new_v4().to_string();
+            let body = serde_json::json!({
+                "nonce": nonce,
+                "expires_at": expires_at.to_rfc3339(),
+            })
+            .to_string();
+            match self.cos_create_only(&lease_url, body.as_bytes()) {
+                Ok(()) => return Ok(nonce),
+                Err(error) if error == "sync_precondition_failed" => {
+                    match self.s3_get_key(&lease_key)? {
+                        Some(current) if !cos_lease_expired(&current.body) => {
+                            return Err("sync_lease_busy".into());
+                        }
+                        Some(_) => self.cos_delete_key(&lease_key)?,
+                        None => {}
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err("sync_lease_busy".into())
+    }
+
+    /// Best effort: a failed release only delays other devices until the TTL.
+    fn cos_lease_release(&self, key: &str, nonce: &str) {
+        let lease_key = format!("{key}.lease");
+        let Ok(Some(current)) = self.s3_get_key(&lease_key) else { return };
+        let owned = serde_json::from_slice::<serde_json::Value>(&current.body)
+            .ok()
+            .and_then(|value| value.get("nonce").and_then(|v| v.as_str()).map(str::to_string))
+            .is_some_and(|value| value == nonce);
+        if owned {
+            let _ = self.cos_delete_key(&lease_key);
+        }
+    }
+
+    fn cos_delete_key(&self, key: &str) -> Result<(), String> {
+        let url = self.s3_url_for(key);
+        let headers = self.s3_headers("DELETE", &url, &[])?;
+        let mut request = self.agent().delete(&url);
         for (name, value) in &headers {
             request = request.set(name, value);
         }
+        match request.call() {
+            Ok(response) if (200..300).contains(&response.status()) => Ok(()),
+            Err(ureq::Error::Status(404, _)) => Ok(()),
+            Ok(response) => Err(format!("S3 delete failed: HTTP {}", response.status())),
+            Err(ureq::Error::Status(code, response)) => {
+                Err(format!("S3 delete failed: HTTP {code} {}", brief(response)))
+            }
+            Err(error) => Err(format!("S3 delete failed: {error}")),
+        }
+    }
+
+    fn s3_put_key(&self, url: &str, bytes: &[u8], condition: Option<&WriteCondition>,
+        extra: &[(&str, &str)]) -> Result<(), String> {
+        let headers = self.s3_headers_extra("PUT", url, bytes, condition, extra)?;
+        let mut request = self.agent().put(url);
+        for (name, value) in &headers {
+            request = request.set(name, value);
+        }
+        let create_only = extra
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-cos-forbid-overwrite"));
         match request.send_bytes(bytes) {
             Ok(response) if (200..300).contains(&response.status()) => Ok(()),
             Ok(response) => Err(format!("S3 write failed: HTTP {}", response.status())),
             Err(ureq::Error::Status(412, _)) => Err("sync_precondition_failed".into()),
+            Err(ureq::Error::Status(409, _)) if create_only => {
+                Err("sync_precondition_failed".into())
+            }
             Err(ureq::Error::Status(code, response)) => {
                 Err(format!("S3 write failed: HTTP {code} {}", brief(response)))
             }
@@ -1434,11 +1597,17 @@ impl RemoteClient {
         url: &str,
         body: &[u8],
     ) -> Result<Vec<(String, String)>, String> {
-        self.s3_headers_conditional(method, url, body, None)
+        self.s3_headers_extra(method, url, body, None, &[])
     }
 
-    fn s3_headers_conditional(&self, method: &str, url: &str, body: &[u8],
-        condition: Option<&WriteCondition>) -> Result<Vec<(String, String)>, String> {
+    /// `extra` headers are part of the signature, so a provider cannot drop them
+    /// silently while the request still verifies.
+    fn s3_headers_extra(&self, method: &str, url: &str, body: &[u8],
+        condition: Option<&WriteCondition>, extra: &[(&str, &str)])
+        -> Result<Vec<(String, String)>, String> {
+        if is_eos_endpoint(&self.endpoint) {
+            return self.eos_headers_conditional(method, url, condition);
+        }
         let now = chrono::Utc::now();
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date_stamp = now.format("%Y%m%d").to_string();
@@ -1449,6 +1618,9 @@ impl RemoteClient {
         if let Some(condition) = condition {
             let (name, value) = condition.header();
             signing_headers.push((name.into(), value.into()));
+        }
+        for (name, value) in extra {
+            signing_headers.push(((*name).to_string(), (*value).to_string()));
         }
         signing_headers.sort_by(|a,b| a.0.cmp(&b.0));
         let canonical_headers = signing_headers.iter().map(|(name,value)| format!("{name}:{value}\n")).collect::<String>();
@@ -1479,12 +1651,43 @@ impl RemoteClient {
             let (name,value) = condition.header();
             headers.push((name.into(), value.into()));
         }
+        for (name, value) in extra {
+            headers.push(((*name).into(), (*value).into()));
+        }
+        Ok(headers)
+    }
+
+    fn eos_headers_conditional(&self, method: &str, url: &str,
+        condition: Option<&WriteCondition>) -> Result<Vec<(String, String)>, String> {
+        let date = chrono::Utc::now()
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        let content_type = "application/octet-stream";
+        let (_, canonical_uri, _) = split_url(url)?;
+        let string_to_sign = format!(
+            "{method}\n\n{content_type}\n{date}\n{canonical_uri}"
+        );
+        let signature = base64::engine::general_purpose::STANDARD
+            .encode(hmac_sha1(self.secret.as_bytes(), string_to_sign.as_bytes()));
+        let mut headers = vec![
+            ("Authorization".into(), format!("AWS {}:{signature}", self.username)),
+            ("Date".into(), date),
+            ("Content-Type".into(), content_type.into()),
+        ];
+        if let Some(condition) = condition {
+            let (name, value) = condition.header();
+            headers.push((name.into(), value.into()));
+        }
         Ok(headers)
     }
 
     fn delete_probe(&self) -> Result<(), String> {
         let (_, suffix) = self.object_key.rsplit_once(".probe-").ok_or("sync_not_probe_object")?;
         uuid::Uuid::parse_str(suffix).map_err(|_| "sync_not_probe_object")?;
+        if self.cos {
+            // A lease left by an aborted probe would block the object forever.
+            let _ = self.cos_delete_key(&format!("{}.lease", self.object_key));
+        }
         let url = match self.kind { SyncKind::Webdav => self.webdav_url(), SyncKind::S3 => self.s3_url() };
         let mut request = self.agent().delete(&url);
         if self.kind == SyncKind::S3 {
@@ -1533,6 +1736,17 @@ fn encode_path_segment(segment: &str) -> String {
     out
 }
 
+fn is_eos_endpoint(endpoint: &str) -> bool {
+    let Ok(target) = parse_http_url(endpoint, true) else {
+        return false;
+    };
+    let host = target.host.trim_end_matches('.').to_ascii_lowercase();
+    host == "cmecloud.cn"
+        || host
+            .strip_suffix(".cmecloud.cn")
+            .is_some_and(|prefix| !prefix.is_empty())
+}
+
 fn split_url(url: &str) -> Result<(String, String, String), String> {
     let rest = url
         .strip_prefix("https://")
@@ -1542,6 +1756,104 @@ fn split_url(url: &str) -> Result<(String, String, String), String> {
         return Err("sync endpoint is missing a host".into());
     }
     Ok((host.to_string(), format!("/{path}"), String::new()))
+}
+
+fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
+    const BLOCK_SIZE: usize = 64;
+    let mut key_block = [0u8; BLOCK_SIZE];
+    if key.len() > BLOCK_SIZE {
+        key_block[..20].copy_from_slice(&sha1_digest(key));
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut inner = [0u8; BLOCK_SIZE];
+    let mut outer = [0u8; BLOCK_SIZE];
+    for index in 0..BLOCK_SIZE {
+        inner[index] = key_block[index] ^ 0x36;
+        outer[index] = key_block[index] ^ 0x5c;
+    }
+
+    let mut inner_input = Vec::with_capacity(BLOCK_SIZE + data.len());
+    inner_input.extend_from_slice(&inner);
+    inner_input.extend_from_slice(data);
+    let inner_digest = sha1_digest(&inner_input);
+
+    let mut outer_input = Vec::with_capacity(BLOCK_SIZE + inner_digest.len());
+    outer_input.extend_from_slice(&outer);
+    outer_input.extend_from_slice(&inner_digest);
+    sha1_digest(&outer_input)
+}
+
+fn sha1_digest(data: &[u8]) -> [u8; 20] {
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let padded_len = ((data.len() + 9 + 63) / 64) * 64;
+    let mut padded = Vec::with_capacity(padded_len);
+    padded.extend_from_slice(data);
+    padded.push(0x80);
+    while (padded.len() + 8) % 64 != 0 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    let mut state = [
+        0x67452301u32,
+        0xefcdab89,
+        0x98badcfe,
+        0x10325476,
+        0xc3d2e1f0,
+    ];
+    for chunk in padded.chunks_exact(64) {
+        let mut words = [0u32; 80];
+        for (index, word) in words[..16].iter_mut().enumerate() {
+            let offset = index * 4;
+            *word = u32::from_be_bytes([
+                chunk[offset],
+                chunk[offset + 1],
+                chunk[offset + 2],
+                chunk[offset + 3],
+            ]);
+        }
+        for index in 16..80 {
+            words[index] = (words[index - 3]
+                ^ words[index - 8]
+                ^ words[index - 14]
+                ^ words[index - 16])
+                .rotate_left(1);
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e] = state;
+        for (index, word) in words.iter().enumerate() {
+            let (function, constant) = match index {
+                0..=19 => ((b & c) | ((!b) & d), 0x5a827999),
+                20..=39 => (b ^ c ^ d, 0x6ed9eba1),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdc),
+                _ => (b ^ c ^ d, 0xca62c1d6),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(function)
+                .wrapping_add(e)
+                .wrapping_add(constant)
+                .wrapping_add(*word);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+        state[0] = state[0].wrapping_add(a);
+        state[1] = state[1].wrapping_add(b);
+        state[2] = state[2].wrapping_add(c);
+        state[3] = state[3].wrapping_add(d);
+        state[4] = state[4].wrapping_add(e);
+    }
+
+    let mut digest = [0u8; 20];
+    for (index, word) in state.iter().enumerate() {
+        digest[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    digest
 }
 
 fn s3_signing_key(secret: &str, date: &str, region: &str) -> Result<Vec<u8>, String> {
@@ -1890,6 +2202,7 @@ mod tests {
             region: "us-east-1".into(),
             object_key: "sealbox/vault.sboxsync".into(),
             conditional_verified: false,
+            cos: false,
         };
         let headers = client
             .s3_headers(
@@ -1901,6 +2214,50 @@ mod tests {
         assert!(headers
             .iter()
             .any(|(name, value)| name == "Authorization" && value.contains("AKIAEXAMPLE")));
+    }
+
+    #[test]
+    fn eos_uses_path_style_and_sigv2_authorization() {
+        let client = RemoteClient {
+            kind: SyncKind::S3,
+            endpoint: "https://eos-beijing-1.cmecloud.cn".into(),
+            username: "AK".into(),
+            secret: "secret".into(),
+            bucket: "vault-bucket".into(),
+            region: "beijing-1".into(),
+            object_key: "sealbox/vault.sboxsync".into(),
+            conditional_verified: false,
+            cos: false,
+        };
+        let url = client.s3_url();
+        assert_eq!(
+            url,
+            "https://eos-beijing-1.cmecloud.cn/vault-bucket/sealbox/vault.sboxsync"
+        );
+        let headers = client.s3_headers("GET", &url, b"").unwrap();
+        assert!(headers.iter().any(|(name, value)| {
+            name == "Authorization" && value.starts_with("AWS AK:")
+        }));
+        assert!(headers.iter().any(|(name, _)| name == "Date"));
+        assert!(!headers.iter().any(|(name, _)| name == "x-amz-date"));
+
+        let conditional = client
+            .eos_headers_conditional("PUT", &url, Some(&WriteCondition::Missing))
+            .unwrap();
+        assert!(conditional
+            .iter()
+            .any(|(name, value)| name == "if-none-match" && value == "*"));
+        assert!(conditional
+            .iter()
+            .any(|(name, value)| name == "Content-Type" && value == "application/octet-stream"));
+
+        assert_eq!(
+            hex::encode(hmac_sha1(
+                b"key",
+                b"The quick brown fox jumps over the lazy dog"
+            )),
+            "de7c9b85b8b78aa6bc8a7a36f70a90701c9db4d9"
+        );
     }
 
     #[test]
@@ -2410,6 +2767,134 @@ mod tests {
             self.puts.set(self.puts.get() + 1);
             Ok(())
         }
+    }
+
+    /// Remote fixture that writes regardless of the supplied precondition.
+    struct IgnoringConditionRemote {
+        body: RefCell<Option<Vec<u8>>>,
+    }
+
+    impl IgnoringConditionRemote {
+        fn new() -> Self {
+            Self {
+                body: RefCell::new(None),
+            }
+        }
+    }
+
+    impl RemoteStore for IgnoringConditionRemote {
+        fn get(&self) -> Result<Option<RemoteObject>, String> {
+            let Some(body) = self.body.borrow().clone() else {
+                return Ok(None);
+            };
+            Ok(Some(RemoteObject {
+                body,
+                etag: StrongEtag::parse(r#""ignored""#)?,
+            }))
+        }
+
+        fn put(&self, body: &[u8], _condition: &WriteCondition) -> Result<(), String> {
+            *self.body.borrow_mut() = Some(body.to_vec());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn tencent_cos_endpoint_matches_normalized_host_only() {
+        assert!(is_tencent_cos_endpoint("https://myqcloud.com/"));
+        assert!(is_tencent_cos_endpoint(" https://bucket.MYQCloud.com:443/cos "));
+        assert!(is_tencent_cos_endpoint(
+            "https://cos.ap-beijing.myqcloud.com"
+        ));
+        assert!(is_tencent_cos_endpoint(
+            "https://pass-1450885502.cos.ap-beijing.myqcloud.com/sealbox"
+        ));
+
+        assert!(!is_tencent_cos_endpoint("https://myqcloud.com.attacker.example"));
+        assert!(!is_tencent_cos_endpoint("https://evil-myqcloud.com"));
+        assert!(!is_tencent_cos_endpoint("https://example.com/myqcloud.com"));
+        assert!(!is_tencent_cos_endpoint("https://s3.amazonaws.com"));
+        assert!(!is_tencent_cos_endpoint("not a url"));
+    }
+
+    #[test]
+    fn cos_lease_expired_covers_stale_live_and_unreadable() {
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(COS_LEASE_SKEW_SECS + 5);
+        let live = chrono::Utc::now() + chrono::Duration::seconds(COS_LEASE_TTL_SECS);
+        let within_skew = chrono::Utc::now() - chrono::Duration::seconds(COS_LEASE_SKEW_SECS - 5);
+
+        assert!(cos_lease_expired(
+            serde_json::json!({ "nonce": "n", "expires_at": stale.to_rfc3339() })
+                .to_string()
+                .as_bytes()
+        ));
+        assert!(!cos_lease_expired(
+            serde_json::json!({ "nonce": "n", "expires_at": live.to_rfc3339() })
+                .to_string()
+                .as_bytes()
+        ));
+        assert!(
+            !cos_lease_expired(
+                serde_json::json!({ "expires_at": within_skew.to_rfc3339() })
+                    .to_string()
+                    .as_bytes()
+            ),
+            "expiry inside the clock-skew margin is still held"
+        );
+        assert!(cos_lease_expired(b"not-json"));
+        assert!(cos_lease_expired(br#"{"nonce":"only"}"#));
+        assert!(cos_lease_expired(br#"{"expires_at":"yesterday"}"#));
+        assert!(cos_lease_expired(br#"{"expires_at":1}"#));
+    }
+
+    #[test]
+    fn cos_forbid_overwrite_is_part_of_sigv4_signed_headers() {
+        let client = RemoteClient {
+            kind: SyncKind::S3,
+            endpoint: "https://cos.ap-beijing.myqcloud.com".into(),
+            username: "AKIDexample".into(),
+            secret: "secret".into(),
+            bucket: "pass-1450885502".into(),
+            region: "ap-beijing".into(),
+            object_key: "sealbox/vault.sboxsync".into(),
+            conditional_verified: true,
+            cos: true,
+        };
+        let url = client.s3_url();
+        assert_eq!(
+            url,
+            "https://pass-1450885502.cos.ap-beijing.myqcloud.com/sealbox/vault.sboxsync"
+        );
+        let headers = client
+            .s3_headers_extra(
+                "PUT",
+                &url,
+                b"body",
+                None,
+                &[("x-cos-forbid-overwrite", "true")],
+            )
+            .unwrap();
+        let authorization = headers
+            .iter()
+            .find(|(name, _)| name == "Authorization")
+            .map(|(_, value)| value.as_str())
+            .unwrap();
+        assert!(authorization.contains(
+            "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-cos-forbid-overwrite"
+        ));
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == "x-cos-forbid-overwrite" && value == "true"));
+    }
+
+    #[test]
+    fn probe_rejects_remote_that_ignores_write_condition() {
+        let remote = IgnoringConditionRemote::new();
+
+        assert_eq!(
+            probe_conditions(&remote, &|| true).unwrap_err(),
+            "sync_conditional_write_unsupported"
+        );
     }
 
     fn stores(local: &SyncSnapshot, remote: Option<&SyncSnapshot>) -> (MemoryLocal, MemoryRemote) {
