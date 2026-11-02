@@ -23,7 +23,34 @@ android {
 }
 tauri { rootDirRel = "../../../../" }
 `;
-const rootGradle = 'classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.25")\n';
+const centralMirror = "https://maven-central.storage-download.googleapis.com/maven2/";
+const rootGradle = `buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.25")
+    }
+}
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+`;
+const buildSrcGradle = `plugins {
+    \`kotlin-dsl\`
+}
+repositories {
+    google()
+    mavenCentral()
+}
+dependencies {
+    implementation("com.android.tools.build:gradle:8.11.0")
+}
+`;
 
 // Importing the patch module above must be inert; fixtures are the only write targets.
 test("pure Android patches are idempotent and retain existing activity configuration", () => {
@@ -78,6 +105,7 @@ test("generated projects sync the authoritative Kotlin template without editing 
     put(join(app, "src/main/res/xml/file_paths.xml"), "<paths>\n</paths>");
     put(join(app, "build.gradle.kts"), appGradle);
     put(join(app, "../build.gradle.kts"), rootGradle);
+    put(join(app, "../buildSrc/build.gradle.kts"), buildSrcGradle);
     put(join(app, "proguard-rules.pro"), "# project rules\n");
     const mainActivity = "package com.sealbox.mobile\n// custom integration must survive\nclass MainActivity : TauriActivity()\n";
     put(activity, mainActivity);
@@ -113,6 +141,120 @@ test("generated projects sync the authoritative Kotlin template without editing 
   } finally {
     // This test owns this mkdtemp directory only.
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Exercise the public file-patching boundary, not private Gradle transformation helpers.
+function withGradleProject(run) {
+  const root = mkdtempSync(join(tmpdir(), "sealbox-gradle-repositories-"));
+  const android = join(root, "src-tauri-mobile/gen/android");
+  const put = (relativePath, content) => {
+    const path = join(android, relativePath);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, content);
+  };
+  const read = (relativePath) => readFileSync(join(android, relativePath), "utf8");
+  try {
+    put("app/src/main/AndroidManifest.xml", manifest);
+    put("app/build.gradle.kts", appGradle);
+    put("build.gradle.kts", rootGradle);
+    put("buildSrc/build.gradle.kts", buildSrcGradle);
+    for (const name of ["DocumentsPlugin.kt", "MobileContext.kt", "ApkInstaller.kt"]) {
+      put(`../../android/${name}`, `// authoritative ${name}\n`);
+    }
+    run({ root, android, put, read });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function assertMirrorFirst(repositories, fallback) {
+  assert.ok(repositories.includes(centralMirror), "Central mirror must exist in this repository scope");
+  assert.ok(repositories.includes(fallback), `${fallback} must remain available`);
+  assert.ok(repositories.indexOf(centralMirror) < repositories.indexOf(fallback),
+    `Central mirror must precede ${fallback}`);
+}
+
+function assertPluginRepositories(settings) {
+  const management = settings.match(/pluginManagement\s*\{\s*repositories\s*\{([^{}]+)\}/);
+  assert.ok(management, "buildSrc needs its own settings pluginManagement repositories before kotlin-dsl resolves");
+  assertMirrorFirst(management[1], "gradlePluginPortal()");
+  assertMirrorFirst(management[1], "google()");
+}
+
+test("fresh buildSrc resolves kotlin-dsl through independent pluginManagement and all Central scopes prefer the mirror", () => {
+  withGradleProject(({ root, put, read }) => {
+    // A root settings repository is not inherited by the separate buildSrc build.
+    const rootSettings = 'pluginManagement { repositories { gradlePluginPortal() } }\nrootProject.name = "custom-root"\n';
+    put("settings.gradle.kts", rootSettings);
+    applyAndroidPatches(root);
+    assertPluginRepositories(read("buildSrc/settings.gradle.kts"));
+    const rootBuild = read("build.gradle.kts");
+    const scopes = [...rootBuild.matchAll(/repositories\s*\{([^}]+)\}/g)];
+    assert.equal(scopes.length, 2, "both root buildscript and allprojects remain present");
+    for (const [, repositories] of scopes) {
+      assertMirrorFirst(repositories, "mavenCentral()");
+      assert.ok(repositories.includes("google()"));
+    }
+    const buildSrc = read("buildSrc/build.gradle.kts");
+    const repositories = buildSrc.match(/repositories\s*\{([^}]+)\}/)?.[1];
+    assert.ok(repositories);
+    assertMirrorFirst(repositories, "mavenCentral()");
+    assert.ok(repositories.includes("google()"));
+    assert.ok(buildSrc.includes("`kotlin-dsl`"));
+    assert.ok(buildSrc.includes('implementation("com.android.tools.build:gradle:8.11.0")'));
+    assert.equal(read("settings.gradle.kts"), rootSettings);
+    const paths = ["build.gradle.kts", "buildSrc/build.gradle.kts", "buildSrc/settings.gradle.kts"];
+    const first = paths.map(read);
+    applyAndroidPatches(root);
+    assert.deepEqual(paths.map(read), first, "repository patches are byte-for-byte idempotent");
+  });
+});
+
+test("existing buildSrc settings retain unrelated configuration and custom plugin repositories", () => {
+  for (const prefix of ["", `pluginManagement {
+    repositories {
+        gradlePluginPortal()
+        maven("https://plugins.example.invalid/maven")
+    }
+    resolutionStrategy {
+        eachPlugin { if (requested.id.id == "custom") useModule("org.example:plugin:1.0") }
+    }
+}
+`]) {
+    withGradleProject(({ root, put, read }) => {
+      const retained = '// existing project configuration\nrootProject.name = "custom-build-src"\ninclude(":helper")\n';
+      put("buildSrc/settings.gradle.kts", prefix + retained);
+      applyAndroidPatches(root);
+      const settings = read("buildSrc/settings.gradle.kts");
+      assertPluginRepositories(settings);
+      assert.ok(settings.includes(retained), "existing settings must not be replaced");
+      if (prefix) {
+        assert.ok(settings.includes('maven("https://plugins.example.invalid/maven")'));
+        assert.ok(settings.includes('eachPlugin { if (requested.id.id == "custom") useModule("org.example:plugin:1.0") }'));
+      }
+      applyAndroidPatches(root);
+      assert.equal(read("buildSrc/settings.gradle.kts"), settings);
+    });
+  }
+});
+
+test("unsupported buildSrc settings or repository layouts fail before any project file is changed", () => {
+  const cases = [
+    ["buildSrc/settings.gradle", 'rootProject.name = "groovy-build-src"\n'],
+    ["buildSrc/settings.gradle.kts", "pluginManagement { configurePluginRepositories() }\n"],
+    ["buildSrc/build.gradle.kts", "plugins { `kotlin-dsl` }\nconfigureRepositories()\n"],
+    ["build.gradle.kts", 'classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.25")\n'],
+  ];
+  for (const [invalidPath, invalidContent] of cases) {
+    withGradleProject(({ root, put, read }) => {
+      put(invalidPath, invalidContent);
+      const paths = ["app/src/main/AndroidManifest.xml", "app/build.gradle.kts", "build.gradle.kts", "buildSrc/build.gradle.kts", invalidPath];
+      const before = paths.map(read);
+      assert.throws(() => applyAndroidPatches(root), /buildSrc|settings|repositories|Gradle/i,
+        `unsupported ${invalidPath} must fail explicitly`);
+      assert.deepEqual(paths.map(read), before, "validation must happen before any writes");
+    });
   }
 });
 

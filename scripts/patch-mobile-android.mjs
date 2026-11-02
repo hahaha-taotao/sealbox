@@ -88,13 +88,63 @@ export function patchAppGradle(appGradle, rootDirRel) {
   return appGradle;
 }
 
+const centralMirror = "https://maven-central.storage-download.googleapis.com/maven2/";
+
+// Deliberately support flat generated repository blocks, not arbitrary Kotlin DSL.
+// Unknown layouts fail before applyAndroidPatches writes any project files.
+function patchRepositories(gradle, expectedCount, label, pluginRepositories = false) {
+  const blocks = [...gradle.matchAll(/\brepositories\s*\{([^{}]*)\}/g)];
+  const openings = gradle.match(/\brepositories\s*\{/g) ?? [];
+  if (blocks.length !== expectedCount || openings.length !== expectedCount) {
+    throw new Error(`Unsupported ${label} repositories layout`);
+  }
+  return gradle.replace(/\brepositories\s*\{([^{}]*)\}/g, (block, body) => {
+    // Validate whole lines so URL slashes are never treated as comments.
+    const lines = body.split(/\r?\n/);
+    const supported = lines.every((line) => !line.trim() || /^\s*\/\//.test(line)
+      || /^\s*(?:google|mavenCentral|gradlePluginPortal)\(\)\s*$/.test(line)
+      || /^\s*maven\("[^"\r\n]+"\)\s*$/.test(line));
+    if (!supported) {
+      throw new Error(`Unsupported ${label} repositories contents`);
+    }
+    const mirrorLine = `maven("${centralMirror}")`;
+    const existing = lines.filter((line) => line.trim() !== mirrorLine);
+    const indent = lines.find((line) => /^\s+\S/.test(line))?.match(/^\s*/)[0] ?? "        ";
+    const missing = pluginRepositories
+      ? ["google()", "gradlePluginPortal()"].filter((call) => !existing.some((line) => line.trim() === call))
+      : [];
+    const content = existing.join("\n").replace(/^\s*\n/, "");
+    return `repositories {\n${indent}${mirrorLine}\n${missing.map((call) => `${indent}${call}\n`).join("")}${content}}`;
+  });
+}
+
+function patchBuildSrcSettings(settings) {
+  if (!/\bpluginManagement\b/.test(settings)) {
+    // The generated build has no settings. Preserve simple existing project identity
+    // and includes; refuse executable/unknown settings rather than guessing ordering.
+    if (!settings.split(/\r?\n/).every((line) => /^\s*(?:\/\/.*|rootProject\.name\s*=\s*"[^"\r\n]*"\s*|include\([^\r\n]*\)\s*)?$/.test(line))) {
+      throw new Error("Unsupported buildSrc settings layout");
+    }
+    return `pluginManagement {\n    repositories {\n        maven("${centralMirror}")\n        google()\n        gradlePluginPortal()\n    }\n}\n${settings}`;
+  }
+  if (!/^(?:\s|\/\/[^\n]*(?:\n|$))*pluginManagement\s*\{\s*repositories\s*\{/.test(settings)) {
+    throw new Error("Unsupported buildSrc settings pluginManagement layout");
+  }
+  return patchRepositories(settings, 1, "buildSrc settings pluginManagement", true);
+}
+
 export function patchRootGradle(rootGradle) {
   // Biometry's kotlinx-coroutines 1.10.2 requires Kotlin 2.x, not template 1.9.25.
   const kotlinGradlePlugin = /org\.jetbrains\.kotlin:kotlin-gradle-plugin:[^"]+/;
   if (!kotlinGradlePlugin.test(rootGradle)) {
     throw new Error("Could not find the Kotlin Gradle plugin in Android root Gradle module");
   }
-  return rootGradle.replace(kotlinGradlePlugin, "org.jetbrains.kotlin:kotlin-gradle-plugin:2.2.10");
+  if (!/\bbuildscript\s*\{\s*repositories\s*\{/.test(rootGradle)
+    || !/\ballprojects\s*\{\s*repositories\s*\{/.test(rootGradle)) {
+    throw new Error("Unsupported Android root Gradle repositories layout");
+  }
+  return patchRepositories(rootGradle, 2, "Android root Gradle")
+    .replace(kotlinGradlePlugin, "org.jetbrains.kotlin:kotlin-gradle-plugin:2.2.10");
 }
 
 function writeChanged(path, text) {
@@ -108,6 +158,9 @@ export function applyAndroidPatches(projectRoot = root) {
   const pathsFile = resolve(appModuleDir, "src/main/res/xml/file_paths.xml");
   const appGradlePath = resolve(appModuleDir, "build.gradle.kts");
   const rootGradlePath = resolve(mobileDir, "gen/android/build.gradle.kts");
+  const buildSrcGradlePath = resolve(mobileDir, "gen/android/buildSrc/build.gradle.kts");
+  const buildSrcSettingsPath = resolve(mobileDir, "gen/android/buildSrc/settings.gradle.kts");
+  const buildSrcGroovySettingsPath = resolve(mobileDir, "gen/android/buildSrc/settings.gradle");
   const proguardPath = resolve(appModuleDir, "proguard-rules.pro");
   const kotlinTargetDir = resolve(appModuleDir, "src/main/java/com/sealbox/mobile");
   // Every tracked Kotlin template is copied verbatim; the generated project is disposable.
@@ -119,9 +172,13 @@ export function applyAndroidPatches(projectRoot = root) {
     manifestPath,
     appGradlePath,
     rootGradlePath,
+    buildSrcGradlePath,
     ...kotlinTemplates.map((template) => template.source),
   ]) {
     if (!existsSync(path)) throw new Error(`Android project or Kotlin template is missing: ${path}`);
+  }
+  if (existsSync(buildSrcGroovySettingsPath)) {
+    throw new Error("Unsupported buildSrc settings.gradle; refusing to replace existing Groovy settings");
   }
   // Read and validate all inputs before writing. No MainActivity modification is necessary.
   const manifest = patchManifest(readFileSync(manifestPath, "utf8"));
@@ -129,6 +186,11 @@ export function applyAndroidPatches(projectRoot = root) {
   const rootDirRel = relative(appModuleDir, mobileDir).split(sep).join("/");
   const appGradle = patchAppGradle(readFileSync(appGradlePath, "utf8"), rootDirRel);
   const rootGradle = patchRootGradle(readFileSync(rootGradlePath, "utf8"));
+  const buildSrcGradle = patchRepositories(readFileSync(buildSrcGradlePath, "utf8"), 1, "buildSrc Gradle");
+  // kotlin-dsl dependencies resolve before buildSrc/build.gradle.kts is evaluated.
+  // Root project repositories cannot configure this independent plugin resolution.
+  const buildSrcSettings = patchBuildSrcSettings(existsSync(buildSrcSettingsPath)
+    ? readFileSync(buildSrcSettingsPath, "utf8") : "");
   const proguard = existsSync(proguardPath)
     ? patchProguard(readFileSync(proguardPath, "utf8"))
     : null;
@@ -140,6 +202,8 @@ export function applyAndroidPatches(projectRoot = root) {
   if (paths !== null) writeChanged(pathsFile, paths);
   writeChanged(appGradlePath, appGradle);
   writeChanged(rootGradlePath, rootGradle);
+  writeChanged(buildSrcGradlePath, buildSrcGradle);
+  writeChanged(buildSrcSettingsPath, buildSrcSettings);
   if (proguard !== null) writeChanged(proguardPath, proguard);
   mkdirSync(kotlinTargetDir, { recursive: true });
   for (const template of templates) writeChanged(template.target, template.content);

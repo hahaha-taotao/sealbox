@@ -91,6 +91,12 @@ jobs:
           node-version: 22
           cache: npm
 
+      - name: Check release version and Android patch tests
+        working-directory: .
+        run: |
+          node scripts/check-version.mjs "${{ github.ref_name }}"
+          node --test scripts/patch-mobile-android.test.mjs
+
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
