@@ -135,7 +135,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          archive="$(find src-tauri/target/release/bundle -type f -name '*.AppImage.tar.gz' -print -quit)"
+          archive="$(find src-tauri/target -type f -name '*.AppImage.tar.gz' -print -quit || true)"
+          if [ -z "$archive" ]; then
+            archive="$(find src-tauri/target -type f -name '*.AppImage' ! -name '*.sig' -print -quit)"
+          fi
           test -n "$archive"
           test -f "${archive}.sig"
           gh release download "${{ github.ref_name }}" --repo hahaha-taotao/sealbox --pattern latest.json --output latest.json

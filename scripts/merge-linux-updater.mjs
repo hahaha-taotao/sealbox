@@ -1,6 +1,17 @@
 // 把 Linux x64 的 updater 条目并进已有 latest.json。
 // Windows 的 tauri-action 先上传 latest.json；Linux job 不能整文件覆盖，否则会丢掉 windows-*。
 
+export function assertLinuxUpdaterAsset(assetName) {
+  if (
+    assetName.includes("/") ||
+    assetName.includes("\\") ||
+    assetName.endsWith(".sig") ||
+    !(assetName.endsWith(".AppImage") || assetName.endsWith(".AppImage.tar.gz"))
+  ) {
+    throw new Error(`不是 AppImage updater 包: ${assetName}`);
+  }
+}
+
 export function mergeLinuxUpdater(manifest, platform) {
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) {
     throw new Error("latest.json 不是对象");
@@ -51,9 +62,7 @@ async function main() {
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repo)) {
     throw new Error(`repo 格式不对: ${repo}`);
   }
-  if (assetName.includes("/") || assetName.includes("\\") || !assetName.endsWith(".AppImage.tar.gz")) {
-    throw new Error(`不是 AppImage updater 包: ${assetName}`);
-  }
+  assertLinuxUpdaterAsset(assetName);
   const manifest = JSON.parse(readFileSync(latestPath, "utf8"));
   const merged = mergeLinuxUpdater(manifest, {
     signature: readFileSync(signaturePath, "utf8"),
