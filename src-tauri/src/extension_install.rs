@@ -147,8 +147,13 @@ pub fn extensions_page_url(kind: BrowserKind) -> &'static str {
 }
 
 pub fn exe_stem(path: &Path) -> String {
-    path.file_stem()
-        .and_then(|s| s.to_str())
+    // 测试和 Windows 进程路径都带反斜杠。Linux 的 Path 不把 `\` 当分隔符，
+    // file_stem 会把整段路径当成文件名。
+    let raw = path.to_string_lossy();
+    let name = raw.rsplit(['/', '\\']).next().unwrap_or("");
+    Path::new(name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase()
 }
