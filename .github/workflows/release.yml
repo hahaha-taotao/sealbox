@@ -135,22 +135,33 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          archive="$(find src-tauri/target -type f -name '*.AppImage.tar.gz' -print -quit || true)"
-          if [ -z "$archive" ]; then
-            archive="$(find src-tauri/target -type f -name '*.AppImage' ! -name '*.sig' -print -quit)"
+          work="$RUNNER_TEMP/linux-updater"
+          mkdir -p "$work"
+          # 打包步骤已经把 AppImage 和 .sig 传到 Release。本地 target 目录不一定还在，
+          # 也没有 AppImage.tar.gz，所以签名以 Release 上的资产为准。
+          gh release download "${{ github.ref_name }}" --repo hahaha-taotao/sealbox --pattern "*.AppImage.sig" --dir "$work"
+          gh release download "${{ github.ref_name }}" --repo hahaha-taotao/sealbox --pattern "latest.json" --dir "$work"
+          sig="$(find "$work" -type f -name '*.AppImage.sig' ! -name '*.tar.gz.sig' -print -quit || true)"
+          if [ -z "$sig" ]; then
+            sig="$(find "$work" -type f -name '*.AppImage.tar.gz.sig' -print -quit || true)"
           fi
-          test -n "$archive"
-          test -f "${archive}.sig"
-          gh release download "${{ github.ref_name }}" --repo hahaha-taotao/sealbox --pattern latest.json --output latest.json
+          if [ -z "$sig" ] || [ ! -f "$work/latest.json" ]; then
+            echo "::error::Release 上缺少 AppImage 签名或 latest.json"
+            find "$work" -type f -print
+            exit 1
+          fi
+          asset="$(basename "$sig")"
+          asset="${asset%.sig}"
+          echo "linux updater asset: $asset"
           node scripts/merge-linux-updater.mjs \
-            --latest latest.json \
-            --signature "${archive}.sig" \
-            --asset-name "$(basename "$archive")" \
+            --latest "$work/latest.json" \
+            --signature "$sig" \
+            --asset-name "$asset" \
             --tag "${{ github.ref_name }}" \
             --repo hahaha-taotao/sealbox \
-            --out latest.merged.json
-          mv latest.merged.json latest.json
-          node -e "const j=require('./latest.json'); if(!j.platforms['windows-x86_64']||!j.platforms['linux-x86_64']) process.exit(1)"
+            --out "$work/latest.merged.json"
+          node --input-type=commonjs -e "const fs=require('fs'); const j=JSON.parse(fs.readFileSync(process.argv[1],'utf8')); if(!Object.keys(j.platforms).some(k=>k.startsWith('windows-'))||!j.platforms['linux-x86_64']) process.exit(1)" "$work/latest.merged.json"
+          cp "$work/latest.merged.json" latest.json
           gh release upload "${{ github.ref_name }}" latest.json --repo hahaha-taotao/sealbox --clobber
 
   android:
