@@ -1,6 +1,6 @@
 [package]
 name = "sealbox-mobile"
-version = "0.14.8"
+version = "0.14.9"
 description = "Sealbox Android vault"
 edition = "2021"
 
