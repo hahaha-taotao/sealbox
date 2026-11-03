@@ -71,7 +71,7 @@
     "targets": ["nsis"],
     "publisher": "Sealbox",
     "shortDescription": "Sealbox 印盒 — 本地凭据金库",
-    "longDescription": "A local credential vault for Windows. Unlock with a master password. Website logins, API tokens, SSH keys, mailboxes, servers, and databases stay encrypted on disk.",
+    "longDescription": "A local credential vault for Windows and Linux. Unlock with a master password. Website logins, API tokens, SSH keys, mailboxes, servers, and databases stay encrypted on disk.",
     "category": "Utility",
     "resources": {
       "../extension/manifest.json": "extension/manifest.json",

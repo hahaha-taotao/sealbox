@@ -4,7 +4,8 @@
 
 - **每次构建都必须同时产出桌面版和 Android 版，不允许只构建其中一端。**
   发布入口只有 `.github/workflows/release.yml`：推 `vX.Y.Z` tag 会同时跑
-  `release`（Windows 安装包）和 `android`（arm64 APK）两个 job，两个产物挂在同一个 Release 上。
+  `release`（Windows 安装包）、`linux`（amd64 deb 与 AppImage）和 `android`（arm64 APK）三个 job，产物挂在同一个 Release 上。
+  Linux 的 AppImage 更新条目要并进 Windows 已经上传的 `latest.json`，不能让 Linux job 重新上传一份只有 `linux-x86_64` 的清单。
   不要再新增只构建单一平台的 workflow——原来的 `android.yml` 就是因此并进 `release.yml` 的；
   也不要再引入 `mobile-v*` 独立发布入口。
 - 桌面和移动共用同一个版本号 `X.Y.Z`，以下字段必须一致：

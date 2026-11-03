@@ -58,7 +58,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: Sealbox ${{ github.ref_name }}
-          releaseBody: 桌面安装包与 Android APK 由同一次构建产出（${{ github.sha }}）。
+          releaseBody: Windows 安装包、Linux（deb / AppImage）与 Android APK 由同一次构建产出（${{ github.sha }}）。
           releaseDraft: false
           prerelease: false
           uploadUpdaterJson: true
@@ -69,6 +69,86 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release view "${{ github.ref_name }}" --json assets --jq '.assets[].name' | grep -qx 'latest.json'
+
+  linux:
+    name: Build Linux deb and AppImage
+    needs: release
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Check release version and updater merge
+        run: |
+          node scripts/check-version.mjs "${{ github.ref_name }}"
+          node --test scripts/merge-linux-updater.test.mjs
+
+      - name: Run Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Build and upload Linux bundles
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Sealbox ${{ github.ref_name }}
+          releaseBody: Windows 安装包、Linux（deb / AppImage）与 Android APK 由同一次构建产出（${{ github.sha }}）。
+          releaseDraft: false
+          prerelease: false
+          # Windows job 已经上传了带 windows-x86_64 的 latest.json。这里再上传会整文件覆盖。
+          uploadUpdaterJson: false
+          uploadUpdaterSignatures: true
+          args: --bundles deb,appimage
+
+      - name: Add linux-x86_64 to latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          archive="$(find src-tauri/target/release/bundle -type f -name '*.AppImage.tar.gz' -print -quit)"
+          test -n "$archive"
+          test -f "${archive}.sig"
+          gh release download "${{ github.ref_name }}" --repo hahaha-taotao/sealbox --pattern latest.json --output latest.json
+          node scripts/merge-linux-updater.mjs \
+            --latest latest.json \
+            --signature "${archive}.sig" \
+            --asset-name "$(basename "$archive")" \
+            --tag "${{ github.ref_name }}" \
+            --repo hahaha-taotao/sealbox \
+            --out latest.merged.json
+          mv latest.merged.json latest.json
+          node -e "const j=require('./latest.json'); if(!j.platforms['windows-x86_64']||!j.platforms['linux-x86_64']) process.exit(1)"
+          gh release upload "${{ github.ref_name }}" latest.json --repo hahaha-taotao/sealbox --clobber
 
   android:
     name: Build and upload Android arm64 APK

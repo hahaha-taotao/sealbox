@@ -52,7 +52,11 @@ npm install
 npm run tauri build
 ```
 
-产物在 `src-tauri/target/release/bundle/nsis/`。
+产物在 `src-tauri/target/release/bundle/nsis/`。Linux 上同一条命令加 `--bundles deb,appimage`，产物在 `bundle/deb/` 和 `bundle/appimage/`。
+
+Linux x64 从同一个 Release 下载 `Sealbox_<version>_amd64.deb`（Debian / Ubuntu）或 `Sealbox_<version>_amd64.AppImage`。AppImage 加上可执行权限后直接运行；deb 依赖系统里的 WebKitGTK 4.1。金库在 `~/.local/share/com.sealbox.app/vault.db`。应用内更新走 AppImage。Chrome / Edge 扩展的一键安装仍只在 Windows 上可用。
+
+On Linux x64, install the `.deb` or run the `.AppImage` from the same release. In-app updates use the AppImage. The one-click Chrome / Edge extension installer remains Windows-only.
 
 ## 功能 Features
 
