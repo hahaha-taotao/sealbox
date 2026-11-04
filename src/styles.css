@@ -234,6 +234,23 @@ button { cursor: pointer; }
   min-width: 0;
 }
 .mcp-card h3 { margin: 0 0 8px; font-size: 15px; }
+.card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.card-head h3 { margin: 0; }
+.lock-switch {
+  display: inline-flex; align-items: center; gap: 8px; flex-shrink: 0;
+  color: var(--muted); font-size: 12px; cursor: pointer; user-select: none;
+}
+.lock-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.lock-switch i {
+  width: 36px; height: 20px; border-radius: 999px; background: #d5d8e6; position: relative; display: inline-block;
+}
+.lock-switch i::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: #fff;
+  transition: transform .15s ease;
+}
+.lock-switch input:checked + i { background: var(--brand); }
+.lock-switch input:checked + i::after { transform: translateX(16px); }
+.lock-switch input:focus-visible + i { outline: 2px solid var(--brand); outline-offset: 2px; }
 .mcp-card .crumb { margin: 0 0 12px; }
 .mcp-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 12px; }
 .plugin-path {

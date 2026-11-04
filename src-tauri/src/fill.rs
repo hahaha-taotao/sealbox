@@ -561,6 +561,7 @@ mod tests {
         {
             let mut s = mutex.lock().unwrap();
             s.idle_secs = 2;
+            s.auto_lock = true;
             s.age_last_active(Duration::from_secs(1));
         }
         let hits = match_websites(&mutex, "https://github.com/login").unwrap();
@@ -581,6 +582,7 @@ mod tests {
         {
             let mut s = mutex.lock().unwrap();
             s.idle_secs = 2;
+            s.auto_lock = true;
             s.age_last_active(Duration::from_secs(1));
         }
         let sec = reveal_for_fill(&mutex, &hits[0].id, "https://github.com/login").unwrap();
@@ -597,6 +599,7 @@ mod tests {
         {
             let mut s = mutex.lock().unwrap();
             s.idle_secs = 1;
+            s.auto_lock = true;
             s.age_last_active(Duration::from_secs(2));
         }
         assert_eq!(
@@ -664,6 +667,7 @@ mod tests {
         {
             let mut s = mutex.lock().unwrap();
             s.idle_secs = 2;
+            s.auto_lock = true;
             s.age_last_active(Duration::from_secs(1));
         }
         let classified =

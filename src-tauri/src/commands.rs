@@ -124,6 +124,7 @@ fn normalize_settings(settings: Settings) -> Settings {
         } else {
             settings.hotkey
         },
+        auto_lock: settings.auto_lock,
     }
 }
 
@@ -139,11 +140,17 @@ fn settings_from_vault(vault: &Vault) -> Settings {
         .flatten()
         .and_then(|s| s.parse::<u64>().ok());
     let hotkey = vault.get_setting("hotkey").ok().flatten();
+    let auto_lock = vault
+        .get_setting("auto_lock")
+        .ok()
+        .flatten()
+        .map(|s| s != "0");
     let defaults = Settings::default();
     normalize_settings(Settings {
         idle_secs: idle.unwrap_or(defaults.idle_secs),
         clipboard_secs: clip.unwrap_or(defaults.clipboard_secs),
         hotkey: hotkey.unwrap_or(defaults.hotkey),
+        auto_lock: auto_lock.unwrap_or(defaults.auto_lock),
     })
 }
 
@@ -155,6 +162,7 @@ fn apply_vault_settings(session: &mut Session) {
     session.idle_secs = settings.idle_secs;
     session.clipboard_secs = settings.clipboard_secs;
     session.hotkey = settings.hotkey;
+    session.auto_lock = settings.auto_lock;
 }
 
 fn persist_session_settings(session: &Session) -> Result<(), String> {
@@ -167,6 +175,9 @@ fn persist_session_settings(session: &Session) -> Result<(), String> {
         .map_err(map_err)?;
     vault
         .set_setting("hotkey", &session.hotkey)
+        .map_err(map_err)?;
+    vault
+        .set_setting("auto_lock", if session.auto_lock { "1" } else { "0" })
         .map_err(map_err)?;
     Ok(())
 }
@@ -1258,6 +1269,9 @@ pub struct Settings {
     pub idle_secs: u64,
     pub clipboard_secs: u64,
     pub hotkey: String,
+    /// Missing means auto-lock stays off.
+    #[serde(default)]
+    pub auto_lock: bool,
 }
 
 impl Default for Settings {
@@ -1266,6 +1280,7 @@ impl Default for Settings {
             idle_secs: 900,
             clipboard_secs: 20,
             hotkey: "Ctrl+Shift+Space".into(),
+            auto_lock: false,
         }
     }
 }
@@ -1280,6 +1295,7 @@ pub fn settings_get(state: State<AppState>) -> Settings {
         idle_secs: s.idle_secs,
         clipboard_secs: s.clipboard_secs,
         hotkey: s.hotkey.clone(),
+        auto_lock: s.auto_lock,
     }
 }
 
@@ -1299,6 +1315,7 @@ pub fn settings_set(
             s.idle_secs = settings.idle_secs;
             s.clipboard_secs = settings.clipboard_secs;
             s.hotkey = settings.hotkey.clone();
+            s.auto_lock = settings.auto_lock;
             persist_session_settings(&s)?;
             (false, true)
         }
@@ -2070,6 +2087,7 @@ mod tests {
         session.idle_secs = 60 * 60;
         session.clipboard_secs = 45;
         session.hotkey = "Ctrl+Alt+K".into();
+        session.auto_lock = false;
         persist_session_settings(&session).unwrap();
         drop(session);
 
@@ -2078,10 +2096,13 @@ mod tests {
         assert_eq!(stored.idle_secs, 3600);
         assert_eq!(stored.clipboard_secs, 45);
         assert_eq!(stored.hotkey, "Ctrl+Alt+K");
+        assert!(!stored.auto_lock);
         assert_eq!(persisted_hotkey(&path).as_deref(), Some("Ctrl+Alt+K"));
 
         let mut restarted = Session::default();
         assert_eq!(restarted.idle_secs, 15 * 60);
+        assert!(!restarted.auto_lock);
+        restarted.auto_lock = true;
         restarted.set_unlocked(reopened, dek);
         // Unlock refreshes activity. The window then sits while the user types
         // the password and opens settings; status used to idle-lock against the
@@ -2099,6 +2120,10 @@ mod tests {
         assert_eq!(restarted.idle_secs, 3600);
         assert_eq!(restarted.clipboard_secs, 45);
         assert_eq!(restarted.hotkey, "Ctrl+Alt+K");
+        assert!(!restarted.auto_lock);
+        restarted.age_last_active(std::time::Duration::from_secs(3601));
+        assert!(!restarted.maybe_idle_lock());
+        assert!(restarted.is_unlocked());
     }
 
     #[test]
@@ -2111,6 +2136,7 @@ mod tests {
             idle_secs: 1,
             clipboard_secs: 1,
             hotkey: "  ".into(),
+            auto_lock: true,
         });
         session.idle_secs = stored.idle_secs;
         session.clipboard_secs = stored.clipboard_secs;
@@ -2124,6 +2150,7 @@ mod tests {
         assert_eq!(stored.idle_secs, 60);
         assert_eq!(stored.clipboard_secs, 5);
         assert_eq!(stored.hotkey, Settings::default().hotkey);
+        assert!(stored.auto_lock);
     }
 
     fn sample_site() -> UpsertEntry {
@@ -2380,6 +2407,7 @@ mod tests {
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
         session.idle_secs = 1;
+        session.auto_lock = true;
         session.age_last_active(std::time::Duration::from_secs(2));
         let state = AppState {
             session: Arc::new(Mutex::new(session)),

@@ -447,8 +447,9 @@ export const api = {
     invoke<CsvImportResult>("csv_commit", args),
   csvExport: (args: { path: string; password: string; riskConfirmed: boolean }) =>
     invoke<void>("csv_export", args),
-  settingsGet: () => invoke<{ idle_secs: number; clipboard_secs: number; hotkey: string }>("settings_get"),
-  settingsSet: (settings: { idle_secs: number; clipboard_secs: number; hotkey: string }) =>
+  settingsGet: () =>
+    invoke<{ idle_secs: number; clipboard_secs: number; hotkey: string; auto_lock: boolean }>("settings_get"),
+  settingsSet: (settings: { idle_secs: number; clipboard_secs: number; hotkey: string; auto_lock: boolean }) =>
     invoke("settings_set", { settings }),
   syncStatus: () => invoke<SyncView>("sync_status"),
   syncSave: (input: SyncSaveInput) => invoke<SyncView>("sync_save", { input }),

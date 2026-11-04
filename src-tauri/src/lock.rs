@@ -170,6 +170,7 @@ mod tests {
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
         session.idle_secs = 1;
+        session.auto_lock = true;
         session.age_last_active(std::time::Duration::from_secs(2));
         let mcp = crate::mcp::McpState::default();
         mcp.open_pairing();

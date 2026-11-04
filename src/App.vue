@@ -1458,6 +1458,7 @@ async function runBackupRestore() {
 const settingsIdle = ref(15);
 const settingsClip = ref(20);
 const settingsHotkey = ref("Ctrl+Shift+Space");
+const settingsAutoLock = ref(false);
 const oldMaster = ref("");
 const newMaster = ref("");
 const newMaster2 = ref("");
@@ -2030,6 +2031,7 @@ async function loadSettings() {
   settingsIdle.value = Math.max(1, Math.round(s.idle_secs / 60));
   settingsClip.value = s.clipboard_secs;
   settingsHotkey.value = s.hotkey;
+  settingsAutoLock.value = s.auto_lock === true;
 }
 async function saveSettings() {
   try {
@@ -2037,6 +2039,7 @@ async function saveSettings() {
       idle_secs: settingsIdle.value * 60,
       clipboard_secs: settingsClip.value,
       hotkey: settingsHotkey.value,
+      auto_lock: settingsAutoLock.value,
     });
     showToast("设置已保存");
   } catch (e) {
@@ -3153,12 +3156,19 @@ onMounted(async () => {
           </div>
           <div class="settings-grid">
             <div class="mcp-card">
-              <h3>锁定与快捷键</h3>
-              <p class="crumb">空闲超时后自动锁库；复制秘密后按设定秒数清空剪贴板。</p>
+              <div class="card-head">
+                <h3>锁定与快捷键</h3>
+                <label class="lock-switch">
+                  <span>自动锁定</span>
+                  <input type="checkbox" v-model="settingsAutoLock" />
+                  <i aria-hidden="true"></i>
+                </label>
+              </div>
+              <p class="crumb">{{ settingsAutoLock ? '空闲超时后自动锁库；复制秘密后按设定秒数清空剪贴板。' : '已关闭自动锁定，空闲不会锁库。复制秘密后仍按设定秒数清空剪贴板。' }}</p>
               <div class="settings-fields">
                 <div class="field">
                   <label>空闲锁定（分钟）</label>
-                  <input type="number" min="1" v-model.number="settingsIdle" />
+                  <input type="number" min="1" v-model.number="settingsIdle" :disabled="!settingsAutoLock" />
                 </div>
                 <div class="field">
                   <label>剪贴板清空（秒）</label>
