@@ -2141,6 +2141,7 @@ mod tests {
         session.idle_secs = stored.idle_secs;
         session.clipboard_secs = stored.clipboard_secs;
         session.hotkey = stored.hotkey;
+        session.auto_lock = stored.auto_lock;
         persist_session_settings(&session).unwrap();
         session.lock();
         assert!(persist_session_settings(&session).is_err());
