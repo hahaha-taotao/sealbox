@@ -542,6 +542,65 @@ pub(crate) struct EndpointRuntime {
     pub agent: ureq::Agent,
     pub username: String,
     pub secret: Zeroizing<String>,
+    /// Separates CRM sessions by credential, current secret and mTLS identity.
+    pub cache_key: String,
+    limits: Option<(Vec<String>, Vec<String>)>,
+}
+
+impl EndpointRuntime {
+    pub(crate) fn check_request(&self, method: &str, path: &str) -> Result<(), ToolFailure> {
+        let Some((methods, prefixes)) = self.limits.as_ref() else { return Ok(()); };
+        let path = path.split('?').next().unwrap_or(path);
+        if !methods.iter().any(|allowed| allowed == method) {
+            return Err(ToolFailure::validation("请求方法不在所选 profile 允许列表内"));
+        }
+        if !prefixes.iter().any(|prefix| path == prefix ||
+            (path.starts_with(prefix) && (prefix.ends_with('/') || path.as_bytes().get(prefix.len()) == Some(&b'/')))) {
+            return Err(ToolFailure::validation("请求路径不在所选 profile 允许前缀内"));
+        }
+        Ok(())
+    }
+}
+
+/// Profile-owned endpoint configuration, independent of the legacy global binding.
+pub(crate) fn build_profile_runtime(
+    session: &Session,
+    credential_id: &str,
+    profile: &sealbox_core::profile::CredentialProfile,
+) -> Result<EndpointRuntime, ToolFailure> {
+    let label = match profile.adapter.as_str() {
+        "zoomkey_jira" => "jira",
+        "zoomkey_crm" => "crm",
+        _ => return Err(ToolFailure::validation("未知 ZoomKey adapter")),
+    };
+    let expected_auth = if label == "jira" { "basic" } else { "mtls" };
+    if profile.auth.kind != expected_auth {
+        return Err(ToolFailure::validation("ZoomKey profile 认证类型与封装协议不匹配"));
+    }
+    let vault = session.vault().map_err(|e| ToolFailure::validation(e.to_string()))?;
+    let dek = session.dek().map_err(|e| ToolFailure::validation(e.to_string()))?;
+    let policy = load_policy(vault, dek);
+    if !policy.enabled {
+        return Err(ToolFailure::validation("MCP 未启用。请先在 Sealbox 的 MCP 页面打开。"));
+    }
+    let endpoint = ZoomkeyEndpointPolicy {
+        base_url: if label == "crm" { format!("{}/webservice.php", profile.origin) } else { profile.origin.clone() },
+        credential_id: credential_id.to_string(),
+        client_cert_id: profile.auth.client_cert_id.clone().unwrap_or_default(),
+        ca_bundle_path: profile.auth.ca_bundle_path.clone().unwrap_or_default(),
+    };
+    // The saved profile is the exact host allowlist for this credential. Reuse
+    // the private-network IP guard and DNS pinning, never the singleton binding.
+    let target = crate::http_guard::parse_http_url(&profile.origin, true)
+        .map_err(ToolFailure::validation)?;
+    let allowed_hosts = vec![target.host];
+    build_endpoint_runtime(session, label, &endpoint, &allowed_hosts,
+        Some((profile.allowed_methods.clone(), profile.allowed_path_prefixes.clone())))
+}
+
+pub(crate) fn profile_navigation(text: &str) -> String {
+    text.replace("zoomkey_jira_", "http_call op=")
+        .replace("zoomkey_crm_", "http_call op=")
 }
 
 pub(crate) fn build_runtime(
@@ -571,9 +630,9 @@ fn build_runtime_inner(
         .dek()
         .map_err(|e| ToolFailure::validation(e.to_string()))?;
     let policy = load_policy(vault, dek);
-    let (endpoint, service) = match label {
-        "jira" => (&policy.jira, JIRA_SERVICE),
-        "crm" => (&policy.crm, CRM_SERVICE),
+    let endpoint = match label {
+        "jira" => &policy.jira,
+        "crm" => &policy.crm,
         _ => return Err(ToolFailure::validation("未知 ZoomKey 端点")),
     };
     if require_enabled && !policy.enabled {
@@ -581,8 +640,20 @@ fn build_runtime_inner(
             "ZoomKey MCP 未启用，请先在 Sealbox 的 MCP 页面打开",
         ));
     }
-    let pinned =
-        target::pin(&endpoint.base_url, &policy.allowed_hosts).map_err(ToolFailure::validation)?;
+    build_endpoint_runtime(session, label, endpoint, &policy.allowed_hosts, None)
+}
+
+fn build_endpoint_runtime(
+    session: &Session,
+    label: &'static str,
+    endpoint: &ZoomkeyEndpointPolicy,
+    allowed_hosts: &[String],
+    limits: Option<(Vec<String>, Vec<String>)>,
+) -> Result<EndpointRuntime, ToolFailure> {
+    let vault = session.vault().map_err(|e| ToolFailure::validation(e.to_string()))?;
+    let dek = session.dek().map_err(|e| ToolFailure::validation(e.to_string()))?;
+    let service = if label == "jira" { JIRA_SERVICE } else { CRM_SERVICE };
+    let pinned = target::pin(&endpoint.base_url, allowed_hosts).map_err(ToolFailure::validation)?;
 
     if endpoint.credential_id.trim().is_empty() {
         return Err(ToolFailure::validation(format!(
@@ -653,12 +724,18 @@ fn build_runtime_inner(
         .resolver(pinned.resolver())
         .build();
 
+    let cache_material = Zeroizing::new(format!("{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        endpoint.credential_id, endpoint.base_url, username, token,
+        cert_pem, key_pem, ca_pem));
+    let cache_key = sha256_hex(cache_material.as_bytes());
     Ok(EndpointRuntime {
         base_url: endpoint.base_url.clone(),
         origin: pinned.origin(),
         agent,
         username,
         secret: Zeroizing::new(token),
+        cache_key,
+        limits,
     })
 }
 

@@ -1,4 +1,4 @@
-//! 本地仓库上的 `github_git_*` 工具。
+//! 本地仓库上的 `git` 工具。对外只注册这一个名字；`github_git` 与 `github_git_*` 是调用别名。
 //!
 //! 是否可用看 MCP 页的总开关。仓库一律传本机绝对路径。
 //! push / pull / clone 用一次性 askpass 注入金库 Token，不改 remote URL。
@@ -68,8 +68,8 @@ fn action_prop() -> Value {
 
 pub fn tool_definitions() -> Vec<Value> {
     vec![tool(
-        "github_git",
-        "本机仓库的常用 git。action 取 status、diff、log、branches、fetch、pull、commit、push、clone。除 clone 外 path 是仓库绝对路径；clone 的 path 是已存在的父目录。写动作每次弹出一次桌面确认。",
+        "git",
+        "本机 git。action 取 status、diff、log、branches、fetch、pull、commit、push、clone。除 clone 外 path 是仓库绝对路径；clone 的 path 是已存在的父目录。写动作每次弹出一次桌面确认。",
         schema(
             &[
                 ("action", action_prop()),
@@ -78,7 +78,7 @@ pub fn tool_definitions() -> Vec<Value> {
                 ("credential_id", credential_id_prop()),
                 ("staged", json!({"type":"boolean","default":false,"description":"仅 diff：看暂存区"})),
                 ("stat_only", json!({"type":"boolean","default":true,"description":"仅 diff：只返回 --stat。false 才返回 patch"})),
-                ("file", string_schema(1, 500)),
+                ("file", json!({"type":"string","minLength":1,"maxLength":500,"description":"仅 diff / commit：仓库内相对路径"})),
                 (
                     "files",
                     json!({
@@ -89,7 +89,7 @@ pub fn tool_definitions() -> Vec<Value> {
                     }),
                 ),
                 ("all", json!({"type":"boolean","default":false,"description":"仅 commit：先 git add -A 再提交。与 file/files 互斥。"})),
-                ("message", string_schema(1, 2000)),
+                ("message", json!({"type":"string","minLength":1,"maxLength":2000,"description":"仅 commit：提交信息"})),
                 ("limit", json!({"type":"integer","minimum":1,"maximum":100,"default":20,"description":"仅 log"})),
                 ("remote", json!({"type":"string","minLength":1,"maxLength":64,"description":"fetch/pull/push 的远程名，默认 origin。必须是 https://github.com"})),
                 ("branch", json!({"type":"string","minLength":0,"maxLength":200,"description":"仅 push：目标分支；空字符串表示当前分支。与 tag 互斥"})),
@@ -97,8 +97,8 @@ pub fn tool_definitions() -> Vec<Value> {
                 ("tags", json!({"type":"boolean","default":false,"description":"仅 push：推送分支时带上全部标签"})),
                 ("force_with_lease", json!({"type":"boolean","default":false,"description":"仅 push：先 ls-remote 再 --force-with-lease。不推标签时不能用"})),
                 ("repo", json!({"type":"string","minLength":1,"maxLength":201,"description":"仅 clone：owner/repo"})),
-                ("owner", string_schema(1, 100)),
-                ("name", string_schema(1, 100)),
+                ("owner", json!({"type":"string","minLength":1,"maxLength":100,"description":"仅 clone：仓库 owner；优先用 repo=owner/repo"})),
+                ("name", json!({"type":"string","minLength":1,"maxLength":100,"description":"仅 clone：新建目录名"})),
             ],
             &["action", "path"],
         ),
@@ -106,13 +106,14 @@ pub fn tool_definitions() -> Vec<Value> {
     )]
 }
 
-/// 旧的细工具名映射到 github_git 的 action。未知名原样返回。
+/// 旧的细工具名映射到 git 的 action。未知名返回 None。
 fn legacy_git_action(name: &str) -> Option<&'static str> {
     Some(match name {
         "github_git_status" => "status",
         "github_git_diff" => "diff",
         "github_git_log" => "log",
         "github_git_branches" => "branches",
+        "github_git_fetch" => "fetch",
         "github_git_pull" => "pull",
         "github_git_commit" | "github_git_stage" => "commit",
         "github_git_push" => "push",
@@ -129,7 +130,7 @@ fn definition_named<'a>(definitions: &'a [Value], name: &str) -> Result<&'a Valu
 }
 
 pub fn is_git_tool(name: &str) -> bool {
-    name == "github_git" || name.starts_with("github_git_")
+    name == "git" || name == "github_git" || name.starts_with("github_git_")
 }
 
 pub fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<String, String> {
@@ -164,8 +165,11 @@ pub fn prepare_tool(
     args: Value,
 ) -> Result<PreparedGitOp, String> {
     let definitions = tool_definitions();
-    let definition = definition_named(&definitions, "github_git")?;
-    let (action, args) = if name == "github_git" {
+    let definition = definition_named(&definitions, "git")?;
+    let (action, args) = if name == "git" || name == "github_git" {
+        if !args.get("action").and_then(Value::as_str).is_some_and(|action|GIT_ACTIONS.contains(&action)) {
+            return Err(format!("git 需要合法 action：{}",GIT_ACTIONS.join("、")));
+        }
         crate::github_mcp::validate_tool_arguments(&definition["inputSchema"], &args)?;
         let action = args
             .get("action")
@@ -177,6 +181,19 @@ pub fn prepare_tool(
         let action = legacy_git_action(name).ok_or_else(|| "未知 GitHub git 工具".to_string())?;
         (action.to_string(), args)
     };
+    let action_keys: &[&str] = match action.as_str() {
+        "status" | "branches" => &[],
+        "diff" => &["staged","stat_only","file"],
+        "log" => &["limit"],
+        "fetch" | "pull" => &["remote"],
+        "commit" => &["file","files","all","message"],
+        "push" => &["remote","branch","tag","tags","force_with_lease"],
+        "clone" => &["repo","owner","name"],
+        _ => &[],
+    };
+    if let Some(key) = args.as_object().and_then(|obj|obj.keys().find(|key| {
+        !["action","path","credential","credential_id"].contains(&key.as_str()) && !action_keys.contains(&key.as_str())
+    })) { return Err(format!("参数 {key} 不适用于 git action={action}")); }
     let vault = session.vault().map_err(|e| e.to_string())?;
     let dek = session.dek().map_err(|e| e.to_string())?;
     if !crate::zoomkey::mcp_enabled(vault, dek) {
@@ -193,7 +210,12 @@ pub fn prepare_tool(
         "push" => prepare_push(session, &args)?,
         "pull" => prepare_pull(session, &args)?,
         "clone" => prepare_clone(session, &args)?,
-        _ => return Err("未知的 github_git action".into()),
+        _ => {
+            return Err(format!(
+                "未知的 git action。可用 {}",
+                GIT_ACTIONS.join("、")
+            ))
+        }
     };
     session.touch();
     Ok(redact_prepared(prepared, secrets))
@@ -403,28 +425,28 @@ fn prepare_commit(session: &Session, args: &Value) -> Result<PreparedGitOp, Stri
 fn prepare_fetch(session: &Session, args: &Value) -> Result<PreparedGitOp, String> {
     let root = repo_root(session, args)?;
     let remote = remote_name(args)?;
-    require_github_https_remote(&root, &remote)?;
+    let (fetch_url, _) = github_remote_urls(&root, &remote)?;
     let token = github_token(session, args)?;
     let payload = git_confirm_payload(
         "抓取 GitHub 远端",
         "允许这次本地 git 写操作？",
         &[
             ("仓库", display_path(&root)),
-            ("远程", remote.clone()),
+            ("远程", fetch_url.clone()),
             ("说明", "只更新远端跟踪，不改工作区".into()),
         ],
     );
     Ok(PreparedGitOp::Pending {
         payload,
         deny: "用户拒绝了这次 git 写操作".into(),
-        exec: Box::new(move |_session| git_with_token(&root, &["fetch", &remote], &token)),
+        exec: Box::new(move |_session| git_with_token(&root, &["fetch", &fetch_url], &token)),
     })
 }
 
 fn prepare_push(session: &Session, args: &Value) -> Result<PreparedGitOp, String> {
     let root = repo_root(session, args)?;
     let remote = remote_name(args)?;
-    require_github_https_remote(&root, &remote)?;
+    let (_, push_urls) = github_remote_urls(&root, &remote)?;
     let requested_branch = requested_branch(args)?;
     let tag = requested_tag(args)?;
     let tags = args.get("tags").and_then(Value::as_bool).unwrap_or(false);
@@ -439,7 +461,7 @@ fn prepare_push(session: &Session, args: &Value) -> Result<PreparedGitOp, String
         return Err("只推标签时不能使用 force_with_lease".into());
     }
     let token = github_token(session, args)?;
-    let mut cmd = vec!["push".to_string(), remote.clone()];
+    let mut cmd = vec!["push".to_string(), push_urls[0].clone()];
     let branch;
     let target_label;
     if let Some(tag_name) = tag.as_ref() {
@@ -458,7 +480,7 @@ fn prepare_push(session: &Session, args: &Value) -> Result<PreparedGitOp, String
             cmd.push("--tags".into());
         }
         if force_with_lease {
-            let before = ls_remote_sha(&root, &token, &remote, &name)?;
+            let before = ls_remote_sha(&root, &token, &push_urls[0], &name)?;
             if before.is_empty() {
                 cmd.push(format!("--force-with-lease=refs/heads/{name}:"));
             } else {
@@ -505,7 +527,7 @@ fn prepare_push(session: &Session, args: &Value) -> Result<PreparedGitOp, String
 fn prepare_pull(session: &Session, args: &Value) -> Result<PreparedGitOp, String> {
     let root = repo_root(session, args)?;
     let remote = remote_name(args)?;
-    require_github_https_remote(&root, &remote)?;
+    let (fetch_url, _) = github_remote_urls(&root, &remote)?;
     if working_tree_dirty(&root)? {
         return Err("工作区有未提交改动，已拒绝 pull".into());
     }
@@ -521,7 +543,7 @@ fn prepare_pull(session: &Session, args: &Value) -> Result<PreparedGitOp, String
                 branch
                     .as_deref()
                     .map(|value| format!("{remote}/{value}"))
-                    .unwrap_or_else(|| format!("{remote} 当前分支")),
+                    .unwrap_or_else(|| fetch_url.clone()),
             ),
         ],
     );
@@ -529,7 +551,7 @@ fn prepare_pull(session: &Session, args: &Value) -> Result<PreparedGitOp, String
         payload,
         deny: "用户拒绝了这次 git 写操作".into(),
         exec: Box::new(move |_session| {
-            let mut cmd = vec!["pull".to_string(), "--ff-only".into(), remote];
+            let mut cmd = vec!["pull".to_string(), "--ff-only".into(), fetch_url];
             if let Some(branch) = branch {
                 cmd.push(branch);
             }
@@ -749,17 +771,34 @@ fn require_github_https_origin(root: &Path) -> Result<(), String> {
     require_github_https_remote(root, "origin")
 }
 
-fn require_github_https_remote(root: &Path, remote: &str) -> Result<(), String> {
-    let url = git_output(root, &["remote", "get-url", remote], None)?;
-    let url = url.trim();
+fn github_remote_urls(root: &Path, remote: &str) -> Result<(String, Vec<String>), String> {
+    let fetch = normalize_github_remote_url(&git_output(root, &["remote", "get-url", remote], None)?)?;
+    let mut push = Vec::new();
+    if let Ok(raw) = git_output(root, &["config", "--get-all", &format!("remote.{remote}.pushurl")], None) {
+        for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
+            push.push(normalize_github_remote_url(line)?);
+        }
+    }
+    if push.is_empty() {
+        push.push(fetch.clone());
+    }
+    Ok((fetch, push))
+}
+
+fn normalize_github_remote_url(raw: &str) -> Result<String, String> {
+    let url = raw.trim();
     if url.starts_with("git@") || url.starts_with("ssh://") {
         return Err("只允许 https://github.com 远程，已拒绝 SSH".into());
     }
     let parsed = crate::http_guard::parse_http_url(url, true)?;
-    if parsed.scheme != "https" || parsed.host != "github.com" || parsed.port != 443 {
+    if parsed.scheme != "https" || !parsed.host.eq_ignore_ascii_case("github.com") || parsed.port != 443 {
         return Err("只允许 https://github.com 远程".into());
     }
-    Ok(())
+    Ok(url.to_string())
+}
+
+fn require_github_https_remote(root: &Path, remote: &str) -> Result<(), String> {
+    github_remote_urls(root, remote).map(|_| ())
 }
 
 fn remote_name(args: &Value) -> Result<String, String> {
@@ -923,7 +962,13 @@ fn git_command(root: &Path, args: &[&str], token: Option<&str>) -> Result<Output
     }
     command.arg("-C").arg(root);
     if token.is_some() {
-        command.args(["-c", "credential.helper="]);
+        command.args([
+            "-c", "credential.helper=",
+            "-c", "core.hooksPath=/dev/null",
+            "-c", "http.proxy=",
+            "-c", "https.proxy=",
+            "-c", "http.followRedirects=false",
+        ]);
     }
     command
         .args(args)
@@ -1012,7 +1057,7 @@ fn askpass_script() -> String {
     if cfg!(windows) {
         "@echo off\r\necho(%1)| findstr /I \"Username\" >nul\r\nif %errorlevel%==0 (\r\n  echo x-access-token\r\n  goto :eof\r\n)\r\necho %SEALBOX_GIT_ASKPASS_TOKEN%\r\n".into()
     } else {
-        "#!/bin/sh\ncase \"$1\" in\n  [Uu]sername*) echo x-access-token ;;\n  *) echo \"$SEALBOX_GIT_ASKPASS_TOKEN\" ;;\nesac\n".into()
+        "#!/bin/sh\ncase \"$1\" in\n  [Uu]sername*) printf '%s\\n' x-access-token; exit 0 ;;\nesac\nurl=$(printf '%s' \"$1\" | sed -n \"s/.*'\\(https:\\/\\/[^']*\\)'.*/\\1/p\")\ncase \"$url\" in\n  https://github.com|https://github.com/*|https://github.com:443|https://github.com:443/*) printf '%s\\n' \"$SEALBOX_GIT_ASKPASS_TOKEN\" ;;\n  *) exit 1 ;;\nesac\n".into()
     }
 }
 
@@ -1266,7 +1311,8 @@ mod tests {
         let definitions = tool_definitions();
         assert_eq!(definitions.len(), 1);
         let definition = &definitions[0];
-        assert_eq!(definition["name"], "github_git");
+        assert_eq!(definition["name"], "git");
+        assert!(!definitions.iter().any(|tool| tool["name"] == "github_git"));
         assert_eq!(definition["readOnly"], false);
         assert_eq!(definition["risk"], "high");
         assert_eq!(definition["annotations"]["readOnlyHint"], false);
@@ -1287,12 +1333,12 @@ mod tests {
     fn push_schema_allows_branch_without_branch_or_tag_requirement() {
         let definition = crate::github_mcp::tool_definitions_for_mcp()
             .into_iter()
-            .find(|tool| tool["name"] == "github_git")
-            .expect("github_git must be exposed by the MCP catalog");
+            .find(|tool| tool["name"] == "git")
+            .expect("git must be exposed by the MCP catalog");
         let schema = &definition["inputSchema"];
         let required = schema["required"]
             .as_array()
-            .expect("github_git schema must expose required");
+            .expect("git schema must expose required");
         assert!(required.iter().any(|value| value == "action"));
         assert!(required.iter().any(|value| value == "path"));
         assert!(!required.iter().any(|value| value == "branch"));
@@ -1348,6 +1394,23 @@ mod tests {
             .map(|field| field.value.as_str())
             .unwrap_or_default();
         assert_eq!(target, "origin/master");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn pushurl_outside_github_is_rejected_before_network() {
+        let repo = temp_git_repo();
+        Command::new("git").arg("-C").arg(&repo)
+            .args(["remote", "add", "origin", "https://github.com/octocat/hello.git"]).status().unwrap();
+        Command::new("git").arg("-C").arg(&repo)
+            .args(["remote", "set-url", "--push", "origin", "https://example.com/steal.git"]).status().unwrap();
+        let err = match prepare_tool(&mut enabled_session(), "git", json!({
+            "action": "push", "path": repo.to_string_lossy(), "branch": "master"
+        })) {
+            Err(error) => error,
+            Ok(_) => panic!("非 GitHub pushurl 必须在联网前拒绝"),
+        };
+        assert!(err.contains("github.com"), "{err}");
         let _ = fs::remove_dir_all(&repo);
     }
 

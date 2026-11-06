@@ -206,6 +206,15 @@ pub(crate) fn call(
         _ => return Err(ToolFailure::validation(format!("未知 JIRA 工具 {name}"))),
     }
     let runtime = super::build_runtime(session, "jira")?;
+    call_with_runtime(&runtime, name, args)
+}
+
+/// Reuse the DTO/JQL rules with a runtime bound to the selected credential profile.
+pub(crate) fn call_with_runtime(
+    runtime: &EndpointRuntime,
+    name: &str,
+    args: &Value,
+) -> Result<ToolOutcome, ToolFailure> {
     match name {
         "zoomkey_jira_nav" => nav(&runtime, args),
         "zoomkey_jira_connection_status" => connection_status(&runtime, args),
@@ -217,8 +226,11 @@ pub(crate) fn call(
         "zoomkey_jira_my_open_issues" => search(&runtime, args, SearchMode::MyOpen),
         "zoomkey_jira_project_unfinished" => search(&runtime, args, SearchMode::ProjectUnfinished),
         "zoomkey_jira_preset_unfinished" => search(&runtime, args, SearchMode::Preset),
-        _ => Err(ToolFailure::validation("未知 JIRA 工具")),
-    }
+        _ => Err(ToolFailure::validation("未知 JIRA 操作")),
+    }.map(|mut outcome| {
+        outcome.text = super::profile_navigation(&outcome.text);
+        outcome
+    })
 }
 
 fn nav(runtime: &EndpointRuntime, args: &Value) -> Result<ToolOutcome, ToolFailure> {
@@ -303,7 +315,7 @@ fn nav(runtime: &EndpointRuntime, args: &Value) -> Result<ToolOutcome, ToolFailu
         }
     }
     lines.push(String::new());
-    lines.push("下一步可选：".into());
+    lines.push("先调用 vault_describe 查看所选凭据的已登记操作；再用 http_call(credential_id, op, params)。下一步可选：".into());
     lines.push("- zoomkey_jira_my_open_issues  我的未完成清单".into());
     lines.push("- zoomkey_jira_preset_unfinished  呼市燃热跨项目未完成".into());
     lines.push("- zoomkey_jira_search_issues  自定义 JQL".into());
@@ -1139,6 +1151,7 @@ fn encode_component(value: &str) -> String {
 }
 
 fn get_json(runtime: &EndpointRuntime, path: &str) -> Result<Value, ToolFailure> {
+    runtime.check_request("GET", path)?;
     if !path.starts_with('/') {
         return Err(ToolFailure::validation("内部路径必须以 / 开头"));
     }

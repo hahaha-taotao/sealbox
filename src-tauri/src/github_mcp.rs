@@ -847,6 +847,66 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
     let (dispatched, args) = normalize_tool_call(name, args)?;
     let name = dispatched.as_str();
     let (token, credential_label) = prepare(session, name, &args)?;
+    let result = execute_api_call(name, args, token, credential_label);
+    session.touch();
+    result
+}
+
+/// Owns the selected credential so network I/O and desktop confirmation can run
+/// after the caller has released the global Session mutex.
+pub(crate) struct PreparedGithubCall {
+    name: String,
+    args: Value,
+    token: zeroize::Zeroizing<String>,
+    credential_label: String,
+}
+
+impl PreparedGithubCall {
+    pub(crate) fn execute(self) -> Result<(u16, String), String> {
+        execute_api_call(&self.name, self.args, self.token.to_string(), self.credential_label)
+    }
+}
+
+pub(crate) fn prepare_profile_call(
+    session: &Session,
+    credential_id: &str,
+    name: &str,
+    mut args: Value,
+) -> Result<PreparedGithubCall, String> {
+    let object = args.as_object_mut().ok_or("操作参数必须是对象")?;
+    // Never pass a model-provided credential selector to the legacy resolver.
+    for key in ["credential", "credential_id", "credential_name"] {
+        object.remove(key);
+    }
+    object.insert("credential_id".into(), Value::String(credential_id.to_string()));
+    let definition = api_tool_definitions()
+        .into_iter()
+        .find(|definition| definition["name"].as_str() == Some(name))
+        .ok_or("未知内置操作")?;
+    validate_arguments(&definition["inputSchema"], &args)?;
+    let vault = session.vault().map_err(|e| e.to_string())?;
+    let dek = session.dek().map_err(|e| e.to_string())?;
+    if !crate::zoomkey::mcp_enabled(vault, dek) {
+        return Err("MCP 未启用。请先在 Sealbox 的 MCP 页面打开。".into());
+    }
+    // Resolve by exact ID, not title/account matching, even with multiple tokens.
+    let token = token_from_id(session, credential_id)?;
+    let title = list_credentials(session)?.into_iter()
+        .find(|entry| entry.id == credential_id).ok_or("GitHub 凭据不存在")?.title;
+    Ok(PreparedGithubCall {
+        name: name.to_string(),
+        args,
+        token: zeroize::Zeroizing::new(token),
+        credential_label: title,
+    })
+}
+
+fn execute_api_call(
+    name: &str,
+    args: Value,
+    token: String,
+    credential_label: String,
+) -> Result<(u16, String), String> {
     let (status, result) = match name {
         "github_release_generate_notes" => {
             let repository = repository_args(&args)?;
@@ -1292,7 +1352,6 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
         }
         _ => return Err("未知 GitHub 工具".into()),
     }?;
-    session.touch();
     let serialized = serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?;
     Ok((status, redact_text(&serialized, &[token.as_str()])))
 }
@@ -1739,43 +1798,9 @@ fn request_json<T>(
     path: &str,
     map: impl FnOnce(&Value) -> Result<T, String>,
 ) -> Result<(u16, T), String> {
-    let target = parse_http_url(&format!("{API_BASE}{path}"), true)?;
-    if target.scheme != "https" || target.host != "api.github.com" || target.port != 443 {
-        return Err("GitHub API 目标不合法".into());
-    }
-    assert_public_target(&target)?;
-    let agent = ureq::builder()
-        .redirects(0)
-        .timeout(Duration::from_secs(15))
-        .timeout_connect(Duration::from_secs(8))
-        .resolver(PublicResolver)
-        .user_agent(concat!("Sealbox/", env!("CARGO_PKG_VERSION")))
-        .build();
-    let response = agent
-        .get(&format!("{API_BASE}{path}"))
-        .set("Authorization", &format!("Bearer {token}"))
-        .set("Accept", "application/vnd.github+json")
-        .set("X-GitHub-Api-Version", API_VERSION)
-        .call();
-    let (status, body, truncated) = match response {
-        Ok(response) => {
-            let (status, body, truncated) = read_response(response);
-            (status, body, truncated)
-        }
-        Err(ureq::Error::Status(status, response)) => {
-            let (_, body, truncated) = read_response(response);
-            return Err(redact_text(
-                &github_error(status, &body, truncated),
-                &[token],
-            ));
-        }
-        Err(_) => return Err("GitHub 网络请求失败".into()),
-    };
-    if truncated {
-        return Err("GitHub 响应超过安全大小限制".into());
-    }
-    let value: Value =
-        serde_json::from_slice(&body).map_err(|_| "GitHub 响应不是有效 JSON".to_string())?;
+    // Keep all REST requests on the same host/transport/profile-limit guard.
+    let (status, value) = crate::github_api::Github::open(token, "GitHub")
+        .get(path, Vec::new())?;
     map(&value)
         .map(|value| (status, value))
         .map_err(|error| format!("GitHub 响应处理失败: {error}"))
@@ -2031,7 +2056,7 @@ mod tests {
             "github_release_publish",
             "github_pr_merge",
             "github_issue_close",
-            "github_git",
+            "git",
             "github_release_create",
         ] {
             assert!(definitions.iter().any(|definition| definition["name"] == name), "{name} missing");
@@ -2059,7 +2084,7 @@ mod tests {
     #[test]
     fn file_and_ref_tools_are_registered_for_shared_mcp() {
         let definitions = tool_definitions_for_mcp();
-        for name in ["github_release_create", "github_pr_create", "github_issue_close", "github_git"] {
+        for name in ["github_release_create", "github_pr_create", "github_issue_close", "git"] {
             assert!(definitions.iter().any(|definition| definition["name"] == name), "{name} missing");
         }
     }
@@ -2087,11 +2112,13 @@ mod tests {
             assert!(!names.contains(name));
         }
         assert!(!names.contains("github_get_authenticated_user"));
+        assert!(!names.contains("github_git"));
+        assert!(names.contains("git"));
     }
 
     #[test]
     fn task_tools_are_high_risk() {
-        for name in ["github_release_create", "github_pr_create", "github_issue_close", "github_git"] {
+        for name in ["github_release_create", "github_pr_create", "github_issue_close", "git"] {
             let def = find_tool(name);
             assert_eq!(def["readOnly"], false);
             assert_eq!(def["risk"], "high");
@@ -2235,7 +2262,7 @@ mod tests {
         assert!(release_error.contains("未启用"), "{release_error}");
         let git_error = call_tool(
             &mut session,
-            "github_git",
+            "git",
             json!({"action":"status","path":"E:\\\\repo"}),
         )
         .unwrap_err();

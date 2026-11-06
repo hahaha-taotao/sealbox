@@ -123,6 +123,9 @@ fn validate(env: &BackupEnvelope, dek: &[u8; 32]) -> Result<(), VaultError> {
         if let SecretPayload::ClientCert { cert_pem, key_pem, passphrase } = &*payload {
             crate::certificate::validate_client_cert(cert_pem, key_pem, passphrase.as_deref()).map_err(|_| corrupt())?;
         }
+        if let Some(blob) = &e.profile_blob {
+            crate::profile::open_profile_blob(dek, blob, &payload).map_err(|_| corrupt())?;
+        }
         if let Some(blob) = &e.notes_blob {
             let notes = Zeroizing::new(decrypt(dek, &Encrypted::from_bytes(blob).map_err(|_| corrupt())?).map_err(|_| corrupt())?);
             std::str::from_utf8(&notes).map_err(|_| corrupt())?;
@@ -562,6 +565,7 @@ mod tests {
                     fingerprint: None,
                     secret_blob: bad_secret,
                     notes_blob: None,
+                    profile_blob: None,
                     tags: vec![],
                 },
             ],

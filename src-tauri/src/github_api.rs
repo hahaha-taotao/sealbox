@@ -76,6 +76,52 @@ type ReplyFn = dyn FnMut(&Captured) -> Result<HttpReply, String> + Send;
 thread_local! {
     static PROBE: RefCell<Option<ProbeSlot>> = const { RefCell::new(None) };
     static PROBE_GEN: Cell<u64> = const { Cell::new(0) };
+    static PROFILE_LIMITS: RefCell<Option<ProfileLimits>> = const { RefCell::new(None) };
+}
+
+#[derive(Clone)]
+struct ProfileLimits {
+    methods: Vec<String>,
+    paths: Vec<String>,
+}
+
+/// Apply the selected profile to every real request, including prerequisite GETs.
+/// The RAII restore also runs on panic and isolates concurrent callers by thread.
+pub(crate) fn with_profile_limits<T>(
+    methods: &[String],
+    paths: &[String],
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<ProfileLimits>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PROFILE_LIMITS.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = PROFILE_LIMITS.with(|slot| slot.replace(Some(ProfileLimits {
+        methods: methods.to_vec(),
+        paths: paths.to_vec(),
+    })));
+    let _restore = Restore(previous);
+    action()
+}
+
+fn check_profile_limits(method: Method, path: &str) -> Result<(), String> {
+    let path = path.split('?').next().unwrap_or(path);
+    PROFILE_LIMITS.with(|slot| {
+        let limits = slot.borrow();
+        let Some(limits) = limits.as_ref() else { return Ok(()); };
+        if !limits.methods.iter().any(|allowed| allowed == method_name(method)) {
+            return Err("请求方法不在所选 profile 允许列表内".into());
+        }
+        if !limits.paths.iter().any(|prefix| {
+            path == prefix || (path.starts_with(prefix) &&
+                (prefix.ends_with('/') || path.as_bytes().get(prefix.len()) == Some(&b'/')))
+        }) {
+            return Err("请求路径不在所选 profile 允许前缀内".into());
+        }
+        Ok(())
+    })
 }
 
 struct ProbeSlot {
@@ -163,6 +209,7 @@ impl Github {
     }
 
     pub fn send(&self, call: &Call, confirm: Option<&Confirm>) -> Result<(u16, Value), String> {
+        check_profile_limits(call.method, &call.path)?;
         let url = pinned_url(API, "api.github.com", &call.path, &call.query)?;
         self.exchange_json(call, confirm, &url)
     }
@@ -194,6 +241,7 @@ impl Github {
         ok: &'static [u16],
         confirm: Option<&Confirm>,
     ) -> Result<(u16, Value), String> {
+        check_profile_limits(Method::Post, path)?;
         let url = pinned_url(UPLOADS, "uploads.github.com", path, &[])?;
         let call = Call {
             method: Method::Post,
@@ -239,6 +287,7 @@ impl Github {
         if dest.exists() {
             return Err("目标文件已存在".into());
         }
+        check_profile_limits(Method::Get, path)?;
         let url = pinned_url(API, "api.github.com", path, &query)?;
         let call = Call {
             method: Method::Get,

@@ -3,6 +3,7 @@ use crate::crypto::{
     decrypt, derive_kek, encrypt, random_key, unwrap_key, wrap_key, ArgonParams, Encrypted,
 };
 use crate::db;
+use crate::profile::{CredentialProfile, open_profile_blob, validate_for_secret, reject_embedded_secret};
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::types::Type;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -52,6 +53,8 @@ pub enum VaultError {
     ConcurrentModification,
     #[error("invalid entry patch: {0}")]
     InvalidPatch(String),
+    #[error("invalid credential profile: {0}")]
+    InvalidProfile(String),
     #[error("备份密钥拉伸参数超出允许范围")]
     InvalidBackupKdf,
     #[error("文件夹名称不能为空")]
@@ -631,6 +634,12 @@ impl Vault {
                 input.url.clone(),
             ),
         };
+        // Upserts preserve an existing profile, but may not change the secret
+        // into an incompatible kind or copy its new material into that profile.
+        let existing_profile: Option<Vec<u8>> = self.conn.query_row(
+            "SELECT profile_blob FROM entries WHERE id=?1", params![&id], |r| r.get(0),
+        ).optional()?.flatten();
+        if let Some(blob) = existing_profile { open_profile_blob(dek, &blob, &input.secret)?; }
         let secret_json = serde_json::to_vec(&input.secret)?;
         let secret_blob = encrypt(dek, &secret_json)?.to_bytes();
         let notes_blob = match &input.notes {
@@ -774,6 +783,43 @@ impl Vault {
             return Err(VaultError::KindMismatch);
         }
         Ok(payload)
+    }
+
+    /// Read only active credentials. A missing profile is distinct from a missing entry.
+    pub fn credential_profile(&self, dek: &[u8; 32], id: &str) -> Result<Option<CredentialProfile>, VaultError> {
+        let blob: Option<Vec<u8>> = self.conn.query_row(
+            "SELECT profile_blob FROM entries WHERE id=?1 AND deleted_at IS NULL", params![id], |r| r.get(0),
+        ).optional()?.ok_or(VaultError::NotFound)?;
+        let Some(blob) = blob else { return Ok(None); };
+        let secret = zeroize::Zeroizing::new(self.get_active_secret(dek, id)?);
+        Ok(Some(open_profile_blob(dek, &blob, &secret)?))
+    }
+
+    /// Store policy alongside its credential, never in settings. Clearing also
+    /// authenticates the DEK and rejects deleted/missing credentials.
+    pub fn set_credential_profile(&self, dek: &[u8; 32], id: &str, profile: Option<&CredentialProfile>) -> Result<(), VaultError> {
+        self.with_transaction(|conn| {
+            let secret = zeroize::Zeroizing::new(self.get_active_secret(dek, id)?);
+            let blob = if let Some(profile) = profile {
+                validate_for_secret(profile, &secret).map_err(VaultError::InvalidProfile)?;
+                if let Some(cert_id) = &profile.auth.client_cert_id {
+                    let cert = zeroize::Zeroizing::new(self.get_active_secret(dek, cert_id)?);
+                    if !matches!(&*cert, SecretPayload::ClientCert { passphrase, .. } if passphrase.as_deref().unwrap_or("").is_empty()) {
+                        return Err(VaultError::InvalidProfile("mTLS reference must be an active usable client certificate".into()));
+                    }
+                    reject_embedded_secret(profile, &cert).map_err(VaultError::InvalidProfile)?;
+                } else if profile.auth.kind == "mtls" && matches!(&*secret, SecretPayload::ClientCert { passphrase: Some(p), .. } if !p.is_empty()) {
+                    return Err(VaultError::InvalidProfile("mTLS private keys must be unencrypted inside the vault".into()));
+                }
+                let plain = zeroize::Zeroizing::new(serde_json::to_vec(profile)?);
+                Some(encrypt(dek, &plain)?.to_bytes())
+            } else { None };
+            let changed = conn.execute("UPDATE entries SET profile_blob=?1, updated_at=?2 WHERE id=?3 AND deleted_at IS NULL", params![blob, now_rfc3339(), id])?;
+            if changed != 1 { return Err(VaultError::NotFound); }
+            // No service, URL, schema, fixed values or credential material in audit.
+            self.audit("update", Some(id), if profile.is_some() { "credential_profile=set" } else { "credential_profile=cleared" })?;
+            Ok(())
+        })
     }
 
     pub fn update_entry_metadata(
@@ -1477,7 +1523,7 @@ impl Vault {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, title, account, url, folder_id, pinned, expires_at,
                     use_count, last_used_at, created_at, updated_at, deleted_at,
-                    has_totp, fingerprint, secret_blob, notes_blob FROM entries",
+                    has_totp, fingerprint, secret_blob, notes_blob, profile_blob FROM entries",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(BackupEntry {
@@ -1498,6 +1544,7 @@ impl Vault {
                 fingerprint: r.get(14)?,
                 secret_blob: r.get(15)?,
                 notes_blob: r.get(16)?,
+                profile_blob: r.get(17)?,
                 tags: Vec::new(),
             })
         })?;
@@ -1549,6 +1596,13 @@ impl Vault {
             certificate::validate_client_cert(cert_pem, key_pem, passphrase.as_deref())
                 .map_err(|_| VaultError::CorruptBackup)?;
         }
+        let new_profile = match &entry.profile_blob {
+            Some(blob) => {
+                let profile = open_profile_blob(source_dek, blob, &payload).map_err(|_| VaultError::CorruptBackup)?;
+                Some(encrypt(dest_dek, &zeroize::Zeroizing::new(serde_json::to_vec(&profile)?))?.to_bytes())
+            }
+            None => None,
+        };
         let new_secret = encrypt(dest_dek, &secret)?.to_bytes();
         let new_notes = match &entry.notes_blob {
             Some(b) => {
@@ -1561,8 +1615,8 @@ impl Vault {
             "INSERT INTO entries (
                 id, kind, title, account, url, folder_id, pinned, expires_at,
                 use_count, last_used_at, created_at, updated_at, deleted_at,
-                has_totp, fingerprint, secret_blob, notes_blob
-            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+                has_totp, fingerprint, secret_blob, notes_blob, profile_blob
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)
             ON CONFLICT(id) DO UPDATE SET
                 kind=excluded.kind, title=excluded.title, account=excluded.account,
                 url=excluded.url, folder_id=excluded.folder_id, pinned=excluded.pinned,
@@ -1570,7 +1624,7 @@ impl Vault {
                 last_used_at=excluded.last_used_at, updated_at=excluded.updated_at,
                 deleted_at=excluded.deleted_at, has_totp=excluded.has_totp,
                 fingerprint=excluded.fingerprint, secret_blob=excluded.secret_blob,
-                notes_blob=excluded.notes_blob",
+                notes_blob=excluded.notes_blob, profile_blob=excluded.profile_blob",
             params![
                 &entry.id,
                 &entry.kind,
@@ -1589,6 +1643,7 @@ impl Vault {
                 &entry.fingerprint,
                 new_secret,
                 new_notes,
+                new_profile,
             ],
         )?;
         self.conn.execute(
@@ -2353,7 +2408,16 @@ impl Vault {
                 )?;
             }
             for entry in &snapshot.entries {
-                let secret = decrypt(source_dek, &Encrypted::from_bytes(&entry.secret_blob)?)?;
+                let secret = zeroize::Zeroizing::new(decrypt(source_dek, &Encrypted::from_bytes(&entry.secret_blob)?)?);
+                let payload = zeroize::Zeroizing::new(serde_json::from_slice::<SecretPayload>(&secret).map_err(|_| VaultError::CorruptBackup)?);
+                if payload.kind() != EntryKind::parse(&entry.kind)? { return Err(VaultError::CorruptBackup); }
+                let profile_blob = match &entry.profile_blob {
+                    Some(blob) => {
+                        let profile = open_profile_blob(source_dek, blob, &payload).map_err(|_| VaultError::CorruptBackup)?;
+                        Some(encrypt(dest_dek, &zeroize::Zeroizing::new(serde_json::to_vec(&profile)?))?.to_bytes())
+                    }
+                    None => None,
+                };
                 let notes = match &entry.notes_blob {
                     Some(blob) => Some(decrypt(source_dek, &Encrypted::from_bytes(blob)?)?),
                     None => None,
@@ -2371,8 +2435,8 @@ impl Vault {
                     "INSERT INTO entries (
                         id, kind, title, account, url, folder_id, pinned, expires_at,
                         use_count, last_used_at, created_at, updated_at, deleted_at,
-                        has_totp, fingerprint, secret_blob, notes_blob
-                    ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                        has_totp, fingerprint, secret_blob, notes_blob, profile_blob
+                    ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
                     params![
                         &entry.id,
                         &entry.kind,
@@ -2391,6 +2455,7 @@ impl Vault {
                         &entry.fingerprint,
                         &secret_blob,
                         &notes_blob,
+                        &profile_blob,
                     ],
                 )?;
                 for tag in normalize_tag_names(&entry.tags) {
@@ -2500,6 +2565,8 @@ pub struct BackupEntry {
     pub fingerprint: Option<String>,
     pub secret_blob: Vec<u8>,
     pub notes_blob: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_blob: Option<Vec<u8>>,
     pub tags: Vec<String>,
 }
 
@@ -2710,6 +2777,102 @@ mod tests {
         };
         assert!(vault.query_audit(&q).is_err());
         assert!(vault.list_audit(1000).is_err());
+    }
+
+    fn profile_entry(id: &str) -> UpsertEntry {
+        UpsertEntry { id: Some(id.into()), kind: EntryKind::ApiToken, title: "profile credential".into(),
+            account: Some("alice".into()), url: None, folder_id: None, tags: vec![], pinned: false,
+            expires_at: None, notes: None, secret: SecretPayload::ApiToken {
+                service: "custom".into(), account: Some("alice".into()), token: "unique-secret-credential".into(),
+            } }
+    }
+
+    #[test]
+    fn credential_profile_is_encrypted_preserved_and_in_entry_revision() {
+        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        let input = profile_entry("profile-entry"); vault.upsert_entry(&dek, input.clone()).unwrap();
+        assert!(vault.credential_profile(&dek, "profile-entry").unwrap().is_none());
+        let profile = crate::profile::tests::example(); let revision = vault.entry_revision("profile-entry").unwrap();
+        vault.set_credential_profile(&dek, "profile-entry", Some(&profile)).unwrap();
+        assert_eq!(vault.credential_profile(&dek, "profile-entry").unwrap(), Some(profile.clone()));
+        assert_ne!(vault.entry_revision("profile-entry").unwrap(), revision);
+        assert!(matches!(vault.patch_entry(&dek, "profile-entry", serde_json::Map::new(), &revision), Err(VaultError::ConcurrentModification)));
+        let blob: Vec<u8> = vault.conn.query_row("SELECT profile_blob FROM entries WHERE id='profile-entry'", [], |r| r.get(0)).unwrap();
+        let plain = serde_json::to_vec(&profile).unwrap(); assert_ne!(blob, plain);
+        assert!(!blob.windows(profile.origin.len()).any(|part| part == profile.origin.as_bytes()));
+        assert_eq!(decrypt(&dek, &Encrypted::from_bytes(&blob).unwrap()).unwrap(), plain);
+        assert!(vault.credential_profile(&[9; 32], "profile-entry").is_err());
+        assert!(vault.set_credential_profile(&[9; 32], "profile-entry", None).is_err());
+        assert_eq!(vault.credential_profile(&dek, "profile-entry").unwrap(), Some(profile.clone()));
+        let settings: i64 = vault.conn.query_row("SELECT count(*) FROM settings", [], |r| r.get(0)).unwrap(); assert_eq!(settings, 0);
+        vault.upsert_entry(&dek, input).unwrap(); assert_eq!(vault.credential_profile(&dek, "profile-entry").unwrap(), Some(profile));
+        vault.set_credential_profile(&dek, "profile-entry", None).unwrap(); assert!(vault.credential_profile(&dek, "profile-entry").unwrap().is_none());
+    }
+
+    #[test]
+    fn credential_profile_rejects_missing_trash_and_plaintext_without_mutation() {
+        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        vault.upsert_entry(&dek, profile_entry("p")).unwrap(); let profile = crate::profile::tests::example();
+        assert!(matches!(vault.credential_profile(&dek, "missing"), Err(VaultError::NotFound)));
+        assert!(matches!(vault.set_credential_profile(&dek, "missing", Some(&profile)), Err(VaultError::NotFound)));
+        assert!(matches!(vault.set_credential_profile(&dek, "missing", None), Err(VaultError::NotFound)));
+        let before = vault.entry_revision("p").unwrap();
+        for field in ["description", "fixed_query", "default"] {
+            let mut bad = profile.clone(); match field {
+                "description" => bad.operations[0].description = "do not leak unique-secret-credential".into(),
+                "fixed_query" => { bad.operations[0].fixed_query.insert("opaque".into(), "unique-secret-credential".into()); }
+                _ => { bad.operations[0].params["properties"]["id"]["default"] = serde_json::json!("unique-secret-credential"); }
+            }
+            let err = vault.set_credential_profile(&dek, "p", Some(&bad)).unwrap_err().to_string(); assert!(!err.contains("unique-secret-credential"));
+            assert_eq!(vault.entry_revision("p").unwrap(), before);
+        }
+        vault.set_credential_profile(&dek, "p", Some(&profile)).unwrap(); vault.soft_delete(&["p".into()]).unwrap();
+        assert!(matches!(vault.credential_profile(&dek, "p"), Err(VaultError::NotFound)));
+        assert!(matches!(vault.set_credential_profile(&dek, "p", Some(&profile)), Err(VaultError::NotFound)));
+        assert!(matches!(vault.set_credential_profile(&dek, "p", None), Err(VaultError::NotFound)));
+        assert!(vault.snapshot_for_backup().unwrap().entries[0].profile_blob.is_some());
+        vault.restore(&["p".into()]).unwrap(); assert_eq!(vault.credential_profile(&dek, "p").unwrap(), Some(profile));
+        vault.soft_delete(&["p".into()]).unwrap(); vault.empty_trash().unwrap(); assert!(matches!(vault.credential_profile(&dek, "p"), Err(VaultError::NotFound)));
+    }
+
+    #[test]
+    fn profile_auth_kind_github_binding_and_combined_mtls_are_checked() {
+        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        vault.upsert_entry(&dek, profile_entry("p")).unwrap();
+        let mut profile = crate::profile::tests::example(); profile.auth.kind = "basic".into();
+        vault.set_credential_profile(&dek, "p", Some(&profile)).unwrap(); profile.auth.client_cert_id = Some("missing-cert".into());
+        assert!(matches!(vault.set_credential_profile(&dek, "p", Some(&profile)), Err(VaultError::NotFound)));
+        profile.auth.client_cert_id = Some("p".into()); assert!(matches!(vault.set_credential_profile(&dek, "p", Some(&profile)), Err(VaultError::InvalidProfile(_))));
+        let cert = SecretPayload::ClientCert { cert_pem: "test-cert".into(), key_pem: "test-private-key".into(), passphrase: None };
+        let blob = encrypt(&dek, &serde_json::to_vec(&cert).unwrap()).unwrap().to_bytes();
+        vault.conn.execute("INSERT INTO entries(id,kind,title,created_at,updated_at,secret_blob) VALUES ('cert','client_cert','certificate','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',?1)", params![blob]).unwrap();
+        profile.auth.client_cert_id = Some("cert".into()); profile.auth.ca_bundle_path = Some("ca.pem".into());
+        vault.set_credential_profile(&dek, "p", Some(&profile)).unwrap(); assert_eq!(vault.credential_profile(&dek, "p").unwrap(), Some(profile.clone()));
+        profile.operations[0].description = "test-private-key".into(); assert!(vault.set_credential_profile(&dek, "p", Some(&profile)).is_err());
+        let mut github = profile_entry("github"); if let SecretPayload::ApiToken { service, .. } = &mut github.secret { *service = "github".into(); }
+        vault.upsert_entry(&dek, github).unwrap(); assert!(vault.set_credential_profile(&dek, "github", Some(&crate::profile::tests::example())).is_err());
+        let mut profile = crate::profile::tests::example(); profile.origin = "https://api.github.com".into(); vault.set_credential_profile(&dek, "github", Some(&profile)).unwrap();
+        profile.auth.kind = "mtls".into(); assert!(vault.set_credential_profile(&dek, "p", Some(&profile)).is_err());
+        profile.auth.client_cert_id = Some("cert".into()); vault.set_credential_profile(&dek, "p", Some(&profile)).unwrap();
+        vault.soft_delete(&["cert".into()]).unwrap(); assert!(vault.set_credential_profile(&dek, "p", Some(&profile)).is_err());
+    }
+
+    #[test]
+    fn profile_reencryption_and_legacy_snapshot_default_roundtrip() {
+        let (src, source_dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        src.upsert_entry(&source_dek, profile_entry("p")).unwrap(); let profile = crate::profile::tests::example();
+        src.set_credential_profile(&source_dek, "p", Some(&profile)).unwrap(); let snapshot = src.snapshot_for_backup().unwrap();
+        let (dest, dest_dek) = Vault::create_in_memory("different target password").unwrap();
+        dest.replace_snapshot_reencrypted(&source_dek, &dest_dek, &snapshot).unwrap(); assert_eq!(dest.credential_profile(&dest_dek, "p").unwrap(), Some(profile));
+        assert!(dest.credential_profile(&source_dek, "p").is_err());
+        let blob = dest.snapshot_for_backup().unwrap().entries.remove(0).profile_blob.unwrap();
+        assert_ne!(Some(blob.clone()), snapshot.entries[0].profile_blob); assert!(decrypt(&source_dek, &Encrypted::from_bytes(&blob).unwrap()).is_err());
+        let mut legacy = serde_json::to_value(&snapshot).unwrap(); legacy["entries"][0].as_object_mut().unwrap().remove("profile_blob");
+        assert!(serde_json::from_value::<BackupSnapshot>(legacy).unwrap().entries[0].profile_blob.is_none());
+        let before = dest.entry_revision("p").unwrap(); let mut bad = snapshot.clone(); bad.entries[0].profile_blob = Some(vec![0; 50]);
+        assert!(dest.replace_snapshot_reencrypted(&source_dek, &dest_dek, &bad).is_err()); assert_eq!(dest.entry_revision("p").unwrap(), before);
+        let baseline = src.snapshot_for_backup().unwrap(); src.set_credential_profile(&source_dek, "p", None).unwrap();
+        assert!(matches!(src.replace_sync_bundle_if_unchanged(&source_dek, &baseline, &[], &baseline, &[]), Err(VaultError::ConcurrentModification)));
     }
 
     #[test]

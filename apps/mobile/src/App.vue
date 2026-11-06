@@ -8,6 +8,8 @@ import { authenticate, checkStatus, getData, hasData, removeData, setData } from
 import { KINDS, api, kindLabel, type BackupPreview, type CsvPreview, type DocumentRef, type Counts, type EntryDto, type EntryField, type EntryKind, type Folder, type MobileRelease, type SyncReport, type SyncView } from "./api";
 import { DB_ENGINES, SERVER_PROTOCOLS, optionsWithStored, databaseFields, defaultPort } from "../../../src/lib/entry-options";
 import { preservePayload } from "../../../src/lib/entry-patch.mjs";
+import CredentialProfileEditor from "../../../src/components/CredentialProfileEditor.vue";
+import { credentialProfileApi } from "./lib/credential-profile";
 import { completeChoices, buildResolutions, type SyncChoice } from '../../../src/lib/sync-choice.mjs';
 
 type Page = "lock" | "vault" | "detail" | "edit" | "settings" | "sync";
@@ -41,6 +43,15 @@ const trash = ref(false);
 const uncategorized = ref(false);
 const filtersOpen = ref(false);
 const selected = ref<EntryDto | null>(null);
+const credentialProfileOpen = ref(false);
+const credentialProfileEditor = ref<{ canDiscard: () => boolean } | null>(null);
+const canEditCredentialProfile = computed(() => !trash.value && Boolean(selected.value &&
+  (["api_token", "website", "mailbox", "server", "database", "client_cert"] as EntryKind[]).includes(selected.value.kind)));
+function toggleCredentialProfile() {
+  if (credentialProfileOpen.value && !credentialProfileEditor.value?.canDiscard()) return;
+  revealed.value = "";
+  credentialProfileOpen.value = !credentialProfileOpen.value;
+}
 const revealed = ref("");
 const notes = ref("");
 const fields = ref<EntryField[]>([]);
@@ -166,6 +177,11 @@ function canGoBackInApp() {
 }
 
 function goBack() {
+  if (page.value === "detail" && credentialProfileOpen.value) {
+    if (!credentialProfileEditor.value?.canDiscard()) return;
+    credentialProfileOpen.value = false;
+    return;
+  }
   if (management.value) { clearManagement(); return; }
   if (page.value === 'edit') clearEdit();
   switch (page.value) {
@@ -206,6 +222,7 @@ function syncBackListener() {
 }
 
 watch([page, filtersOpen, management], syncBackListener);
+watch(page, (next) => { if (next !== "detail") credentialProfileOpen.value = false; });
 
 const DOMAIN = "com.sealbox.mobile";
 const DEK_NAME = "vault-dek";
@@ -382,6 +399,7 @@ async function toggleBiometry() {
 }
 
 async function openDetail(row: EntryDto) {
+  credentialProfileOpen.value = false;
   selected.value = row;
   revealed.value = "";
   fields.value = [];
@@ -419,6 +437,8 @@ function startCreate(next: EntryKind) {
 
 async function startEdit() {
   if (!selected.value) return;
+  if (credentialProfileOpen.value && !credentialProfileEditor.value?.canDiscard()) return;
+  credentialProfileOpen.value = false;
   const row = selected.value;
   clearEdit();
   form.id = row.id;
@@ -1067,7 +1087,7 @@ onMounted(async () => {
     </template>
 
     <section v-else-if="page === 'detail' && selected" class="view">
-      <div class="top"><button class="link" @click="page = 'vault'">返回</button><h1>{{ selected.title }}</h1><button class="link" @click="startEdit">编辑</button></div>
+      <div class="top"><button class="link" @click="goBack">返回</button><h1>{{ selected.title }}</h1><button class="link" @click="startEdit">编辑</button></div>
       <div class="scroll pad">
         <div class="kv">
           <div class="row"><span class="k">类型</span><span>{{ kindLabel(selected.kind) }}</span></div>
@@ -1089,6 +1109,22 @@ onMounted(async () => {
           <div v-for="(field, i) in fields" :key="`${field.label}-${i}`" class="row"><span class="k">{{ field.label }}</span><span>{{ field.value }}</span></div>
         </div>
         <p v-if="notes" class="hint">{{ notes }}</p>
+        <template v-if="canEditCredentialProfile">
+          <div class="gap"></div>
+          <button class="ghost" type="button" :aria-expanded="credentialProfileOpen" @click="toggleCredentialProfile">{{ credentialProfileOpen ? '收起 HTTP 操作 profile' : '编辑 HTTP 操作 profile' }}</button>
+          <p class="hint">为本凭据新增具名操作，不新增 MCP 工具。认证只引用金库秘密。</p>
+          <CredentialProfileEditor
+            v-if="credentialProfileOpen"
+            :key="selected.id"
+            ref="credentialProfileEditor"
+            :credential-id="selected.id"
+            :kind="selected.kind"
+            :origin-hint="selected.url"
+            platform="mobile"
+            :api="credentialProfileApi"
+            @saved="showToast('凭据 HTTP profile 已更新')"
+          />
+        </template>
         <div class="gap"></div>
         <button class="ghost" @click="togglePin">{{ selected.pinned ? "取消置顶" : "置顶" }}</button>
         <div class="gap"></div>
@@ -1112,9 +1148,11 @@ onMounted(async () => {
           <div class="field"><label>TOTP 密钥，可选</label><input v-model="form.totp" /></div>
         </template>
         <template v-else-if="form.kind === 'api_token'">
-          <div class="field"><label>服务</label><input v-model="form.service" /></div>
+          <div class="field"><label>服务（可手填新平台）</label><input v-model="form.service" placeholder="github 或 my_company_api" /></div>
+          <div class="field"><label>服务网址（profile origin 提示）</label><input v-model="form.url" placeholder="https://api.example.com" /></div>
           <div class="field"><label>账号</label><input v-model="form.account" /></div>
-          <div class="field"><label>Token</label><textarea v-model="form.token"></textarea></div>
+          <div class="field"><label>Token（只存金库，不填入 profile）</label><textarea v-model="form.token"></textarea></div>
+          <p class="hint">保存后从凭据详情编辑 HTTP 操作 profile；新增服务或操作不增加 MCP 工具。</p>
         </template>
         <template v-else-if="form.kind === 'ssh'">
           <div class="field"><label>私钥</label><textarea v-model="form.privateKey"></textarea></div>

@@ -138,7 +138,7 @@ impl Vault {
 
     fn raw_revision_value(&self, id: &str) -> Result<serde_json::Value, VaultError> {
         let row = self.conn.query_row(
-            "SELECT id,kind,title,account,url,folder_id,pinned,expires_at,use_count,last_used_at,created_at,updated_at,deleted_at,has_totp,fingerprint,secret_blob,notes_blob FROM entries WHERE id=?1",
+            "SELECT id,kind,title,account,url,folder_id,pinned,expires_at,use_count,last_used_at,created_at,updated_at,deleted_at,has_totp,fingerprint,secret_blob,notes_blob,profile_blob FROM entries WHERE id=?1",
             params![id],
             |r| Ok((
                 r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?,
@@ -146,7 +146,7 @@ impl Vault {
                 r.get::<_, i64>(6)?, r.get::<_, Option<String>>(7)?, r.get::<_, i64>(8)?,
                 r.get::<_, Option<String>>(9)?, r.get::<_, String>(10)?, r.get::<_, String>(11)?,
                 r.get::<_, Option<String>>(12)?, r.get::<_, i64>(13)?, r.get::<_, Option<String>>(14)?,
-                r.get::<_, Vec<u8>>(15)?, r.get::<_, Option<Vec<u8>>>(16)?,
+                r.get::<_, Vec<u8>>(15)?, r.get::<_, Option<Vec<u8>>>(16)?, r.get::<_, Option<Vec<u8>>>(17)?,
             )),
         ).optional()?.ok_or(VaultError::NotFound)?;
         let mut tags = self.tags_for(id)?;
@@ -156,7 +156,7 @@ impl Vault {
             "folder_id": row.5, "pinned": row.6, "expires_at": row.7, "use_count": row.8,
             "last_used_at": row.9, "created_at": row.10, "updated_at": row.11, "deleted_at": row.12,
             "has_totp": row.13, "fingerprint": row.14, "secret_blob": row.15,
-            "notes_blob": row.16, "tags": tags,
+            "notes_blob": row.16, "profile_blob": row.17, "tags": tags,
         }))
     }
 }

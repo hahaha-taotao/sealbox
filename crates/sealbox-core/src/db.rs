@@ -78,7 +78,8 @@ fn migrate(conn: &Connection) -> Result<(), DbError> {
           has_totp INTEGER NOT NULL DEFAULT 0,
           fingerprint TEXT,
           secret_blob BLOB NOT NULL,
-          notes_blob BLOB
+          notes_blob BLOB,
+          profile_blob BLOB
         );
         CREATE TABLE IF NOT EXISTS entry_tags (
           entry_id TEXT NOT NULL,
@@ -106,6 +107,11 @@ fn migrate(conn: &Connection) -> Result<(), DbError> {
         );
         "#,
     )?;
+    // Existing vaults predate credential-scoped encrypted profiles.
+    let has_profile: bool = conn.prepare("PRAGMA table_info(entries)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?.iter().any(|name| name == "profile_blob");
+    if !has_profile { conn.execute("ALTER TABLE entries ADD COLUMN profile_blob BLOB", [])?; }
     drop_hello_columns(conn)?;
     Ok(())
 }

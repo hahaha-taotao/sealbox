@@ -38,6 +38,48 @@ export interface EntryProfile {
   fields: EntryField[];
 }
 
+export type CredentialProfileAdapter = "http" | "github" | "zoomkey_jira" | "zoomkey_crm";
+
+/** Request recipes only. Tokens, passwords and private keys stay in the vault entry. */
+export interface CredentialProfileAuth {
+  kind: "bearer" | "basic" | "header" | "mtls";
+  header_name?: string | null;
+  prefix?: string | null;
+  client_cert_id?: string | null;
+  ca_bundle_path?: string | null;
+}
+
+export interface CredentialOperation {
+  name: string;
+  description: string;
+  method: string;
+  path_template: string;
+  params: Record<string, unknown>;
+  query_params: string[];
+  body_params: string[];
+  fixed_query: Record<string, string>;
+  fixed_body: Record<string, unknown>;
+  risk: "low" | "medium" | "high";
+  read_only: boolean;
+}
+
+export interface CredentialProfile {
+  version: number;
+  adapter: CredentialProfileAdapter;
+  service: string;
+  origin: string;
+  auth: CredentialProfileAuth;
+  allowed_methods: string[];
+  allowed_path_prefixes: string[];
+  operations: CredentialOperation[];
+}
+
+export interface CredentialProfileApi {
+  get: (id: string) => Promise<CredentialProfile | null>;
+  set: (id: string, profile: CredentialProfile | null) => Promise<CredentialProfile | null>;
+  reset: (id: string) => Promise<CredentialProfile | null>;
+}
+
 export type WebsiteDuplicate = EntryDto;
 
 export type SyncKind = "webdav" | "s3";
@@ -423,6 +465,10 @@ export const api = {
   importClientCert: (input: ImportClientCertInput) => invoke<EntryDto>("import_client_cert", { input }),
   notes: (id: string) => invoke<string | null>("get_notes", { id }),
   profile: (id: string) => invoke<EntryProfile>("entry_profile", { id }),
+  credentialProfileGet: (id: string) => invoke<CredentialProfile | null>("credential_profile_get", { id }),
+  credentialProfileSet: (id: string, profile: CredentialProfile | null) =>
+    invoke<CredentialProfile | null>("credential_profile_set", { id, profile }),
+  credentialProfileReset: (id: string) => invoke<CredentialProfile | null>("credential_profile_reset", { id }),
   genPassword: (opts: {
     mode?: "password" | "passphrase";
     length?: number;

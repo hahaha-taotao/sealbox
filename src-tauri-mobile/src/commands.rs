@@ -106,6 +106,40 @@ fn persist_settings(session: &Session) -> Result<(), String> {
         .map_err(map_err)
 }
 
+#[tauri::command]
+pub fn credential_profile_get(
+    state: State<AppState>,
+    id: String,
+) -> Result<Option<sealbox_core::profile::CredentialProfile>, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let dek = session.dek().map_err(map_err)?;
+    session.vault().map_err(map_err)?.credential_profile(dek, &id).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn credential_profile_set(
+    state: State<AppState>,
+    id: String,
+    profile: Option<sealbox_core::profile::CredentialProfile>,
+) -> Result<Option<sealbox_core::profile::CredentialProfile>, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let dek = *session.dek().map_err(map_err)?;
+    let vault = session.vault().map_err(map_err)?;
+    vault.set_credential_profile(&dek, &id, profile.as_ref()).map_err(map_err)?;
+    let _ = vault.audit("credential_profile", Some(&id), if profile.is_some() { "set" } else { "reset" });
+    vault.credential_profile(&dek, &id).map_err(map_err)
+}
+
+#[tauri::command]
+pub fn credential_profile_reset(
+    state: State<AppState>,
+    id: String,
+) -> Result<Option<sealbox_core::profile::CredentialProfile>, String> {
+    credential_profile_set(state, id, None)
+}
+
 #[derive(Serialize)]
 pub struct Status {
     pub initialized: bool,

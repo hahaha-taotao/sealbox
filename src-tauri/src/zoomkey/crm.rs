@@ -23,6 +23,7 @@ struct CrmSession {
     session_name: String,
     username: String,
     base_url: String,
+    cache_key: String,
     expires_at: Instant,
 }
 
@@ -180,6 +181,15 @@ pub(crate) fn call(
         _ => return Err(ToolFailure::validation(format!("未知 CRM 工具 {name}"))),
     }
     let runtime = super::build_runtime(session, "crm")?;
+    call_with_runtime(&runtime, name, args)
+}
+
+/// Keep challenge/login and all read-only DTO rules behind this fixed dispatcher.
+pub(crate) fn call_with_runtime(
+    runtime: &EndpointRuntime,
+    name: &str,
+    args: &Value,
+) -> Result<ToolOutcome, ToolFailure> {
     match name {
         "zoomkey_crm_nav" => nav(&runtime, args),
         "zoomkey_crm_connection_status" => connection_status(&runtime, args),
@@ -191,8 +201,11 @@ pub(crate) fn call(
         "zoomkey_crm_project_members" => project_members(&runtime, args),
         "zoomkey_crm_query" => run_query(&runtime, args),
         "zoomkey_crm_retrieve" => retrieve(&runtime, args),
-        _ => Err(ToolFailure::validation("未知 CRM 工具")),
-    }
+        _ => Err(ToolFailure::validation("未知 CRM 操作")),
+    }.map(|mut outcome| {
+        outcome.text = super::profile_navigation(&outcome.text);
+        outcome
+    })
 }
 
 fn nav(runtime: &EndpointRuntime, args: &Value) -> Result<ToolOutcome, ToolFailure> {
@@ -230,7 +243,7 @@ fn nav(runtime: &EndpointRuntime, args: &Value) -> Result<ToolOutcome, ToolFailu
         ));
     }
     lines.push(String::new());
-    lines.push("下一步可选：".into());
+    lines.push("先调用 vault_describe 查看所选凭据的已登记操作；再用 http_call(credential_id, op, params)。下一步可选：".into());
     lines.push("- zoomkey_crm_find_project  按编号/名称查项目".into());
     lines.push("- zoomkey_crm_find_account  查客户".into());
     lines.push("- zoomkey_crm_query  自定义只读查询".into());
@@ -866,6 +879,7 @@ fn ensure_session(runtime: &EndpointRuntime, force: bool) -> Result<String, Tool
             if let Some(session) = guard.as_ref() {
                 if session.username == runtime.username
                     && session.base_url == runtime.base_url
+                    && session.cache_key == runtime.cache_key
                     && session.expires_at > now + Duration::from_secs(30)
                 {
                     return Ok(session.session_name.clone());
@@ -914,6 +928,7 @@ fn ensure_session(runtime: &EndpointRuntime, force: bool) -> Result<String, Tool
             session_name: session_name.clone(),
             username: runtime.username.clone(),
             base_url: runtime.base_url.clone(),
+            cache_key: runtime.cache_key.clone(),
             expires_at: now + SESSION_TTL,
         });
     }
@@ -926,6 +941,23 @@ fn call_operation(
     query: &[(&str, String)],
     form: Option<Vec<(&str, String)>>,
 ) -> Result<Value, ToolFailure> {
+    // POST is reserved for the fixed challenge-response login. No profile or
+    // model argument can supply a write operation, custom body or another path.
+    let operation = query.iter().find(|(key, _)| *key == "operation").map(|(_, value)| value.as_str());
+    let valid = match (method, form.as_ref()) {
+        ("GET", None) => matches!(operation, Some("getchallenge" | "listtypes" | "describe" | "query" | "retrieve")),
+        ("POST", Some(form)) => {
+            operation.is_none() && form.len() == 3 &&
+                form.iter().any(|(key, value)| *key == "operation" && value == "login") &&
+                form.iter().any(|(key, _)| *key == "username") &&
+                form.iter().any(|(key, _)| *key == "accessKey")
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(ToolFailure::validation("CRM 仅允许封装的只读操作及固定 login"));
+    }
+    runtime.check_request(method, "/webservice.php")?;
     let mut url = runtime.base_url.clone();
     if !query.is_empty() {
         let pairs: Vec<String> = query

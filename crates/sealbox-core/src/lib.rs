@@ -8,6 +8,7 @@ pub mod http_guard;
 pub mod identity;
 pub mod mail;
 pub mod passphrase_words;
+pub mod profile;
 pub mod redact;
 pub mod sync;
 pub mod totp;

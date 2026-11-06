@@ -15,6 +15,12 @@ pub struct Session {
     clipboard_deadline: Option<Instant>,
     clipboard_hash: Option<[u8; 32]>,
     failed_unlocks: u32,
+    generation: u64,
+}
+
+fn next_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
 }
 
 impl Default for Session {
@@ -30,6 +36,7 @@ impl Default for Session {
             clipboard_deadline: None,
             clipboard_hash: None,
             failed_unlocks: 0,
+            generation: next_generation(),
         }
     }
 }
@@ -61,7 +68,10 @@ impl Session {
         false
     }
 
+    pub fn generation(&self) -> u64 { self.generation }
+
     pub fn lock(&mut self) {
+        self.generation = next_generation();
         if self.clipboard_hash.is_some() {
             let current = crate::clipboard::read_text().unwrap_or_default();
             if self.clipboard_owned(&current) {
@@ -86,6 +96,7 @@ impl Session {
         if self.dek.is_some() || self.vault.is_some() {
             self.lock();
         }
+        self.generation = next_generation();
         self.vault = Some(vault);
         self.dek = Some(dek);
         self.failed_unlocks = 0;

@@ -1,5 +1,6 @@
 use crate::crypto::{decrypt, encrypt, Encrypted};
 use crate::http_guard::{assert_public_target, parse_http_url, PublicResolver};
+use crate::profile::{CredentialProfile, open_profile_blob, validate_for_secret};
 use crate::vault::{
     BackupEntry, BackupSnapshot, SecretPayload, Tombstone, Vault, VaultError, TOMBSTONE_ENTRY,
     TOMBSTONE_FOLDER,
@@ -138,6 +139,10 @@ struct SyncEntry {
     secret: Option<SecretPayload>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     notes: Option<String>,
+    // This plaintext metadata is carried only inside the sync-key ciphertext.
+    // Device-specific profile_blob is cleared, then resealed with the target DEK.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<CredentialProfile>,
 }
 
 impl Drop for SyncEntry {
@@ -145,6 +150,7 @@ impl Drop for SyncEntry {
         self.notes.zeroize();
         self.entry.secret_blob.zeroize();
         if let Some(blob) = &mut self.entry.notes_blob { blob.zeroize(); }
+        if let Some(blob) = &mut self.entry.profile_blob { blob.zeroize(); }
         if let Some(secret) = &mut self.secret {
             match secret {
                 SecretPayload::Website { url, username, password, totp_secret } => {
@@ -857,13 +863,17 @@ impl SyncEntry {
             }
             None => None,
         };
+        if secret.kind() != crate::vault::EntryKind::parse(&entry.kind)? { return Err(VaultError::CorruptBackup); }
+        let profile = entry.profile_blob.as_ref().map(|blob| open_profile_blob(dek, blob, &secret)).transpose()?;
         let mut entry = entry.clone();
         entry.secret_blob.clear();
         entry.notes_blob = None;
+        entry.profile_blob = None;
         Ok(Self {
             entry,
             secret: Some(secret),
             notes,
+            profile,
         })
     }
 
@@ -881,7 +891,13 @@ impl SyncEntry {
 
     fn seal(&self, dek: &[u8; 32]) -> Result<BackupEntry, VaultError> {
         let secret = self.secret.as_ref().ok_or(VaultError::CorruptBackup)?;
+        if secret.kind() != crate::vault::EntryKind::parse(&self.entry.kind)? { return Err(VaultError::CorruptBackup); }
+        if let Some(profile) = &self.profile { validate_for_secret(profile, secret).map_err(VaultError::InvalidProfile)?; }
         let mut entry = self.entry.clone();
+        entry.profile_blob = self.profile.as_ref().map(|profile| {
+            let plain = Zeroizing::new(serde_json::to_vec(profile)?);
+            encrypt(dek, &plain).map(|blob| blob.to_bytes()).map_err(VaultError::from)
+        }).transpose()?;
         let secret = serde_json::to_vec(secret)?;
         entry.secret_blob = encrypt(dek, &secret)?.to_bytes();
         entry.notes_blob = match &self.notes {
@@ -930,6 +946,13 @@ fn decode_snapshot(
                 .iter()
                 .map(|entry| entry.open_legacy(dek))
                 .collect::<Result<Vec<_>, _>>()?;
+        }
+        for entry in &snapshot.entries {
+            let secret = entry.secret.as_ref().ok_or("远端同步凭据缺失")?;
+            if let Some(profile) = &entry.profile {
+                validate_for_secret(profile, secret).map_err(|_| "远端同步 profile 无效".to_string())?;
+            }
+            if entry.entry.profile_blob.is_some() { return Err("远端同步 profile 未转换为可移植格式".into()); }
         }
         return Ok((snapshot, legacy));
     }
@@ -1919,6 +1942,7 @@ mod tests {
                 fingerprint: None,
                 secret_blob: Vec::new(),
                 notes_blob: None,
+                profile_blob: None,
                 tags: vec![],
             },
             secret: Some(SecretPayload::Website {
@@ -1928,6 +1952,7 @@ mod tests {
                 totp_secret: None,
             }),
             notes: None,
+            profile: None,
         }
     }
 

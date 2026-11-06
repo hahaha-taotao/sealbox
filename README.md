@@ -4,7 +4,7 @@
 
 A local credential vault for Windows. Unlock with a master password. Website logins, API tokens, SSH keys, mailboxes, servers, and databases stay encrypted on disk. Copied secrets are cleared from the clipboard on a timer. Encrypted `.svbak` backups can be exported and imported. An optional localhost MCP lets Cursor / Claude Code use credentials without seeing plaintext. A Chrome / Edge extension can fill or save website logins.
 
-当前版本 Current version: **v0.9.0** (`0.9.0`)
+当前版本 Current version: **v0.16.0** (`0.16.0`)
 
 ### 当前范围口径 Scope of this release
 
@@ -65,10 +65,10 @@ On Linux x64, install the `.deb` or run the `.AppImage` from the same release. I
 - **速查 Quick search** — 默认全局热键 `Ctrl+Shift+Space`，回车复制主秘密
 - **安全习惯 Hygiene** — 空闲自动锁定、审计日志（不记明文）、回收站、置顶、标签、单层文件夹；文件夹可重命名、删除（条目变为未归类）或合并，标签可重命名、删除或合并
 - **备份与导入 Backup & import** — 加密 `.svbak` 导出 / 导入（默认合并，覆盖需确认）；可从 Chrome / Edge、Bitwarden、1Password 导出的 UTF-8 CSV 导入网站账号，默认跳过已有同站同账号
-- **MCP** — 本机 `127.0.0.1` 服务；GitHub MCP 提供只读 API、本地 git 和工作区短名；Issue、PR、Release、文件、ref、Actions 和 secret 写入另有独立开关，且每次弹出桌面确认。ZoomKey 提供受限的 JIRA / CRM 只读工具。模型可用 Token 标题或默认凭据，不必先抄 UUID
+- **MCP** — 本机 `127.0.0.1` 服务，只注册 `vault_list`、`vault_describe`、`http_call`、`git`、`mail`、`vault_revoke` 六个稳定工具。平台的固定 origin、认证、具名操作与参数白名单写在凭据 profile 中，可在凭据详情编辑；远程请求只走 `http_call`。内置 GitHub 与 ZoomKey JIRA/CRM 配方复用已有 DTO 裁剪和受限通道，写操作逐次桌面确认。
 - **客户端证书 Client cert** — 保险库里可以导入 mTLS 用的客户端证书与私钥（PEM），由 Rust 侧限长、解析并校验证书/私钥匹配后加密保存，随金库一起备份；列表和速查不会显示或复制私钥，锁定时会清理 TLS 运行时缓存
 - **插件 Plugin** — Chrome / Edge 从客户端安装后按当前网址填充、填 TOTP 或一键登记；在侧栏「插件」页配对
-- **邮箱 Mail** — 用已保存的 QQ / Gmail 授权码只读打开 INBOX，默认最近 50 封，可继续加载更早；正文按需读取并转成纯文本。可以下载附件。金库解锁后，MCP 提供 mail_accounts、mail_list、mail_read、mail_download_attachment。仍不发信、不删信、不标已读。163、Outlook 和自定义邮箱只显示、不连接。
+- **邮箱 Mail** — 用已保存的 QQ / Gmail 授权码只读打开 INBOX，默认最近 50 封，可继续加载更早；正文按需读取并转成纯文本。MCP 统一使用 `mail(action=accounts/list/read/save)`；保存附件需确认，且不覆盖文件。仍不发信、不删信、不标已读。163、Outlook 和自定义邮箱只显示、不连接。
 
 ## 安全模型 Security
 
@@ -131,23 +131,46 @@ On first launch, set a master password (at least 10 characters). Closing the win
 
 ## MCP
 
-1. 解锁金库 / Unlock the vault.
-2. 打开侧栏 **MCP**，在 GitHub MCP 卡片中点击“启用 GitHub MCP”。服务只监听 `127.0.0.1`，默认端口 17891。
-3. 复制页面上的配置到 Cursor / Claude Code / Paste the snippet into Cursor or Claude Code.
+1. 解锁金库，打开侧栏 **MCP**，点击 **启用 MCP**。服务只监听 `127.0.0.1`，默认端口 17891。
+2. 复制页面配置到 Cursor / Claude Code。认证 Token 和浏览器填表 Token 分开，均不应粘贴到模型对话。
+3. 在凭据详情打开 **HTTP profile** 编辑配方。GitHub Token 自动使用内置 GitHub profile；原 ZoomKey 连接设置提供 JIRA / CRM 内置 profile 的默认绑定。自定义服务没有 profile 时不暴露远程操作。
 
-默认工具 Tools:
+`tools/list` 永远只有以下六项，不随锁库、开关、平台或凭据数量变化；关闭总开关会在调用时拒绝执行，而不是向模型换发工具表。
 
-- `github_list_credentials` — 列出活动 GitHub Token 的标题和账号，不含 Token
-- `github_user_info`（旧名 `github_get_authenticated_user`）— 当前 Token 对应账号
-- `github_repo_list` / `github_repo_get` — 当前 Token 可见的仓库，以及单个仓库的默认分支、是否私有和描述
-- `github_git` — 本机仓库。`action` 为 `status` / `diff` / `log` / `branches` / `fetch` / `pull` / `commit` / `push` / `clone`。`path` 是仓库绝对路径；`clone` 时 `path` 是已存在的父目录，另传 `repo="owner/repo"`。`commit` 可带 `files` 或 `all=true`，暂存和提交只确认一次。`fetch` 只更新远端跟踪。`push` 可指定 `remote`、`branch`、`tag`、`tags`、`force_with_lease`
-- `github_release` — 版本管理。`action` 为 `list` / `get` / `notes` / `create` / `publish`。`create` 默认草稿
-- `github_pr` — `action` 为 `list` / `get` / `create` / `merge`。`create` 默认草稿，`merge` 必须带编号
-- `github_issue` — `action` 为 `list` / `get` / `create` / `comment` / `close`
+| 工具 | 参数与用途 |
+|---|---|
+| `vault_list` | 可选 `query`、`kind`、`limit`、`offset`；返回 ID、标题、类型、服务、origin、操作名，不含秘密与备注 |
+| `vault_describe` | `credential_id`；返回该凭据已登记操作的方法、路径模板、封闭参数 schema、风险和确认要求 |
+| `http_call` | `credential_id`、`op`、`params`；唯一远程 HTTP 入口。只接受说明书声明的参数 |
+| `git` | `action=status/diff/log/branches/fetch/pull/commit/push/clone`；本机仓库，`path` 必须是绝对路径。clone 的 path 是已存在父目录，另传 `repo=owner/repo` |
+| `mail` | `action=accounts/list/read/save`；list 用 `entryId`、可选 `beforeUid`；read 再传 `uid`；save 再传 `part` 与新文件 `path` |
+| `vault_revoke` | 无参数；撤销当前调用会话尚未用完的授权，阻断待审批调用，不影响其他会话或浏览器填表 |
 
-GitHub MCP 默认停用。启用后只开放上面这些工具。凭据可传标题（`credential="agentos"`）；金库里只有一条 GitHub Token 时自动选用。仓库用 `repo="owner/repo"`，本地 git 用本机绝对路径。写入每次弹出桌面确认。不提供搜索仓库、读远端文件、Actions、变量、secret、下载产物、建仓、改 ref 或删仓库。Token 不会返回给模型。
+模型的固定使用顺序（说明书不是第二份工具表）：
 
-停用时这些工具都不会出现在 `tools/list`，直接调用也会被拒绝。模型收到的是结构化字段或截断后的 git 输出，不包含 Token、请求头、Release body 或完整远端响应。金库锁定时工具会失败。后续接口规划见 [`docs/superpowers/specs/2026-09-20-github-mcp-roadmap.md`](docs/superpowers/specs/2026-09-20-github-mcp-roadmap.md)。MCP Token 可在页面轮换。
+```text
+vault_list({"query":"work"})
+vault_describe({"credential_id":"<从列表取得的 ID>"})
+http_call({"credential_id":"<同一 ID>","op":"issues_list","params":{"repo":"owner/repo"}})
+```
+
+平台名不再出现在对外工具名中；旧平台细工具不能绕过 `http_call` 直接调用。GitHub 内置操作覆盖当前账号、仓库、Issue、PR 和 Release，复用现有 DTO 裁剪；仍固定访问 `api.github.com`（上传适配器只允许 `uploads.github.com`），不是任意 GitHub REST 代理。ZoomKey 的导航、字段、项目、查询等成为凭据操作，保留固定目标、mTLS、CRM challenge/login 以及只读查询限制。
+
+### 编辑 profile
+
+桌面和 Android 的凭据详情均提供配方表单和高级 JSON。`adapter=http` 为通用 HTTPS 配方，可选 Bearer、Basic、自定义认证 Header、mTLS；HTTP 认证也可叠加金库中的客户端证书。秘密始终取自所选凭据，配方不接受明文 Token、密码或私钥。固定 origin 只能包含 HTTPS 协议、主机、端口；操作定义 method、path_template、query/body 参数白名单、固定非秘密参数和风险。参数 schema 必须 `additionalProperties:false`，支持有限深度的 object/string/integer/number/boolean/array、enum 与长度/数值界限，不支持 `$ref`、`oneOf`、正则或模型提供的请求头。
+
+例如 `list_items` 定义为 `GET /api/items`，只将已声明的 `q` 参数路由到 query；新增这条配方不需要改 Rust 或注册新工具。路径参数必须声明且必填，不得包含主机、路径穿越或控制字符。未知操作、未知参数、非法 origin、路径越界、重定向和私网目标会拒绝；只有内置 ZoomKey 在精确目标白名单与 mTLS 约束下使用原有内网通道。
+
+profile 随凭据加密存储、备份与同步。界面里的“恢复默认”会清除显式配方，对内置服务恢复默认 profile，对自定义服务恢复成没有远程操作。Android 可编辑并同步配方；本机 MCP 执行服务仍在桌面端，不能在普通浏览器里模拟 Tauri invoke。
+
+### 确认、审计与会话
+
+HTTP 写方法（POST/PUT/PATCH/DELETE）、声明非只读的操作、Git 写动作与附件保存逐次弹出桌面确认。确认不持有金库锁，确认后重新检查解锁代次、凭据/profile/客户端证书版本、总开关与调用方授权，避免锁库或撤销后仍执行。请求无重定向，通用 HTTP 用公共 DNS 解析器阻止重绑定；响应限长、敏感字段清理、精确秘密脱敏，审计不记录秘密、请求头、query/body。
+
+MCP 使用 Streamable HTTP 会话：`initialize` 响应的 `Mcp-Session-Id` 头必须在后续请求中回传。`vault_revoke` 使当前会话与未执行的审批失效；重新使用需重新 initialize。锁库、停止 MCP、轮换 MCP Token 会使全部旧会话失效。撤销不能撤回已经发到远端的请求。MCP Token 可在界面轮换。
+
+完整收束方案见 [MCP 工具面收束](docs/mcp-surface/2026-11-06-mcp工具面收束.md)。
 
 ## 插件 Plugin（Chrome / Edge）
 

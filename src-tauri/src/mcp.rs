@@ -5,6 +5,7 @@ use crate::session::Session;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +31,7 @@ pub struct McpState {
     pub token: Arc<Mutex<String>>,
     pub fill_token: Arc<Mutex<String>>,
     pairing: Arc<Mutex<Option<PairingWindow>>>,
+    callers: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
 
 impl Default for McpState {
@@ -40,6 +42,7 @@ impl Default for McpState {
             token: Arc::new(Mutex::new(String::new())),
             fill_token: Arc::new(Mutex::new(String::new())),
             pairing: Arc::new(Mutex::new(None)),
+            callers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -70,12 +73,21 @@ fn constant_eq(a: &str, b: &str) -> bool {
 }
 
 fn host_allowed(headers: &[(String, String)], port: u16) -> bool {
-    let host = headers
+    let raw = headers
         .iter()
         .find(|(k, _)| k == "host")
         .map(|(_, v)| v.trim().to_ascii_lowercase())
         .unwrap_or_default();
+    // [::1]:17891 -> ::1:17891. Clients commonly send localhost or IPv6 loopback.
+    // Only the loopback name and the bound port are accepted.
+    let host = if let Some(rest) = raw.strip_prefix('[') {
+        rest.replacen("]:", ":", 1)
+    } else {
+        raw
+    };
     host == format!("127.0.0.1:{port}")
+        || host == format!("localhost:{port}")
+        || host == format!("::1:{port}")
 }
 
 #[derive(Serialize)]
@@ -87,6 +99,34 @@ pub struct PairingStatus {
 }
 
 impl McpState {
+    fn open_caller(&self) -> Result<String, String> {
+        let mut callers = recover_lock(&self.callers);
+        callers.retain(|_, active| active.load(Ordering::SeqCst));
+        if callers.len() >= 128 {
+            return Err("MCP 会话过多，请在 Sealbox 重启 MCP".into());
+        }
+        let id = Uuid::new_v4().to_string();
+        callers.insert(id.clone(), Arc::new(AtomicBool::new(true)));
+        Ok(id)
+    }
+
+    fn caller_permit(&self, id: &str) -> Result<Arc<AtomicBool>, String> {
+        recover_lock(&self.callers).get(id).cloned()
+            .filter(|active| active.load(Ordering::SeqCst))
+            .ok_or_else(|| "MCP 调用会话无效或已撤销，请重新 initialize".into())
+    }
+
+    fn revoke_caller(&self, id: &str) -> Result<(), String> {
+        self.caller_permit(id)?.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn invalidate_callers(&self) {
+        let mut callers = recover_lock(&self.callers);
+        for active in callers.values() { active.store(false, Ordering::SeqCst); }
+        callers.clear();
+    }
+
     pub fn open_pairing(&self) -> PairingStatus {
         let code = new_pairing_code();
         let expires_at = Instant::now() + Duration::from_secs(PAIRING_SECS);
@@ -167,88 +207,122 @@ struct JsonRpcReq {
     params: Value,
 }
 
-fn tools_list(session: &Mutex<Session>) -> Value {
-    let locked = lock_session(session);
-    let (mcp_on, zoomkey_tools) = locked
-        .vault()
-        .ok()
-        .and_then(|vault| {
-            locked.dek().ok().map(|dek| {
-                let zoomkey = crate::zoomkey::load_policy(vault, dek);
-                (
-                    zoomkey.enabled,
-                    crate::zoomkey::tool_definitions_for_vault(vault, dek, &zoomkey),
-                )
-            })
-        })
-        .unwrap_or((false, Vec::new()));
-    let mut tools: Vec<Value> = Vec::new();
-    if mcp_on {
-        tools.extend(github_mcp::tool_definitions_for_mcp());
-    }
-    tools.extend(zoomkey_tools);
+fn tools_list(_session: &Mutex<Session>) -> Value {
+    // The catalog is a stable protocol surface, independent of credentials,
+    // platform profiles, lock state and the execution switch.
+    let mut tools = crate::credential_mcp::tool_definitions();
+    tools.extend(crate::git_workspace::tool_definitions());
     tools.extend(mail_tool_definitions());
+    for tool in &mut tools {
+        if let Some(schema) = tool.get_mut("inputSchema") {
+            sanitize_mcp_schema(schema);
+        }
+        if let Some(schema) = tool.get_mut("outputSchema") {
+            sanitize_mcp_schema(schema);
+        }
+    }
     json!({ "tools": tools })
 }
 
+/// DSH's tool registry only accepts a small JSON Schema subset. Numeric and
+/// string bounds stay in the server-side validator, but advertising them makes
+/// `tools.register` reject the whole list, so the client reports startup failure
+/// and registers nothing.
+fn sanitize_mcp_schema(schema: &mut Value) {
+    const KEEP: &[&str] = &[
+        "type",
+        "oneOf",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "enum",
+        "const",
+        "description",
+        "title",
+        "default",
+        "examples",
+    ];
+    match schema {
+        Value::Object(map) => {
+            map.retain(|key, _| KEEP.contains(&key.as_str()));
+            if let Some(props) = map.get_mut("properties").and_then(Value::as_object_mut) {
+                for child in props.values_mut() {
+                    sanitize_mcp_schema(child);
+                }
+            }
+            if let Some(items) = map.get_mut("items") {
+                sanitize_mcp_schema(items);
+            }
+            if let Some(branches) = map.get_mut("oneOf").and_then(Value::as_array_mut) {
+                for child in branches {
+                    sanitize_mcp_schema(child);
+                }
+            }
+            if let Some(extra) = map.get("additionalProperties") {
+                if !extra.is_boolean() {
+                    map.insert("additionalProperties".into(), Value::Bool(false));
+                }
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                sanitize_mcp_schema(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn negotiated_protocol(params: &Value) -> String {
+    const KNOWN: &[&str] = &[
+        "2025-11-25",
+        "2025-06-18",
+        "2025-03-26",
+        "2024-11-05",
+        "2024-10-07",
+    ];
+    params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .filter(|version| KNOWN.contains(version))
+        .unwrap_or("2025-03-26")
+        .to_string()
+}
+
+const MAIL_ACTIONS: &[&str] = &["accounts", "list", "read", "save"];
+
 fn mail_tool_definitions() -> Vec<Value> {
-    let annotations = github_mcp::annotations(true, false);
-    let entry = json!({"type": "string", "minLength": 1, "maxLength": 128});
-    let uid = json!({"type": "integer", "minimum": 1, "maximum": 4294967295u64});
-    vec![
-        json!({
-            "name": "mail_accounts",
-            "description": "列出已保存的邮箱账号（id、标题、地址、服务商、是否支持）。不含授权码。",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false},
-            "readOnly": true,
-            "risk": "low",
-            "annotations": annotations.clone()
-        }),
-        json!({
-            "name": "mail_list",
-            "description": "只读列出邮箱收件箱，最多 50 封。beforeUid 表示只取比它更早的邮件。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"entryId": entry.clone(), "beforeUid": uid.clone()},
-                "required": ["entryId"],
-                "additionalProperties": false
+    vec![json!({
+        "name": "mail",
+        "description": "邮箱。action：accounts 列出账号（不含授权码）；list 只读收件箱，最多 50 封，可带 beforeUid；read 读取纯文本和附件清单；save 把一个附件保存到已有目录中的新文件，不覆盖。entryId 用于 list/read/save，uid 用于 read/save，part 与 path 仅 save。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": MAIL_ACTIONS, "description": "accounts、list、read、save"},
+                "entryId": {"type": "string", "minLength": 1, "maxLength": 128, "description": "list、read、save"},
+                "beforeUid": {"type": "integer", "minimum": 1, "maximum": 4294967295u64, "description": "仅 list"},
+                "uid": {"type": "integer", "minimum": 1, "maximum": 4294967295u64, "description": "read、save"},
+                "part": {"type": "string", "minLength": 1, "maxLength": 32, "description": "仅 save"},
+                "path": {"type": "string", "minLength": 1, "maxLength": 1024, "description": "仅 save"}
             },
-            "readOnly": true,
-            "risk": "low",
-            "annotations": annotations.clone()
-        }),
-        json!({
-            "name": "mail_read",
-            "description": "只读读取一封邮件的纯文本和附件清单。不返回 HTML，不下载附件。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"entryId": entry.clone(), "uid": uid.clone()},
-                "required": ["entryId", "uid"],
-                "additionalProperties": false
-            },
-            "readOnly": true,
-            "risk": "low",
-            "annotations": annotations.clone()
-        }),
-        json!({
-            "name": "mail_download_attachment",
-            "description": "把一封邮件的一个附件保存到已有目录中的新文件。不覆盖已有文件。",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "entryId": entry,
-                    "uid": uid.clone(),
-                    "part": {"type": "string", "minLength": 1, "maxLength": 32},
-                    "path": {"type": "string", "minLength": 1, "maxLength": 1024}
-                },
-                "required": ["entryId", "uid", "part", "path"],
-                "additionalProperties": false
-            },
-            "readOnly": true,
-            "risk": "low",
-            "annotations": annotations
-        }),
-    ]
+            "required": ["action"],
+            "additionalProperties": false
+        },
+        "readOnly": false,
+        "risk": "high",
+        "annotations": github_mcp::annotations(false, true)
+    })]
+}
+
+fn legacy_mail_action(name: &str) -> Option<&'static str> {
+    match name {
+        "mail_accounts" => Some("accounts"),
+        "mail_list" => Some("list"),
+        "mail_read" => Some("read"),
+        "mail_download_attachment" => Some("save"),
+        _ => None,
+    }
 }
 
 fn mail_audit_detail(operation: &str, decision: &str, reason: &str, entry: &str, uid: &str, part: &str) -> String {
@@ -328,15 +402,33 @@ fn load_mail_secret(session: &crate::session::Session, entry_id: &str) -> Result
     }
 }
 
-fn call_mail_tool(session: &Mutex<Session>, name: &str, args: Value) -> Result<String, String> {
+fn call_mail_tool(session: &Mutex<Session>, name: &str, args: Value, permit: &AtomicBool, generation: u64) -> Result<String, String> {
     let entry = args.get("entryId").and_then(Value::as_str).unwrap_or("-").to_string();
+    let secrets = {
+        let s=lock_session(session);
+        let vault=s.vault().map_err(|e|e.to_string())?;
+        let dek=s.dek().map_err(|e|e.to_string())?;
+        let ids=if entry=="-" {
+            vault.list_entries(&crate::vault::ListFilter{kind:Some(crate::vault::EntryKind::MailAuth),..Default::default()}).map_err(|e|e.to_string())?.into_iter().map(|entry|entry.id).collect::<Vec<_>>()
+        } else {vec![entry.clone()]};
+        let mut secrets=zeroize::Zeroizing::new(Vec::new());
+        for id in ids {
+            if let Ok(mut payload)=vault.get_active_secret(dek,&id) {
+                secrets.extend(crate::redact::secrets_from_payload(&payload));
+                zeroize::Zeroize::zeroize(&mut payload);
+            }
+        }
+        secrets
+    };
     let uid = args
         .get("uid")
         .and_then(Value::as_u64)
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".into());
     let part = args.get("part").and_then(Value::as_str).unwrap_or("-").to_string();
-    let result = call_mail_inner(session, name, &args);
+    let guard=||require_call_authorized(&lock_session(session),permit,generation);
+    let result = call_mail_inner(session, name, &args, &guard)
+        .map(|text|redact_tool_text(text,&secrets)).map_err(|text|redact_tool_text(text,&secrets));
     if let Ok(vault) = lock_session(session).vault() {
         let (decision, reason, action) = match &result {
             Ok(_) => ("allow", "ok", "mcp_mail"),
@@ -351,10 +443,29 @@ fn call_mail_tool(session: &Mutex<Session>, name: &str, args: Value) -> Result<S
     result
 }
 
-fn call_mail_inner(session: &Mutex<Session>, name: &str, args: &Value) -> Result<String, String> {
-    match name {
-        "mail_accounts" => {
-            ensure_mail_keys(args, &[])?;
+fn call_mail_inner(session: &Mutex<Session>, name: &str, args: &Value, guard: &dyn Fn()->Result<(),String>) -> Result<String, String> {
+    let (action, args) = if name == "mail" {
+        let action = args.get("action").and_then(Value::as_str).ok_or_else(|| {
+            format!("mail 需要 action：{}", MAIL_ACTIONS.join("、"))
+        })?;
+        if !MAIL_ACTIONS.contains(&action) {
+            return Err(format!(
+                "mail 不支持 action={action}。可用 {}",
+                MAIL_ACTIONS.join("、")
+            ));
+        }
+        let mut args = args.clone();
+        args.as_object_mut().map(|object| object.remove("action"));
+        (action, args)
+    } else {
+        (
+            legacy_mail_action(name).ok_or_else(|| format!("未知工具 {name}"))?,
+            args.clone(),
+        )
+    };
+    match action {
+        "accounts" => {
+            ensure_mail_keys(&args, &[])?;
             let session = lock_session(session);
             let dek = *session.dek().map_err(|error| error.to_string())?;
             let vault = session.vault().map_err(|error| error.to_string())?;
@@ -381,10 +492,10 @@ fn call_mail_inner(session: &Mutex<Session>, name: &str, args: &Value) -> Result
             }
             serde_json::to_string(&accounts).map_err(|_| "参数无效".into())
         }
-        "mail_list" => {
-            ensure_mail_keys(args, &["entryId", "beforeUid"])?;
-            let entry_id = mail_arg_str(args, "entryId", true)?.unwrap_or("");
-            let before = mail_arg_u32(args, "beforeUid", false)?;
+        "list" => {
+            ensure_mail_keys(&args, &["entryId", "beforeUid"])?;
+            let entry_id = mail_arg_str(&args, "entryId", true)?.unwrap_or("");
+            let before = mail_arg_u32(&args, "beforeUid", false)?;
             let (email, provider, auth_code) = {
                 let session = lock_session(session);
                 load_mail_secret(&session, entry_id)?
@@ -399,10 +510,10 @@ fn call_mail_inner(session: &Mutex<Session>, name: &str, args: &Value) -> Result
             drop(auth_code);
             serde_json::to_string(&messages).map_err(|_| "参数无效".into())
         }
-        "mail_read" => {
-            ensure_mail_keys(args, &["entryId", "uid"])?;
-            let entry_id = mail_arg_str(args, "entryId", true)?.unwrap_or("");
-            let uid = mail_arg_u32(args, "uid", true)?.ok_or("参数无效")?;
+        "read" => {
+            ensure_mail_keys(&args, &["entryId", "uid"])?;
+            let entry_id = mail_arg_str(&args, "entryId", true)?.unwrap_or("");
+            let uid = mail_arg_u32(&args, "uid", true)?.ok_or("参数无效")?;
             let (email, provider, auth_code) = {
                 let session = lock_session(session);
                 load_mail_secret(&session, entry_id)?
@@ -426,12 +537,12 @@ fn call_mail_inner(session: &Mutex<Session>, name: &str, args: &Value) -> Result
             }))
             .map_err(|_| "参数无效".into())
         }
-        "mail_download_attachment" => {
-            ensure_mail_keys(args, &["entryId", "uid", "part", "path"])?;
-            let entry_id = mail_arg_str(args, "entryId", true)?.unwrap_or("");
-            let uid = mail_arg_u32(args, "uid", true)?.ok_or("参数无效")?;
-            let part = mail_arg_str(args, "part", true)?.unwrap_or("").to_string();
-            let path = mail_arg_str(args, "path", true)?.unwrap_or("").to_string();
+        "save" => {
+            ensure_mail_keys(&args, &["entryId", "uid", "part", "path"])?;
+            let entry_id = mail_arg_str(&args, "entryId", true)?.unwrap_or("");
+            let uid = mail_arg_u32(&args, "uid", true)?.ok_or("参数无效")?;
+            let part = mail_arg_str(&args, "part", true)?.unwrap_or("").to_string();
+            let path = mail_arg_str(&args, "path", true)?.unwrap_or("").to_string();
             let (email, provider, auth_code) = {
                 let session = lock_session(session);
                 load_mail_secret(&session, entry_id)?
@@ -444,10 +555,14 @@ fn call_mail_inner(session: &Mutex<Session>, name: &str, args: &Value) -> Result
             let bytes = sealbox_core::mail::fetch_attachment(&mut io, &email, &auth_code, uid, &part)
                 .map_err(sealbox_core::mail::failure_message)?;
             drop(auth_code);
+            guard()?;
             let saved = sealbox_core::mail::write_exclusive(&path, &bytes).map_err(str::to_string)?;
             serde_json::to_string(&json!({"bytes": saved, "path": path})).map_err(|_| "参数无效".into())
         }
-        _ => Err(format!("未知工具 {name}")),
+        _ => Err(format!(
+            "mail 不支持 action={action}。可用 {}",
+            MAIL_ACTIONS.join("、")
+        )),
     }
 }
 
@@ -561,12 +676,12 @@ fn tool_call_result(text: &str, is_error: bool) -> Value {
     result
 }
 
-fn handle_rpc(session: &Mutex<Session>, mcp: &McpState, req: JsonRpcReq) -> Option<Value> {
+fn handle_rpc(session: &Mutex<Session>, mcp: &McpState, req: JsonRpcReq, caller: &str) -> Option<Value> {
     let out = match req.method.as_str() {
         "initialize" => rpc_ok(
-            req.id,
+            req.id.clone(),
             json!({
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": negotiated_protocol(&req.params),
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "sealbox", "version": env!("CARGO_PKG_VERSION") }
             }),
@@ -581,7 +696,7 @@ fn handle_rpc(session: &Mutex<Session>, mcp: &McpState, req: JsonRpcReq) -> Opti
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let args = req.params.get("arguments").cloned().unwrap_or(json!({}));
-            match call_tool(session, mcp, name, args) {
+            match call_tool(session, mcp, caller, name, args) {
                 Ok(text) => rpc_ok(req.id, tool_call_result(&text, false)),
                 Err(e) => rpc_ok(req.id, tool_call_result(&e, true)),
             }
@@ -591,7 +706,7 @@ fn handle_rpc(session: &Mutex<Session>, mcp: &McpState, req: JsonRpcReq) -> Opti
     Some(out)
 }
 
-fn call_git_tool(session: &Mutex<Session>, name: &str, args: Value) -> Result<String, String> {
+fn call_git_tool(session: &Mutex<Session>, name: &str, args: Value, permit: &AtomicBool, generation: u64) -> Result<String, String> {
     let context = github_mcp::GithubAuditContext {
         path: args.get("path").and_then(Value::as_str).map(str::to_string),
         reference: args
@@ -614,11 +729,7 @@ fn call_git_tool(session: &Mutex<Session>, name: &str, args: Value) -> Result<St
         }) => {
             if crate::confirm::ask_payload(&payload) {
                 let mut s = lock_session(session);
-                if !s.is_unlocked() {
-                    Err("金库已锁定。请先在 Sealbox 窗口解锁，再让我重试。".into())
-                } else {
-                    exec(&mut s)
-                }
+                require_call_authorized(&s, permit, generation).and_then(|_| exec(&mut s))
             } else {
                 Err(deny)
             }
@@ -644,116 +755,198 @@ fn call_git_tool(session: &Mutex<Session>, name: &str, args: Value) -> Result<St
             ),
         };
         let action = if text.is_ok() {
-            "mcp_github"
+            "mcp_git"
         } else {
-            "mcp_github_denied"
+            "mcp_git_denied"
         };
         let _ = vault.audit(action, None, &detail);
     }
     text
 }
 
+fn require_call_authorized(s: &Session, permit: &AtomicBool, generation: u64) -> Result<(), String> {
+    if !permit.load(Ordering::SeqCst) { return Err("当前调用方的授权已撤销".into()); }
+    if !s.is_unlocked() || s.generation() != generation {
+        return Err("金库已锁定或解锁会话已改变，请重新调用".into());
+    }
+    crate::credential_mcp::require_enabled(s)
+}
+
+enum PreparedRemote {
+    Http(crate::profile_http::PreparedHttp),
+    Builtin(crate::http_profiles::PreparedBuiltinCall),
+}
+
+impl PreparedRemote {
+    fn confirmation(&self) -> Option<&crate::confirm::ConfirmPayload> {
+        match self {
+            Self::Http(p) => p.confirmation.as_ref(),
+            Self::Builtin(p) => p.confirmation.as_ref(),
+        }
+    }
+    fn execute(self) -> Result<(u16, String), String> {
+        match self {
+            Self::Http(p) => p.execute().map(|text| {
+                let status=serde_json::from_str::<Value>(&text).ok().and_then(|value|value.get("status").and_then(Value::as_u64)).unwrap_or(200) as u16;
+                (status,text)
+            }),
+            Self::Builtin(p) => p.execute_with_status_after_confirmation(true),
+        }
+    }
+}
+
+fn call_http_tool(session: &Mutex<Session>, permit: &AtomicBool, args: Value) -> Result<String, String> {
+    // Resolve only registered metadata for audit; never log an attacker supplied
+    // operation name, URL, body or query when validation itself fails.
+    let id=args.get("credential_id").and_then(Value::as_str).unwrap_or("").to_string();
+    let requested_op=args.get("op").and_then(Value::as_str).unwrap_or("");
+    let (origin,op_name)={
+        let s=lock_session(session);
+        crate::http_profiles::effective_profile(&s,&id).ok().flatten().map(|profile|{
+            let op=profile.operations.iter().find(|op|op.name==requested_op).map(|op|op.name.clone()).unwrap_or_else(||"-".into());
+            (profile.origin,op)
+        }).unwrap_or_else(||("-".into(),"-".into()))
+    };
+    let result=call_http_tool_inner(session,permit,args);
+    let mut s=lock_session(session);
+    if let Ok(vault)=s.vault() {
+        let status=result.as_ref().ok().map(|(status,_)|status.to_string()).unwrap_or_else(||"-".into());
+        let reason=match &result {Ok(_)=>"ok",Err(e) if e.contains("拒绝")=>"denied",Err(e) if e.contains("撤销")=>"revoked",Err(_)=>"validation_or_request"};
+        let detail=format!("operation=http_call op={} decision={} reason={} origin={} credential={} status={}",
+            audit_token(&op_name),if result.is_ok(){"allow"}else{"deny"},reason,audit_token(&origin),&crate::http_guard::sha256_hex(id.as_bytes())[..12],status);
+        let _=vault.audit(if result.is_ok(){"mcp_http"}else{"mcp_http_denied"},None,&detail);
+    }
+    if result.is_ok(){s.touch();}
+    result.map(|(_,text)|text)
+}
+
+fn call_http_tool_inner(session: &Mutex<Session>, permit: &AtomicBool, args: Value) -> Result<(u16, String), String> {
+    crate::credential_mcp::validate_tool("http_call", &args)?;
+    let id = args["credential_id"].as_str().ok_or("缺少凭据 ID")?;
+    let op_name = args["op"].as_str().ok_or("缺少操作名")?;
+    let params = &args["params"];
+    let (prepared, generation, revision, profile_bytes, cert_revision, secrets) = {
+        let s = lock_session(session);
+        crate::credential_mcp::require_enabled(&s)?;
+        let profile = crate::http_profiles::effective_profile(&s, id)?
+            .ok_or("该凭据没有 HTTP profile，请先在 Sealbox 登记操作")?;
+        sealbox_core::profile::validate_profile(&profile)?;
+        let operation = profile.operations.iter().find(|operation| operation.name == op_name)
+            .ok_or_else(|| format!("未知操作。该凭据可用操作：{}", profile.operations.iter().map(|op|op.name.as_str()).collect::<Vec<_>>().join("、")))?;
+        sealbox_core::profile::validate_operation_params(operation, params)?;
+        let vault = s.vault().map_err(|e|e.to_string())?;
+        let dek = s.dek().map_err(|e|e.to_string())?;
+        let mut payload = vault.get_active_secret(dek, id).map_err(|_|"凭据不存在或已在回收站".to_string())?;
+        let secrets = zeroize::Zeroizing::new(crate::redact::secrets_from_payload(&payload));
+        zeroize::Zeroize::zeroize(&mut payload);
+        let cert_revision = profile.auth.client_cert_id.as_ref().filter(|id|!id.is_empty())
+            .map(|id| vault.entry_revision(id).map(|revision|(id.clone(),revision))).transpose().map_err(|e|e.to_string())?;
+        let prepared = if let Some(prepared) = crate::http_profiles::prepare_builtin(&s, id, &profile, op_name, params.clone()) {
+            PreparedRemote::Builtin(prepared?)
+        } else {
+            PreparedRemote::Http(crate::profile_http::prepare(&s, id, &profile, operation, params)?)
+        };
+        (prepared, s.generation(), vault.entry_revision(id).map_err(|e|e.to_string())?,
+            serde_json::to_vec(&profile).map_err(|_|"profile 编码失败".to_string())?, cert_revision, secrets)
+    };
+    let result = (|| {
+        if let Some(payload) = prepared.confirmation() {
+            if !crate::confirm::ask_payload(payload) { return Err("用户拒绝了这次写操作".into()); }
+        }
+        // Never retain the vault mutex while waiting for a human. Check everything
+        // again after approval: lock/revoke/profile edits must invalidate it.
+        {
+            let s = lock_session(session);
+            require_call_authorized(&s, permit, generation)?;
+            let vault = s.vault().map_err(|e|e.to_string())?;
+            if vault.entry_revision(id).map_err(|e|e.to_string())? != revision {
+                return Err("凭据或 profile 已改变，请重新调用".into());
+            }
+            let current = crate::http_profiles::effective_profile(&s,id)?.ok_or("profile 已移除")?;
+            if serde_json::to_vec(&current).map_err(|_|"profile 编码失败".to_string())? != profile_bytes {
+                return Err("profile 策略已改变，请重新调用".into());
+            }
+            if let Some((cert_id, revision)) = &cert_revision {
+                if &vault.entry_revision(cert_id).map_err(|e|e.to_string())? != revision {
+                    return Err("客户端证书已改变，请重新调用".into());
+                }
+            }
+        }
+        prepared.execute()
+    })();
+    result.map(|(status,text)| (status,redact_tool_text(text,&secrets)))
+        .map_err(|text| redact_tool_text(text,&secrets))
+}
+
+fn audit_token(input:&str)->String {
+    input.chars().filter(|c|!c.is_control() && !c.is_whitespace() && *c!='=').take(256).collect()
+}
+
+fn redact_tool_text(text:String,secrets:&[String])->String {
+    let text = match serde_json::from_str::<Value>(&text) {
+        Ok(value) => serde_json::to_string(&crate::credential_mcp::redact_value(value,secrets)).unwrap_or_else(|_|"响应编码失败".into()),
+        Err(_) => {
+            let mut text=text;
+            for secret in secrets.iter().filter(|s|!s.is_empty()) {text=text.replace(secret,"[REDACTED]");}
+            crate::redact::redact_text(&text,&[])
+        }
+    };
+    const MAX:usize = 64*1024;
+    if text.len()<=MAX {return text;}
+    let mut end=MAX;
+    while !text.is_char_boundary(end) {end-=1;}
+    json!({"text":&text[..end],"truncated":true}).to_string()
+}
+
 fn call_tool(
     session: &Mutex<Session>,
     mcp: &McpState,
+    caller: &str,
     name: &str,
     args: Value,
 ) -> Result<String, String> {
-    {
+    let permit = mcp.caller_permit(caller)?;
+    if !crate::credential_mcp::TOOL_NAMES.contains(&name) {
+        return Err(format!("未知 MCP 工具。可用 {}", crate::credential_mcp::TOOL_NAMES.join("、")));
+    }
+    if name == "vault_revoke" {
+        crate::credential_mcp::validate_tool(name,&args)?;
+        mcp.revoke_caller(caller)?;
+        let s=lock_session(session);
+        if let Ok(vault)=s.vault() {let _=vault.audit("mcp_revoke",None,"scope=current_caller decision=allow");}
+        return Ok(json!({"revoked":true,"scope":"current_caller","reauthorization_required":true}).to_string());
+    }
+    let generation = {
         let mut s = lock_session(session);
         idle_lock_if_needed(&mut s, mcp);
         if !s.is_unlocked() {
             return Err("金库已锁定。请先在 Sealbox 窗口解锁，再让我重试。".into());
         }
-    }
-    if github_mcp::is_github_tool(name) {
-        if crate::git_workspace::is_git_tool(name) {
-            return call_git_tool(session, name, args);
-        }
-        let result = {
-            let mut s = lock_session(session);
-            github_mcp::call_tool_detailed(&mut s, name, args)
-        };
-        let s = lock_session(session);
-        if let Ok(vault) = s.vault() {
-            let detail = match &result {
-                Ok(result) => format_github_audit_detail(
-                    name,
-                    "allow",
-                    "ok",
-                    Some(result.status),
-                    result.result_count,
-                    &result.credential_fingerprint,
-                    &result.context,
-                ),
-                Err(error) => format_github_audit_detail(
-                    name,
-                    "deny",
-                    error.reason,
-                    error.status,
-                    None,
-                    error.credential_fingerprint.as_deref().unwrap_or(""),
-                    &error.context,
-                ),
-            };
-            let action = if result.is_ok() {
-                "mcp_github"
-            } else {
-                "mcp_github_denied"
-            };
-            let _ = vault.audit(action, None, &detail);
-        }
-        return result
-            .map(|result| result.text)
-            .map_err(|error| error.message);
-    }
-    if matches!(
-        name,
-        "mail_accounts" | "mail_list" | "mail_read" | "mail_download_attachment"
-    ) {
-        return call_mail_tool(session, name, args);
-    }
-    if crate::zoomkey::is_zoomkey_tool(name) {
-        let result = {
-            let mut s = lock_session(session);
-            crate::zoomkey::call_tool_detailed(&mut s, name, args)
-        };
-        let s = lock_session(session);
-        if let Ok(vault) = s.vault() {
-            let detail = match &result {
-                Ok(result) => format_zoomkey_audit_detail(
-                    name,
-                    "allow",
-                    "ok",
-                    Some(result.status),
-                    result.result_count,
-                    &result.credential_fingerprint,
-                    &result.context,
-                ),
-                Err(error) => format_zoomkey_audit_detail(
-                    name,
-                    "deny",
-                    error.reason,
-                    error.status,
-                    None,
-                    error.credential_fingerprint.as_deref().unwrap_or(""),
-                    &error.context,
-                ),
-            };
-            let action = if result.is_ok() {
-                "mcp_zoomkey"
-            } else {
-                "mcp_zoomkey_denied"
-            };
-            let _ = vault.audit(action, None, &detail);
-        }
-        return result
-            .map(|result| result.text)
-            .map_err(|error| error.message);
-    }
+        crate::credential_mcp::require_enabled(&s)?;
+        s.generation()
+    };
     match name {
-        "list_credentials" | "copy_secret" | "http_request" => Err("该 MCP 工具已停用".into()),
-        _ => Err(format!("未知工具 {name}")),
+        "vault_list" | "vault_describe" => {
+            let mut s=lock_session(session);
+            let result=if name=="vault_list" {crate::credential_mcp::list(&s,&args)} else {crate::credential_mcp::describe(&s,&args)};
+            if let Ok(vault)=s.vault() {let _=vault.audit("mcp_vault",None,&format!("operation={name} decision={}",if result.is_ok(){"allow"}else{"deny"}));}
+            if result.is_ok() {s.touch();}
+            result
+        },
+        "http_call" => call_http_tool(session,&permit,args),
+        "git" => call_git_tool(session,name,args,&permit,generation),
+        "mail" => {
+            let definition=mail_tool_definitions().remove(0);
+            let action=args.get("action").and_then(Value::as_str).unwrap_or("");
+            if !MAIL_ACTIONS.contains(&action) {return Err(format!("mail 需要合法 action：{}",MAIL_ACTIONS.join("、")));}
+            github_mcp::validate_tool_arguments(&definition["inputSchema"],&args)?;
+            if action=="save" && !crate::confirm::ask("保存邮件附件","允许把附件保存到本机新文件？",&[("目标文件",args.get("path").and_then(Value::as_str).unwrap_or("").to_string())]) {
+                return Err("用户拒绝了这次写操作".into());
+            }
+            require_call_authorized(&lock_session(session),&permit,generation)?;
+            call_mail_tool(session,name,args,&permit,generation)
+        },
+        _ => unreachable!(),
     }
 }
 
@@ -810,9 +1003,14 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpReq, String> {
 }
 
 fn write_http(stream: &mut TcpStream, status: &str, body: &[u8]) {
+    write_http_with_session(stream,status,body,None);
+}
+
+fn write_http_with_session(stream: &mut TcpStream, status: &str, body: &[u8], caller: Option<&str>) {
+    let session_header=caller.map(|id|format!("Mcp-Session-Id: {id}\r\n")).unwrap_or_default();
     let _ = write!(
         stream,
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{session_header}Connection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(body);
@@ -882,7 +1080,7 @@ fn handle_client(mut stream: TcpStream, session: Arc<Mutex<Session>>, mcp: McpSt
             return;
         }
         let fill_token = recover_lock(&mcp.fill_token).clone();
-        if auth != format!("Bearer {fill_token}") {
+        if fill_token.is_empty() || !constant_eq(&auth, &format!("Bearer {fill_token}")) {
             write_http(
                 &mut stream,
                 "401 Unauthorized",
@@ -913,7 +1111,7 @@ fn handle_client(mut stream: TcpStream, session: Arc<Mutex<Session>>, mcp: McpSt
         return;
     }
     let token = recover_lock(&mcp.token).clone();
-    if auth != format!("Bearer {token}") {
+    if token.is_empty() || !constant_eq(&auth, &format!("Bearer {token}")) {
         write_http(
             &mut stream,
             "401 Unauthorized",
@@ -928,10 +1126,27 @@ fn handle_client(mut stream: TcpStream, session: Arc<Mutex<Session>>, mcp: McpSt
             return;
         }
     };
-    match handle_rpc(&session, &mcp, rpc) {
+    let initializing=rpc.method=="initialize";
+    let caller=if initializing {
+        match mcp.open_caller() {
+            Ok(id)=>id,
+            Err(_)=>{write_http(&mut stream,"429 Too Many Requests",br#"{"error":"too many MCP sessions"}"#);return;}
+        }
+    } else {
+        let Some(id)=req.headers.iter().find(|(key,_)|key=="mcp-session-id").map(|(_,value)|value.as_str()) else {
+            write_http(&mut stream,"400 Bad Request",br#"{"error":"Mcp-Session-Id required; initialize first"}"#);
+            return;
+        };
+        if mcp.caller_permit(id).is_err() {
+            write_http(&mut stream,"404 Not Found",br#"{"error":"MCP session revoked or expired; initialize again"}"#);
+            return;
+        }
+        id.to_string()
+    };
+    match handle_rpc(&session, &mcp, rpc, &caller) {
         Some(resp) => {
             let bytes = serde_json::to_vec(&resp).unwrap_or_else(|_| b"{}".to_vec());
-            write_http(&mut stream, "200 OK", &bytes);
+            write_http_with_session(&mut stream, "200 OK", &bytes, initializing.then_some(caller.as_str()));
         }
         None => write_http(&mut stream, "204 No Content", b""),
     }
@@ -1033,268 +1248,9 @@ fn remove_stale_bridge_file() {
 pub fn stop(mcp: &McpState) {
     mcp.running.store(false, Ordering::SeqCst);
     mcp.close_pairing();
+    mcp.invalidate_callers();
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn disabled_github_tools_are_not_exposed() {
-        let session = Mutex::new(Session::default());
-        let listed = tools_list(&session);
-        let names = listed["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|tool| tool["name"].as_str())
-            .collect::<Vec<_>>();
-        assert!(!names.iter().any(|name| name.starts_with("github_")));
-        for name in ["mail_accounts", "mail_list", "mail_read", "mail_download_attachment"] {
-            assert!(names.contains(&name), "missing {name}");
-        }
-    }
-
-    fn github_tool_names(enabled: bool) -> Vec<String> {
-        let (vault, dek) =
-            crate::vault::Vault::create_in_memory("correct horse battery staple extra").unwrap();
-        vault
-            .set_secret_setting(
-                &dek,
-                "zoomkey_mcp_policy",
-                &format!(r#"{{"enabled":{enabled}}}"#),
-            )
-            .unwrap();
-        let mut session = Session::default();
-        session.set_unlocked(vault, dek);
-        let listed = tools_list(&Mutex::new(session));
-        listed["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|tool| tool["name"].as_str())
-            .filter(|name| name.starts_with("github_"))
-            .map(str::to_string)
-            .collect()
-    }
-
-    #[test]
-    fn enabled_github_tools_are_exposed_as_a_single_capability() {
-        let disabled = github_tool_names(false);
-        assert!(disabled.is_empty());
-
-        let enabled = github_tool_names(true);
-        for name in [
-            "github_repo_list",
-            "github_repo_get",
-            "github_git",
-            "github_issues_get",
-            "github_pr_create",
-            "github_release_create",
-            "github_list_credentials",
-            "github_user_info",
-        ] {
-            assert!(enabled.iter().any(|tool| tool == name), "missing {name}");
-        }
-
-        let listed_tools = enabled
-            .iter()
-            .map(|name| name.as_str())
-            .collect::<Vec<_>>();
-        assert!(!listed_tools.iter().any(|name| *name == "github_get_file"));
-        assert!(!listed_tools
-            .iter()
-            .any(|name| *name == "github_git_workspace_register"));
-    }
-
-    #[test]
-    fn host_must_be_loopback_with_port() {
-        assert!(host_allowed(
-            &[("host".into(), "127.0.0.1:17891".into())],
-            17891
-        ));
-        assert!(!host_allowed(
-            &[("host".into(), "localhost:17891".into())],
-            17891
-        ));
-        assert!(!host_allowed(&[], 17891));
-    }
-
-    #[test]
-    fn pairing_code_is_one_shot_and_windowed() {
-        let mcp = McpState::default();
-        let status = mcp.open_pairing();
-        assert!(status.active);
-        assert_eq!(status.expires_in_secs, 60);
-        let code = status.code.unwrap();
-        let current = mcp.pairing_status();
-        assert!(current.active);
-        assert!((1..=60).contains(&current.expires_in_secs));
-        mcp.consume_pairing(&code).unwrap();
-        assert!(mcp.consume_pairing(&code).is_err());
-        assert!(!mcp.pairing_status().active);
-    }
-
-    #[test]
-    fn json_tool_results_include_structured_content() {
-        let result = tool_call_result(r#"{"ok":true,"pushed":false}"#, false);
-        assert_eq!(result["structuredContent"]["ok"], true);
-        assert_eq!(result["isError"], false);
-        let list = tool_call_result(r#"[{"title":"github"}]"#, false);
-        assert_eq!(list["structuredContent"][0]["title"], "github");
-        let text = tool_call_result("not json", false);
-        assert!(text.get("structuredContent").is_none());
-    }
-
-    #[test]
-    fn enabled_github_tools_are_exposed_as_single_toggle() {
-        assert!(github_tool_names(false).is_empty());
-        let enabled = github_tool_names(true);
-        for name in [
-            "github_repo_list",
-            "github_git",
-            "github_issue_close",
-            "github_list_credentials",
-            "github_release_publish",
-            "github_pr_merge",
-        ] {
-            assert!(enabled.iter().any(|tool| tool == name), "missing {name}");
-        }
-    }
-
-    #[test]
-    fn start_while_locked_does_not_mint_tokens() {
-        let mutex = Arc::new(Mutex::new(Session::default()));
-        let mcp = McpState::default();
-        let port = start(&mcp, mutex).unwrap();
-        assert_ne!(port, 0);
-        assert!(recover_lock(&mcp.fill_token).is_empty());
-        assert!(recover_lock(&mcp.token).is_empty());
-        stop(&mcp);
-    }
-
-    fn github_session(enabled: bool) -> Mutex<Session> {
-        let (vault, dek) = crate::vault::Vault::create_in_memory("correct horse battery staple extra").unwrap();
-        vault.set_secret_setting(&dek, "zoomkey_mcp_policy", &format!(r#"{{"enabled":{enabled}}}"#)).unwrap();
-        vault.upsert_entry(&dek, crate::vault::UpsertEntry {
-            id: None,
-            kind: crate::vault::EntryKind::ApiToken,
-            title: "github".into(),
-            account: Some("octocat".into()),
-            url: None,
-            folder_id: None,
-            tags: Vec::new(),
-            pinned: false,
-            expires_at: None,
-            notes: None,
-            secret: crate::vault::SecretPayload::ApiToken {
-                service: "github".into(),
-                account: Some("octocat".into()),
-                token: "ghp_test_token_value".into(),
-            },
-        }).unwrap();
-        let mut session = Session::default();
-        session.set_unlocked(vault, dek);
-        Mutex::new(session)
-    }
-
-    fn github_rpc(session: &Mutex<Session>, name: &str, args: Value) -> Value {
-        handle_rpc(session, &McpState::default(), JsonRpcReq {
-            jsonrpc: "2.0".into(),
-            id: Some(json!(1)),
-            method: "tools/call".into(),
-            params: json!({"name":name,"arguments":args}),
-        }).unwrap()
-    }
-
-    #[test]
-    fn github_legacy_rpc_reads_and_denied_writes_reach_shared_handlers() {
-        let session = github_session(true);
-        let probe = crate::github_api::TransportProbe::install(|call| {
-            assert_eq!(call.method, "GET");
-            Ok(crate::github_api::HttpReply {
-                status: 200,
-                body: br#"{"number":7,"title":"bug","state":"open","login":"octocat"}"#.to_vec(),
-            })
-        });
-        let read = github_rpc(&session, "github_issue", json!({"action":"get","repo":"o/r","number":7}));
-        assert_eq!(read["result"]["isError"], false, "{read}");
-        assert_eq!(read["result"]["structuredContent"]["number"], 7);
-        assert_eq!(probe.calls()[0].url, "https://api.github.com/repos/o/r/issues/7");
-        let alias = github_rpc(&session, "github_get_authenticated_user", json!({}));
-        assert_eq!(alias["result"]["isError"], false, "{alias}");
-        assert_eq!(alias["result"]["structuredContent"]["login"], "octocat");
-        let denied = crate::confirm::with_auto(Some(false), || github_rpc(
-            &session, "github_issue", json!({"action":"close","repo":"o/r","number":7}),
-        ));
-        assert_eq!(denied["result"]["isError"], true, "{denied}");
-        assert!(denied["result"]["content"][0]["text"].as_str().unwrap().contains("拒绝"));
-        let create_denied = crate::confirm::with_auto(Some(false), || github_rpc(
-            &session, "github_issue", json!({"action":"create","repo":"o/r","title":"bug"}),
-        ));
-        assert_eq!(create_denied["result"]["isError"], true, "{create_denied}");
-        assert!(create_denied["result"]["content"][0]["text"].as_str().unwrap().contains("拒绝"));
-        assert_eq!(probe.calls().len(), 3);
-        assert!(probe.calls().iter().all(|call| call.method == "GET"));
-    }
-
-    #[test]
-    fn github_compatibility_rpc_respects_lock_and_mcp_switch() {
-        let probe = crate::github_api::TransportProbe::install(|_| panic!("disabled calls must not reach HTTP"));
-        for (session, expected) in [
-            (Mutex::new(Session::default()), "锁定"),
-            (github_session(false), "未启用"),
-        ] {
-            for (name, args) in [
-                ("github_issue", json!({"action":"get","repo":"o/r","number":1})),
-                ("github_pr", json!({"action":"list","repo":"o/r"})),
-                ("github_release", json!({"action":"list","repo":"o/r"})),
-                ("github_get_authenticated_user", json!({})),
-            ] {
-                let response = github_rpc(&session, name, args);
-                assert_eq!(response["result"]["isError"], true);
-                assert!(response["result"]["content"][0]["text"].as_str().unwrap().contains(expected), "{response}");
-            }
-        }
-        assert!(probe.calls().is_empty());
-    }
-
-    #[test]
-    fn github_rpc_catalog_contains_only_fine_grained_api_tools() {
-        let response = handle_rpc(&github_session(true), &McpState::default(), JsonRpcReq {
-            jsonrpc: "2.0".into(),
-            id: Some(json!(1)),
-            method: "tools/list".into(),
-            params: json!({}),
-        }).unwrap();
-        let tools = response["result"]["tools"].as_array().unwrap();
-        let names: std::collections::HashSet<_> = tools.iter().map(|tool| tool["name"].as_str().unwrap()).collect();
-        assert_eq!(names.len(), tools.len());
-        for name in ["github_issue", "github_pr", "github_release", "github_get_authenticated_user"] {
-            assert!(!names.contains(name));
-        }
-        for name in ["github_issues_get", "github_issue_close", "github_git", "github_user_info"] {
-            assert!(names.contains(name));
-        }
-    }
-
-    #[test]
-    fn locked_vault_errors() {
-        let response = handle_rpc(
-            &Mutex::new(Session::default()),
-            &McpState::default(),
-            JsonRpcReq {
-                jsonrpc: "2.0".into(),
-                id: Some(json!(1)),
-                method: "tools/call".into(),
-                params: json!({"name":"github_list_credentials","arguments":{}}),
-            },
-        )
-        .unwrap();
-        assert!(response["result"]["content"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("锁定"));
-    }
-}
+#[path = "mcp_surface_tests.rs"]
+mod tests;

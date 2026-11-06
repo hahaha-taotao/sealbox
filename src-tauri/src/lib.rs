@@ -7,11 +7,14 @@ pub mod clipboard;
 pub mod commands;
 pub mod confirm;
 pub mod csv_import;
+pub mod credential_mcp;
 pub mod extension_install;
 pub mod fill;
 pub mod git_workspace;
 pub mod github_api;
 pub mod github_mcp;
+pub mod http_profiles;
+pub mod profile_http;
 pub mod lock;
 pub mod mcp;
 pub mod session;
@@ -69,6 +72,9 @@ pub fn run() {
             commands::import_client_cert,
             commands::get_notes,
             commands::entry_profile,
+            commands::credential_profile_get,
+            commands::credential_profile_set,
+            commands::credential_profile_reset,
             commands::tick_idle,
             commands::gen_password,
             commands::export_backup,

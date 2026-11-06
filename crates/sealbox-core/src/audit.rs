@@ -45,9 +45,22 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("mail_save_attachment", "保存邮件附件"),
     ("mcp_mail", "邮箱 MCP 调用"),
     ("mcp_mail_denied", "邮箱 MCP 调用未成功"),
+    ("credential_profile", "修改凭据 HTTP 配方"),
+    ("mcp_vault", "查询凭据元数据"),
+    ("mcp_http", "凭据 HTTP 调用"),
+    ("mcp_http_denied", "凭据 HTTP 调用未成功"),
+    ("mcp_git", "本机 Git 调用"),
+    ("mcp_git_denied", "本机 Git 调用未成功"),
+    ("mcp_revoke", "撤销当前调用方授权"),
 ];
 
 const TOOLS: &[(&str, &str)] = &[
+    ("git", "Git 操作"),
+    ("mail", "邮箱操作"),
+    ("http_call", "凭据 HTTP 操作"),
+    ("vault_list", "列出凭据元数据"),
+    ("vault_describe", "读取操作说明书"),
+    ("vault_revoke", "撤销调用方授权"),
     ("github_get_authenticated_user", "查询 GitHub 账号"),
     ("github_list_repositories", "列出仓库"),
     ("github_get_repository", "查询仓库"),
@@ -211,11 +224,22 @@ pub fn format_event(raw: AuditEvent) -> AuditDisplay {
         .to_string();
     let mut result = "recorded";
     let mut description = String::new();
-    if matches!(
+    if matches!(raw.action.as_str(), "mcp_http" | "mcp_http_denied") {
+        if let Some(v) = structured(&raw.detail,&["operation","op","decision","reason","origin","credential","status"]) {
+            result=if v[2]=="allow" {"success"} else if v[3]=="denied" {"denied"} else {"failure"};
+            description=format!("操作：{}；目标：{}；凭据指纹：{}；HTTP 状态：{}",v[1],v[4],v[5],v[6]);
+        }
+    } else if matches!(raw.action.as_str(), "mcp_vault" | "mcp_revoke") {
+        result=if raw.detail.contains("decision=allow") {"success"}else{"failure"};
+        description=operation.clone();
+    } else if raw.action=="credential_profile" {
+        result="success";
+        description=if raw.detail=="reset" {"恢复内置配方或清除自定义配方"}else{"保存凭据的受限 HTTP 配方"}.into();
+    } else if matches!(
         raw.action.as_str(),
-        "mcp_github" | "mcp_github_denied" | "mcp_zoomkey" | "mcp_zoomkey_denied"
+        "mcp_github" | "mcp_github_denied" | "mcp_zoomkey" | "mcp_zoomkey_denied" | "mcp_git" | "mcp_git_denied"
     ) {
-        let github = raw.action.starts_with("mcp_github");
+        let github = raw.action.starts_with("mcp_github") || raw.action.starts_with("mcp_git");
         let keys: &[&str] = if github {
             &[
                 "operation",

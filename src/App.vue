@@ -5,6 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import packageJson from "../package.json";
 import { DB_ENGINES } from "./lib/entry-options";
+import CredentialProfileEditor from "./components/CredentialProfileEditor.vue";
 import { auditDateBounds, createAuditRequestGuard } from "./lib/audit-request";
 import { buildMailDocument, hasRemoteImages } from "./lib/mail-html";
 import { buildResolutions, completeChoices, type SyncChoice } from "./lib/sync-choice.mjs";
@@ -515,8 +516,9 @@ async function saveZoomkeyPolicy(opts: { toggling?: boolean } = {}) {
   }
   if (zoomkeyPolicy.value.enabled && (opts.toggling || !previousEnabled)) {
     const ok = confirm(
-      "开启后，Sealbox 会同时开放 GitHub 和 ZoomKey MCP 工具；ZoomKey 只会向白名单内的内网主机发起请求（携带金库里的客户端证书）。\n" +
-        "请确认白名单里只有你信任的公司内网域名。配齐凭据的端点会自动出现在工具列表。继续？",
+      "开启后，所有平台通过凭据 profile 的具名操作调用，http_call 是唯一远程 HTTP 入口。\n" +
+        "工具表固定为 vault_list、vault_describe、http_call、git、mail、vault_revoke，不随总开关或凭据数量改变；停用后调用会被拒绝。\n" +
+        "请只保存你信任的 origin、路径、参数和非秘密元数据；认证由金库注入。继续？",
     );
     if (!ok) {
       if (opts.toggling) zoomkeyPolicy.value.enabled = previousEnabled;
@@ -884,8 +886,27 @@ function closeForm() {
 const detailOpen = ref(false);
 const detailTrashed = ref(false);
 const detail = ref<EntryProfile | null>(null);
+const credentialProfileOpen = ref(false);
+const credentialProfileEditor = ref<{ canDiscard: () => boolean } | null>(null);
+const credentialProfileApi = {
+  get: api.credentialProfileGet,
+  set: api.credentialProfileSet,
+  reset: api.credentialProfileReset,
+};
+const canEditCredentialProfile = computed(() => !detailTrashed.value && Boolean(detail.value &&
+  (["api_token", "website", "mailbox", "server", "database", "client_cert"] as EntryKind[]).includes(detail.value.entry.kind)));
+function toggleCredentialProfile() {
+  if (credentialProfileOpen.value && !credentialProfileEditor.value?.canDiscard()) return;
+  hideSecret();
+  credentialProfileOpen.value = !credentialProfileOpen.value;
+}
+function requestCloseDetail() {
+  if (credentialProfileOpen.value && !credentialProfileEditor.value?.canDiscard()) return;
+  closeDetail();
+}
 let detailSeq = 0;
 function closeDetail() {
+  credentialProfileOpen.value = false;
   detailSeq += 1;
   detailOpen.value = false;
   detailTrashed.value = false;
@@ -906,6 +927,7 @@ function revealedSecretText() {
   return "";
 }
 async function openDetail(row: EntryDto, trashed = page.value === "vault" && Boolean(filter.trash)) {
+  credentialProfileOpen.value = false;
   const seq = ++detailSeq;
   detailOpen.value = true;
   detailTrashed.value = trashed;
@@ -946,6 +968,8 @@ function openCreate() {
   showForm.value = true;
 }
 async function openEdit(row: EntryDto) {
+  if (credentialProfileOpen.value && !credentialProfileEditor.value?.canDiscard()) return;
+  credentialProfileOpen.value = false;
   resetGenerator();
   clearWebsiteDuplicateState();
   editing.value = row;
@@ -1731,7 +1755,7 @@ function hideVisibleSecrets() {
   hideSecret();
   // 失焦/切后台只隐藏已明文展示的秘密，不再关闭正在录入的凭据表单，避免已输入内容丢失。
   // 文件选择框（以及它的收尾事件）导致的失焦不算「用户离开了」，此时也不关详情弹窗。
-  if (!nativeDialogInFlight()) {
+  if (!nativeDialogInFlight() && !credentialProfileOpen.value) {
     closeDetail();
   }
   hideBridgeTokens();
@@ -1739,6 +1763,7 @@ function hideVisibleSecrets() {
 
 function clearSecrets() {
   hideVisibleSecrets();
+  closeDetail();
   clientCertInfo.value = null;
   certInfoFor.value = null;
   closeForm();
@@ -2840,7 +2865,15 @@ onMounted(async () => {
             <button class="btn" type="button" :disabled="!mcp?.has_token" @click="copyMcpSnippet">复制配置</button>
           </div>
           <div class="mcp-card">
-            <h3>ZoomKey JIRA / CRM</h3>
+            <h3>固定六工具 · 所有平台通过 profile</h3>
+            <p class="crumb"><code>vault_list</code> · <code>vault_describe</code> · <code>http_call</code> · <code>git</code> · <code>mail</code> · <code>vault_revoke</code></p>
+            <p class="crumb">工具表不随总开关、凭据数量或平台改变；停用 MCP 时仍保留六工具定义，但调用会被拒绝。金库锁定也会拒绝调用。</p>
+            <p class="crumb"><code>http_call</code> 是唯一远程 HTTP 入口。先用 <code>vault_list</code> 找凭据，再用 <code>vault_describe</code> 看具名操作、参数与风险，最后按操作名调用。Git 与邮件使用各自工具的 action。</p>
+            <p class="crumb">新增平台或接口：保险库 → 凭据详情 →「编辑 HTTP 操作 profile」。可编辑固定 origin、认证、允许方法/路径、具名操作与参数；秘密仍留在金库，不写进 profile。没有 profile 的新平台不开放 HTTP 操作。</p>
+          </div>
+          <details class="mcp-card">
+            <summary>ZoomKey 旧连接设置（迁移辅助）</summary>
+            <p class="crumb">保留既有连接配置与连通性检查，便于迁移。推荐在所选凭据详情保存 ZoomKey profile，Jira/CRM 操作统一经 vault_describe / http_call；旧细工具名仅为兼容别名，不在工具表中推荐或追加。</p>
             <template v-if="zoomkeyPolicy">
               <div class="field">
                 <label>允许的主机名（每行一个，精确匹配）</label>
@@ -2860,7 +2893,7 @@ onMounted(async () => {
                 </div>
                 <div class="field"><label>站点地址</label><input v-model="zoomkeyPolicy.jira.base_url" /></div>
                 <div class="field">
-                  <label>金库凭据（API Token 条目，服务选「ZoomKey JIRA」，账号=用户名，密钥=密码）</label>
+                  <label>金库凭据（API Token 条目，服务填 zoomkey-jira，账号=用户名，密钥=密码）</label>
                   <select v-model="zoomkeyPolicy.jira.credential_id">
                     <option value="">未选择</option>
                     <option v-for="c in zoomkeyCandidates.jira_credentials" :key="c.id" :value="c.id">
@@ -2868,7 +2901,7 @@ onMounted(async () => {
                     </option>
                   </select>
                   <p class="crumb" v-if="!zoomkeyCandidates.jira_credentials.length">
-                    还没有可用的 JIRA 凭据。请在保险库新建一条 API Token：服务选「ZoomKey JIRA」、账号填 JIRA 用户名、密钥填 JIRA 密码，保存后回到本页重新进入即可选中。
+                    还没有可用的 JIRA 凭据。请在保险库新建一条 API Token：服务填 zoomkey-jira、账号填 JIRA 用户名、密钥填 JIRA 密码，保存后回到本页重新进入即可选中。
                   </p>
                 </div>
                 <div class="field">
@@ -2903,7 +2936,7 @@ onMounted(async () => {
                   <p class="crumb">必须指向 Vtiger 的 webservice.php。填站点首页会拿到登录页 HTML，测试连接会失败。</p>
                 </div>
                 <div class="field">
-                  <label>金库凭据（API Token 条目，服务选「ZoomKey CRM」，账号=用户名，密钥=AccessKey）</label>
+                  <label>金库凭据（API Token 条目，服务填 zoomkey-crm，账号=用户名，密钥=AccessKey）</label>
                   <select v-model="zoomkeyPolicy.crm.credential_id">
                     <option value="">未选择</option>
                     <option v-for="c in zoomkeyCandidates.crm_credentials" :key="c.id" :value="c.id">
@@ -2911,7 +2944,7 @@ onMounted(async () => {
                     </option>
                   </select>
                   <p class="crumb" v-if="!zoomkeyCandidates.crm_credentials.length">
-                    还没有可用的 CRM 凭据。请在保险库新建一条 API Token：服务选「ZoomKey CRM」、账号填 CRM 用户名、密钥填 AccessKey，保存后回到本页重新进入即可选中。
+                    还没有可用的 CRM 凭据。请在保险库新建一条 API Token：服务填 zoomkey-crm、账号填 CRM 用户名、密钥填 AccessKey，保存后回到本页重新进入即可选中。
                   </p>
                 </div>
                 <div class="field">
@@ -2939,11 +2972,11 @@ onMounted(async () => {
                 <pre>{{ zoomkeyTestResult.text }}</pre>
               </div>
             </template>
-            <p class="crumb" v-else>解锁金库后才能读取 ZoomKey 策略。</p>
-          </div>
+            <p class="crumb" v-else>解锁金库后才能读取 ZoomKey 迁移设置。</p>
+          </details>
           <div class="mcp-card">
-            <h3>工具列表</h3>
-            <p class="crumb">当前 MCP 对模型暴露的工具，与 tools/list 一致。</p>
+            <h3>工具列表（固定六个）</h3>
+            <p class="crumb">以下定义来自 tools/list；开关或凭据变化不会增删工具。操作菜单在凭据 profile 中，通过 vault_describe 读取，而不是动态追加工具。</p>
             <div class="tool-list" v-if="mcpTools.length">
               <div class="tool-item" v-for="tool in mcpTools" :key="tool.name">
                 <div class="tool-heading">
@@ -3300,8 +3333,8 @@ onMounted(async () => {
         </div>
       </section>
 
-      <div class="dialog-mask" v-if="detailOpen" @click.self="closeDetail">
-        <div class="dialog detail-dialog" role="dialog" aria-modal="true" aria-labelledby="detail-title">
+      <div class="dialog-mask" v-if="detailOpen" @click.self="requestCloseDetail">
+        <div class="dialog detail-dialog" :style="credentialProfileOpen ? { width: 'min(920px, 92vw)' } : undefined" role="dialog" aria-modal="true" aria-labelledby="detail-title">
           <p v-if="!detail" class="crumb">正在读取…</p>
           <template v-else>
           <div class="dialog-heading">
@@ -3309,7 +3342,7 @@ onMounted(async () => {
               <h3 id="detail-title">{{ detail.entry.title }}</h3>
               <p class="crumb">{{ kindLabel(detail.entry.kind) }} · {{ folderName(detail.entry.folder_id) }}</p>
             </div>
-            <button class="nav-btn" type="button" @click="closeDetail">×</button>
+            <button class="nav-btn" type="button" @click="requestCloseDetail">×</button>
           </div>
           <dl class="detail-fields">
             <template v-for="field in detail.fields" :key="field.label">
@@ -3330,6 +3363,21 @@ onMounted(async () => {
             <code>{{ revealFor === detail.entry.id ? revealedSecretText() : "••••••••" }}</code>
           </div>
           <p v-else class="crumb">私钥不在详情里显示。可以复制公开证书，或进入编辑查看证书信息。</p>
+          <div v-if="canEditCredentialProfile" style="margin: 16px 0">
+            <button class="btn" type="button" :aria-expanded="credentialProfileOpen" @click="toggleCredentialProfile">{{ credentialProfileOpen ? '收起 HTTP 操作 profile' : '编辑 HTTP 操作 profile' }}</button>
+            <p class="crumb">为本凭据登记固定 origin、认证和具名操作；新平台只加 profile，不增加 MCP 工具。</p>
+          </div>
+          <CredentialProfileEditor
+            v-if="credentialProfileOpen && canEditCredentialProfile"
+            :key="detail.entry.id"
+            ref="credentialProfileEditor"
+            :credential-id="detail.entry.id"
+            :kind="detail.entry.kind"
+            :origin-hint="detail.entry.url"
+            platform="desktop"
+            :api="credentialProfileApi"
+            @saved="showToast('凭据 HTTP profile 已更新')"
+          />
           <div class="detail-actions">
             <button v-if="detail.entry.kind !== 'client_cert'" class="btn" type="button" @click="copy(detail.entry.id)">复制密码</button>
             <button class="btn" type="button" @click="copy(detail.entry.id, 'account')">复制账号</button>
@@ -3340,7 +3388,7 @@ onMounted(async () => {
             <button v-if="!detailTrashed" class="btn" type="button" @click="openEdit(detail.entry)">编辑</button>
             <button v-if="!detailTrashed" class="btn danger" type="button" @click="remove([detail.entry.id])">移入回收站</button>
             <button v-else class="btn" type="button" @click="restore([detail.entry.id])">还原</button>
-            <button class="btn" type="button" @click="closeDetail">关闭</button>
+            <button class="btn" type="button" @click="requestCloseDetail">关闭</button>
           </div>
           </template>
         </div>
@@ -3425,17 +3473,12 @@ onMounted(async () => {
           </div>
         </div>
         <div class="field" v-if="form.kind === 'website'"><label>TOTP 密钥（可选）</label><input v-model="form.totp" placeholder="Base32 或 otpauth://totp/..." /></div>
-        <div class="field" v-if="form.kind === 'api_token'"><label>服务</label>
-          <select v-model="form.service">
-            <option value="github">GitHub</option>
-            <option value="gitee">Gitee</option>
-            <option value="gitlab">GitLab</option>
-            <option value="zoomkey-jira">ZoomKey JIRA（MCP 用）</option>
-            <option value="zoomkey-crm">ZoomKey CRM（MCP 用）</option>
-            <option value="custom">自定义</option>
-          </select>
+        <div class="field" v-if="form.kind === 'api_token'"><label>服务（可填写新平台名称）</label>
+          <input v-model="form.service" list="credential-services" placeholder="例如 github、my_company_api" />
+          <datalist id="credential-services"><option value="github">GitHub</option><option value="gitee">Gitee</option><option value="gitlab">GitLab</option><option value="zoomkey-jira">ZoomKey Jira（旧配置迁移）</option><option value="zoomkey-crm">ZoomKey CRM（旧配置迁移）</option></datalist>
+          <p class="crumb">保存后在凭据详情编辑 HTTP 操作 profile；服务名称不会新增 MCP 工具。</p>
         </div>
-        <div class="field" v-if="form.kind === 'api_token'"><label>允许的网址（自定义服务必填）</label>
+        <div class="field" v-if="form.kind === 'api_token'"><label>服务网址（HTTP profile 的 origin 提示）</label>
           <input v-model="form.url" placeholder="https://api.example.com" />
         </div>
         <div class="field" v-if="form.kind === 'api_token'"><label>Token</label><input v-model="form.token" /></div>

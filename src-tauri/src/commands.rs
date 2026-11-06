@@ -1553,6 +1553,7 @@ pub fn mcp_stop(state: State<AppState>) -> Result<McpStatus, String> {
 #[tauri::command]
 pub fn mcp_rotate_token(state: State<AppState>) -> Result<McpStatus, String> {
     let tok = mcp::new_token();
+    state.mcp.invalidate_callers();
     {
         let mut session = lock_session(&state.session);
         session.require_unlocked().map_err(map_err)?;
@@ -1693,6 +1694,40 @@ pub fn copy_extension_path(app: AppHandle, state: State<AppState>) -> Result<(),
     let path = crate::extension_install::dest_path_for_app(&app)?;
     let mut session = lock_session(&state.session);
     copy_untracked_text(&mut session, &path)
+}
+
+/// Profile data contains recipes only. Authentication material stays in the entry.
+#[tauri::command]
+pub fn credential_profile_get(
+    state: State<AppState>,
+    id: String,
+) -> Result<Option<sealbox_core::profile::CredentialProfile>, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    crate::http_profiles::effective_profile(&session, &id)
+}
+
+#[tauri::command]
+pub fn credential_profile_set(
+    state: State<AppState>,
+    id: String,
+    profile: Option<sealbox_core::profile::CredentialProfile>,
+) -> Result<Option<sealbox_core::profile::CredentialProfile>, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let dek = *session.dek().map_err(map_err)?;
+    let vault = session.vault().map_err(map_err)?;
+    vault.set_credential_profile(&dek, &id, profile.as_ref()).map_err(map_err)?;
+    let _ = vault.audit("credential_profile", Some(&id), if profile.is_some() { "set" } else { "reset" });
+    crate::http_profiles::effective_profile(&session, &id)
+}
+
+#[tauri::command]
+pub fn credential_profile_reset(
+    state: State<AppState>,
+    id: String,
+) -> Result<Option<sealbox_core::profile::CredentialProfile>, String> {
+    credential_profile_set(state, id, None)
 }
 
 #[tauri::command]
