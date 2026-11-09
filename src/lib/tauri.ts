@@ -300,6 +300,13 @@ export interface McpStatus {
   fill_url: string;
   has_token: boolean;
   has_fill_token: boolean;
+  listen_mode: string;
+  listen_address: string;
+}
+
+export interface McpListen {
+  mode: string;
+  address: string;
 }
 
 export interface ExtensionInstallStatus {
@@ -512,6 +519,8 @@ export const api = {
   home: () =>
     invoke<{ counts: Counts; recent: EntryDto[]; expiring: EntryDto[] }>("home_overview"),
   mcpStatus: () => invoke<McpStatus>("mcp_status"),
+  mcpListenGet: () => invoke<McpListen>("mcp_listen_get"),
+  mcpListenSet: (input: McpListen) => invoke<McpStatus>("mcp_listen_set", { input }),
   mcpRotate: () => invoke<McpStatus>("mcp_rotate_token"),
   fillRotate: () => invoke<McpStatus>("fill_rotate_token"),
   revealMcpToken: () => invoke<string>("reveal_mcp_token"),

@@ -496,6 +496,14 @@ async function refreshMcp() {
   hideBridgeTokens();
   mcp.value = await api.mcpStatus();
   try {
+    const listen = await api.mcpListenGet();
+    listenMode.value = listen.mode || "loopback";
+    listenAddress.value = listen.address || "";
+  } catch {
+    listenMode.value = mcp.value?.listen_mode || "loopback";
+    listenAddress.value = mcp.value?.listen_address || "";
+  }
+  try {
     zoomkeyPolicy.value = await api.zoomkeyPolicyGet();
     zoomkeyCandidates.value = await api.zoomkeyCandidates();
   } catch {
@@ -578,6 +586,26 @@ async function pickCaBundlePath(endpoint: "jira" | "crm") {
   }
 }
 
+const listenMode = ref("loopback");
+const listenAddress = ref("");
+const listenBusy = ref(false);
+async function saveListen() {
+  if (listenBusy.value) return;
+  listenBusy.value = true;
+  try {
+    mcp.value = await api.mcpListenSet({
+      mode: listenMode.value,
+      address: listenAddress.value.trim(),
+    });
+    listenMode.value = mcp.value.listen_mode || listenMode.value;
+    listenAddress.value = mcp.value.listen_address || "";
+    showToast(listenMode.value === "loopback" ? "MCP 只监听本机" : "MCP 监听已更新");
+  } catch (e) {
+    showToast(String(e));
+  } finally {
+    listenBusy.value = false;
+  }
+}
 async function rotateMcp() {
   if (!confirm("轮换 Token 后，Cursor / Claude Code 里的旧配置会失效，确定？")) return;
   hideBridgeTokens();
@@ -2846,6 +2874,25 @@ onMounted(async () => {
               </button>
               <button class="btn" type="button" @click="rotateMcp">轮换 MCP Token</button>
             </div>
+          </div>
+          <div class="mcp-card">
+            <h3>监听范围</h3>
+            <p class="crumb">默认只允许本机。局域网没有 TLS，只在可信网络打开。不提供公网。锁定金库后会退回仅本机。</p>
+            <div class="field">
+              <label>模式</label>
+              <select v-model="listenMode">
+                <option value="loopback">仅本机 127.0.0.1</option>
+                <option value="lan">局域网（私网地址）</option>
+                <option value="address">指定局域网地址</option>
+              </select>
+            </div>
+            <div class="field" v-if="listenMode === 'address'">
+              <label>本机局域网 IPv4</label>
+              <input v-model="listenAddress" placeholder="192.168.1.20" />
+            </div>
+            <button class="btn" type="button" :disabled="listenBusy" @click="saveListen">
+              {{ listenBusy ? "应用中…" : "保存并应用" }}
+            </button>
           </div>
           <div class="mcp-card">
             <h3>Cursor / Claude Code</h3>
