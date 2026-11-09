@@ -19,6 +19,9 @@ export default defineConfig({
         },
       },
   server: {
+    // Vite 8 binds "localhost" to ::1 only. WebView2 opens 127.0.0.1 and the
+    // window then dies because nothing is listening there.
+    host: "127.0.0.1",
     port: mobile ? 1421 : 1420,
     strictPort: true,
     watch: { ignored: ["**/src-tauri/**", "**/src-tauri-mobile/**"] },

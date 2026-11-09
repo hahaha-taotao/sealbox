@@ -167,9 +167,15 @@ pub fn run() {
             let lock = MenuItem::with_id(app, "lock", "锁定", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &lock, &quit])?;
-            let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().cloned().unwrap())
-                .menu(&menu)
+            // The configured bundle icon is not guaranteed to be available in every
+            // `tauri dev` environment (for example when the generated context has no
+            // embedded default icon). Do not panic while creating the tray icon: a
+            // missing tray icon must not terminate the whole desktop process.
+            let mut tray = TrayIconBuilder::new().menu(&menu);
+            if let Some(icon) = app.default_window_icon().cloned() {
+                tray = tray.icon(icon);
+            }
+            let _tray = tray
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => {
