@@ -7,16 +7,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-const DEFAULT_PORT: u16 = 17891;
+pub const DEFAULT_PORT: u16 = 17891;
+pub const LISTEN_MODE_LOOPBACK: &str = "loopback";
+pub const LISTEN_MODE_LAN: &str = "lan";
+pub const LISTEN_MODE_ADDRESS: &str = "address";
 const PAIRING_SECS: u64 = 60;
 const PAIRING_MAX_FAILURES: u32 = 5;
+const MAX_HTTP_LINE: usize = 8192;
+const MAX_HTTP_HEADERS: usize = 64 * 1024;
+const MAX_HTTP_BODY: usize = 1_000_000;
+const MAX_ACTIVE_CONNECTIONS: usize = 128;
 
 struct PairingWindow {
     code: String,
@@ -24,12 +32,46 @@ struct PairingWindow {
     failures: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ListenPolicy {
+    mode: String,
+    address: String,
+}
+
+impl ListenPolicy {
+    fn loopback() -> Self {
+        Self {
+            mode: LISTEN_MODE_LOOPBACK.into(),
+            address: String::new(),
+        }
+    }
+
+    fn lan_ip(&self) -> Result<Ipv4Addr, String> {
+        match self.mode.as_str() {
+            LISTEN_MODE_LAN => local_private_ipv4()
+                .ok_or_else(|| "未找到可用的 RFC1918 局域网 IPv4 地址".to_string()),
+            LISTEN_MODE_ADDRESS => self
+                .address
+                .parse::<Ipv4Addr>()
+                .map_err(|_| "指定监听地址无效".to_string()),
+            _ => Err("当前监听模式不需要局域网地址".into()),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct McpState {
     pub running: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+    active_connections: Arc<AtomicUsize>,
     pub port: Arc<Mutex<u16>>,
     pub token: Arc<Mutex<String>>,
     pub fill_token: Arc<Mutex<String>>,
+    listen_mode: Arc<Mutex<String>>,
+    listen_address: Arc<Mutex<String>>,
+    active_mode: Arc<Mutex<String>>,
+    active_address: Arc<Mutex<String>>,
+    listener_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
     pairing: Arc<Mutex<Option<PairingWindow>>>,
     callers: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
@@ -38,11 +80,91 @@ impl Default for McpState {
     fn default() -> Self {
         Self {
             running: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(AtomicU64::new(0)),
+            active_connections: Arc::new(AtomicUsize::new(0)),
             port: Arc::new(Mutex::new(DEFAULT_PORT)),
             token: Arc::new(Mutex::new(String::new())),
             fill_token: Arc::new(Mutex::new(String::new())),
+            listen_mode: Arc::new(Mutex::new(LISTEN_MODE_LOOPBACK.into())),
+            listen_address: Arc::new(Mutex::new(String::new())),
+            active_mode: Arc::new(Mutex::new(LISTEN_MODE_LOOPBACK.into())),
+            active_address: Arc::new(Mutex::new(String::new())),
+            listener_threads: Arc::new(Mutex::new(Vec::new())),
             pairing: Arc::new(Mutex::new(None)),
             callers: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+fn private_ipv4(ip: Ipv4Addr) -> bool {
+    let [a, b, _, _] = ip.octets();
+    a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168)
+}
+
+pub fn normalize_listen_config(mode: &str, address: &str) -> Result<(String, String), String> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        LISTEN_MODE_LOOPBACK => Ok((LISTEN_MODE_LOOPBACK.into(), String::new())),
+        LISTEN_MODE_LAN => Ok((LISTEN_MODE_LAN.into(), String::new())),
+        LISTEN_MODE_ADDRESS => {
+            let address = address.trim();
+            let ip = address
+                .parse::<Ipv4Addr>()
+                .map_err(|_| "指定地址必须是 IPv4 地址".to_string())?;
+            if !private_ipv4(ip) {
+                return Err("指定地址必须是 10/8、172.16/12 或 192.168/16 私网地址".into());
+            }
+            Ok((LISTEN_MODE_ADDRESS.into(), ip.to_string()))
+        }
+        _ => Err("监听模式必须是 loopback、lan 或 address".into()),
+    }
+}
+
+fn local_private_ipv4() -> Option<Ipv4Addr> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 80)).ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if private_ipv4(ip) => Some(ip),
+        _ => None,
+    }
+}
+
+impl McpState {
+    pub fn listen_config(&self) -> (String, String) {
+        (
+            recover_lock(&self.listen_mode).clone(),
+            recover_lock(&self.listen_address).clone(),
+        )
+    }
+
+    pub fn set_listen_config(&self, mode: &str, address: &str) -> Result<(), String> {
+        let (mode, address) = normalize_listen_config(mode, address)?;
+        *recover_lock(&self.listen_mode) = mode;
+        *recover_lock(&self.listen_address) = address;
+        Ok(())
+    }
+
+    fn configured_policy(&self) -> ListenPolicy {
+        let (mode, address) = self.listen_config();
+        ListenPolicy { mode, address }
+    }
+
+    fn set_active_policy(&self, policy: &ListenPolicy) {
+        *recover_lock(&self.active_mode) = policy.mode.clone();
+        *recover_lock(&self.active_address) = policy.address.clone();
+    }
+
+    pub fn active_config(&self) -> (String, String) {
+        (
+            recover_lock(&self.active_mode).clone(),
+            recover_lock(&self.active_address).clone(),
+        )
+    }
+
+    pub fn active_host(&self) -> String {
+        let (mode, address) = self.active_config();
+        match mode.as_str() {
+            LISTEN_MODE_ADDRESS | LISTEN_MODE_LAN if !address.is_empty() => address,
+            _ => "127.0.0.1".into(),
         }
     }
 }
@@ -72,22 +194,78 @@ fn constant_eq(a: &str, b: &str) -> bool {
         == 0
 }
 
-fn host_allowed(headers: &[(String, String)], port: u16) -> bool {
-    let raw = headers
-        .iter()
-        .find(|(k, _)| k == "host")
-        .map(|(_, v)| v.trim().to_ascii_lowercase())
-        .unwrap_or_default();
-    // [::1]:17891 -> ::1:17891. Clients commonly send localhost or IPv6 loopback.
-    // Only the loopback name and the bound port are accepted.
-    let host = if let Some(rest) = raw.strip_prefix('[') {
-        rest.replacen("]:", ":", 1)
-    } else {
-        raw
+fn parse_host_port(raw: &str) -> Option<(String, u16)> {
+    let raw = raw.trim().to_ascii_lowercase();
+    if let Some(rest) = raw.strip_prefix('[') {
+        let (host, port) = rest.split_once("]:")?;
+        return Some((host.to_string(), port.parse().ok()?));
+    }
+    let (host, port) = raw.rsplit_once(':')?;
+    Some((host.to_string(), port.parse().ok()?))
+}
+
+fn host_allowed_with_policy(
+    headers: &[(String, String)],
+    port: u16,
+    policy: &ListenPolicy,
+    peer_ip: IpAddr,
+) -> bool {
+    let mut hosts = headers.iter().filter(|(k, _)| k == "host");
+    let Some((_, raw)) = hosts.next() else {
+        return false;
     };
-    host == format!("127.0.0.1:{port}")
-        || host == format!("localhost:{port}")
-        || host == format!("::1:{port}")
+    if hosts.next().is_some() {
+        return false;
+    }
+    let Some((host, host_port)) = parse_host_port(raw) else {
+        return false;
+    };
+    if host_port != port {
+        return false;
+    }
+    match policy.mode.as_str() {
+        LISTEN_MODE_LOOPBACK => {
+            host == "127.0.0.1" || host == "localhost" || host == "::1"
+        }
+        LISTEN_MODE_LAN | LISTEN_MODE_ADDRESS => {
+            if peer_ip.is_loopback() {
+                host == "127.0.0.1" || host == "localhost" || host == "::1"
+            } else {
+                host == policy.address
+            }
+        }
+        _ => false,
+    }
+}
+
+fn host_allowed(headers: &[(String, String)], port: u16) -> bool {
+    host_allowed_with_policy(
+        headers,
+        port,
+        &ListenPolicy::loopback(),
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+    )
+}
+
+fn peer_allowed(ip: IpAddr, policy: &ListenPolicy) -> bool {
+    match policy.mode.as_str() {
+        LISTEN_MODE_LOOPBACK => ip.is_loopback(),
+        LISTEN_MODE_LAN | LISTEN_MODE_ADDRESS => {
+            ip.is_loopback() || matches!(ip, IpAddr::V4(ip) if private_ipv4(ip))
+        }
+        _ => false,
+    }
+}
+
+fn destination_allowed(ip: IpAddr, policy: &ListenPolicy) -> bool {
+    if ip.is_loopback() {
+        return true;
+    }
+    match policy.mode.as_str() {
+        LISTEN_MODE_LAN => matches!(ip, IpAddr::V4(ip) if private_ipv4(ip)),
+        LISTEN_MODE_ADDRESS => policy.address.parse::<Ipv4Addr>().map(|wanted| ip == IpAddr::V4(wanted)).unwrap_or(false),
+        _ => false,
+    }
 }
 
 #[derive(Serialize)]
@@ -957,13 +1135,38 @@ struct HttpReq {
     body: Vec<u8>,
 }
 
+fn read_limited_line<R: BufRead>(reader: &mut R, max: usize) -> Result<String, String> {
+    let mut bytes = Vec::new();
+    loop {
+        let buf = reader.fill_buf().map_err(|e| e.to_string())?;
+        if buf.is_empty() {
+            break;
+        }
+        let take = buf
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or(buf.len());
+        if bytes.len().saturating_add(take) > max {
+            return Err("HTTP 行过长".into());
+        }
+        let chunk = buf[..take].to_vec();
+        reader.consume(take);
+        bytes.extend_from_slice(&chunk);
+        if chunk.last() == Some(&b'\n') {
+            break;
+        }
+    }
+    String::from_utf8(bytes).map_err(|_| "HTTP 行不是 UTF-8".into())
+}
+
 fn read_http_request(stream: &mut TcpStream) -> Result<HttpReq, String> {
     stream.set_read_timeout(Some(Duration::from_secs(15))).ok();
     let mut reader = BufReader::new(stream);
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .map_err(|e| e.to_string())?;
+    let request_line = read_limited_line(&mut reader, MAX_HTTP_LINE)?;
+    if request_line.len() > MAX_HTTP_LINE || !request_line.ends_with('\n') {
+        return Err("HTTP 请求行过长或不完整".into());
+    }
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("").to_ascii_uppercase();
     let path = parts
@@ -974,23 +1177,31 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpReq, String> {
         .unwrap_or("/")
         .to_string();
     let mut headers = Vec::new();
+    let mut header_bytes = request_line.len();
     let mut content_length = 0usize;
     loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        let line = read_limited_line(&mut reader, MAX_HTTP_LINE)?;
+        header_bytes = header_bytes.saturating_add(line.len());
+        if header_bytes > MAX_HTTP_HEADERS {
+            return Err("HTTP 请求头过大".into());
+        }
         if line == "\r\n" || line == "\n" || line.is_empty() {
             break;
         }
-        if let Some((k, v)) = line.split_once(':') {
-            let key = k.trim().to_ascii_lowercase();
-            let val = v.trim().to_string();
-            if key == "content-length" {
-                content_length = val.parse().unwrap_or(0);
-            }
-            headers.push((key, val));
+        let Some((k, v)) = line.split_once(':') else {
+            return Err("HTTP 请求头无效".into());
+        };
+        let key = k.trim().to_ascii_lowercase();
+        let val = v.trim().to_string();
+        if key == "content-length" {
+            content_length = val.parse().map_err(|_| "Content-Length 无效".to_string())?;
         }
+        headers.push((key, val));
     }
-    let mut body = vec![0u8; content_length.min(1_000_000)];
+    if content_length > MAX_HTTP_BODY {
+        return Err("HTTP 请求体过大".into());
+    }
+    let mut body = vec![0u8; content_length];
     if !body.is_empty() {
         reader.read_exact(&mut body).map_err(|e| e.to_string())?;
     }
@@ -1016,12 +1227,30 @@ fn write_http_with_session(stream: &mut TcpStream, status: &str, body: &[u8], ca
     let _ = stream.write_all(body);
 }
 
-fn handle_client(mut stream: TcpStream, session: Arc<Mutex<Session>>, mcp: McpState) {
+fn handle_client(
+    mut stream: TcpStream,
+    session: Arc<Mutex<Session>>,
+    mcp: McpState,
+    policy: ListenPolicy,
+    peer_ip: IpAddr,
+    local_ip: IpAddr,
+    generation: u64,
+) {
+    if !mcp.running.load(Ordering::SeqCst) || mcp.generation.load(Ordering::SeqCst) != generation {
+        return;
+    }
     let Ok(req) = read_http_request(&mut stream) else {
         return;
     };
     let port = *recover_lock(&mcp.port);
-    if !host_allowed(&req.headers, port) {
+    if !mcp.running.load(Ordering::SeqCst) || mcp.generation.load(Ordering::SeqCst) != generation {
+        return;
+    }
+    if !peer_allowed(peer_ip, &policy) || !destination_allowed(local_ip, &policy) {
+        write_http(&mut stream, "403 Forbidden", br#"{"ok":false,"error":"address not allowed"}"#);
+        return;
+    }
+    if !host_allowed_with_policy(&req.headers, port, &policy, peer_ip) {
         write_http(
             &mut stream,
             "403 Forbidden",
@@ -1029,16 +1258,24 @@ fn handle_client(mut stream: TcpStream, session: Arc<Mutex<Session>>, mcp: McpSt
         );
         return;
     }
+    if policy.mode != LISTEN_MODE_LOOPBACK && req.path != "/mcp" {
+        write_http(&mut stream, "404 Not Found", br#"{"error":"LAN MCP only serves /mcp"}"#);
+        return;
+    }
+    if req.path != "/mcp" && !req.path.starts_with("/fill") {
+        write_http(&mut stream, "404 Not Found", b"{}");
+        return;
+    }
     if req.method == "OPTIONS" {
         write_http(&mut stream, "405 Method Not Allowed", b"{}");
         return;
     }
-    let auth = req
-        .headers
-        .iter()
-        .find(|(k, _)| k == "authorization")
-        .map(|(_, v)| v.clone())
-        .unwrap_or_default();
+    let mut authorization_headers = req.headers.iter().filter(|(k, _)| k == "authorization");
+    let auth = authorization_headers.next().map(|(_, v)| v.clone()).unwrap_or_default();
+    if authorization_headers.next().is_some() {
+        write_http(&mut stream, "400 Bad Request", br#"{"error":"duplicate authorization"}"#);
+        return;
+    }
     if req.path == "/fill/pair" {
         if req.method != "POST" {
             write_http(&mut stream, "405 Method Not Allowed", b"{}");
@@ -1133,10 +1370,15 @@ fn handle_client(mut stream: TcpStream, session: Arc<Mutex<Session>>, mcp: McpSt
             Err(_)=>{write_http(&mut stream,"429 Too Many Requests",br#"{"error":"too many MCP sessions"}"#);return;}
         }
     } else {
-        let Some(id)=req.headers.iter().find(|(key,_)|key=="mcp-session-id").map(|(_,value)|value.as_str()) else {
+        let mut session_headers = req.headers.iter().filter(|(key, _)| key == "mcp-session-id");
+        let Some((_, id)) = session_headers.next() else {
             write_http(&mut stream,"400 Bad Request",br#"{"error":"Mcp-Session-Id required; initialize first"}"#);
             return;
         };
+        if session_headers.next().is_some() {
+            write_http(&mut stream,"400 Bad Request",br#"{"error":"duplicate Mcp-Session-Id"}"#);
+            return;
+        }
         if mcp.caller_permit(id).is_err() {
             write_http(&mut stream,"404 Not Found",br#"{"error":"MCP session revoked or expired; initialize again"}"#);
             return;
@@ -1152,78 +1394,48 @@ fn handle_client(mut stream: TcpStream, session: Arc<Mutex<Session>>, mcp: McpSt
     }
 }
 
-pub fn start(mcp: &McpState, session: Arc<Mutex<Session>>) -> Result<u16, String> {
-    if mcp.running.load(Ordering::SeqCst) {
-        return Ok(*recover_lock(&mcp.port));
+struct ConnectionGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
-    {
-        let unlocked = lock_session(&session).is_unlocked();
-        if unlocked {
-            {
-                let s = lock_session(&session);
-                if let (Ok(v), Ok(dek)) = (s.vault(), s.dek()) {
-                    if let Ok(Some(tok)) = v.get_secret_setting(dek, "mcp_token") {
-                        if !tok.is_empty() {
-                            *recover_lock(&mcp.token) = tok;
-                        }
-                    }
-                    if let Ok(Some(tok)) = v.get_secret_setting(dek, "fill_token") {
-                        if !tok.is_empty() {
-                            *recover_lock(&mcp.fill_token) = tok;
-                        }
-                    }
-                }
-            }
-            let mut token = recover_lock(&mcp.token);
-            let minted_token = if token.is_empty() {
-                *token = new_token();
-                Some(token.clone())
-            } else {
-                None
-            };
-            drop(token);
-            if let Some(tok) = minted_token {
-                let s = lock_session(&session);
-                if let (Ok(v), Ok(dek)) = (s.vault(), s.dek()) {
-                    let _ = v.set_secret_setting(dek, "mcp_token", &tok);
-                }
-            }
-            let mut fill = recover_lock(&mcp.fill_token);
-            let minted_fill = if fill.is_empty() {
-                *fill = fill::new_fill_token();
-                Some(fill.clone())
-            } else {
-                None
-            };
-            drop(fill);
-            if let Some(tok) = minted_fill {
-                let s = lock_session(&session);
-                if let (Ok(v), Ok(dek)) = (s.vault(), s.dek()) {
-                    let _ = v.set_secret_setting(dek, "fill_token", &tok);
-                }
-            }
-        }
-    }
-    let listener = TcpListener::bind(("127.0.0.1", DEFAULT_PORT))
-        .or_else(|_| TcpListener::bind("127.0.0.1:0"))
-        .map_err(|e| e.to_string())?;
-    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    *recover_lock(&mcp.port) = port;
-    mcp.running.store(true, Ordering::SeqCst);
-    remove_stale_bridge_file();
-    let running = mcp.running.clone();
-    let mcp_accept = mcp.clone();
+}
+
+fn spawn_listener(
+    listener: TcpListener,
+    running: Arc<AtomicBool>,
+    session: Arc<Mutex<Session>>,
+    mcp: McpState,
+    policy: ListenPolicy,
+    generation: u64,
+) -> JoinHandle<()> {
     thread::spawn(move || {
         listener.set_nonblocking(true).ok();
         while running.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((stream, addr)) => {
-                    if !addr.ip().is_loopback() {
+                    let peer_ip = addr.ip();
+                    let local_ip = stream
+                        .local_addr()
+                        .map(|address| address.ip())
+                        .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+                    if !peer_allowed(peer_ip, &policy) || !destination_allowed(local_ip, &policy) {
                         continue;
                     }
+                    let active = mcp.active_connections.fetch_add(1, Ordering::SeqCst);
+                    if active >= MAX_ACTIVE_CONNECTIONS {
+                        mcp.active_connections.fetch_sub(1, Ordering::SeqCst);
+                        continue;
+                    }
+                    let guard = ConnectionGuard(mcp.active_connections.clone());
                     let session = session.clone();
-                    let mcp = mcp_accept.clone();
-                    thread::spawn(move || handle_client(stream, session, mcp));
+                    let mcp = mcp.clone();
+                    let policy = policy.clone();
+                    thread::spawn(move || {
+                        let _guard = guard;
+                        handle_client(stream, session, mcp, policy, peer_ip, local_ip, generation);
+                    });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(50));
@@ -1231,8 +1443,128 @@ pub fn start(mcp: &McpState, session: Arc<Mutex<Session>>) -> Result<u16, String
                 Err(_) => thread::sleep(Duration::from_millis(50)),
             }
         }
-    });
-    Ok(port)
+    })
+}
+
+pub fn start(mcp: &McpState, session: Arc<Mutex<Session>>) -> Result<u16, String> {
+    // Re-evaluate unlock/policy/config on every start request. Startup begins with
+    // loopback before unlock; the subsequent unlock must be able to rebind LAN.
+    if mcp.running.load(Ordering::SeqCst) {
+        stop(mcp);
+    }
+    let (unlocked, enabled) = {
+        let s = lock_session(&session);
+        let unlocked = s.is_unlocked();
+        let enabled = if unlocked {
+            match (s.vault(), s.dek()) {
+                (Ok(vault), Ok(dek)) => crate::zoomkey::mcp_enabled(vault, dek),
+                _ => false,
+            }
+        } else {
+            false
+        };
+        (unlocked, enabled)
+    };
+    if unlocked {
+        {
+            let s = lock_session(&session);
+            if let (Ok(v), Ok(dek)) = (s.vault(), s.dek()) {
+                if let Ok(Some(tok)) = v.get_secret_setting(dek, "mcp_token") {
+                    if !tok.is_empty() {
+                        *recover_lock(&mcp.token) = tok;
+                    }
+                }
+                if let Ok(Some(tok)) = v.get_secret_setting(dek, "fill_token") {
+                    if !tok.is_empty() {
+                        *recover_lock(&mcp.fill_token) = tok;
+                    }
+                }
+            }
+        }
+        let mut token = recover_lock(&mcp.token);
+        let minted_token = if token.is_empty() {
+            *token = new_token();
+            Some(token.clone())
+        } else {
+            None
+        };
+        drop(token);
+        if let Some(tok) = minted_token {
+            let s = lock_session(&session);
+            if let (Ok(v), Ok(dek)) = (s.vault(), s.dek()) {
+                let _ = v.set_secret_setting(dek, "mcp_token", &tok);
+            }
+        }
+        let mut fill = recover_lock(&mcp.fill_token);
+        let minted_fill = if fill.is_empty() {
+            *fill = fill::new_fill_token();
+            Some(fill.clone())
+        } else {
+            None
+        };
+        drop(fill);
+        if let Some(tok) = minted_fill {
+            let s = lock_session(&session);
+            if let (Ok(v), Ok(dek)) = (s.vault(), s.dek()) {
+                let _ = v.set_secret_setting(dek, "fill_token", &tok);
+            }
+        }
+    }
+    // A locked vault or disabled MCP never exposes the configured LAN address.
+    let policy = if unlocked && enabled {
+        mcp.configured_policy()
+    } else {
+        ListenPolicy::loopback()
+    };
+    let loopback_listener = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), DEFAULT_PORT))
+        .or_else(|_| TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)))
+        .map_err(|e| e.to_string())?;
+    let port = loopback_listener.local_addr().map_err(|e| e.to_string())?.port();
+    let mut listeners = vec![(loopback_listener, ListenPolicy::loopback())];
+    let mut bind_error = None;
+    let active_policy = if policy.mode == LISTEN_MODE_LOOPBACK {
+        policy
+    } else {
+        match policy.lan_ip() {
+            Ok(ip) => {
+                let address = ip.to_string();
+                match TcpListener::bind(SocketAddr::new(IpAddr::V4(ip), port)) {
+                    Ok(lan_listener) => {
+                        let mut active = policy;
+                        active.address = address;
+                        listeners.push((lan_listener, active.clone()));
+                        active
+                    }
+                    Err(error) => {
+                        bind_error = Some(format!("无法绑定 MCP 局域网地址 {address}:{port}: {error}"));
+                        ListenPolicy::loopback()
+                    }
+                }
+            }
+            Err(error) => {
+                bind_error = Some(error);
+                ListenPolicy::loopback()
+            }
+        }
+    };
+    *recover_lock(&mcp.port) = port;
+    mcp.set_active_policy(&active_policy);
+    let generation = mcp.generation.fetch_add(1, Ordering::SeqCst).saturating_add(1);
+    mcp.running.store(true, Ordering::SeqCst);
+    remove_stale_bridge_file();
+    let running = mcp.running.clone();
+    let handles = listeners
+        .into_iter()
+        .map(|(listener, listener_policy)| {
+            spawn_listener(listener, running.clone(), session.clone(), mcp.clone(), listener_policy, generation)
+        })
+        .collect::<Vec<_>>();
+    *recover_lock(&mcp.listener_threads) = handles;
+    if let Some(error) = bind_error {
+        Err(error)
+    } else {
+        Ok(port)
+    }
 }
 
 fn remove_stale_bridge_file() {
@@ -1247,8 +1579,14 @@ fn remove_stale_bridge_file() {
 
 pub fn stop(mcp: &McpState) {
     mcp.running.store(false, Ordering::SeqCst);
+    mcp.generation.fetch_add(1, Ordering::SeqCst);
     mcp.close_pairing();
     mcp.invalidate_callers();
+    let handles = std::mem::take(&mut *recover_lock(&mcp.listener_threads));
+    for handle in handles {
+        let _ = handle.join();
+    }
+    mcp.set_active_policy(&ListenPolicy::loopback());
 }
 
 #[cfg(test)]

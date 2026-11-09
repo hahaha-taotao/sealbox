@@ -22,8 +22,7 @@ pub fn register_active_mcp(mcp: &McpState) {
 }
 
 fn sweep_mcp(mcp: &McpState) {
-    mcp.close_pairing();
-    mcp.invalidate_callers();
+    crate::mcp::stop(mcp);
     crate::zoomkey::tls::clear_cache();
     crate::zoomkey::crm::clear_cache();
 }

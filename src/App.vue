@@ -536,6 +536,7 @@ async function saveZoomkeyPolicy(opts: { toggling?: boolean } = {}) {
   zoomkeyBusy.value = true;
   try {
     zoomkeyPolicy.value = await api.zoomkeyPolicySet(zoomkeyPolicy.value);
+    mcp.value = await api.mcpStatus();
     mcpTools.value = await api.mcpTools();
     if (opts.toggling) {
       showToast(zoomkeyPolicy.value.enabled ? "MCP 已启用" : "MCP 已停用");
@@ -591,11 +592,19 @@ const listenAddress = ref("");
 const listenBusy = ref(false);
 async function saveListen() {
   if (listenBusy.value) return;
+  const address = listenAddress.value.trim();
+  if (listenMode.value !== "loopback") {
+    const target = listenMode.value === "address" ? address || "指定私网地址" : "本机自动发现的私网地址";
+    const ok = confirm(
+      `将 MCP 暴露到可信局域网（${target}）。局域网监听无 TLS，Bearer Token 可能被同网段嗅探；远程 git/mail/http 工具会在本机执行，写操作仍需本机确认。仅在隔离可信网络或 VPN 使用，不提供公网访问。继续？`,
+    );
+    if (!ok) return;
+  }
   listenBusy.value = true;
   try {
     mcp.value = await api.mcpListenSet({
       mode: listenMode.value,
-      address: listenAddress.value.trim(),
+      address,
     });
     listenMode.value = mcp.value.listen_mode || listenMode.value;
     listenAddress.value = mcp.value.listen_address || "";
@@ -2896,7 +2905,7 @@ onMounted(async () => {
           </div>
           <div class="mcp-card">
             <h3>Cursor / Claude Code</h3>
-            <p class="crumb">金库锁定时工具会失败并提示先解锁。</p>
+            <p class="crumb">金库锁定时工具会失败并提示先解锁。局域网电脑调用 git 时，path 必须是运行 Sealbox 这台电脑上的绝对路径；push 仍需本机确认。</p>
             <div class="field">
               <label>Bearer Token</label>
               <div class="secret-row">

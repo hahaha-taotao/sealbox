@@ -205,6 +205,25 @@ fn load_bridge_tokens(state: &AppState, session: &Session) {
     apply_bridge_tokens(state, v, dek);
 }
 
+fn apply_mcp_listen_settings(state: &AppState, session: &Session) {
+    let Ok(vault) = session.vault() else {
+        return;
+    };
+    let mode = vault
+        .get_setting("mcp_listen_mode")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| crate::mcp::LISTEN_MODE_LOOPBACK.into());
+    let address = vault
+        .get_setting("mcp_listen_address")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if state.mcp.set_listen_config(&mode, &address).is_err() {
+        let _ = state.mcp.set_listen_config(crate::mcp::LISTEN_MODE_LOOPBACK, "");
+    }
+}
+
 #[derive(Serialize)]
 pub struct Status {
     pub initialized: bool,
@@ -298,6 +317,7 @@ pub fn unlock_vault(
             let _ = vault.purge_expired_trash(chrono::Utc::now(), 30);
             session.set_unlocked(vault, dek);
             apply_vault_settings(&mut session);
+            apply_mcp_listen_settings(&state, &session);
             if let Ok(vault) = session.vault() {
                 crate::auto_sync::refresh_from_vault(&state, vault);
             }
@@ -1048,6 +1068,7 @@ pub fn import_backup(
         {
             let mut session = lock_session(&state.session);
             session.set_unlocked(vault, dek);
+            apply_mcp_listen_settings(&state, &session);
             if let Ok(vault) = session.vault() {
                 crate::auto_sync::refresh_from_vault(&state, vault);
             }
@@ -1175,6 +1196,7 @@ pub fn backup_restore_new(
     {
         let mut session = lock_session(&state.session);
         session.set_unlocked(vault, dek);
+        apply_mcp_listen_settings(&state, &session);
         if let Ok(vault) = session.vault() {
             crate::auto_sync::refresh_from_vault(&state, vault);
         }
@@ -1511,25 +1533,86 @@ pub struct McpStatus {
     pub fill_url: String,
     pub has_token: bool,
     pub has_fill_token: bool,
+    pub listen_mode: String,
+    pub listen_address: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct McpListen {
+    pub mode: String,
+    pub address: String,
 }
 
 fn mcp_status_of(state: &AppState) -> McpStatus {
     let port = *recover_lock(&state.mcp.port);
     let has_token = !recover_lock(&state.mcp.token).is_empty();
     let has_fill_token = !recover_lock(&state.mcp.fill_token).is_empty();
+    let (listen_mode, listen_address) = state.mcp.active_config();
+    let host = state.mcp.active_host();
     McpStatus {
         running: state.mcp.running.load(std::sync::atomic::Ordering::SeqCst),
         port,
-        url: format!("http://127.0.0.1:{port}/mcp"),
+        url: format!("http://{host}:{port}/mcp"),
         fill_url: format!("http://127.0.0.1:{port}/fill"),
         has_token,
         has_fill_token,
+        listen_mode,
+        listen_address,
     }
 }
 
 #[tauri::command]
 pub fn mcp_status(state: State<AppState>) -> McpStatus {
     mcp_status_of(&state)
+}
+
+#[tauri::command]
+pub fn mcp_listen_get(state: State<AppState>) -> Result<McpListen, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let (mode, address) = state.mcp.listen_config();
+    Ok(McpListen { mode, address })
+}
+
+#[tauri::command]
+pub fn mcp_listen_set(state: State<AppState>, input: McpListen) -> Result<McpStatus, String> {
+    let (mode, address) = crate::mcp::normalize_listen_config(&input.mode, &input.address)?;
+    let old = state.mcp.listen_config();
+    let was_running = state.mcp.running.load(std::sync::atomic::Ordering::SeqCst);
+    {
+        let mut session = lock_session(&state.session);
+        session.require_unlocked().map_err(map_err)?;
+        let vault = session.vault().map_err(map_err)?;
+        let dek = session.dek().map_err(map_err)?;
+        if mode != crate::mcp::LISTEN_MODE_LOOPBACK && !crate::zoomkey::mcp_enabled(vault, dek) {
+            return Err("请先启用 MCP，再开放局域网监听".into());
+        }
+        vault
+            .set_setting("mcp_listen_mode", &mode)
+            .map_err(map_err)?;
+        vault
+            .set_setting("mcp_listen_address", &address)
+            .map_err(map_err)?;
+    }
+    state.mcp.set_listen_config(&mode, &address)?;
+    if was_running {
+        mcp::stop(&state.mcp);
+        if let Err(error) = mcp::start(&state.mcp, state.session.clone()) {
+            let _ = state.mcp.set_listen_config(&old.0, &old.1);
+            let mut session = lock_session(&state.session);
+            if let Ok(vault) = session.vault() {
+                let _ = vault.set_setting("mcp_listen_mode", &old.0);
+                let _ = vault.set_setting("mcp_listen_address", &old.1);
+            }
+            drop(session);
+            let _ = mcp::start(&state.mcp, state.session.clone());
+            return Err(error);
+        }
+    }
+    if let Ok(vault) = lock_session(&state.session).vault() {
+        let _ = vault.audit("mcp_listen", None, &format!("mode={mode} address={address}"));
+    }
+    Ok(mcp_status_of(&state))
 }
 
 #[tauri::command]
@@ -1749,13 +1832,30 @@ pub fn zoomkey_policy_set(
     state: State<AppState>,
     policy: ZoomkeyMcpPolicy,
 ) -> Result<ZoomkeyMcpPolicy, String> {
-    let mut session = lock_session(&state.session);
-    session.require_unlocked().map_err(map_err)?;
     let normalized = zoomkey::normalize_policy(policy);
-    let dek = *session.dek().map_err(map_err)?;
-    let vault = session.vault().map_err(map_err)?;
-    zoomkey::save_policy(vault, &dek, &normalized)?;
-    let _ = vault.audit("mcp_zoomkey_policy", None, on_off(normalized.enabled));
+    let previous = {
+        let mut session = lock_session(&state.session);
+        session.require_unlocked().map_err(map_err)?;
+        let dek = *session.dek().map_err(map_err)?;
+        let vault = session.vault().map_err(map_err)?;
+        let previous = zoomkey::load_policy(vault, &dek);
+        zoomkey::save_policy(vault, &dek, &normalized)?;
+        let _ = vault.audit("mcp_zoomkey_policy", None, on_off(normalized.enabled));
+        previous
+    };
+    // Disable keeps the local fill bridge alive but drops all LAN/MCP sessions;
+    // enabling rebinds the configured private address after the session guard is gone.
+    mcp::stop(&state.mcp);
+    if let Err(error) = mcp::start(&state.mcp, state.session.clone()) {
+        let mut session = lock_session(&state.session);
+        if let (Ok(vault), Ok(dek)) = (session.vault(), session.dek()) {
+            let _ = zoomkey::save_policy(vault, dek, &previous);
+        }
+        drop(session);
+        mcp::stop(&state.mcp);
+        let _ = mcp::start(&state.mcp, state.session.clone());
+        return Err(error);
+    }
     Ok(normalized)
 }
 

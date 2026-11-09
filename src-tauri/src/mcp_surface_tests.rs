@@ -160,4 +160,25 @@ fn pairing_code_is_one_shot_and_windowed(){let mcp=McpState::default();let statu
 #[test]
 fn json_tool_results_include_structured_content(){let result=tool_call_result(r#"{"ok":true}"#,false);assert_eq!(result["structuredContent"]["ok"],true);assert!(tool_call_result("not json",false).get("structuredContent").is_none());}
 #[test]
+fn listen_config_accepts_only_private_ipv4(){
+    assert_eq!(normalize_listen_config("loopback", "").unwrap(), ("loopback".into(), "".into()));
+    assert_eq!(normalize_listen_config("lan", "ignored").unwrap(), ("lan".into(), "".into()));
+    assert_eq!(normalize_listen_config("address", "192.168.1.20").unwrap(), ("address".into(), "192.168.1.20".into()));
+    for address in ["127.0.0.1", "0.0.0.0", "169.254.1.1", "8.8.8.8", "::1"] {
+        assert!(normalize_listen_config("address", address).is_err(), "{address} must be rejected");
+    }
+}
+
+#[test]
+fn lan_host_and_peer_policy_is_exact_and_loopback_fill_only(){
+    let policy=ListenPolicy{mode:LISTEN_MODE_LAN.into(),address:"192.168.1.20".into()};
+    let remote="192.168.1.20:17891";
+    assert!(host_allowed_with_policy(&[("host".into(),remote.into())],17891,&policy,"192.168.1.9".parse().unwrap()));
+    assert!(!host_allowed_with_policy(&[("host".into(),"localhost:17891".into())],17891,&policy,"192.168.1.9".parse().unwrap()));
+    assert!(!host_allowed_with_policy(&[("host".into(),remote.into()),("host".into(),"evil:17891".into())],17891,&policy,"192.168.1.9".parse().unwrap()));
+    assert!(peer_allowed("192.168.1.9".parse().unwrap(),&policy));
+    assert!(!peer_allowed("8.8.8.8".parse().unwrap(),&policy));
+}
+
+#[test]
 fn start_while_locked_does_not_mint_tokens(){let mcp=McpState::default();let port=start(&mcp,Arc::new(Mutex::new(Session::default()))).unwrap();assert_ne!(port,0);assert!(recover_lock(&mcp.token).is_empty());assert!(recover_lock(&mcp.fill_token).is_empty());stop(&mcp);}

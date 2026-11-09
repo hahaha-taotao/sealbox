@@ -99,6 +99,8 @@ pub fn run() {
             commands::sync_verify_conditional,
             commands::change_master,
             commands::mcp_status,
+            commands::mcp_listen_get,
+            commands::mcp_listen_set,
             commands::mcp_start,
             commands::mcp_stop,
             commands::mcp_rotate_token,
