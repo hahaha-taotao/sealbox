@@ -15,6 +15,7 @@ pub mod github_mcp;
 pub mod lock;
 pub mod mcp;
 pub mod session;
+pub mod secure_store;
 pub mod transfer;
 pub mod zoomkey;
 
@@ -93,6 +94,8 @@ pub fn run() {
             commands::sync_verify_conditional,
             commands::change_master,
             commands::mcp_status,
+            commands::mcp_listen_get,
+            commands::mcp_listen_set,
             commands::mcp_start,
             commands::mcp_stop,
             commands::mcp_rotate_token,
@@ -198,6 +201,7 @@ pub fn run() {
             let mut startup_hotkey = commands::Settings::default().hotkey;
             if let Some(state) = app.try_state::<AppState>() {
                 if let Ok(path) = commands::vault_path_for(app.handle()) {
+                    crate::mcp::load_persisted_config(&state.mcp, &path);
                     if let Some(hotkey) = commands::persisted_hotkey(&path) {
                         startup_hotkey = hotkey;
                     }

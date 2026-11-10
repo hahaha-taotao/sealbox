@@ -6,16 +6,109 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const DEFAULT_PORT: u16 = 17891;
 const PAIRING_SECS: u64 = 60;
 const PAIRING_MAX_FAILURES: u32 = 5;
+pub const LISTEN_CONFIG_KEY: &str = "mcp_listen_config";
+const LISTEN_MODE_KEY: &str = "mcp_listen_mode";
+const LISTEN_ADDRESS_KEY: &str = "mcp_listen_address";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListenMode {
+    Loopback,
+    Lan,
+    Address,
+}
+
+impl ListenMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Loopback => "loopback",
+            Self::Lan => "lan",
+            Self::Address => "address",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListenConfig {
+    pub mode: ListenMode,
+    pub address: Option<Ipv4Addr>,
+}
+
+impl Default for ListenConfig {
+    fn default() -> Self {
+        Self {
+            mode: ListenMode::Loopback,
+            address: None,
+        }
+    }
+}
+
+impl ListenConfig {
+    pub fn view(self) -> ListenConfigView {
+        ListenConfigView {
+            mode: self.mode.as_str().to_string(),
+            address: self
+                .address
+                .map(|address| address.to_string())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ListenConfigInput {
+    pub mode: String,
+    #[serde(default)]
+    pub address: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ListenConfigView {
+    pub mode: String,
+    pub address: String,
+}
+
+pub fn is_private_ipv4(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    matches!(
+        octets,
+        [10, _, _, _] | [172, 16..=31, _, _] | [192, 168, _, _]
+    )
+}
+
+pub fn parse_listen_config(mode: &str, address: &str) -> Result<ListenConfig, String> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "loopback" => Ok(ListenConfig::default()),
+        "lan" => Ok(ListenConfig {
+            mode: ListenMode::Lan,
+            address: None,
+        }),
+        "address" => {
+            let raw = address.trim();
+            let parsed = raw
+                .parse::<Ipv4Addr>()
+                .map_err(|_| "监听地址必须是 IPv4 地址".to_string())?;
+            if !is_private_ipv4(parsed) {
+                return Err("监听地址必须是本机私有 IPv4 地址".into());
+            }
+            Ok(ListenConfig {
+                mode: ListenMode::Address,
+                address: Some(parsed),
+            })
+        }
+        _ => Err("监听模式必须是 loopback、lan 或 address".into()),
+    }
+}
 
 struct PairingWindow {
     code: String,
@@ -29,6 +122,13 @@ pub struct McpState {
     pub port: Arc<Mutex<u16>>,
     pub token: Arc<Mutex<String>>,
     pub fill_token: Arc<Mutex<String>>,
+    bound_host: Arc<Mutex<Ipv4Addr>>,
+    configured: Arc<Mutex<ListenConfig>>,
+    effective: Arc<Mutex<ListenConfig>>,
+    locked: Arc<AtomicBool>,
+    restart_on_lock: Arc<AtomicBool>,
+    listener_epoch: Arc<AtomicU64>,
+    listener_thread: Arc<Mutex<Option<JoinHandle<()>>>>,
     pairing: Arc<Mutex<Option<PairingWindow>>>,
 }
 
@@ -39,6 +139,13 @@ impl Default for McpState {
             port: Arc::new(Mutex::new(DEFAULT_PORT)),
             token: Arc::new(Mutex::new(String::new())),
             fill_token: Arc::new(Mutex::new(String::new())),
+            bound_host: Arc::new(Mutex::new(Ipv4Addr::LOCALHOST)),
+            configured: Arc::new(Mutex::new(ListenConfig::default())),
+            effective: Arc::new(Mutex::new(ListenConfig::default())),
+            locked: Arc::new(AtomicBool::new(true)),
+            restart_on_lock: Arc::new(AtomicBool::new(false)),
+            listener_epoch: Arc::new(AtomicU64::new(0)),
+            listener_thread: Arc::new(Mutex::new(None)),
             pairing: Arc::new(Mutex::new(None)),
         }
     }
@@ -69,13 +176,26 @@ fn constant_eq(a: &str, b: &str) -> bool {
         == 0
 }
 
-fn host_allowed(headers: &[(String, String)], port: u16) -> bool {
+fn host_allowed(headers: &[(String, String)], local: SocketAddr) -> bool {
     let host = headers
         .iter()
         .find(|(k, _)| k == "host")
         .map(|(_, v)| v.trim().to_ascii_lowercase())
         .unwrap_or_default();
-    host == format!("127.0.0.1:{port}")
+    host == local.to_string().to_ascii_lowercase()
+}
+
+fn peer_allowed(peer: SocketAddr, local: SocketAddr) -> bool {
+    let IpAddr::V4(local_ip) = local.ip() else {
+        return false;
+    };
+    let IpAddr::V4(peer_ip) = peer.ip() else {
+        return false;
+    };
+    if local_ip.is_loopback() {
+        return peer_ip.is_loopback();
+    }
+    is_private_ipv4(local_ip) && is_private_ipv4(peer_ip)
 }
 
 #[derive(Serialize)]
@@ -151,6 +271,26 @@ impl McpState {
 
     pub fn close_pairing(&self) {
         *recover_lock(&self.pairing) = None;
+    }
+
+    pub fn configured(&self) -> ListenConfig {
+        *recover_lock(&self.configured)
+    }
+
+    pub fn effective(&self) -> ListenConfig {
+        *recover_lock(&self.effective)
+    }
+
+    pub fn bound_host(&self) -> Ipv4Addr {
+        *recover_lock(&self.bound_host)
+    }
+
+    fn set_configured(&self, config: ListenConfig) {
+        *recover_lock(&self.configured) = config;
+    }
+
+    fn set_effective(&self, config: ListenConfig) {
+        *recover_lock(&self.effective) = config;
     }
 }
 
@@ -659,12 +799,14 @@ fn call_tool(
     name: &str,
     args: Value,
 ) -> Result<String, String> {
-    {
+    let locked = {
         let mut s = lock_session(session);
-        idle_lock_if_needed(&mut s, mcp);
-        if !s.is_unlocked() {
-            return Err("金库已锁定。请先在 Sealbox 窗口解锁，再让我重试。".into());
-        }
+        let idle_locked = idle_lock_if_needed(&mut s, mcp);
+        idle_locked || !s.is_unlocked()
+    };
+    if locked {
+        let _ = crate::mcp::rebind_locked(mcp);
+        return Err("金库已锁定。请先在 Sealbox 窗口解锁，再让我重试。".into());
     }
     if github_mcp::is_github_tool(name) {
         if crate::git_workspace::is_git_tool(name) {
@@ -819,15 +961,34 @@ fn write_http(stream: &mut TcpStream, status: &str, body: &[u8]) {
 }
 
 fn handle_client(mut stream: TcpStream, session: Arc<Mutex<Session>>, mcp: McpState) {
+    let (Ok(local), Ok(peer)) = (stream.local_addr(), stream.peer_addr()) else {
+        return;
+    };
+    if !peer_allowed(peer, local) {
+        write_http(
+            &mut stream,
+            "403 Forbidden",
+            br#"{"ok":false,"error":"invalid peer"}"#,
+        );
+        return;
+    }
     let Ok(req) = read_http_request(&mut stream) else {
         return;
     };
     let port = *recover_lock(&mcp.port);
-    if !host_allowed(&req.headers, port) {
+    if !host_allowed(&req.headers, local) {
         write_http(
             &mut stream,
             "403 Forbidden",
             br#"{"ok":false,"error":"invalid host"}"#,
+        );
+        return;
+    }
+    if mcp.locked.load(Ordering::SeqCst) {
+        write_http(
+            &mut stream,
+            "403 Forbidden",
+            br#"{"ok":false,"error":"vault locked"}"#,
         );
         return;
     }
@@ -859,6 +1020,14 @@ fn handle_client(mut stream: TcpStream, session: Arc<Mutex<Session>>, mcp: McpSt
         let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("");
         match mcp.consume_pairing(code) {
             Ok(()) => {
+                if mcp.locked.load(Ordering::SeqCst) || !lock_session(&session).is_unlocked() {
+                    write_http(
+                        &mut stream,
+                        "403 Forbidden",
+                        br#"{"ok":false,"error":"vault locked"}"#,
+                    );
+                    return;
+                }
                 let fill_token = recover_lock(&mcp.fill_token).clone();
                 let body = serde_json::to_vec(&json!({
                     "ok": true,
@@ -937,75 +1106,137 @@ fn handle_client(mut stream: TcpStream, session: Arc<Mutex<Session>>, mcp: McpSt
     }
 }
 
-pub fn start(mcp: &McpState, session: Arc<Mutex<Session>>) -> Result<u16, String> {
-    if mcp.running.load(Ordering::SeqCst) {
-        return Ok(*recover_lock(&mcp.port));
-    }
-    {
-        let unlocked = lock_session(&session).is_unlocked();
-        if unlocked {
-            {
-                let s = lock_session(&session);
-                if let (Ok(v), Ok(dek)) = (s.vault(), s.dek()) {
-                    if let Ok(Some(tok)) = v.get_secret_setting(dek, "mcp_token") {
-                        if !tok.is_empty() {
-                            *recover_lock(&mcp.token) = tok;
-                        }
-                    }
-                    if let Ok(Some(tok)) = v.get_secret_setting(dek, "fill_token") {
-                        if !tok.is_empty() {
-                            *recover_lock(&mcp.fill_token) = tok;
-                        }
-                    }
-                }
-            }
-            let mut token = recover_lock(&mcp.token);
-            let minted_token = if token.is_empty() {
-                *token = new_token();
-                Some(token.clone())
-            } else {
-                None
-            };
-            drop(token);
-            if let Some(tok) = minted_token {
-                let s = lock_session(&session);
-                if let (Ok(v), Ok(dek)) = (s.vault(), s.dek()) {
-                    let _ = v.set_secret_setting(dek, "mcp_token", &tok);
-                }
-            }
-            let mut fill = recover_lock(&mcp.fill_token);
-            let minted_fill = if fill.is_empty() {
-                *fill = fill::new_fill_token();
-                Some(fill.clone())
-            } else {
-                None
-            };
-            drop(fill);
-            if let Some(tok) = minted_fill {
-                let s = lock_session(&session);
-                if let (Ok(v), Ok(dek)) = (s.vault(), s.dek()) {
-                    let _ = v.set_secret_setting(dek, "fill_token", &tok);
-                }
+fn persisted_config(vault: &crate::vault::Vault) -> ListenConfig {
+    if let Ok(Some(raw)) = vault.get_setting(LISTEN_CONFIG_KEY) {
+        if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+            let mode = value.get("mode").and_then(Value::as_str).unwrap_or("");
+            let address = value.get("address").and_then(Value::as_str).unwrap_or("");
+            if let Ok(config) = parse_listen_config(mode, address) {
+                return config;
             }
         }
     }
-    let listener = TcpListener::bind(("127.0.0.1", DEFAULT_PORT))
-        .or_else(|_| TcpListener::bind("127.0.0.1:0"))
-        .map_err(|e| e.to_string())?;
-    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    // Read the pre-release split keys for a one-time backwards-compatible
+    // migration; subsequent saves use the single atomic JSON setting.
+    let mode = vault
+        .get_setting(LISTEN_MODE_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "loopback".into());
+    let address = vault
+        .get_setting(LISTEN_ADDRESS_KEY)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    parse_listen_config(&mode, &address).unwrap_or_default()
+}
+
+/// Read the non-secret preference before unlocking. Invalid or legacy values
+/// fail closed to the loopback default and are never used to open a socket.
+pub fn load_persisted_config(mcp: &McpState, path: &Path) {
+    if let Ok(vault) = crate::vault::Vault::open(path.to_str().unwrap_or_default()) {
+        mcp.set_configured(persisted_config(&vault));
+    }
+}
+
+fn load_session_config(mcp: &McpState, session: &Arc<Mutex<Session>>) {
+    let s = lock_session(session);
+    if let Ok(vault) = s.vault() {
+        mcp.set_configured(persisted_config(vault));
+    }
+}
+
+fn lan_bind_ip() -> Result<Ipv4Addr, String> {
+    use std::net::UdpSocket;
+    // UDP connect asks the OS routing table for the source address without
+    // sending a packet. Try representative RFC1918 destinations and refuse
+    // to fall back to 0.0.0.0, which could expose a public interface.
+    for target in [
+        "10.0.0.1:9",
+        "10.255.255.254:9",
+        "172.16.0.1:9",
+        "172.31.255.254:9",
+        "192.168.0.1:9",
+        "192.168.1.1:9",
+        "192.168.255.254:9",
+    ] {
+        let Ok(socket) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
+            continue;
+        };
+        if socket.connect(target).is_err() {
+            continue;
+        }
+        let Ok(SocketAddr::V4(local)) = socket.local_addr() else {
+            continue;
+        };
+        if is_private_ipv4(*local.ip()) {
+            return Ok(*local.ip());
+        }
+    }
+    Err("未找到本机私网 IPv4 地址，请改用 address 模式".into())
+}
+
+fn bind_ip(config: ListenConfig) -> Result<Ipv4Addr, String> {
+    match config.mode {
+        ListenMode::Loopback => Ok(Ipv4Addr::LOCALHOST),
+        ListenMode::Lan => lan_bind_ip(),
+        ListenMode::Address => config
+            .address
+            .filter(|address| is_private_ipv4(*address))
+            .ok_or_else(|| "监听地址必须是本机私有 IPv4 地址".into()),
+    }
+}
+
+fn stop_signal(mcp: &McpState, preserve_lock_restart: bool) {
+    let was_running = mcp.running.swap(false, Ordering::SeqCst);
+    if preserve_lock_restart && was_running {
+        mcp.restart_on_lock.store(true, Ordering::SeqCst);
+    }
+    mcp.listener_epoch.fetch_add(1, Ordering::SeqCst);
+    mcp.close_pairing();
+}
+
+fn join_listener(mcp: &McpState) {
+    let handle = recover_lock(&mcp.listener_thread).take();
+    let Some(handle) = handle else {
+        return;
+    };
+    if handle.thread().id() != thread::current().id() {
+        let _ = handle.join();
+    }
+}
+
+fn bind_and_spawn(
+    mcp: &McpState,
+    config: ListenConfig,
+    session: Arc<Mutex<Session>>,
+    unlocked: bool,
+) -> Result<u16, String> {
+    let ip = bind_ip(config)?;
+    let requested = SocketAddr::new(IpAddr::V4(ip), DEFAULT_PORT);
+    let listener = TcpListener::bind(requested)
+        .or_else(|_| TcpListener::bind(SocketAddr::new(IpAddr::V4(ip), 0)))
+        .map_err(|error| format!("无法绑定 MCP 监听地址 {requested}: {error}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("无法配置 MCP 监听器: {error}"))?;
+    let local_addr = listener.local_addr().map_err(|e| e.to_string())?;
+    let port = local_addr.port();
     *recover_lock(&mcp.port) = port;
+    *recover_lock(&mcp.bound_host) = ip;
+    mcp.set_effective(config);
+    mcp.locked.store(!unlocked, Ordering::SeqCst);
+    mcp.restart_on_lock.store(false, Ordering::SeqCst);
     mcp.running.store(true, Ordering::SeqCst);
+    let epoch = mcp.listener_epoch.fetch_add(1, Ordering::SeqCst) + 1;
     remove_stale_bridge_file();
     let running = mcp.running.clone();
+    let listener_epoch = mcp.listener_epoch.clone();
     let mcp_accept = mcp.clone();
-    thread::spawn(move || {
-        listener.set_nonblocking(true).ok();
-        while running.load(Ordering::SeqCst) {
+    let handle = thread::spawn(move || {
+        while running.load(Ordering::SeqCst) && listener_epoch.load(Ordering::SeqCst) == epoch {
             match listener.accept() {
-                Ok((stream, addr)) => {
-                    if !addr.ip().is_loopback() {
-                        continue;
-                    }
+                Ok((stream, _addr)) => {
                     let session = session.clone();
                     let mcp = mcp_accept.clone();
                     thread::spawn(move || handle_client(stream, session, mcp));
@@ -1017,7 +1248,133 @@ pub fn start(mcp: &McpState, session: Arc<Mutex<Session>>) -> Result<u16, String
             }
         }
     });
+    *recover_lock(&mcp.listener_thread) = Some(handle);
     Ok(port)
+}
+
+fn hydrate_tokens(mcp: &McpState, session: &Arc<Mutex<Session>>) {
+    // A vault switch or failed secret read must never leave the previous
+    // vault's bearer tokens in memory.
+    recover_lock(&mcp.token).clear();
+    recover_lock(&mcp.fill_token).clear();
+    let mut loaded = None;
+    {
+        let s = lock_session(session);
+        if let (Ok(vault), Ok(dek)) = (s.vault(), s.dek()) {
+            let mcp_token = vault
+                .get_secret_setting(dek, "mcp_token")
+                .ok()
+                .flatten()
+                .filter(|token| !token.is_empty());
+            let fill_token = vault
+                .get_secret_setting(dek, "fill_token")
+                .ok()
+                .flatten()
+                .filter(|token| !token.is_empty());
+            loaded = Some((mcp_token, fill_token));
+        }
+    }
+    let (mut mcp_token, mut fill_token) = loaded.unwrap_or((None, None));
+    if mcp_token.is_none() {
+        mcp_token = Some(new_token());
+    }
+    if fill_token.is_none() {
+        fill_token = Some(fill::new_fill_token());
+    }
+    let mcp_token = mcp_token.unwrap_or_default();
+    let fill_token = fill_token.unwrap_or_default();
+    *recover_lock(&mcp.token) = mcp_token.clone();
+    *recover_lock(&mcp.fill_token) = fill_token.clone();
+    let s = lock_session(session);
+    if let (Ok(vault), Ok(dek)) = (s.vault(), s.dek()) {
+        let _ = vault.set_secret_setting(dek, "mcp_token", &mcp_token);
+        let _ = vault.set_secret_setting(dek, "fill_token", &fill_token);
+    }
+}
+
+fn restart_with_config(
+    mcp: &McpState,
+    config: ListenConfig,
+    session: Arc<Mutex<Session>>,
+    unlocked: bool,
+) -> Result<u16, String> {
+    if mcp.running.load(Ordering::SeqCst) {
+        stop_signal(mcp, false);
+    }
+    join_listener(mcp);
+    bind_and_spawn(mcp, config, session, unlocked)
+}
+
+pub fn apply_listen_config(
+    mcp: &McpState,
+    session: Arc<Mutex<Session>>,
+    config: ListenConfig,
+) -> Result<u16, String> {
+    if !lock_session(&session).is_unlocked() {
+        return Err("请先解锁金库再保存监听设置".into());
+    }
+    let previous = mcp.configured();
+    let previous_effective = mcp.effective();
+    let previous_locked = mcp.locked.load(Ordering::SeqCst);
+    let was_running = mcp.running.load(Ordering::SeqCst);
+    mcp.set_configured(config);
+    mcp.locked.store(false, Ordering::SeqCst);
+    if was_running && previous_effective == config {
+        return Ok(*recover_lock(&mcp.port));
+    }
+    match restart_with_config(mcp, config, session.clone(), true) {
+        Ok(port) => Ok(port),
+        Err(error) => {
+            mcp.set_configured(previous);
+            mcp.locked.store(previous_locked, Ordering::SeqCst);
+            mcp.set_effective(previous_effective);
+            if was_running {
+                let _ = restart_with_config(mcp, previous_effective, session, !previous_locked);
+            }
+            Err(error)
+        }
+    }
+}
+
+pub fn start(mcp: &McpState, session: Arc<Mutex<Session>>) -> Result<u16, String> {
+    let unlocked = lock_session(&session).is_unlocked();
+    if unlocked {
+        load_session_config(mcp, &session);
+        hydrate_tokens(mcp, &session);
+        mcp.locked.store(false, Ordering::SeqCst);
+    } else {
+        mcp.locked.store(true, Ordering::SeqCst);
+    }
+    let desired = if unlocked {
+        mcp.configured()
+    } else {
+        ListenConfig::default()
+    };
+    if mcp.running.load(Ordering::SeqCst) && mcp.effective() == desired {
+        return Ok(*recover_lock(&mcp.port));
+    }
+    restart_with_config(mcp, desired, session, unlocked)
+}
+
+/// Signal the locked state without waiting for the listener thread. This is
+/// safe to call from Session::lock while its mutex is held.
+pub fn signal_locked(mcp: &McpState) {
+    mcp.locked.store(true, Ordering::SeqCst);
+    stop_signal(mcp, true);
+    mcp.set_effective(ListenConfig::default());
+    *recover_lock(&mcp.bound_host) = Ipv4Addr::LOCALHOST;
+}
+
+/// Rebind a previously running listener to loopback after the session mutex
+/// has been released. It never uses the persisted LAN/address preference.
+pub fn rebind_locked(mcp: &McpState) -> Result<u16, String> {
+    mcp.locked.store(true, Ordering::SeqCst);
+    if !mcp.restart_on_lock.swap(false, Ordering::SeqCst) {
+        return Ok(*recover_lock(&mcp.port));
+    }
+    let session = crate::lock::active_session()
+        .unwrap_or_else(|| Arc::new(Mutex::new(Session::default())));
+    restart_with_config(mcp, ListenConfig::default(), session, false)
 }
 
 fn remove_stale_bridge_file() {
@@ -1031,8 +1388,9 @@ fn remove_stale_bridge_file() {
 }
 
 pub fn stop(mcp: &McpState) {
-    mcp.running.store(false, Ordering::SeqCst);
-    mcp.close_pairing();
+    stop_signal(mcp, false);
+    mcp.restart_on_lock.store(false, Ordering::SeqCst);
+    join_listener(mcp);
 }
 
 #[cfg(test)]
@@ -1109,16 +1467,45 @@ mod tests {
     }
 
     #[test]
-    fn host_must_be_loopback_with_port() {
+    fn host_and_peer_match_actual_bound_address() {
+        let local = "127.0.0.1:17891".parse::<SocketAddr>().unwrap();
+        let peer = "127.0.0.1:50000".parse::<SocketAddr>().unwrap();
         assert!(host_allowed(
             &[("host".into(), "127.0.0.1:17891".into())],
-            17891
+            local
         ));
         assert!(!host_allowed(
             &[("host".into(), "localhost:17891".into())],
-            17891
+            local
         ));
-        assert!(!host_allowed(&[], 17891));
+        assert!(!host_allowed(&[], local));
+        assert!(peer_allowed(peer, local));
+        assert!(!peer_allowed(
+            "192.168.1.20:50000".parse().unwrap(),
+            local
+        ));
+        let lan = "192.168.1.20:17891".parse::<SocketAddr>().unwrap();
+        assert!(peer_allowed(
+            "192.168.1.30:50000".parse().unwrap(),
+            lan
+        ));
+        assert!(!peer_allowed("8.8.8.8:50000".parse().unwrap(), lan));
+    }
+
+    #[test]
+    fn listen_config_rejects_non_private_address() {
+        assert_eq!(parse_listen_config("loopback", "").unwrap(), ListenConfig::default());
+        assert_eq!(
+            parse_listen_config("lan", "").unwrap(),
+            ListenConfig { mode: ListenMode::Lan, address: None }
+        );
+        assert_eq!(
+            parse_listen_config("address", "192.168.1.20").unwrap(),
+            ListenConfig { mode: ListenMode::Address, address: Some("192.168.1.20".parse().unwrap()) }
+        );
+        for address in ["127.0.0.1", "0.0.0.0", "8.8.8.8", "224.0.0.1", "172.15.0.1"] {
+            assert!(parse_listen_config("address", address).is_err(), "{address}");
+        }
     }
 
     #[test]
