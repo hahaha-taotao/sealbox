@@ -86,6 +86,17 @@ pub fn is_private_ipv4(address: Ipv4Addr) -> bool {
     )
 }
 
+/// Tailscale IPv4 addresses come from the shared CGNAT range 100.64.0.0/10.
+/// Keep this separate from RFC1918 so peer checks cannot mix the two network
+/// classes accidentally.
+pub fn is_tailscale_ipv4(address: Ipv4Addr) -> bool {
+    matches!(address.octets(), [100, 64..=127, _, _])
+}
+
+fn is_listenable_ipv4(address: Ipv4Addr) -> bool {
+    is_private_ipv4(address) || is_tailscale_ipv4(address)
+}
+
 pub fn parse_listen_config(mode: &str, address: &str) -> Result<ListenConfig, String> {
     match mode.trim().to_ascii_lowercase().as_str() {
         "loopback" => Ok(ListenConfig::default()),
@@ -98,8 +109,8 @@ pub fn parse_listen_config(mode: &str, address: &str) -> Result<ListenConfig, St
             let parsed = raw
                 .parse::<Ipv4Addr>()
                 .map_err(|_| "监听地址必须是 IPv4 地址".to_string())?;
-            if !is_private_ipv4(parsed) {
-                return Err("监听地址必须是本机私有 IPv4 地址".into());
+            if !is_listenable_ipv4(parsed) {
+                return Err("监听地址必须是本机私有或 Tailscale IPv4 地址".into());
             }
             Ok(ListenConfig {
                 mode: ListenMode::Address,
@@ -194,6 +205,9 @@ fn peer_allowed(peer: SocketAddr, local: SocketAddr) -> bool {
     };
     if local_ip.is_loopback() {
         return peer_ip.is_loopback();
+    }
+    if is_tailscale_ipv4(local_ip) {
+        return is_tailscale_ipv4(peer_ip);
     }
     is_private_ipv4(local_ip) && is_private_ipv4(peer_ip)
 }
@@ -1182,8 +1196,8 @@ fn bind_ip(config: ListenConfig) -> Result<Ipv4Addr, String> {
         ListenMode::Lan => lan_bind_ip(),
         ListenMode::Address => config
             .address
-            .filter(|address| is_private_ipv4(*address))
-            .ok_or_else(|| "监听地址必须是本机私有 IPv4 地址".into()),
+            .filter(|address| is_listenable_ipv4(*address))
+            .ok_or_else(|| "监听地址必须是本机私有或 Tailscale IPv4 地址".into()),
     }
 }
 
@@ -1490,10 +1504,32 @@ mod tests {
             lan
         ));
         assert!(!peer_allowed("8.8.8.8:50000".parse().unwrap(), lan));
+
+        let tailscale = "100.124.254.40:17891".parse::<SocketAddr>().unwrap();
+        assert!(peer_allowed(
+            "100.125.1.2:50000".parse().unwrap(),
+            tailscale
+        ));
+        assert!(!peer_allowed(
+            "192.168.1.30:50000".parse().unwrap(),
+            tailscale
+        ));
+        assert!(!peer_allowed(
+            "100.125.1.2:50000".parse().unwrap(),
+            lan
+        ));
+        assert!(!peer_allowed(
+            "100.125.1.2:50000".parse().unwrap(),
+            "8.8.8.8:17891".parse().unwrap()
+        ));
     }
 
     #[test]
-    fn listen_config_rejects_non_private_address() {
+    fn listen_config_allows_tailscale_but_rejects_non_local_ranges() {
+        assert!(is_tailscale_ipv4("100.124.254.40".parse().unwrap()));
+        assert!(!is_private_ipv4("100.124.254.40".parse().unwrap()));
+        assert!(!is_tailscale_ipv4("100.63.255.255".parse().unwrap()));
+        assert!(!is_tailscale_ipv4("100.128.0.1".parse().unwrap()));
         assert_eq!(parse_listen_config("loopback", "").unwrap(), ListenConfig::default());
         assert_eq!(
             parse_listen_config("lan", "").unwrap(),
@@ -1503,7 +1539,11 @@ mod tests {
             parse_listen_config("address", "192.168.1.20").unwrap(),
             ListenConfig { mode: ListenMode::Address, address: Some("192.168.1.20".parse().unwrap()) }
         );
-        for address in ["127.0.0.1", "0.0.0.0", "8.8.8.8", "224.0.0.1", "172.15.0.1"] {
+        assert_eq!(
+            parse_listen_config("address", "100.124.254.40").unwrap(),
+            ListenConfig { mode: ListenMode::Address, address: Some("100.124.254.40".parse().unwrap()) }
+        );
+        for address in ["127.0.0.1", "0.0.0.0", "8.8.8.8", "224.0.0.1", "172.15.0.1", "100.63.255.255", "100.128.0.1"] {
             assert!(parse_listen_config("address", address).is_err(), "{address}");
         }
     }

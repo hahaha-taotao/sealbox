@@ -2852,18 +2852,18 @@ onMounted(async () => {
           </div>
           <div class="mcp-card">
             <h3>监听范围</h3>
-            <p class="crumb">默认只允许本机。局域网没有 TLS，只在可信网络打开。不提供公网。锁定金库后会退回仅本机。</p>
+            <p class="crumb">默认只允许本机。局域网没有 TLS，只在可信网络打开。不提供公网。可在指定地址中填写 Tailscale 100.64.0.0/10；自动局域网模式只选择 RFC1918 地址。锁定金库后会退回仅本机。</p>
             <div class="field">
               <label>模式</label>
               <select v-model="listenMode">
                 <option value="loopback">仅本机 127.0.0.1</option>
-                <option value="lan">局域网（私网地址）</option>
-                <option value="address">指定局域网地址</option>
+                <option value="lan">局域网（自动选择 RFC1918 地址）</option>
+                <option value="address">指定私网 / Tailscale 地址</option>
               </select>
             </div>
             <div class="field" v-if="listenMode === 'address'">
-              <label>本机局域网 IPv4</label>
-              <input v-model="listenAddress" placeholder="192.168.1.20" />
+              <label>本机私网 / Tailscale IPv4</label>
+              <input v-model="listenAddress" placeholder="192.168.1.20 或 100.124.254.40" />
             </div>
             <button class="btn" type="button" :disabled="listenBusy" @click="saveListen">
               {{ listenBusy ? "应用中…" : "保存并应用" }}
