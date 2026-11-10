@@ -5,6 +5,7 @@ use crate::backup::{
 use crate::clipboard;
 use crate::lock::{idle_lock_if_needed, lock_everything, lock_session, recover_lock};
 use crate::mcp::{self, McpState};
+use crate::secure_store;
 use crate::session::Session;
 use crate::sync::{self, SyncConfig, SyncKind, SyncReport, SyncView};
 use crate::totp::{generate_passphrase, generate_password_with_options, ssh_fingerprint, totp_now};
@@ -154,6 +155,9 @@ fn settings_from_vault(vault: &Vault) -> Settings {
     })
 }
 
+const AUTO_UNLOCK_MARKER_KEY: &str = "auto_unlock_dek_check";
+const AUTO_UNLOCK_MARKER: &str = "sealbox-auto-unlock-v1";
+
 fn apply_vault_settings(session: &mut Session) {
     let Ok(vault) = session.vault() else {
         return;
@@ -163,6 +167,70 @@ fn apply_vault_settings(session: &mut Session) {
     session.clipboard_secs = settings.clipboard_secs;
     session.hotkey = settings.hotkey;
     session.auto_lock = settings.auto_lock;
+}
+
+/// The DEK is persisted only while automatic locking is disabled.  The marker
+/// is encrypted with the DEK and prevents an arbitrary 32-byte credential from
+/// opening an empty vault (which has no encrypted entry to authenticate).
+fn sync_auto_unlock_credential(session: &Session) {
+    let Ok(vault) = session.vault() else {
+        return;
+    };
+    let Ok(dek) = session.dek() else {
+        return;
+    };
+    if session.auto_lock {
+        let _ = secure_store::clear_dek();
+        return;
+    }
+    let marker_ok = vault
+        .get_secret_setting(dek, AUTO_UNLOCK_MARKER_KEY)
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some(AUTO_UNLOCK_MARKER);
+    if !marker_ok {
+        if vault
+            .set_secret_setting(dek, AUTO_UNLOCK_MARKER_KEY, AUTO_UNLOCK_MARKER)
+            .is_err()
+        {
+            let _ = secure_store::clear_dek();
+            return;
+        }
+    }
+    let _ = secure_store::save_dek(dek);
+}
+
+/// Restore a DEK from the OS credential store only when the persisted vault
+/// setting explicitly disables automatic locking.  Any stale or malformed
+/// credential is removed before falling back to the password screen.
+fn restore_auto_unlock(path: &Path, session: &mut Session) -> bool {
+    if session.is_unlocked() {
+        return true;
+    }
+    let Ok(vault) = Vault::open(path.to_str().unwrap_or_default()) else {
+        return false;
+    };
+    if settings_from_vault(&vault).auto_lock {
+        let _ = secure_store::clear_dek();
+        return false;
+    }
+    let Ok(Some(dek)) = secure_store::load_dek() else {
+        return false;
+    };
+    let marker_ok = vault
+        .get_secret_setting(&dek, AUTO_UNLOCK_MARKER_KEY)
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some(AUTO_UNLOCK_MARKER);
+    if !marker_ok {
+        let _ = secure_store::clear_dek();
+        return false;
+    }
+    session.set_unlocked(vault, dek);
+    apply_vault_settings(session);
+    true
 }
 
 fn persist_session_settings(session: &Session) -> Result<(), String> {
@@ -236,25 +304,39 @@ pub fn get_status(app: AppHandle, state: State<AppState>) -> Result<Status, Stri
     let path = vault_path(&app)?;
     *recover_lock(&state.db_path) = Some(path.clone());
     let initialized = Vault::is_initialized(path.to_str().unwrap_or_default());
-    let mut session = lock_session(&state.session);
-    // Status is polled by the window, including the call that paints settings
-    // right after unlock. Idle lock stays on the security clock; this read must
-    // not treat a just-unlocked vault as already idle.
-    let unlocked = session.is_unlocked();
-    if initialized && unlocked {
-        bind_open_vault(&mut session, &path);
-    }
-    if initialized && unlocked {
-        load_bridge_tokens(&state, &session);
-    }
-    if unlocked {
-        apply_vault_settings(&mut session);
-    }
-    let counts = if unlocked {
-        session.vault().ok().and_then(|v| v.counts().ok())
-    } else {
-        None
+    let (unlocked, counts) = {
+        let mut session = lock_session(&state.session);
+        if initialized && !session.is_unlocked() {
+            // Reopening the app after a process restart may restore only the DEK
+            // from the OS credential store. The master password is never persisted.
+            restore_auto_unlock(&path, &mut session);
+        }
+        // Status is polled by the window, including the call that paints settings
+        // right after unlock. Idle lock stays on the security clock; this read must
+        // not treat a just-unlocked vault as already idle.
+        let unlocked = session.is_unlocked();
+        if initialized && unlocked {
+            bind_open_vault(&mut session, &path);
+            load_bridge_tokens(&state, &session);
+            if let Ok(vault) = session.vault() {
+                crate::auto_sync::refresh_from_vault(&state, vault);
+            }
+        }
+        if unlocked {
+            apply_vault_settings(&mut session);
+        }
+        let counts = if unlocked {
+            session.vault().ok().and_then(|v| v.counts().ok())
+        } else {
+            None
+        };
+        (unlocked, counts)
     };
+    // Auto-unlock can occur after startup already created a loopback listener;
+    // reconcile the persisted preferred scope only after releasing session.
+    if unlocked {
+        let _ = mcp::start(&state.mcp, state.session.clone());
+    }
     Ok(Status {
         initialized,
         unlocked,
@@ -294,6 +376,7 @@ pub fn setup_vault(app: AppHandle, state: State<AppState>, password: String) -> 
     let vault = Vault::open(path.to_str().unwrap()).map_err(map_err)?;
     let mut session = lock_session(&state.session);
     session.set_unlocked(vault, dek);
+    sync_auto_unlock_credential(&session);
     drop(session);
     hydrate_bridge_tokens(&state);
     let _ = mcp::start(&state.mcp, state.session.clone());
@@ -318,6 +401,7 @@ pub fn unlock_vault(
             session.set_unlocked(vault, dek);
             apply_vault_settings(&mut session);
             apply_mcp_listen_settings(&state, &session);
+            sync_auto_unlock_credential(&session);
             if let Ok(vault) = session.vault() {
                 crate::auto_sync::refresh_from_vault(&state, vault);
             }
@@ -329,6 +413,7 @@ pub fn unlock_vault(
         }
         Err(e) => {
             let _ = vault.audit("unlock", None, "fail");
+            let _ = secure_store::clear_dek();
             session.note_failed_unlock();
             Err(e.to_string())
         }
@@ -954,6 +1039,7 @@ pub fn tick_security(state: &AppState) -> bool {
         idle_lock_if_needed(&mut session, &state.mcp)
     };
     if locked {
+        let _ = mcp::rebind_locked(&state.mcp);
         clear_transfer_and_runtime(state);
     }
     locked
@@ -1068,7 +1154,9 @@ pub fn import_backup(
         {
             let mut session = lock_session(&state.session);
             session.set_unlocked(vault, dek);
+            apply_vault_settings(&mut session);
             apply_mcp_listen_settings(&state, &session);
+            sync_auto_unlock_credential(&session);
             if let Ok(vault) = session.vault() {
                 crate::auto_sync::refresh_from_vault(&state, vault);
             }
@@ -1159,6 +1247,11 @@ pub fn backup_restore(
         },
     )
     .map_err(map_err)?;
+    {
+        let mut session = lock_session(&state.session);
+        apply_vault_settings(&mut session);
+        sync_auto_unlock_credential(&session);
+    }
     recover_lock(&state.sync_runtime).invalidate();
     Ok(RestoreReport { imported, skipped })
 }
@@ -1196,7 +1289,9 @@ pub fn backup_restore_new(
     {
         let mut session = lock_session(&state.session);
         session.set_unlocked(vault, dek);
+        apply_vault_settings(&mut session);
         apply_mcp_listen_settings(&state, &session);
+        sync_auto_unlock_credential(&session);
         if let Ok(vault) = session.vault() {
             crate::auto_sync::refresh_from_vault(&state, vault);
         }
@@ -1339,10 +1434,12 @@ pub fn settings_set(
             s.hotkey = settings.hotkey.clone();
             s.auto_lock = settings.auto_lock;
             persist_session_settings(&s)?;
+            sync_auto_unlock_credential(&s);
             (false, true)
         }
     };
     if idle_locked {
+        let _ = mcp::rebind_locked(&state.mcp);
         clear_transfer_and_runtime(&state);
     }
     if !saved {
@@ -1512,6 +1609,9 @@ pub fn change_master(
     old_password: String,
     new_password: String,
 ) -> Result<(), String> {
+    // A master-password change invalidates the persisted DEK credential even
+    // though the vault currently keeps the same DEK in memory.
+    let _ = secure_store::clear_dek();
     {
         let mut session = lock_session(&state.session);
         session.require_unlocked().map_err(map_err)?;
@@ -1553,7 +1653,7 @@ fn mcp_status_of(state: &AppState) -> McpStatus {
         running: state.mcp.running.load(std::sync::atomic::Ordering::SeqCst),
         port,
         url: format!("http://{host}:{port}/mcp"),
-        fill_url: format!("http://127.0.0.1:{port}/fill"),
+        fill_url: format!("http://{host}:{port}/fill"),
         has_token,
         has_fill_token,
         listen_mode,
@@ -1593,6 +1693,10 @@ pub fn mcp_listen_set(state: State<AppState>, input: McpListen) -> Result<McpSta
         vault
             .set_setting("mcp_listen_address", &address)
             .map_err(map_err)?;
+        let encoded = serde_json::json!({"mode": mode.clone(), "address": address.clone()}).to_string();
+        vault
+            .set_setting(crate::mcp::LISTEN_CONFIG_KEY, &encoded)
+            .map_err(map_err)?;
     }
     state.mcp.set_listen_config(&mode, &address)?;
     if was_running {
@@ -1603,6 +1707,8 @@ pub fn mcp_listen_set(state: State<AppState>, input: McpListen) -> Result<McpSta
             if let Ok(vault) = session.vault() {
                 let _ = vault.set_setting("mcp_listen_mode", &old.0);
                 let _ = vault.set_setting("mcp_listen_address", &old.1);
+                let old_encoded = serde_json::json!({"mode": old.0, "address": old.1}).to_string();
+                let _ = vault.set_setting(crate::mcp::LISTEN_CONFIG_KEY, &old_encoded);
             }
             drop(session);
             let _ = mcp::start(&state.mcp, state.session.clone());
@@ -2262,6 +2368,33 @@ mod tests {
     }
 
     #[test]
+    fn auto_unlock_marker_is_encrypted_and_rejects_a_different_dek() {
+        let (path, dek) = temp_vault_path();
+        let vault = Vault::open(path.to_str().unwrap()).unwrap();
+        let mut session = Session::default();
+        session.set_unlocked(vault, dek);
+        session.auto_lock = false;
+        sync_auto_unlock_credential(&session);
+
+        let reopened = Vault::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            reopened
+                .get_secret_setting(&dek, AUTO_UNLOCK_MARKER_KEY)
+                .unwrap()
+                .as_deref(),
+            Some(AUTO_UNLOCK_MARKER)
+        );
+        assert!(reopened
+            .get_secret_setting(&[9u8; 32], AUTO_UNLOCK_MARKER_KEY)
+            .unwrap()
+            .is_none());
+
+        session.auto_lock = true;
+        sync_auto_unlock_credential(&session);
+        let _ = secure_store::clear_dek();
+    }
+
+    #[test]
     fn settings_reject_out_of_range_and_require_an_unlocked_vault() {
         let (path, dek) = temp_vault_path();
         let vault = Vault::open(path.to_str().unwrap()).unwrap();
@@ -2459,6 +2592,9 @@ mod tests {
         assert!(!json.contains("fill_should_not_serialize"));
         assert!(status.has_token);
         assert!(status.has_fill_token);
+        assert_eq!(status.listen_mode, "loopback");
+        assert_eq!(status.listen_address, "");
+        assert!(status.url.starts_with("http://127.0.0.1:"));
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub mod profile_http;
 pub mod lock;
 pub mod mcp;
 pub mod session;
+pub mod secure_store;
 pub mod transfer;
 pub mod zoomkey;
 
@@ -206,6 +207,7 @@ pub fn run() {
             let mut startup_hotkey = commands::Settings::default().hotkey;
             if let Some(state) = app.try_state::<AppState>() {
                 if let Ok(path) = commands::vault_path_for(app.handle()) {
+                    crate::mcp::load_persisted_config(&state.mcp, &path);
                     if let Some(hotkey) = commands::persisted_hotkey(&path) {
                         startup_hotkey = hotkey;
                     }

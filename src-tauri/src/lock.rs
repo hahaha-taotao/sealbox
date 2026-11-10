@@ -17,12 +17,18 @@ pub fn register_active_session(session: &Arc<Mutex<Session>>) {
     *recover_lock(active_slot()) = Arc::downgrade(session);
 }
 
+pub fn active_session() -> Option<Arc<Mutex<Session>>> {
+    recover_lock(active_slot()).upgrade()
+}
+
 pub fn register_active_mcp(mcp: &McpState) {
     *recover_lock(active_mcp_slot()) = Some(mcp.clone());
 }
 
 fn sweep_mcp(mcp: &McpState) {
-    crate::mcp::stop(mcp);
+    crate::mcp::signal_locked(mcp);
+    recover_lock(&mcp.token).clear();
+    recover_lock(&mcp.fill_token).clear();
     crate::zoomkey::tls::clear_cache();
     crate::zoomkey::crm::clear_cache();
 }
@@ -41,12 +47,15 @@ pub fn on_session_locked() {
 pub fn lock_everything(session: &Mutex<Session>, mcp: &McpState) {
     crate::confirm::deny_pending();
     lock_session(session).lock();
+    let _ = crate::secure_store::clear_dek();
     sweep_mcp(mcp);
+    let _ = crate::mcp::rebind_locked(mcp);
 }
 
 /// Idle timeout uses the same cleanup as an explicit lock.
 pub fn idle_lock_if_needed(session: &mut Session, mcp: &McpState) -> bool {
     if session.maybe_idle_lock() {
+        let _ = crate::secure_store::clear_dek();
         sweep_mcp(mcp);
         true
     } else {
@@ -70,6 +79,7 @@ pub fn emergency_lock() {
             Err(std::sync::TryLockError::WouldBlock) => {}
         }
     }
+    let _ = crate::secure_store::clear_dek();
     let _ = crate::clipboard::clear();
 }
 

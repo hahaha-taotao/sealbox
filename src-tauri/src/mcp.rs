@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -19,6 +20,7 @@ pub const DEFAULT_PORT: u16 = 17891;
 pub const LISTEN_MODE_LOOPBACK: &str = "loopback";
 pub const LISTEN_MODE_LAN: &str = "lan";
 pub const LISTEN_MODE_ADDRESS: &str = "address";
+pub const LISTEN_CONFIG_KEY: &str = "mcp_listen_config";
 const PAIRING_SECS: u64 = 60;
 const PAIRING_MAX_FAILURES: u32 = 5;
 const MAX_HTTP_LINE: usize = 8192;
@@ -67,6 +69,9 @@ pub struct McpState {
     pub port: Arc<Mutex<u16>>,
     pub token: Arc<Mutex<String>>,
     pub fill_token: Arc<Mutex<String>>,
+    /// True while the vault is locked; listeners remain loopback-only then.
+    pub locked: Arc<AtomicBool>,
+    restart_on_lock: Arc<AtomicBool>,
     listen_mode: Arc<Mutex<String>>,
     listen_address: Arc<Mutex<String>>,
     active_mode: Arc<Mutex<String>>,
@@ -85,6 +90,8 @@ impl Default for McpState {
             port: Arc::new(Mutex::new(DEFAULT_PORT)),
             token: Arc::new(Mutex::new(String::new())),
             fill_token: Arc::new(Mutex::new(String::new())),
+            locked: Arc::new(AtomicBool::new(true)),
+            restart_on_lock: Arc::new(AtomicBool::new(false)),
             listen_mode: Arc::new(Mutex::new(LISTEN_MODE_LOOPBACK.into())),
             listen_address: Arc::new(Mutex::new(String::new())),
             active_mode: Arc::new(Mutex::new(LISTEN_MODE_LOOPBACK.into())),
@@ -125,6 +132,39 @@ fn local_private_ipv4() -> Option<Ipv4Addr> {
     match socket.local_addr().ok()?.ip() {
         IpAddr::V4(ip) if private_ipv4(ip) => Some(ip),
         _ => None,
+    }
+}
+
+fn persisted_listen_config(vault: &crate::vault::Vault) -> (String, String) {
+    if let Ok(Some(raw)) = vault.get_setting(LISTEN_CONFIG_KEY) {
+        if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+            let mode = value.get("mode").and_then(Value::as_str).unwrap_or("");
+            let address = value.get("address").and_then(Value::as_str).unwrap_or("");
+            if let Ok(config) = normalize_listen_config(mode, address) {
+                return config;
+            }
+        }
+    }
+    let mode = vault
+        .get_setting("mcp_listen_mode")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| LISTEN_MODE_LOOPBACK.into());
+    let address = vault
+        .get_setting("mcp_listen_address")
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    normalize_listen_config(&mode, &address)
+        .unwrap_or_else(|_| (LISTEN_MODE_LOOPBACK.into(), String::new()))
+}
+
+/// Load the persisted non-secret listener preference before the vault unlocks.
+/// Invalid values fail closed to loopback and are never used for binding.
+pub fn load_persisted_config(mcp: &McpState, path: &Path) {
+    if let Ok(vault) = crate::vault::Vault::open(path.to_str().unwrap_or_default()) {
+        let (mode, address) = persisted_listen_config(&vault);
+        let _ = mcp.set_listen_config(&mode, &address);
     }
 }
 
@@ -1239,6 +1279,10 @@ fn handle_client(
     if !mcp.running.load(Ordering::SeqCst) || mcp.generation.load(Ordering::SeqCst) != generation {
         return;
     }
+    if mcp.locked.load(Ordering::SeqCst) {
+        write_http(&mut stream, "403 Forbidden", br#"{"ok":false,"error":"vault locked"}"#);
+        return;
+    }
     let Ok(req) = read_http_request(&mut stream) else {
         return;
     };
@@ -1294,6 +1338,10 @@ fn handle_client(
         let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("");
         match mcp.consume_pairing(code) {
             Ok(()) => {
+                if mcp.locked.load(Ordering::SeqCst) || !lock_session(&session).is_unlocked() {
+                    write_http(&mut stream, "403 Forbidden", br#"{"ok":false,"error":"vault locked"}"#);
+                    return;
+                }
                 let fill_token = recover_lock(&mcp.fill_token).clone();
                 let body = serde_json::to_vec(&json!({
                     "ok": true,
@@ -1465,7 +1513,15 @@ pub fn start(mcp: &McpState, session: Arc<Mutex<Session>>) -> Result<u16, String
         };
         (unlocked, enabled)
     };
+    mcp.locked.store(!unlocked, Ordering::SeqCst);
     if unlocked {
+        {
+            let s = lock_session(&session);
+            if let Ok(vault) = s.vault() {
+                let (mode, address) = persisted_listen_config(vault);
+                let _ = mcp.set_listen_config(&mode, &address);
+            }
+        }
         {
             let s = lock_session(&session);
             if let (Ok(v), Ok(dek)) = (s.vault(), s.dek()) {
@@ -1560,6 +1616,7 @@ pub fn start(mcp: &McpState, session: Arc<Mutex<Session>>) -> Result<u16, String
         })
         .collect::<Vec<_>>();
     *recover_lock(&mcp.listener_threads) = handles;
+    mcp.restart_on_lock.store(false, Ordering::SeqCst);
     if let Some(error) = bind_error {
         Err(error)
     } else {
@@ -1579,6 +1636,7 @@ fn remove_stale_bridge_file() {
 
 pub fn stop(mcp: &McpState) {
     mcp.running.store(false, Ordering::SeqCst);
+    mcp.restart_on_lock.store(false, Ordering::SeqCst);
     mcp.generation.fetch_add(1, Ordering::SeqCst);
     mcp.close_pairing();
     mcp.invalidate_callers();
@@ -1587,6 +1645,37 @@ pub fn stop(mcp: &McpState) {
         let _ = handle.join();
     }
     mcp.set_active_policy(&ListenPolicy::loopback());
+}
+
+/// Mark MCP locked while the session mutex may still be held. Listener threads
+/// do not touch the session, so joining them here closes the old LAN socket
+/// before a loopback-only rebind.
+pub fn signal_locked(mcp: &McpState) {
+    let was_running = mcp.running.swap(false, Ordering::SeqCst);
+    mcp.locked.store(true, Ordering::SeqCst);
+    if was_running {
+        mcp.restart_on_lock.store(true, Ordering::SeqCst);
+    }
+    mcp.generation.fetch_add(1, Ordering::SeqCst);
+    mcp.close_pairing();
+    mcp.invalidate_callers();
+    let handles = std::mem::take(&mut *recover_lock(&mcp.listener_threads));
+    for handle in handles {
+        let _ = handle.join();
+    }
+    mcp.set_active_policy(&ListenPolicy::loopback());
+}
+
+/// Rebind only if MCP was active before locking; the persisted LAN preference
+/// is never used while the vault remains locked.
+pub fn rebind_locked(mcp: &McpState) -> Result<u16, String> {
+    mcp.locked.store(true, Ordering::SeqCst);
+    if !mcp.restart_on_lock.swap(false, Ordering::SeqCst) {
+        return Ok(*recover_lock(&mcp.port));
+    }
+    let session = crate::lock::active_session()
+        .unwrap_or_else(|| Arc::new(Mutex::new(Session::default())));
+    start(mcp, session)
 }
 
 #[cfg(test)]
