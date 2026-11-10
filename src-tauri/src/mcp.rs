@@ -27,6 +27,108 @@ const MAX_HTTP_LINE: usize = 8192;
 const MAX_HTTP_HEADERS: usize = 64 * 1024;
 const MAX_HTTP_BODY: usize = 1_000_000;
 const MAX_ACTIVE_CONNECTIONS: usize = 128;
+const LISTEN_MODE_KEY: &str = "mcp_listen_mode";
+const LISTEN_ADDRESS_KEY: &str = "mcp_listen_address";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListenMode {
+    Loopback,
+    Lan,
+    Address,
+}
+
+impl ListenMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Loopback => "loopback",
+            Self::Lan => "lan",
+            Self::Address => "address",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ListenConfig {
+    pub mode: ListenMode,
+    pub address: Option<Ipv4Addr>,
+}
+
+impl Default for ListenConfig {
+    fn default() -> Self {
+        Self {
+            mode: ListenMode::Loopback,
+            address: None,
+        }
+    }
+}
+
+impl ListenConfig {
+    pub fn view(self) -> ListenConfigView {
+        ListenConfigView {
+            mode: self.mode.as_str().to_string(),
+            address: self
+                .address
+                .map(|address| address.to_string())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ListenConfigInput {
+    pub mode: String,
+    #[serde(default)]
+    pub address: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ListenConfigView {
+    pub mode: String,
+    pub address: String,
+}
+
+pub fn is_private_ipv4(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    matches!(
+        octets,
+        [10, _, _, _] | [172, 16..=31, _, _] | [192, 168, _, _]
+    )
+}
+
+/// Tailscale IPv4 addresses come from the shared CGNAT range 100.64.0.0/10.
+/// Keep this separate from RFC1918 so peer checks cannot mix the two network
+/// classes accidentally.
+pub fn is_tailscale_ipv4(address: Ipv4Addr) -> bool {
+    matches!(address.octets(), [100, 64..=127, _, _])
+}
+
+fn is_listenable_ipv4(address: Ipv4Addr) -> bool {
+    is_private_ipv4(address) || is_tailscale_ipv4(address)
+}
+
+pub fn parse_listen_config(mode: &str, address: &str) -> Result<ListenConfig, String> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "loopback" => Ok(ListenConfig::default()),
+        "lan" => Ok(ListenConfig {
+            mode: ListenMode::Lan,
+            address: None,
+        }),
+        "address" => {
+            let raw = address.trim();
+            let parsed = raw
+                .parse::<Ipv4Addr>()
+                .map_err(|_| "监听地址必须是 IPv4 地址".to_string())?;
+            if !is_listenable_ipv4(parsed) {
+                return Err("监听地址必须是本机私有或 Tailscale IPv4 地址".into());
+            }
+            Ok(ListenConfig {
+                mode: ListenMode::Address,
+                address: Some(parsed),
+            })
+        }
+        _ => Err("监听模式必须是 loopback、lan 或 address".into()),
+    }
+}
 
 struct PairingWindow {
     code: String,
@@ -104,8 +206,7 @@ impl Default for McpState {
 }
 
 fn private_ipv4(ip: Ipv4Addr) -> bool {
-    let [a, b, _, _] = ip.octets();
-    a == 10 || (a == 172 && (16..=31).contains(&b)) || (a == 192 && b == 168)
+    is_private_ipv4(ip)
 }
 
 pub fn normalize_listen_config(mode: &str, address: &str) -> Result<(String, String), String> {
@@ -117,8 +218,8 @@ pub fn normalize_listen_config(mode: &str, address: &str) -> Result<(String, Str
             let ip = address
                 .parse::<Ipv4Addr>()
                 .map_err(|_| "指定地址必须是 IPv4 地址".to_string())?;
-            if !private_ipv4(ip) {
-                return Err("指定地址必须是 10/8、172.16/12 或 192.168/16 私网地址".into());
+            if !is_listenable_ipv4(ip) {
+                return Err("指定地址必须是本机私有或 Tailscale IPv4 地址".into());
             }
             Ok((LISTEN_MODE_ADDRESS.into(), ip.to_string()))
         }
@@ -146,12 +247,12 @@ fn persisted_listen_config(vault: &crate::vault::Vault) -> (String, String) {
         }
     }
     let mode = vault
-        .get_setting("mcp_listen_mode")
+        .get_setting(LISTEN_MODE_KEY)
         .ok()
         .flatten()
         .unwrap_or_else(|| LISTEN_MODE_LOOPBACK.into());
     let address = vault
-        .get_setting("mcp_listen_address")
+        .get_setting(LISTEN_ADDRESS_KEY)
         .ok()
         .flatten()
         .unwrap_or_default();
@@ -291,7 +392,17 @@ fn peer_allowed(ip: IpAddr, policy: &ListenPolicy) -> bool {
     match policy.mode.as_str() {
         LISTEN_MODE_LOOPBACK => ip.is_loopback(),
         LISTEN_MODE_LAN | LISTEN_MODE_ADDRESS => {
-            ip.is_loopback() || matches!(ip, IpAddr::V4(ip) if private_ipv4(ip))
+            if ip.is_loopback() {
+                return true;
+            }
+            let local = policy.address.parse::<Ipv4Addr>().ok();
+            match (local, ip) {
+                (Some(local), IpAddr::V4(peer)) if is_tailscale_ipv4(local) => {
+                    is_tailscale_ipv4(peer)
+                }
+                (_, IpAddr::V4(peer)) => is_private_ipv4(peer),
+                _ => false,
+            }
         }
         _ => false,
     }
@@ -303,7 +414,11 @@ fn destination_allowed(ip: IpAddr, policy: &ListenPolicy) -> bool {
     }
     match policy.mode.as_str() {
         LISTEN_MODE_LAN => matches!(ip, IpAddr::V4(ip) if private_ipv4(ip)),
-        LISTEN_MODE_ADDRESS => policy.address.parse::<Ipv4Addr>().map(|wanted| ip == IpAddr::V4(wanted)).unwrap_or(false),
+        LISTEN_MODE_ADDRESS => policy
+            .address
+            .parse::<Ipv4Addr>()
+            .map(|wanted| ip == IpAddr::V4(wanted))
+            .unwrap_or(false),
         _ => false,
     }
 }
