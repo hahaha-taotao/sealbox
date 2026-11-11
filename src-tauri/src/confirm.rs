@@ -5,6 +5,7 @@
 //! 窗口的显示/隐藏由 [`set_hooks`] 注入，避免测试二进制链上 Tauri GUI。
 
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -16,7 +17,33 @@ static ASK_GATE: Mutex<()> = Mutex::new(());
 static PENDING: Mutex<Option<PendingConfirm>> = Mutex::new(None);
 static HOOKS: Mutex<Option<ConfirmHooks>> = Mutex::new(None);
 
+/// True while the main window is hidden to the tray, minimised, or not focused.
+/// A confirmation prompt is easy to miss in that state, so its wait window is
+/// extended instead of expiring while the user is away from the app.
+static MAIN_WINDOW_HIDDEN: AtomicBool = AtomicBool::new(false);
+
 const ASK_TIMEOUT: Duration = Duration::from_secs(600);
+const ASK_TIMEOUT_WHILE_HIDDEN: Duration = Duration::from_secs(1800);
+
+/// How long a prompt waits for an answer. Exposed for tests.
+pub fn ask_timeout(main_window_hidden: bool) -> Duration {
+    if main_window_hidden {
+        ASK_TIMEOUT_WHILE_HIDDEN
+    } else {
+        ASK_TIMEOUT
+    }
+}
+
+/// Set by the window event handler whenever the main window's visibility or
+/// focus changes. Cheap and lock-free: the confirmation thread reads it once
+/// per prompt, not per tick.
+pub fn set_main_window_hidden(hidden: bool) {
+    MAIN_WINDOW_HIDDEN.store(hidden, Ordering::SeqCst);
+}
+
+pub fn main_window_hidden() -> bool {
+    MAIN_WINDOW_HIDDEN.load(Ordering::SeqCst)
+}
 
 #[derive(Clone, Serialize)]
 pub struct ConfirmField {
@@ -147,7 +174,11 @@ fn native_ask_payload(payload: ConfirmPayload) -> bool {
         tx,
     });
     show_payload(&payload);
-    let allowed = rx.recv_timeout(ASK_TIMEOUT).unwrap_or(false);
+    // Read the visibility at prompt time: the user may have opened the app to
+    // answer, and a prompt raised while hidden must not expire early.
+    let allowed = rx
+        .recv_timeout(ask_timeout(main_window_hidden()))
+        .unwrap_or(false);
     pending().take();
     hide();
     allowed
@@ -205,5 +236,24 @@ mod tests {
             })
         });
         assert_eq!(result, Err("用户拒绝了这次写操作".to_string()));
+    }
+
+    #[test]
+    fn hidden_main_window_gets_a_longer_prompt_window() {
+        assert_eq!(ask_timeout(false), Duration::from_secs(600));
+        assert_eq!(ask_timeout(true), Duration::from_secs(1800));
+        assert!(ask_timeout(true) > ask_timeout(false));
+    }
+
+    #[test]
+    fn main_window_visibility_is_tracked() {
+        // Restore the process-wide flag so a failure here cannot leak into
+        // other tests that run in the same binary.
+        let previous = main_window_hidden();
+        set_main_window_hidden(true);
+        assert!(main_window_hidden());
+        set_main_window_hidden(false);
+        assert!(!main_window_hidden());
+        set_main_window_hidden(previous);
     }
 }

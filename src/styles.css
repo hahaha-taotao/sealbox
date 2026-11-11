@@ -53,6 +53,15 @@ button { cursor: pointer; }
 
 .body { flex: 1; display: flex; min-height: 0; }
 
+/* Degraded-mode banner: shown instead of a blocking overlay so the vault
+   stays usable while something like the MCP LAN listener is unavailable. */
+.banner {
+  display: flex; align-items: center; gap: 12px;
+  padding: 8px 14px; font-size: 12px; border-bottom: 1px solid var(--line);
+}
+.banner.warn { background: #fffbeb; color: #92400e; }
+.banner span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
 .rail {
   width: var(--rail);
   background: var(--surface);

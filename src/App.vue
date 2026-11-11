@@ -467,6 +467,18 @@ async function doEmptyTrash() {
 }
 
 const mcp = ref<McpStatus | null>(null);
+// The LAN listener can fail to bind while MCP still runs on loopback. That is a
+// degraded mode, not a start failure, so it is surfaced as a dismissible banner
+// instead of a blocking screen.
+const dismissedMcpError = ref("");
+const mcpErrorBanner = computed(() => {
+  const error = mcp.value?.last_error || "";
+  if (!error || error === dismissedMcpError.value) return "";
+  return error;
+});
+function dismissMcpError() {
+  dismissedMcpError.value = mcp.value?.last_error || "";
+}
 const pairing = ref<{ active: boolean; code: string | null; expires_in_secs: number; port: number } | null>(null);
 const pairingError = ref("");
 const pairingBusy = ref(false);
@@ -2451,6 +2463,11 @@ onMounted(async () => {
         <button class="close" @click="api.window('close')">×</button>
       </div>
     </header>
+
+    <div v-if="mcpErrorBanner" class="banner warn">
+      <span>MCP 局域网监听未生效，当前仅本机可访问：{{ mcpErrorBanner }}</span>
+      <button class="btn" @click="dismissMcpError">关闭</button>
+    </div>
 
     <div class="body" v-if="!status">加载中…</div>
 

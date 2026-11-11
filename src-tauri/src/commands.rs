@@ -1571,6 +1571,10 @@ pub struct McpStatus {
     pub has_fill_token: bool,
     pub listen_mode: String,
     pub listen_address: String,
+    /// Set when the configured LAN listener failed to bind and MCP is running
+    /// loopback-only. The UI shows it as a banner instead of pretending the
+    /// configured `listen_address` is reachable.
+    pub last_error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1594,6 +1598,7 @@ fn mcp_status_of(state: &AppState) -> McpStatus {
         has_fill_token,
         listen_mode,
         listen_address,
+        last_error: state.mcp.last_error(),
     }
 }
 

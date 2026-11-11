@@ -41,6 +41,9 @@ rustls-pemfile = "2"
 webpki-roots = "0.26"
 md-5 = "0.10"
 tauri-plugin-updater = "2"
+# Remember window geometry per monitor layout so docking/undocking an external
+# display does not strand the main window on a screen that is gone.
+tauri-plugin-window-state = "2"
 crypto_box = { version = "0.9", features = ["seal"] }
 
 [target.'cfg(windows)'.dependencies]

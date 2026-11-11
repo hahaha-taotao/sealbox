@@ -178,6 +178,10 @@ pub struct McpState {
     active_mode: Arc<Mutex<String>>,
     active_address: Arc<Mutex<String>>,
     listener_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    /// Why the configured LAN listener could not bind and MCP fell back to
+    /// loopback-only. `None` means the listener bound as configured. Shown in
+    /// the UI instead of failing silently.
+    last_error: Arc<Mutex<Option<String>>>,
     pairing: Arc<Mutex<Option<PairingWindow>>>,
     callers: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
@@ -197,6 +201,7 @@ impl Default for McpState {
             active_mode: Arc::new(Mutex::new(LISTEN_MODE_LOOPBACK.into())),
             active_address: Arc::new(Mutex::new(String::new())),
             listener_threads: Arc::new(Mutex::new(Vec::new())),
+            last_error: Arc::new(Mutex::new(None)),
             pairing: Arc::new(Mutex::new(None)),
             callers: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -285,6 +290,14 @@ impl McpState {
     fn configured_policy(&self) -> ListenPolicy {
         let (mode, address) = self.listen_config();
         ListenPolicy { mode, address }
+    }
+
+    pub fn set_last_error(&self, error: Option<String>) {
+        *recover_lock(&self.last_error) = error;
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        recover_lock(&self.last_error).clone()
     }
 
     fn set_active_policy(&self, policy: &ListenPolicy) {
@@ -1709,6 +1722,16 @@ pub fn start(mcp: &McpState, session: Arc<Mutex<Session>>) -> Result<u16, String
     };
     *recover_lock(&mcp.port) = port;
     mcp.set_active_policy(&active_policy);
+    // A failed LAN bind falls back to loopback. That is a supported degraded
+    // mode, not a start failure: the loopback listeners below are about to
+    // start and `running` becomes true. Returning Err from here used to make
+    // every caller believe MCP was down (so the next start skipped `stop`),
+    // leaking a full set of listener threads each retry. Surface the reason
+    // instead of the failure.
+    if let Some(error) = &bind_error {
+        eprintln!("sealbox: MCP 局域网监听不可用，已回退到仅本机监听：{error}");
+    }
+    mcp.set_last_error(bind_error.clone());
     let generation = mcp.generation.fetch_add(1, Ordering::SeqCst).saturating_add(1);
     mcp.running.store(true, Ordering::SeqCst);
     remove_stale_bridge_file();
@@ -1720,11 +1743,7 @@ pub fn start(mcp: &McpState, session: Arc<Mutex<Session>>) -> Result<u16, String
         })
         .collect::<Vec<_>>();
     *recover_lock(&mcp.listener_threads) = handles;
-    if let Some(error) = bind_error {
-        Err(error)
-    } else {
-        Ok(port)
-    }
+    Ok(port)
 }
 
 fn remove_stale_bridge_file() {
@@ -1739,6 +1758,7 @@ fn remove_stale_bridge_file() {
 
 pub fn stop(mcp: &McpState) {
     mcp.running.store(false, Ordering::SeqCst);
+    mcp.set_last_error(None);
     mcp.generation.fetch_add(1, Ordering::SeqCst);
     mcp.close_pairing();
     mcp.invalidate_callers();

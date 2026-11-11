@@ -39,6 +39,19 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // Only size/position/maximized: the quick and confirm windows are
+        // transient overlays that must keep their tauri.conf geometry, so they
+        // are excluded explicitly rather than relying on the flag filter.
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_denylist(&["quick", "confirm"])
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::SIZE
+                        | tauri_plugin_window_state::StateFlags::POSITION
+                        | tauri_plugin_window_state::StateFlags::MAXIMIZED,
+                )
+                .build(),
+        )
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
             commands::get_status,
@@ -205,9 +218,33 @@ pub fn run() {
                 crate::auto_sync::refresh_from_disk(app.handle(), &state);
             }
             let _ = commands::register_hotkey(app.handle(), &startup_hotkey);
+            // The confirmation window inherits this at prompt time; start from
+            // whatever the main window state is right now.
+            if let Some(main) = app.get_webview_window("main") {
+                crate::confirm::set_main_window_hidden(
+                    !main.is_visible().unwrap_or(true) || !main.is_focused().unwrap_or(true),
+                );
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
+            // Track the main window's usability for the confirmation prompt.
+            // Hidden to the tray or not focused means the user is elsewhere,
+            // so a prompt must wait longer than the 10-minute default.
+            if window.label() == "main" {
+                match event {
+                    tauri::WindowEvent::CloseRequested { .. }
+                    | tauri::WindowEvent::Focused(_) => {
+                        let hidden = !window.is_visible().unwrap_or(true)
+                            || !window.is_focused().unwrap_or(true);
+                        crate::confirm::set_main_window_hidden(hidden);
+                    }
+                    tauri::WindowEvent::Destroyed => {
+                        crate::confirm::set_main_window_hidden(true)
+                    }
+                    _ => {}
+                }
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 if window.label() == "confirm" {

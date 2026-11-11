@@ -302,6 +302,11 @@ export interface McpStatus {
   has_fill_token: boolean;
   listen_mode: string;
   listen_address: string;
+  /**
+   * Set when the configured LAN listener could not bind and MCP is running
+   * loopback-only. `null` means the listener bound as configured.
+   */
+  last_error: string | null;
 }
 
 export interface McpListen {
