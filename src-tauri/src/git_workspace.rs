@@ -1055,11 +1055,44 @@ fn askpass_name() -> &'static str {
     }
 }
 
+/// Whether an askpass prompt is git asking for the user name.
+///
+/// git sends `Username for '<url>':` — the match must be a prefix test, not an
+/// exact word, and it must be case-insensitive.
+fn askpass_prompt_wants_username(prompt: &str) -> bool {
+    prompt.trim_start().to_ascii_lowercase().starts_with("username")
+}
+
+/// Whether a URL extracted from an askpass prompt points at GitHub.
+///
+/// The URL may carry userinfo (`https://x-access-token@github.com`) because git
+/// re-uses the stored user on the follow-up password prompt, so the host has to
+/// be extracted rather than matched on the whole string.
+fn askpass_url_is_github(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = host_port.split(':').next().unwrap_or("");
+    matches!(host.to_ascii_lowercase().as_str(), "github.com")
+}
+
 fn askpass_script() -> String {
     if cfg!(windows) {
-        "@echo off\r\necho(%1)| findstr /I \"Username\" >nul\r\nif %errorlevel%==0 (\r\n  echo x-access-token\r\n  goto :eof\r\n)\r\necho %SEALBOX_GIT_ASKPASS_TOKEN%\r\n".into()
+        // `findstr` is case-insensitive and matches anywhere in the line, which
+        // is what we need for `Username for 'https://github.com':`.
+        "@echo off\r\necho(%1| findstr /I \"Username\" >nul\r\nif %errorlevel%==0 (\r\n  echo x-access-token\r\n  goto :eof\r\n)\r\necho %SEALBOX_GIT_ASKPASS_TOKEN%\r\n".into()
     } else {
-        "#!/bin/sh\ncase \"$1\" in\n  [Uu]sername*) printf '%s\\n' x-access-token; exit 0 ;;\nesac\nurl=$(printf '%s' \"$1\" | sed -n \"s/.*'\\(https:\\/\\/[^']*\\)'.*/\\1/p\")\ncase \"$url\" in\n  https://github.com|https://github.com/*|https://github.com:443|https://github.com:443/*) printf '%s\\n' \"$SEALBOX_GIT_ASKPASS_TOKEN\" ;;\n  *) exit 1 ;;\nesac\n".into()
+        // git asks for the user name first (`Username for '<url>':`) and the
+        // password second (`Password for '<url>':`). The earlier version matched
+        // `[Uu]sername*`, which never fires against the real prompt string, so
+        // the token was returned as the *user name*, the credential lookup then
+        // failed, and the URL whitelist rejected the credential-bearing URL.
+        "#!/bin/sh\ncase \"$1\" in\n  [Uu]sername*) printf '%s\\n' x-access-token; exit 0 ;;\nesac\nurl=$(printf '%s' \"$1\" | sed -n \"s/.*'\\(https:\\/\\/[^']*\\)'.*/\\1/p\")\nhost=$(printf '%s' \"$url\" | sed -e 's#^https\\?://##' -e 's#[/?#].*##' -e 's#.*@##' -e 's#:[0-9]*$##')\ncase \"$host\" in\n  github.com) printf '%s\\n' \"$SEALBOX_GIT_ASKPASS_TOKEN\" ;;\n  *) exit 1 ;;\nesac\n".into()
     }
 }
 
@@ -1665,6 +1698,74 @@ mod tests {
             Ok(_) => panic!("parent path must be rejected before confirmation"),
         };
         assert!(error.contains(".."), "{error}");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+
+    #[test]
+    fn askpass_username_prompt_detection_matches_git_output() {
+        // git asks `Username for '<url>':`; a plain `starts_with("username")`
+        // against the raw string must still match.
+        assert!(askpass_prompt_wants_username("Username for 'https://github.com':"));
+        assert!(askpass_prompt_wants_username("username for 'https://github.com':"));
+        assert!(!askpass_prompt_wants_username("Password for 'https://github.com':"));
+    }
+
+    #[test]
+    fn askpass_url_whitelist_accepts_github_and_rejects_lookalikes() {
+        // The regression: git re-uses the stored user on the password prompt, so
+        // the URL carries `x-access-token@`. Rejecting it returned an empty
+        // password and every push failed with "could not read Password".
+        assert!(askpass_url_is_github("https://github.com"));
+        assert!(askpass_url_is_github("https://github.com/hahaha-taotao/sealbox"));
+        assert!(askpass_url_is_github("https://github.com:443"));
+        assert!(askpass_url_is_github("https://x-access-token@github.com"));
+        assert!(askpass_url_is_github("https://x-access-token@github.com/owner/repo.git"));
+        assert!(askpass_url_is_github("https://GitHub.com"));
+
+        // A token must never be handed to a host that merely looks like GitHub.
+        assert!(!askpass_url_is_github("https://gitlab.com"));
+        assert!(!askpass_url_is_github("https://github.com.evil.com"));
+        assert!(!askpass_url_is_github("https://evilgithub.com"));
+        assert!(!askpass_url_is_github("https://notgithub.com/x"));
+        assert!(!askpass_url_is_github(""));
+    }
+
+    #[test]
+    fn askpass_script_only_emits_the_token_for_github() {
+        if cfg!(windows) {
+            return;
+        }
+        let repo = temp_git_repo();
+        let helper = write_askpass("SEALBOX_TEST_TOKEN").unwrap();
+        let script = helper.join(askpass_name());
+        let ask = |prompt: &str| {
+            Command::new(&script)
+                .arg(prompt)
+                .env("SEALBOX_GIT_ASKPASS_TOKEN", "SEALBOX_TEST_TOKEN")
+                .output()
+                .expect("askpass must run")
+        };
+
+        let user = ask("Username for 'https://github.com':");
+        assert_eq!(String::from_utf8_lossy(&user.stdout).trim(), "x-access-token");
+
+        // Both prompt shapes must yield the token: with and without userinfo.
+        for prompt in [
+            "Password for 'https://github.com':",
+            "Password for 'https://x-access-token@github.com':",
+        ] {
+            let out = ask(prompt);
+            assert!(out.status.success(), "{prompt} should succeed");
+            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "SEALBOX_TEST_TOKEN");
+        }
+
+        // Any other host gets nothing.
+        let foreign = ask("Password for 'https://gitlab.com':");
+        assert!(!foreign.status.success());
+        assert!(foreign.stdout.is_empty());
+
+        let _ = fs::remove_dir_all(&helper);
         let _ = fs::remove_dir_all(&repo);
     }
 }
