@@ -4,7 +4,7 @@
 
 A local credential vault for Windows. Unlock with a master password. Website logins, API tokens, SSH keys, mailboxes, servers, and databases stay encrypted on disk. Copied secrets are cleared from the clipboard on a timer. Encrypted `.svbak` backups can be exported and imported. An optional localhost MCP lets Cursor / Claude Code use credentials without seeing plaintext. A Chrome / Edge extension can fill or save website logins.
 
-当前版本 Current version: **v0.16.0** (`0.16.0`)
+当前版本 Current version: **v0.17.0** (`0.17.0`)
 
 ### 当前范围口径 Scope of this release
 
@@ -63,12 +63,12 @@ On Linux x64, install the `.deb` or run the `.AppImage` from the same release. I
 - **保险库 Vault** — 网站账号、API Token、SSH、邮箱、邮箱授权码、服务器、数据库、客户端证书
 - **解锁 Unlock** — 主密码为根
 - **速查 Quick search** — 默认全局热键 `Ctrl+Shift+Space`，回车复制主秘密
-- **安全习惯 Hygiene** — 空闲自动锁定、审计日志（不记明文）、回收站、置顶、标签、单层文件夹；文件夹可重命名、删除（条目变为未归类）或合并，标签可重命名、删除或合并
+- **安全习惯 Hygiene** — 审计日志（不记明文）、回收站、置顶、标签、单层文件夹；文件夹可重命名、删除（条目变为未归类）或合并，标签可重命名、删除或合并
 - **备份与导入 Backup & import** — 加密 `.svbak` 导出 / 导入（默认合并，覆盖需确认）；可从 Chrome / Edge、Bitwarden、1Password 导出的 UTF-8 CSV 导入网站账号，默认跳过已有同站同账号
-- **MCP** — 本机 `127.0.0.1` 服务，只注册 `vault_list`、`vault_describe`、`http_call`、`git`、`mail`、`vault_revoke` 六个稳定工具。平台的固定 origin、认证、具名操作与参数白名单写在凭据 profile 中，可在凭据详情编辑；远程请求只走 `http_call`。内置 GitHub 与 ZoomKey JIRA/CRM 配方复用已有 DTO 裁剪和受限通道，写操作逐次桌面确认。
-- **客户端证书 Client cert** — 保险库里可以导入 mTLS 用的客户端证书与私钥（PEM），由 Rust 侧限长、解析并校验证书/私钥匹配后加密保存，随金库一起备份；列表和速查不会显示或复制私钥，锁定时会清理 TLS 运行时缓存
+- **MCP** — 本机 `127.0.0.1` 服务，只注册 `vault_list`、`vault_describe`、`http_call`、`git`、`mail`、`vault_revoke` 六个稳定工具。平台的固定 origin、认证、具名操作与参数白名单写在凭据 profile 中，可在凭据详情编辑；远程请求只走 `http_call`。内置 GitHub 与 ZoomKey JIRA/CRM 配方复用已有 DTO 裁剪和受限通道，写操作默认放行，仅强制推送等破坏性写操作逐次桌面确认。
+- **客户端证书 Client cert** — 保险库里可以导入 mTLS 用的客户端证书与私钥（PEM），由 Rust 侧限长、解析并校验证书/私钥匹配后加密保存，随金库一起备份；列表和速查不会显示或复制私钥，退出时会清理 TLS 运行时缓存
 - **插件 Plugin** — Chrome / Edge 从客户端安装后按当前网址填充、填 TOTP 或一键登记；在侧栏「插件」页配对
-- **邮箱 Mail** — 用已保存的 QQ / Gmail 授权码只读打开 INBOX，默认最近 50 封，可继续加载更早；正文按需读取并转成纯文本。MCP 统一使用 `mail(action=accounts/list/read/save)`；保存附件需确认，且不覆盖文件。仍不发信、不删信、不标已读。163、Outlook 和自定义邮箱只显示、不连接。
+- **邮箱 Mail** — 用已保存的 QQ / Gmail 授权码只读打开 INBOX，默认最近 50 封，可继续加载更早；正文按需读取并转成纯文本。MCP 统一使用 `mail(action=accounts/list/read/save)`；保存附件默认放行，且不覆盖文件。仍不发信、不删信、不标已读。163、Outlook 和自定义邮箱只显示、不连接。
 
 ## 安全模型 Security
 
@@ -85,8 +85,8 @@ On Linux x64, install the `.deb` or run the `.AppImage` from the same release. I
 | 存储 Storage | SQLite 金库 `%APPDATA%\com.sealbox.app\vault.db`。不写 `fill.json` |
 | 加密 Encryption | Argon2id 派生主密钥，AES-256-GCM 加密条目秘密；MCP / 填表 Token 也用 DEK 加密后写入 settings |
 | 列表 List | 列表、搜索、审计、MCP 都不返回密码 / Token / 私钥 |
-| 剪贴板 Clipboard | 复制条目秘密、MCP / 填表 Token 和 MCP 配置后约 20 秒，若仍是那条内容则清空；锁定会立刻清掉本应用写入的秘密 |
-| 锁定 Lock | 空闲超时、标题栏或托盘锁定都会丢掉 DEK、清已复制秘密、关掉编辑框和明文显示 |
+| 剪贴板 Clipboard | 复制条目秘密、MCP / 填表 Token 和 MCP 配置后约 20 秒，若仍是那条内容则清空；退出进程会清掉本应用写入的秘密 |
+| 锁定 Lock | 已移除。首次解锁后一直保持解锁，重启后从系统钥匙串自动解锁；仅退出进程时清除内存中的 DEK |
 | 备份 Backup | `.svbak` 用导出密码加密 |
 | 网络 Network | MCP / 填表 API 只监听 `127.0.0.1`，默认端口 `17891`。GitHub 工具只访问 `https://api.github.com:443`，Release 资产上传只访问 `https://uploads.github.com:443`，统一拒绝重定向和内网目标。ZoomKey 仅访问精确白名单内网主机，使用 mTLS、固定路径和只读工具策略 |
 | 插件 Extension | 登录页右下角弹出填充条；一站点多账号可点选。`Alt+Shift+F` 也可打开选择器。填充条在 open Shadow DOM 中，只响应真实用户点击。提交后询问保存/更新，明文只暂存在 `chrome.storage.session`。扩展为检测和填充当前网页而申请 `http://*/*` 与 `https://*/*` 页面权限，Sealbox API 本身仍仅访问 `127.0.0.1`；填表 Token 写入 `chrome.storage.local`，关掉浏览器仍有效，只有轮换后才需要重新配对 |
@@ -123,9 +123,9 @@ npm install
 npm run tauri dev
 ```
 
-首次启动设主密码（至少 10 位）。关闭窗口进入托盘，退出才锁库。全局热键默认 `Ctrl+Shift+Space`。
+首次启动设主密码（至少 10 位）。关闭窗口进入托盘，解锁后一直保持解锁（退出进程才清空内存密钥）。全局热键默认 `Ctrl+Shift+Space`。
 
-On first launch, set a master password (at least 10 characters). Closing the window hides it to the tray; quitting the app locks the vault. The default global hotkey is `Ctrl+Shift+Space`.
+On first launch, set a master password (at least 10 characters). Closing the window hides it to the tray; after unlock the vault stays unlocked until the process exits. The default global hotkey is `Ctrl+Shift+Space`.
 
 数据文件 Data file: `%APPDATA%\com.sealbox.app\vault.db`
 
@@ -135,7 +135,7 @@ On first launch, set a master password (at least 10 characters). Closing the win
 2. 复制页面配置到 Cursor / Claude Code。认证 Token 和浏览器填表 Token 分开，均不应粘贴到模型对话。
 3. 在凭据详情打开 **HTTP profile** 编辑配方。GitHub Token 自动使用内置 GitHub profile；原 ZoomKey 连接设置提供 JIRA / CRM 内置 profile 的默认绑定。自定义服务没有 profile 时不暴露远程操作。
 
-`tools/list` 永远只有以下六项，不随锁库、开关、平台或凭据数量变化；关闭总开关会在调用时拒绝执行，而不是向模型换发工具表。
+`tools/list` 永远只有以下六项，不随开关、平台或凭据数量变化；关闭总开关会在调用时拒绝执行，而不是向模型换发工具表。
 
 | 工具 | 参数与用途 |
 |---|---|
@@ -144,7 +144,7 @@ On first launch, set a master password (at least 10 characters). Closing the win
 | `http_call` | `credential_id`、`op`、`params`；唯一远程 HTTP 入口。只接受说明书声明的参数 |
 | `git` | `action=status/diff/log/branches/fetch/pull/commit/push/clone`；本机仓库，`path` 必须是绝对路径。clone 的 path 是已存在父目录，另传 `repo=owner/repo` |
 | `mail` | `action=accounts/list/read/save`；list 用 `entryId`、可选 `beforeUid`；read 再传 `uid`；save 再传 `part` 与新文件 `path` |
-| `vault_revoke` | 无参数；撤销当前调用会话尚未用完的授权，阻断待审批调用，不影响其他会话或浏览器填表 |
+| `vault_revoke` | 无参数；撤销当前调用会话尚未用完的授权，使未执行的调用失效，不影响其他会话或浏览器填表 |
 
 模型的固定使用顺序（说明书不是第二份工具表）：
 
@@ -166,9 +166,9 @@ profile 随凭据加密存储、备份与同步。界面里的“恢复默认”
 
 ### 确认、审计与会话
 
-HTTP 写方法（POST/PUT/PATCH/DELETE）、声明非只读的操作、Git 写动作与附件保存逐次弹出桌面确认。确认不持有金库锁，确认后重新检查解锁代次、凭据/profile/客户端证书版本、总开关与调用方授权，避免锁库或撤销后仍执行。请求无重定向，通用 HTTP 用公共 DNS 解析器阻止重绑定；响应限长、敏感字段清理、精确秘密脱敏，审计不记录秘密、请求头、query/body。
+写操作默认放行，仅极少数破坏性写操作（如 git 强制推送 force push）逐次弹出桌面确认。确认不持有金库锁，确认后重新检查凭据/profile/客户端证书版本、总开关与调用方授权，避免撤销后仍执行。请求无重定向，通用 HTTP 用公共 DNS 解析器阻止重绑定；响应限长、敏感字段清理、精确秘密脱敏，审计不记录秘密、请求头、query/body。
 
-MCP 使用 Streamable HTTP 会话：`initialize` 响应的 `Mcp-Session-Id` 头必须在后续请求中回传。`vault_revoke` 使当前会话与未执行的审批失效；重新使用需重新 initialize。锁库、停止 MCP、轮换 MCP Token 会使全部旧会话失效。撤销不能撤回已经发到远端的请求。MCP Token 可在界面轮换。
+MCP 使用 Streamable HTTP 会话：`initialize` 响应的 `Mcp-Session-Id` 头必须在后续请求中回传。`vault_revoke` 使当前会话失效；重新使用需重新 initialize。停止 MCP、轮换 MCP Token 会使全部旧会话失效。撤销不能撤回已经发到远端的请求。MCP Token 可在界面轮换。
 
 完整收束方案见 [MCP 工具面收束](docs/mcp-surface/2026-11-06-mcp工具面收束.md)。
 
@@ -183,7 +183,7 @@ After the app starts, fill APIs listen on `127.0.0.1:17891`. Install and pairing
 3. 解锁后点 **配对**，60 秒内把一次性配对码填进扩展 / Unlock, click **Pair**, then enter the one-time code in the extension within 60 seconds.
 4. 打开登录页：检测到密码框后右下角会出现匹配账号，点选填充；也可按 `Alt+Shift+F`。卡片优先显示账号，过长标题会缩略；有备注时在账号后显示前几个字。含 TOTP 的条目会在登录页或下一页验证码框填入当前 6 位码，扩展拿不到 TOTP 密钥。打开插件弹窗时，「登记当前站点」会读当前页已填的账号密码，并可填写备注。登录提交后，若该站点还没有这个账号会询问保存；已有同一账号且密码变了会询问更新；密码没变则不弹。 / Open a login page: after a password field is detected, a bottom-right overlay lists matching accounts. `Alt+Shift+F` also opens the chooser. Buttons show the username first, abbreviate long titles, and append a short note when present. Entries with TOTP fill the current six-digit code on the login page or the following verification-code page; the extension never receives the TOTP secret. Opening the popup copies the page’s current username and password into the save form, with an optional note. After submit, Sealbox asks to save a new login, or update when the same account’s password changed. Unchanged passwords are not prompted.
 
-金库锁定时无法填充或登记。配对码一次性有效；填表 Token 写入 `chrome.storage.local`，关掉浏览器后仍然有效，旧的 session 副本会在启动时迁过来并删掉。与 MCP Token 分开，可单独轮换；轮换后扩展会清掉失效 Token 并要求重新配对。读取明文和写入条目都会按当前页面网址复核。提交后采集的账号密码只暂存在会话存储，确认保存才写入金库，拒绝或超时会清掉。填充选择器在 open Shadow DOM 里，只响应真实用户点击。扩展需要访问当前网页以检测和填充登录字段，因此声明 `http://*/*` 与 `https://*/*` 页面权限；Sealbox 本地接口仍只访问 `127.0.0.1`。可在弹窗里配置站点排除列表。
+金库未解锁时无法填充或登记。配对码一次性有效；填表 Token 写入 `chrome.storage.local`，关掉浏览器后仍然有效，旧的 session 副本会在启动时迁过来并删掉。与 MCP Token 分开，可单独轮换；轮换后扩展会清掉失效 Token 并要求重新配对。读取明文和写入条目都会按当前页面网址复核。提交后采集的账号密码只暂存在会话存储，确认保存才写入金库，拒绝或超时会清掉。填充选择器在 open Shadow DOM 里，只响应真实用户点击。扩展需要访问当前网页以检测和填充登录字段，因此声明 `http://*/*` 与 `https://*/*` 页面权限；Sealbox 本地接口仍只访问 `127.0.0.1`。可在弹窗里配置站点排除列表。
 Fill and save require an unlocked vault. Pairing codes are one-shot. The fill token is stored in `chrome.storage.local` and survives closing the browser; a leftover session copy is migrated and deleted on startup. It is separate from the MCP token and can be rotated on its own. After rotation the extension drops the rejected token and asks to pair again. Secret reveal and save are bound to the current page URL. Captured logins stay in session storage until you confirm save, then they are cleared. The chooser uses an open Shadow DOM and requires a real user gesture. The extension needs `http://*/*` and `https://*/*` page access to detect and fill login fields; Sealbox's local API remains limited to `127.0.0.1`. Sites can be excluded in the popup.
 
 匹配规则：按协议、主机和端口匹配（与 Chrome 网页登录相同），路径只用来排序，不挡同站账号。

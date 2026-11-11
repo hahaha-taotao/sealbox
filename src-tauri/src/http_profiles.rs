@@ -370,6 +370,7 @@ fn prepare_builtin_inner(
                 ConfirmField { label: "操作".into(), value: format!("{} {} {}", selected.name, selected.method, selected.path_template) },
                 ConfirmField { label: "参数".into(), value: summary },
             ],
+            dangerous: false,
         })
     } else { None };
     let inner = if profile.adapter == "github" {
@@ -412,7 +413,6 @@ pub fn call_builtin(
 ) -> Option<Result<String, String>> {
     prepare_builtin(session, credential_id, profile, op, params).map(|prepared| {
         let result = prepared.and_then(PreparedBuiltinCall::execute);
-        if result.is_ok() { session.touch(); }
         result
     })
 }

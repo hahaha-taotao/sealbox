@@ -1516,10 +1516,8 @@ async function runBackupRestore() {
     backupNewPassword2.value = "";
   }
 }
-const settingsIdle = ref(15);
 const settingsClip = ref(20);
 const settingsHotkey = ref("Ctrl+Shift+Space");
-const settingsAutoLock = ref(false);
 const oldMaster = ref("");
 const newMaster = ref("");
 const newMaster2 = ref("");
@@ -1866,25 +1864,6 @@ function applyLockedUi() {
   mailOlderError.value = "";
 }
 
-async function lockVault(strict: boolean) {
-  applyLockedUi();
-  try {
-    await api.lock();
-  } catch (e) {
-    await refreshStatus().catch(() => undefined);
-    if (strict) throw e;
-  }
-  await refreshStatus();
-}
-
-async function doLock() {
-  await lockVault(false);
-}
-
-async function lockForUpdate() {
-  await lockVault(true);
-}
-
 async function openMail() {
   goPage("mail");
   mailError.value = "";
@@ -2090,18 +2069,14 @@ function selectMailAccount(account: MailAccount) {
 
 async function loadSettings() {
   const s = await api.settingsGet();
-  settingsIdle.value = Math.max(1, Math.round(s.idle_secs / 60));
   settingsClip.value = s.clipboard_secs;
   settingsHotkey.value = s.hotkey;
-  settingsAutoLock.value = s.auto_lock === true;
 }
 async function saveSettings() {
   try {
     await api.settingsSet({
-      idle_secs: settingsIdle.value * 60,
       clipboard_secs: settingsClip.value,
       hotkey: settingsHotkey.value,
-      auto_lock: settingsAutoLock.value,
     });
     showToast("设置已保存");
   } catch (e) {
@@ -2196,7 +2171,6 @@ async function installUpdate() {
   updateError.value = "";
   updateStage.value = "installing";
   try {
-    await lockForUpdate();
     await install(update.value);
   } catch (e) {
     updateStage.value = "error";
@@ -2406,7 +2380,6 @@ onMounted(async () => {
   const unFocus = await getCurrentWindow().onFocusChanged((event) => {
     if (!event.payload) hideVisibleSecrets();
   });
-  const unLock = await listen("lock-now", () => doLock());
   const unUnlock = await listen("vault-unlocked", async () => {
     if (status.value?.unlocked) return;
     await refreshStatus();
@@ -2454,7 +2427,6 @@ onMounted(async () => {
     window.removeEventListener("keydown", onKey);
     document.removeEventListener("visibilitychange", onVisibility);
     unFocus();
-    unLock();
     unUnlock();
     unSync();
     stopPairingTimer();
@@ -2473,7 +2445,6 @@ onMounted(async () => {
         <span v-if="status?.unlocked" class="status-dot" />
         <span v-if="status?.unlocked" class="badge">{{ status.counts?.total ?? entries.length }} 凭据</span>
       </div>
-      <button class="btn" v-if="status?.unlocked" @click="doLock">锁定</button>
       <div class="win-btns">
         <button @click="api.window('minimize')">—</button>
         <button @click="api.window('maximize')">□</button>
@@ -2886,7 +2857,7 @@ onMounted(async () => {
           </div>
           <div class="mcp-card">
             <h3>监听范围</h3>
-            <p class="crumb">默认只允许本机。局域网没有 TLS，只在可信网络打开。不提供公网。可在指定地址中填写 Tailscale 100.64.0.0/10；自动局域网模式只选择 RFC1918 地址。锁定金库后会退回仅本机。</p>
+            <p class="crumb">默认只允许本机。局域网没有 TLS，只在可信网络打开。不提供公网。可在指定地址中填写 Tailscale 100.64.0.0/10；自动局域网模式只选择 RFC1918 地址。</p>
             <div class="field">
               <label>模式</label>
               <select v-model="listenMode">
@@ -2905,7 +2876,7 @@ onMounted(async () => {
           </div>
           <div class="mcp-card">
             <h3>Cursor / Claude Code</h3>
-            <p class="crumb">金库锁定时工具会失败并提示先解锁。局域网电脑调用 git 时，path 必须是运行 Sealbox 这台电脑上的绝对路径；push 仍需本机确认。</p>
+            <p class="crumb">局域网电脑调用 git 时，path 必须是运行 Sealbox 这台电脑上的绝对路径；push 仅强制推送（force push）仍需本机确认。</p>
             <div class="field">
               <label>Bearer Token</label>
               <div class="secret-row">
@@ -2923,7 +2894,7 @@ onMounted(async () => {
           <div class="mcp-card">
             <h3>固定六工具 · 所有平台通过 profile</h3>
             <p class="crumb"><code>vault_list</code> · <code>vault_describe</code> · <code>http_call</code> · <code>git</code> · <code>mail</code> · <code>vault_revoke</code></p>
-            <p class="crumb">工具表不随总开关、凭据数量或平台改变；停用 MCP 时仍保留六工具定义，但调用会被拒绝。金库锁定也会拒绝调用。</p>
+            <p class="crumb">工具表不随总开关、凭据数量或平台改变；停用 MCP 时仍保留六工具定义，但调用会被拒绝。</p>
             <p class="crumb"><code>http_call</code> 是唯一远程 HTTP 入口。先用 <code>vault_list</code> 找凭据，再用 <code>vault_describe</code> 看具名操作、参数与风险，最后按操作名调用。Git 与邮件使用各自工具的 action。</p>
             <p class="crumb">新增平台或接口：保险库 → 凭据详情 →「编辑 HTTP 操作 profile」。可编辑固定 origin、认证、允许方法/路径、具名操作与参数；秘密仍留在金库，不写进 profile。没有 profile 的新平台不开放 HTTP 操作。</p>
           </div>
@@ -3246,19 +3217,10 @@ onMounted(async () => {
           <div class="settings-grid">
             <div class="mcp-card">
               <div class="card-head">
-                <h3>锁定与快捷键</h3>
-                <label class="lock-switch">
-                  <span>自动锁定</span>
-                  <input type="checkbox" v-model="settingsAutoLock" />
-                  <i aria-hidden="true"></i>
-                </label>
+                <h3>快捷键</h3>
               </div>
-              <p class="crumb">{{ settingsAutoLock ? '空闲超时后自动锁库；复制秘密后按设定秒数清空剪贴板。' : '已关闭自动锁定，空闲不会锁库。复制秘密后仍按设定秒数清空剪贴板。' }}</p>
+              <p class="crumb">复制秘密后按设定秒数清空剪贴板。</p>
               <div class="settings-fields">
-                <div class="field">
-                  <label>空闲锁定（分钟）</label>
-                  <input type="number" min="1" v-model.number="settingsIdle" :disabled="!settingsAutoLock" />
-                </div>
                 <div class="field">
                   <label>剪贴板清空（秒）</label>
                   <input type="number" min="5" max="120" v-model.number="settingsClip" />
@@ -3631,7 +3593,7 @@ onMounted(async () => {
           <div class="field">
             <label class="check">
               <input type="checkbox" v-model="backupIncludeSettings" />
-              包含本机设置（空闲锁定、剪贴板）
+              包含本机设置（剪贴板）
             </label>
           </div>
           <div style="display:flex;gap:8px;justify-content:flex-end">

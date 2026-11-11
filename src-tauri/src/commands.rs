@@ -3,7 +3,7 @@ use crate::backup::{
     restore_new_with_options, BackupInspection, RestoreOptions, MAX_BACKUP_BYTES,
 };
 use crate::clipboard;
-use crate::lock::{idle_lock_if_needed, lock_everything, lock_session, recover_lock};
+use crate::lock::{lock_session, recover_lock};
 use crate::mcp::{self, McpState};
 use crate::secure_store;
 use crate::session::Session;
@@ -118,40 +118,26 @@ fn bind_open_vault(session: &mut Session, path: &Path) {
 
 fn normalize_settings(settings: Settings) -> Settings {
     Settings {
-        idle_secs: settings.idle_secs.max(60),
         clipboard_secs: settings.clipboard_secs.clamp(5, 120),
         hotkey: if settings.hotkey.trim().is_empty() {
             Settings::default().hotkey
         } else {
             settings.hotkey
         },
-        auto_lock: settings.auto_lock,
     }
 }
 
 fn settings_from_vault(vault: &Vault) -> Settings {
-    let idle = vault
-        .get_setting("idle_secs")
-        .ok()
-        .flatten()
-        .and_then(|s| s.parse::<u64>().ok());
     let clip = vault
         .get_setting("clipboard_secs")
         .ok()
         .flatten()
         .and_then(|s| s.parse::<u64>().ok());
     let hotkey = vault.get_setting("hotkey").ok().flatten();
-    let auto_lock = vault
-        .get_setting("auto_lock")
-        .ok()
-        .flatten()
-        .map(|s| s != "0");
     let defaults = Settings::default();
     normalize_settings(Settings {
-        idle_secs: idle.unwrap_or(defaults.idle_secs),
         clipboard_secs: clip.unwrap_or(defaults.clipboard_secs),
         hotkey: hotkey.unwrap_or(defaults.hotkey),
-        auto_lock: auto_lock.unwrap_or(defaults.auto_lock),
     })
 }
 
@@ -163,15 +149,14 @@ fn apply_vault_settings(session: &mut Session) {
         return;
     };
     let settings = settings_from_vault(vault);
-    session.idle_secs = settings.idle_secs;
     session.clipboard_secs = settings.clipboard_secs;
     session.hotkey = settings.hotkey;
-    session.auto_lock = settings.auto_lock;
 }
 
-/// The DEK is persisted only while automatic locking is disabled.  The marker
-/// is encrypted with the DEK and prevents an arbitrary 32-byte credential from
-/// opening an empty vault (which has no encrypted entry to authenticate).
+/// The DEK is always persisted to the OS credential store so the vault can
+/// auto-unlock on restart.  The marker is encrypted with the DEK and prevents an
+/// arbitrary 32-byte credential from opening an empty vault (which has no
+/// encrypted entry to authenticate).
 fn sync_auto_unlock_credential(session: &Session) {
     let Ok(vault) = session.vault() else {
         return;
@@ -179,10 +164,6 @@ fn sync_auto_unlock_credential(session: &Session) {
     let Ok(dek) = session.dek() else {
         return;
     };
-    if session.auto_lock {
-        let _ = secure_store::clear_dek();
-        return;
-    }
     let marker_ok = vault
         .get_secret_setting(dek, AUTO_UNLOCK_MARKER_KEY)
         .ok()
@@ -201,8 +182,7 @@ fn sync_auto_unlock_credential(session: &Session) {
     let _ = secure_store::save_dek(dek);
 }
 
-/// Restore a DEK from the OS credential store only when the persisted vault
-/// setting explicitly disables automatic locking.  Any stale or malformed
+/// Restore a DEK from the OS credential store.  Any stale or malformed
 /// credential is removed before falling back to the password screen.
 fn restore_auto_unlock(path: &Path, session: &mut Session) -> bool {
     if session.is_unlocked() {
@@ -211,10 +191,6 @@ fn restore_auto_unlock(path: &Path, session: &mut Session) -> bool {
     let Ok(vault) = Vault::open(path.to_str().unwrap_or_default()) else {
         return false;
     };
-    if settings_from_vault(&vault).auto_lock {
-        let _ = secure_store::clear_dek();
-        return false;
-    }
     let Ok(Some(dek)) = secure_store::load_dek() else {
         return false;
     };
@@ -236,16 +212,10 @@ fn restore_auto_unlock(path: &Path, session: &mut Session) -> bool {
 fn persist_session_settings(session: &Session) -> Result<(), String> {
     let vault = session.vault().map_err(map_err)?;
     vault
-        .set_setting("idle_secs", &session.idle_secs.to_string())
-        .map_err(map_err)?;
-    vault
         .set_setting("clipboard_secs", &session.clipboard_secs.to_string())
         .map_err(map_err)?;
     vault
         .set_setting("hotkey", &session.hotkey)
-        .map_err(map_err)?;
-    vault
-        .set_setting("auto_lock", if session.auto_lock { "1" } else { "0" })
         .map_err(map_err)?;
     Ok(())
 }
@@ -485,13 +455,6 @@ fn copy_untracked_text(session: &mut Session, text: &str) -> Result<(), String> 
     }
     clipboard::write_text(text)?;
     session.clear_clipboard_mark();
-    Ok(())
-}
-
-#[tauri::command]
-pub fn lock_vault(state: State<AppState>) -> Result<(), String> {
-    lock_everything(&state.session, &state.mcp);
-    clear_transfer_and_runtime(&state);
     Ok(())
 }
 
@@ -1027,22 +990,15 @@ pub fn entry_profile(state: State<AppState>, id: String) -> Result<EntryProfile,
     Ok(profile)
 }
 
-/// Clipboard wipe and idle lock. Runs on the Rust clock, not a webview listener,
-/// so hiding the main window to the tray cannot stall either invariant.
+/// Clipboard wipe. Runs on the Rust clock, not a webview listener, so hiding
+/// the main window to the tray cannot stall it. The vault is never re-locked.
 pub fn tick_security(state: &AppState) -> bool {
-    let locked = {
-        let mut session = lock_session(&state.session);
-        if session.clipboard_should_clear(&clipboard::read_text().unwrap_or_default()) {
-            let _ = clipboard::clear();
-            session.clear_clipboard_mark();
-        }
-        idle_lock_if_needed(&mut session, &state.mcp)
-    };
-    if locked {
-        let _ = mcp::rebind_locked(&state.mcp);
-        clear_transfer_and_runtime(state);
+    let mut session = lock_session(&state.session);
+    if session.clipboard_should_clear(&clipboard::read_text().unwrap_or_default()) {
+        let _ = clipboard::clear();
+        session.clear_clipboard_mark();
     }
-    locked
+    false
 }
 
 #[tauri::command]
@@ -1383,21 +1339,15 @@ pub fn csv_export(
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Settings {
-    pub idle_secs: u64,
     pub clipboard_secs: u64,
     pub hotkey: String,
-    /// Missing means auto-lock stays off.
-    #[serde(default)]
-    pub auto_lock: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            idle_secs: 900,
             clipboard_secs: 20,
             hotkey: "Ctrl+Shift+Space".into(),
-            auto_lock: false,
         }
     }
 }
@@ -1409,10 +1359,8 @@ pub fn settings_get(state: State<AppState>) -> Settings {
         apply_vault_settings(&mut s);
     }
     Settings {
-        idle_secs: s.idle_secs,
         clipboard_secs: s.clipboard_secs,
         hotkey: s.hotkey.clone(),
-        auto_lock: s.auto_lock,
     }
 }
 
@@ -1423,27 +1371,15 @@ pub fn settings_set(
     settings: Settings,
 ) -> Result<(), String> {
     let settings = normalize_settings(settings);
-    let (idle_locked, saved) = {
+    {
         let mut s = lock_session(&state.session);
-        let idle_locked = idle_lock_if_needed(&mut s, &state.mcp);
-        if idle_locked || !s.is_unlocked() || s.vault().is_err() {
-            (idle_locked, false)
-        } else {
-            s.idle_secs = settings.idle_secs;
-            s.clipboard_secs = settings.clipboard_secs;
-            s.hotkey = settings.hotkey.clone();
-            s.auto_lock = settings.auto_lock;
-            persist_session_settings(&s)?;
-            sync_auto_unlock_credential(&s);
-            (false, true)
+        if !s.is_unlocked() || s.vault().is_err() {
+            return Err("请先解锁金库再保存设置".into());
         }
-    };
-    if idle_locked {
-        let _ = mcp::rebind_locked(&state.mcp);
-        clear_transfer_and_runtime(&state);
-    }
-    if !saved {
-        return Err("请先解锁金库再保存设置".into());
+        s.clipboard_secs = settings.clipboard_secs;
+        s.hotkey = settings.hotkey.clone();
+        persist_session_settings(&s)?;
+        sync_auto_unlock_credential(&s);
     }
     register_hotkey(&app, &settings.hotkey)
 }
@@ -2325,46 +2261,22 @@ mod tests {
         let vault = Vault::open(path.to_str().unwrap()).unwrap();
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
-        session.idle_secs = 60 * 60;
         session.clipboard_secs = 45;
         session.hotkey = "Ctrl+Alt+K".into();
-        session.auto_lock = false;
         persist_session_settings(&session).unwrap();
         drop(session);
 
         let reopened = Vault::open(path.to_str().unwrap()).unwrap();
         let stored = settings_from_vault(&reopened);
-        assert_eq!(stored.idle_secs, 3600);
         assert_eq!(stored.clipboard_secs, 45);
         assert_eq!(stored.hotkey, "Ctrl+Alt+K");
-        assert!(!stored.auto_lock);
         assert_eq!(persisted_hotkey(&path).as_deref(), Some("Ctrl+Alt+K"));
 
         let mut restarted = Session::default();
-        assert_eq!(restarted.idle_secs, 15 * 60);
-        assert!(!restarted.auto_lock);
-        restarted.auto_lock = true;
         restarted.set_unlocked(reopened, dek);
-        // Unlock refreshes activity. The window then sits while the user types
-        // the password and opens settings; status used to idle-lock against the
-        // 15 minute default before the stored timeout was applied.
-        restarted.age_last_active(std::time::Duration::from_secs(16 * 60));
-        assert!(restarted.maybe_idle_lock());
-        assert!(!restarted.is_unlocked());
-
-        let again = Vault::open(path.to_str().unwrap()).unwrap();
-        restarted.set_unlocked(again, dek);
-        restarted.age_last_active(std::time::Duration::from_secs(16 * 60));
         apply_vault_settings(&mut restarted);
-        assert!(!restarted.maybe_idle_lock());
-        assert!(restarted.is_unlocked());
-        assert_eq!(restarted.idle_secs, 3600);
         assert_eq!(restarted.clipboard_secs, 45);
         assert_eq!(restarted.hotkey, "Ctrl+Alt+K");
-        assert!(!restarted.auto_lock);
-        restarted.age_last_active(std::time::Duration::from_secs(3601));
-        assert!(!restarted.maybe_idle_lock());
-        assert!(restarted.is_unlocked());
     }
 
     #[test]
@@ -2373,7 +2285,6 @@ mod tests {
         let vault = Vault::open(path.to_str().unwrap()).unwrap();
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
-        session.auto_lock = false;
         sync_auto_unlock_credential(&session);
 
         let reopened = Vault::open(path.to_str().unwrap()).unwrap();
@@ -2388,9 +2299,6 @@ mod tests {
             .get_secret_setting(&[9u8; 32], AUTO_UNLOCK_MARKER_KEY)
             .unwrap()
             .is_none());
-
-        session.auto_lock = true;
-        sync_auto_unlock_credential(&session);
         let _ = secure_store::clear_dek();
     }
 
@@ -2401,25 +2309,19 @@ mod tests {
         let mut session = Session::default();
         session.set_unlocked(vault, dek);
         let stored = normalize_settings(Settings {
-            idle_secs: 1,
             clipboard_secs: 1,
             hotkey: "  ".into(),
-            auto_lock: true,
         });
-        session.idle_secs = stored.idle_secs;
         session.clipboard_secs = stored.clipboard_secs;
         session.hotkey = stored.hotkey;
-        session.auto_lock = stored.auto_lock;
         persist_session_settings(&session).unwrap();
         session.lock();
         assert!(persist_session_settings(&session).is_err());
 
         let reopened = Vault::open(path.to_str().unwrap()).unwrap();
         let stored = settings_from_vault(&reopened);
-        assert_eq!(stored.idle_secs, 60);
         assert_eq!(stored.clipboard_secs, 5);
         assert_eq!(stored.hotkey, Settings::default().hotkey);
-        assert!(stored.auto_lock);
     }
 
     fn sample_site() -> UpsertEntry {
@@ -2671,27 +2573,5 @@ mod tests {
         assert!(!tick_security(&state));
         assert!(!lock_session(&state.session).clipboard_owned(&secret));
         assert!(!lock_session(&state.session).clipboard_should_clear(&secret));
-    }
-
-    #[test]
-    fn security_tick_idle_locks_without_a_window() {
-        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
-        let mut session = Session::default();
-        session.set_unlocked(vault, dek);
-        session.idle_secs = 1;
-        session.auto_lock = true;
-        session.age_last_active(std::time::Duration::from_secs(2));
-        let state = AppState {
-            session: Arc::new(Mutex::new(session)),
-            mcp: McpState::default(),
-            auto: Mutex::new(crate::auto_sync::AutoSync::default()),
-            db_path: Mutex::new(None),
-            transfer: Mutex::new(crate::transfer::TransferCache::default()),
-            sync_runtime: Mutex::new(crate::sync::SyncRuntime::default()),
-        };
-        state.mcp.open_pairing();
-        assert!(tick_security(&state));
-        assert!(!lock_session(&state.session).is_unlocked());
-        assert!(!state.mcp.pairing_status().active);
     }
 }

@@ -80,8 +80,7 @@ fn score_url(page_url: &str, stored_url: &str) -> i32 {
 }
 
 pub fn match_websites(session: &Mutex<Session>, page_url: &str) -> Result<Vec<FillMatch>, String> {
-    let mut s = lock_session(session);
-    s.maybe_idle_lock();
+    let s = lock_session(session);
     if !s.is_unlocked() {
         return Err("locked".into());
     }
@@ -168,8 +167,7 @@ pub fn reveal_for_fill(
     if page_url.trim().is_empty() {
         return Err("url required".into());
     }
-    let mut s = lock_session(session);
-    s.maybe_idle_lock();
+    let s = lock_session(session);
     if !s.is_unlocked() {
         return Err("locked".into());
     }
@@ -214,7 +212,6 @@ pub fn reveal_for_fill(
     };
     let _ = vault.bump_use(id);
     let _ = vault.audit("browser_fill", Some(id), "ok");
-    s.touch();
     Ok(FillSecret {
         id: id.to_string(),
         title: dto.title,
@@ -243,8 +240,7 @@ pub fn save_from_browser_with_notes(
     password: &str,
     notes: Option<&str>,
 ) -> Result<String, String> {
-    let mut s = lock_session(session);
-    s.maybe_idle_lock();
+    let s = lock_session(session);
     if !s.is_unlocked() {
         return Err("locked".into());
     }
@@ -326,7 +322,6 @@ pub fn save_from_browser_with_notes(
             },
         )
         .map_err(|e| e.to_string())?;
-    s.touch();
     Ok(dto.id)
 }
 
@@ -462,7 +457,6 @@ pub fn new_fill_token() -> String {
 mod tests {
     use super::*;
     use crate::vault::Vault;
-    use std::time::Duration;
 
     fn unlocked_github() -> Mutex<Session> {
         let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
@@ -556,59 +550,6 @@ mod tests {
     }
 
     #[test]
-    fn match_does_not_refresh_idle_timer() {
-        let mutex = unlocked_github();
-        {
-            let mut s = mutex.lock().unwrap();
-            s.idle_secs = 2;
-            s.auto_lock = true;
-            s.age_last_active(Duration::from_secs(1));
-        }
-        let hits = match_websites(&mutex, "https://github.com/login").unwrap();
-        assert_eq!(hits.len(), 1);
-        let mut s = mutex.lock().unwrap();
-        s.age_last_active(Duration::from_millis(1500));
-        assert!(
-            s.maybe_idle_lock(),
-            "browser match probes must not keep the vault unlocked"
-        );
-        assert!(!s.is_unlocked());
-    }
-
-    #[test]
-    fn reveal_for_fill_refreshes_idle_timer() {
-        let mutex = unlocked_github();
-        let hits = match_websites(&mutex, "https://github.com/login").unwrap();
-        {
-            let mut s = mutex.lock().unwrap();
-            s.idle_secs = 2;
-            s.auto_lock = true;
-            s.age_last_active(Duration::from_secs(1));
-        }
-        let sec = reveal_for_fill(&mutex, &hits[0].id, "https://github.com/login").unwrap();
-        assert_eq!(sec.password, "gh-pass");
-        let mut s = mutex.lock().unwrap();
-        s.age_last_active(Duration::from_millis(1500));
-        assert!(!s.maybe_idle_lock());
-        assert!(s.is_unlocked());
-    }
-
-    #[test]
-    fn match_locks_when_already_idle() {
-        let mutex = unlocked_github();
-        {
-            let mut s = mutex.lock().unwrap();
-            s.idle_secs = 1;
-            s.auto_lock = true;
-            s.age_last_active(Duration::from_secs(2));
-        }
-        assert_eq!(
-            match_websites(&mutex, "https://github.com/login").unwrap_err(),
-            "locked"
-        );
-    }
-
-    #[test]
     fn fill_http_rejects_match_secret_and_save_after_lock() {
         let mutex = unlocked_github();
         let hits = match_websites(&mutex, "https://github.com/login").unwrap();
@@ -659,27 +600,6 @@ mod tests {
             .0,
             403
         );
-    }
-
-    #[test]
-    fn classify_does_not_refresh_idle_timer() {
-        let mutex = unlocked_github();
-        {
-            let mut s = mutex.lock().unwrap();
-            s.idle_secs = 2;
-            s.auto_lock = true;
-            s.age_last_active(Duration::from_secs(1));
-        }
-        let classified =
-            classify_save(&mutex, "https://github.com/login", "octocat", "gh-pass").unwrap();
-        assert_eq!(classified.action, "unchanged");
-        let mut s = mutex.lock().unwrap();
-        s.age_last_active(Duration::from_millis(1500));
-        assert!(
-            s.maybe_idle_lock(),
-            "password-update probes must not keep the vault unlocked"
-        );
-        assert!(!s.is_unlocked());
     }
 
     #[test]

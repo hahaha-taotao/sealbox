@@ -1,4 +1,5 @@
-//! 写操作的本机桌面确认。MCP 工作线程会阻塞直到用户点「允许」或「拒绝」。
+//! 写操作的本机桌面确认。默认放行；只有标记为 `dangerous` 的破坏性写操作才弹窗，
+//! MCP 工作线程会阻塞直到用户点「允许」或「拒绝」。
 //!
 //! 测试默认自动放行，避免弹窗；可用 [`with_auto`] 覆盖。
 //! 窗口的显示/隐藏由 [`set_hooks`] 注入，避免测试二进制链上 Tauri GUI。
@@ -28,6 +29,9 @@ pub struct ConfirmPayload {
     pub title: String,
     pub prompt: String,
     pub fields: Vec<ConfirmField>,
+    /// 破坏性写操作才弹窗确认；普通写操作默认放行。
+    #[serde(default)]
+    pub dangerous: bool,
 }
 
 struct PendingConfirm {
@@ -66,12 +70,18 @@ pub fn set_hooks(
 }
 
 pub fn ask(title: &str, prompt: &str, fields: &[(&str, String)]) -> bool {
-    match AUTO.with(std::cell::Cell::get) {
-        1 => return true,
-        n if n < 0 => return false,
-        _ => {}
-    }
-    native_ask(title, prompt, fields)
+    ask_payload(&ConfirmPayload {
+        title: title.to_string(),
+        prompt: prompt.to_string(),
+        fields: fields
+            .iter()
+            .map(|(label, value)| ConfirmField {
+                label: (*label).to_string(),
+                value: value.clone(),
+            })
+            .collect(),
+        dangerous: false,
+    })
 }
 
 /// Run `prepare` while the session mutex is held, then wait for desktop
@@ -92,6 +102,9 @@ pub fn ask_payload(payload: &ConfirmPayload) -> bool {
         1 => return true,
         n if n < 0 => return false,
         _ => {}
+    }
+    if !payload.dangerous {
+        return true;
     }
     native_ask_payload(payload.clone())
 }
@@ -121,20 +134,6 @@ pub fn deny_pending() {
         let _ = item.tx.send(false);
     }
     hide();
-}
-
-fn native_ask(title: &str, prompt: &str, fields: &[(&str, String)]) -> bool {
-    native_ask_payload(ConfirmPayload {
-        title: title.to_string(),
-        prompt: prompt.to_string(),
-        fields: fields
-            .iter()
-            .map(|(label, value)| ConfirmField {
-                label: (*label).to_string(),
-                value: value.clone(),
-            })
-            .collect(),
-    })
 }
 
 fn native_ask_payload(payload: ConfirmPayload) -> bool {
@@ -200,6 +199,7 @@ mod tests {
                         title: "t".into(),
                         prompt: "m".into(),
                         fields: Vec::new(),
+                        dangerous: false,
                     },
                 ))
             })

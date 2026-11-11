@@ -96,7 +96,6 @@ export interface SyncReport {
 }
 
 export interface SettingsView {
-  idle_secs: number;
   clipboard_secs: number;
   biometry_enabled: boolean;
 }
@@ -171,8 +170,6 @@ export const api = {
   unlockDek: (dekB64: string) => invoke("unlock_with_dek", { dekB64 }),
   exportDek: () => invoke<string>("export_dek"),
   setBiometry: (enabled: boolean) => invoke("set_biometry_enabled", { enabled }),
-  lock: () => invoke("lock_vault"),
-  tick: () => invoke<boolean>("tick_idle"),
   entries: (filter: Record<string, unknown>) => invoke<EntryDto[]>("list_entries", { filter }),
   counts: (filter: Record<string, unknown>) => invoke<Counts>("list_counts", { filter }),
   folders: () => invoke<Folder[]>("list_folders"),
@@ -189,8 +186,8 @@ export const api = {
   notes: (id: string) => invoke<string | null>("get_notes", { id }),
   profile: (id: string) => invoke<EntryProfile>("entry_profile", { id }),
   settings: () => invoke<SettingsView>("settings_get"),
-  saveSettings: (idleSecs: number, clipboardSecs: number) =>
-    invoke("settings_set", { idleSecs, clipboardSecs }),
+  saveSettings: (clipboardSecs: number) =>
+    invoke("settings_set", { clipboardSecs }),
   syncStatus: () => invoke<SyncView>("sync_status"),
   syncSave: (input: Record<string, unknown>) => invoke<SyncView>("sync_save", { input }),
   syncClear: () => invoke("sync_clear"),

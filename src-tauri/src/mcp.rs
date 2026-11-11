@@ -1,6 +1,6 @@
 use crate::fill;
 use crate::github_mcp;
-use crate::lock::{idle_lock_if_needed, lock_session, recover_lock};
+use crate::lock::{lock_session, recover_lock};
 use crate::session::Session;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -171,9 +171,8 @@ pub struct McpState {
     pub port: Arc<Mutex<u16>>,
     pub token: Arc<Mutex<String>>,
     pub fill_token: Arc<Mutex<String>>,
-    /// True while the vault is locked; listeners remain loopback-only then.
+    /// True while the vault is not yet unlocked; listeners remain loopback-only then.
     pub locked: Arc<AtomicBool>,
-    restart_on_lock: Arc<AtomicBool>,
     listen_mode: Arc<Mutex<String>>,
     listen_address: Arc<Mutex<String>>,
     active_mode: Arc<Mutex<String>>,
@@ -193,7 +192,6 @@ impl Default for McpState {
             token: Arc::new(Mutex::new(String::new())),
             fill_token: Arc::new(Mutex::new(String::new())),
             locked: Arc::new(AtomicBool::new(true)),
-            restart_on_lock: Arc::new(AtomicBool::new(false)),
             listen_mode: Arc::new(Mutex::new(LISTEN_MODE_LOOPBACK.into())),
             listen_address: Arc::new(Mutex::new(String::new())),
             active_mode: Arc::new(Mutex::new(LISTEN_MODE_LOOPBACK.into())),
@@ -1099,8 +1097,8 @@ fn call_git_tool(session: &Mutex<Session>, name: &str, args: Value, permit: &Ato
 
 fn require_call_authorized(s: &Session, permit: &AtomicBool, generation: u64) -> Result<(), String> {
     if !permit.load(Ordering::SeqCst) { return Err("当前调用方的授权已撤销".into()); }
-    if !s.is_unlocked() || s.generation() != generation {
-        return Err("金库已锁定或解锁会话已改变，请重新调用".into());
+    if s.generation() != generation {
+        return Err("解锁会话已改变，请重新调用".into());
     }
     crate::credential_mcp::require_enabled(s)
 }
@@ -1141,7 +1139,7 @@ fn call_http_tool(session: &Mutex<Session>, permit: &AtomicBool, args: Value) ->
         }).unwrap_or_else(||("-".into(),"-".into()))
     };
     let result=call_http_tool_inner(session,permit,args);
-    let mut s=lock_session(session);
+    let s=lock_session(session);
     if let Ok(vault)=s.vault() {
         let status=result.as_ref().ok().map(|(status,_)|status.to_string()).unwrap_or_else(||"-".into());
         let reason=match &result {Ok(_)=>"ok",Err(e) if e.contains("拒绝")=>"denied",Err(e) if e.contains("撤销")=>"revoked",Err(_)=>"validation_or_request"};
@@ -1149,7 +1147,6 @@ fn call_http_tool(session: &Mutex<Session>, permit: &AtomicBool, args: Value) ->
             audit_token(&op_name),if result.is_ok(){"allow"}else{"deny"},reason,audit_token(&origin),&crate::http_guard::sha256_hex(id.as_bytes())[..12],status);
         let _=vault.audit(if result.is_ok(){"mcp_http"}else{"mcp_http_denied"},None,&detail);
     }
-    if result.is_ok(){s.touch();}
     result.map(|(_,text)|text)
 }
 
@@ -1250,20 +1247,15 @@ fn call_tool(
         return Ok(json!({"revoked":true,"scope":"current_caller","reauthorization_required":true}).to_string());
     }
     let generation = {
-        let mut s = lock_session(session);
-        idle_lock_if_needed(&mut s, mcp);
-        if !s.is_unlocked() {
-            return Err("金库已锁定。请先在 Sealbox 窗口解锁，再让我重试。".into());
-        }
+        let s = lock_session(session);
         crate::credential_mcp::require_enabled(&s)?;
         s.generation()
     };
     match name {
         "vault_list" | "vault_describe" => {
-            let mut s=lock_session(session);
+            let s=lock_session(session);
             let result=if name=="vault_list" {crate::credential_mcp::list(&s,&args)} else {crate::credential_mcp::describe(&s,&args)};
             if let Ok(vault)=s.vault() {let _=vault.audit("mcp_vault",None,&format!("operation={name} decision={}",if result.is_ok(){"allow"}else{"deny"}));}
-            if result.is_ok() {s.touch();}
             result
         },
         "http_call" => call_http_tool(session,&permit,args),
@@ -1273,9 +1265,6 @@ fn call_tool(
             let action=args.get("action").and_then(Value::as_str).unwrap_or("");
             if !MAIL_ACTIONS.contains(&action) {return Err(format!("mail 需要合法 action：{}",MAIL_ACTIONS.join("、")));}
             github_mcp::validate_tool_arguments(&definition["inputSchema"],&args)?;
-            if action=="save" && !crate::confirm::ask("保存邮件附件","允许把附件保存到本机新文件？",&[("目标文件",args.get("path").and_then(Value::as_str).unwrap_or("").to_string())]) {
-                return Err("用户拒绝了这次写操作".into());
-            }
             require_call_authorized(&lock_session(session),&permit,generation)?;
             call_mail_tool(session,name,args,&permit,generation)
         },
@@ -1731,7 +1720,6 @@ pub fn start(mcp: &McpState, session: Arc<Mutex<Session>>) -> Result<u16, String
         })
         .collect::<Vec<_>>();
     *recover_lock(&mcp.listener_threads) = handles;
-    mcp.restart_on_lock.store(false, Ordering::SeqCst);
     if let Some(error) = bind_error {
         Err(error)
     } else {
@@ -1751,7 +1739,6 @@ fn remove_stale_bridge_file() {
 
 pub fn stop(mcp: &McpState) {
     mcp.running.store(false, Ordering::SeqCst);
-    mcp.restart_on_lock.store(false, Ordering::SeqCst);
     mcp.generation.fetch_add(1, Ordering::SeqCst);
     mcp.close_pairing();
     mcp.invalidate_callers();
@@ -1766,11 +1753,8 @@ pub fn stop(mcp: &McpState) {
 /// do not touch the session, so joining them here closes the old LAN socket
 /// before a loopback-only rebind.
 pub fn signal_locked(mcp: &McpState) {
-    let was_running = mcp.running.swap(false, Ordering::SeqCst);
+    mcp.running.store(false, Ordering::SeqCst);
     mcp.locked.store(true, Ordering::SeqCst);
-    if was_running {
-        mcp.restart_on_lock.store(true, Ordering::SeqCst);
-    }
     mcp.generation.fetch_add(1, Ordering::SeqCst);
     mcp.close_pairing();
     mcp.invalidate_callers();
@@ -1779,18 +1763,6 @@ pub fn signal_locked(mcp: &McpState) {
         let _ = handle.join();
     }
     mcp.set_active_policy(&ListenPolicy::loopback());
-}
-
-/// Rebind only if MCP was active before locking; the persisted LAN preference
-/// is never used while the vault remains locked.
-pub fn rebind_locked(mcp: &McpState) -> Result<u16, String> {
-    mcp.locked.store(true, Ordering::SeqCst);
-    if !mcp.restart_on_lock.swap(false, Ordering::SeqCst) {
-        return Ok(*recover_lock(&mcp.port));
-    }
-    let session = crate::lock::active_session()
-        .unwrap_or_else(|| Arc::new(Mutex::new(Session::default())));
-    start(mcp, session)
 }
 
 #[cfg(test)]

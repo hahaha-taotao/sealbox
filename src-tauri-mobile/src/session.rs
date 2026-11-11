@@ -6,8 +6,6 @@ use zeroize::Zeroize;
 pub struct Session {
     vault: Option<Vault>,
     dek: Option<[u8; 32]>,
-    last_active: Instant,
-    pub idle_secs: u64,
     pub clipboard_secs: u64,
     clipboard_deadline: Option<Instant>,
     clipboard_hash: Option<[u8; 32]>,
@@ -23,8 +21,6 @@ impl Default for Session {
         Self {
             vault: None,
             dek: None,
-            last_active: Instant::now(),
-            idle_secs: 60,
             clipboard_secs: 20,
             clipboard_deadline: None,
             clipboard_hash: None,
@@ -37,14 +33,6 @@ impl Default for Session {
 impl Session {
     pub fn is_unlocked(&self) -> bool {
         self.dek.is_some()
-    }
-
-    pub fn maybe_idle_lock(&mut self) -> bool {
-        if self.dek.is_some() && self.last_active.elapsed() > Duration::from_secs(self.idle_secs) {
-            self.lock();
-            return true;
-        }
-        false
     }
 
     /// Returns whether a DEK was actually discarded.
@@ -78,7 +66,6 @@ impl Session {
         self.vault = Some(vault);
         self.dek = Some(dek);
         self.failed_unlocks = 0;
-        self.last_active = Instant::now();
     }
 
     pub fn note_failed_unlock(&mut self) {
@@ -97,9 +84,7 @@ impl Session {
     }
 
     pub fn require_unlocked(&mut self) -> Result<(), VaultError> {
-        self.maybe_idle_lock();
         self.dek()?;
-        self.last_active = Instant::now();
         Ok(())
     }
 

@@ -83,24 +83,17 @@ fn setting_u64(vault: &Vault, key: &str, fallback: u64) -> u64 {
 }
 
 fn apply_settings(session: &mut Session) {
-    let (idle, clip) = {
+    let clip = {
         let Ok(vault) = session.vault() else {
             return;
         };
-        (
-            setting_u64(vault, "idle_secs", 60).max(30),
-            setting_u64(vault, "clipboard_secs", 20).clamp(5, 120),
-        )
+        setting_u64(vault, "clipboard_secs", 20).clamp(5, 120)
     };
-    session.idle_secs = idle;
     session.clipboard_secs = clip;
 }
 
 fn persist_settings(session: &Session) -> Result<(), String> {
     let vault = session.vault().map_err(map_err)?;
-    vault
-        .set_setting("idle_secs", &session.idle_secs.to_string())
-        .map_err(map_err)?;
     vault
         .set_setting("clipboard_secs", &session.clipboard_secs.to_string())
         .map_err(map_err)
@@ -188,7 +181,6 @@ pub fn setup_vault(app: AppHandle, state: State<AppState>, password: String) -> 
     let path_str = path.to_str().ok_or("金库路径无效")?;
     let dek = Vault::create(path_str, &password).map_err(map_err)?;
     let vault = Vault::open(path_str).map_err(map_err)?;
-    vault.set_setting("idle_secs", "60").map_err(map_err)?;
     vault.set_setting("clipboard_secs", "20").map_err(map_err)?;
     {
         let mut session = lock_session(&state.session);
@@ -276,37 +268,17 @@ pub fn set_biometry_enabled(app: AppHandle, state: State<AppState>, enabled: boo
 }
 
 #[tauri::command]
-pub fn lock_vault(state: State<AppState>) -> Result<(), String> {
-    {
-        let mut session = lock_session(&state.session);
-        session.lock();
-        let _ = session.take_lock_event();
-    }
-    discard_transfer_and_runtime(&state);
-    Ok(())
-}
-
-#[tauri::command]
 pub fn tick_idle(state: State<AppState>) -> Result<bool, String> {
-    let (locked, lock_event, unlocked) = {
-        let mut session = lock_session(&state.session);
-        let locked = session.maybe_idle_lock();
-        if !locked && session.clipboard_deadline_due() {
-            let current = clipboard::read_text().unwrap_or_default();
-            if session.clipboard_should_clear(&current) {
-                let _ = clipboard::clear();
-                session.clear_clipboard_mark();
-            }
+    let mut session = lock_session(&state.session);
+    if session.clipboard_deadline_due() {
+        let current = clipboard::read_text().unwrap_or_default();
+        if session.clipboard_should_clear(&current) {
+            let _ = clipboard::clear();
+            session.clear_clipboard_mark();
         }
-        let lock_event = session.take_lock_event();
-        let unlocked = session.is_unlocked();
-        (locked, lock_event, unlocked)
-    };
-    // No DEK means the first-run screen. Do not wipe its backup preview.
-    if locked || lock_event {
-        discard_transfer_and_runtime(&state);
     }
-    Ok(locked || !unlocked)
+    let _ = session.take_lock_event();
+    Ok(!session.is_unlocked())
 }
 
 #[tauri::command]
@@ -540,7 +512,6 @@ pub fn entry_profile(state: State<AppState>, id: String) -> Result<EntryProfile,
 
 #[derive(Serialize)]
 pub struct SettingsView {
-    pub idle_secs: u64,
     pub clipboard_secs: u64,
     pub biometry_enabled: bool,
 }
@@ -550,7 +521,6 @@ pub fn settings_get(state: State<AppState>) -> Result<SettingsView, String> {
     let mut session = lock_session(&state.session);
     session.require_unlocked().map_err(map_err)?;
     apply_settings(&mut session);
-    let idle_secs = session.idle_secs;
     let clipboard_secs = session.clipboard_secs;
     let biometry_enabled = session
         .vault()
@@ -561,17 +531,15 @@ pub fn settings_get(state: State<AppState>) -> Result<SettingsView, String> {
         .as_deref()
         == Some("1");
     Ok(SettingsView {
-        idle_secs,
         clipboard_secs,
         biometry_enabled,
     })
 }
 
 #[tauri::command]
-pub fn settings_set(state: State<AppState>, idle_secs: u64, clipboard_secs: u64) -> Result<(), String> {
+pub fn settings_set(state: State<AppState>, clipboard_secs: u64) -> Result<(), String> {
     let mut session = lock_session(&state.session);
     session.require_unlocked().map_err(map_err)?;
-    session.idle_secs = idle_secs.max(30);
     session.clipboard_secs = clipboard_secs.clamp(5, 120);
     persist_settings(&session)
 }
@@ -709,7 +677,6 @@ pub fn install_mobile_update(app: AppHandle, state: State<AppState>, path: Strin
         session.lock();
     }
     invalidate_runtime(&state);
-    let _ = app.emit("lock-now", ());
     Ok(())
 }
 

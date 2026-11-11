@@ -431,7 +431,6 @@ export const api = {
   status: () => invoke<Status>("get_status"),
   setup: (password: string) => invoke("setup_vault", { password }),
   unlock: (password: string) => invoke("unlock_vault", { password }),
-  lock: () => invoke("lock_vault"),
   list: (filter: ListFilter) => invoke<EntryDto[]>("list_entries", { filter }),
   counts: (filter: ListFilter) => invoke<Counts>("list_counts", { filter }),
   findWebsiteDuplicates: (url: string, username: string, excludeId?: string | null) =>
@@ -501,8 +500,8 @@ export const api = {
   csvExport: (args: { path: string; password: string; riskConfirmed: boolean }) =>
     invoke<void>("csv_export", args),
   settingsGet: () =>
-    invoke<{ idle_secs: number; clipboard_secs: number; hotkey: string; auto_lock: boolean }>("settings_get"),
-  settingsSet: (settings: { idle_secs: number; clipboard_secs: number; hotkey: string; auto_lock: boolean }) =>
+    invoke<{ clipboard_secs: number; hotkey: string }>("settings_get"),
+  settingsSet: (settings: { clipboard_secs: number; hotkey: string }) =>
     invoke("settings_set", { settings }),
   syncStatus: () => invoke<SyncView>("sync_status"),
   syncSave: (input: SyncSaveInput) => invoke<SyncView>("sync_save", { input }),

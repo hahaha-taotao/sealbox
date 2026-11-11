@@ -132,6 +132,7 @@ pub fn prepare(
                 ConfirmField { label: "目标 origin".into(), value: secrets.sanitize(&origin) },
                 ConfirmField { label: "风险".into(), value: secrets.sanitize(&op.risk) },
             ],
+            dangerous: false,
         })
     } else { None };
     Ok(PreparedHttp {

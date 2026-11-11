@@ -62,14 +62,14 @@ fn action_prop() -> Value {
     json!({
         "type": "string",
         "enum": GIT_ACTIONS,
-        "description": "status/diff/log/branches 只读；fetch 只更新远端跟踪；pull 快进当前分支；commit 可带 files 或 all，暂存和提交一次确认；push 推分支或标签；clone 把 owner/repo 克隆到 path 指定的已存在父目录。"
+        "description": "status/diff/log/branches 只读；fetch 只更新远端跟踪；pull 快进当前分支；commit 可带 files 或 all；push 推分支或标签；clone 把 owner/repo 克隆到 path 指定的已存在父目录。"
     })
 }
 
 pub fn tool_definitions() -> Vec<Value> {
     vec![tool(
         "git",
-        "本机 git。action 取 status、diff、log、branches、fetch、pull、commit、push、clone。除 clone 外 path 是仓库绝对路径；clone 的 path 是已存在的父目录。写动作每次弹出一次桌面确认。",
+        "本机 git。action 取 status、diff、log、branches、fetch、pull、commit、push、clone。除 clone 外 path 是仓库绝对路径；clone 的 path 是已存在的父目录。普通写动作默认放行，仅强制推送（force push）需桌面确认。",
         schema(
             &[
                 ("action", action_prop()),
@@ -217,7 +217,6 @@ pub fn prepare_tool(
             ))
         }
     };
-    session.touch();
     Ok(redact_prepared(prepared, secrets))
 }
 
@@ -266,6 +265,7 @@ fn git_confirm_payload(
                 value: value.clone(),
             })
             .collect(),
+        dangerous: false,
     }
 }
 
@@ -489,7 +489,7 @@ fn prepare_push(session: &Session, args: &Value) -> Result<PreparedGitOp, String
         }
         branch = Some(name);
     }
-    let payload = git_confirm_payload(
+    let mut payload = git_confirm_payload(
         "推送到 GitHub",
         "允许这次本地 git 写操作？",
         &[
@@ -508,6 +508,8 @@ fn prepare_push(session: &Session, args: &Value) -> Result<PreparedGitOp, String
             ),
         ],
     );
+    // 强制推送会改写远端历史，属于破坏性写操作，保留桌面确认；普通 push 默认放行。
+    payload.dangerous = force_with_lease;
     Ok(PreparedGitOp::Pending {
         payload,
         deny: "用户拒绝了这次 git 写操作".into(),

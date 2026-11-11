@@ -20,7 +20,7 @@ pub fn tool_definitions() -> Vec<Value> {
             "type":"object", "properties":{"credential_id":{"type":"string","minLength":1,"maxLength":128}},
             "required":["credential_id"],"additionalProperties":false
         }), true, "low"),
-        definition("http_call", "唯一远程 HTTP 入口。使用 vault_describe 声明的凭据 ID、操作名和参数；不能自行传 URL、方法、请求头或认证。写操作需 Sealbox 桌面逐次确认。", json!({
+        definition("http_call", "唯一远程 HTTP 入口。使用 vault_describe 声明的凭据 ID、操作名和参数；不能自行传 URL、方法、请求头或认证。写操作默认放行，仅极少数破坏性写操作需要桌面确认。", json!({
             "type":"object", "properties":{
                 "credential_id":{"type":"string","minLength":1,"maxLength":128},
                 "op":{"type":"string","minLength":1,"maxLength":64},

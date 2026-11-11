@@ -351,6 +351,7 @@ impl Github {
                         value: value.clone(),
                     })
                     .collect(),
+                dangerous: false,
             });
             if !allowed {
                 return Err("用户拒绝了这次 GitHub 写操作".into());

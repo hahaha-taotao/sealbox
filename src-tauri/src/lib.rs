@@ -45,7 +45,6 @@ pub fn run() {
             commands::home_overview,
             commands::setup_vault,
             commands::unlock_vault,
-            commands::lock_vault,
             commands::list_entries,
             commands::list_counts,
             commands::find_website_duplicates,
@@ -167,15 +166,12 @@ pub fn run() {
                 let Some(state) = handle.try_state::<AppState>() else {
                     continue;
                 };
-                if commands::tick_security(&state) {
-                    let _ = handle.emit("lock-now", ());
-                }
+                let _ = commands::tick_security(&state);
                 crate::auto_sync::tick(&handle, &state);
             });
             let show = MenuItem::with_id(app, "show", "打开", true, None::<&str>)?;
-            let lock = MenuItem::with_id(app, "lock", "锁定", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &lock, &quit])?;
+            let menu = Menu::with_items(app, &[&show, &quit])?;
             // The configured bundle icon is not guaranteed to be available in every
             // `tauri dev` environment (for example when the generated context has no
             // embedded default icon). Do not panic while creating the tray icon: a
@@ -192,13 +188,6 @@ pub fn run() {
                             let _ = w.show();
                             let _ = w.set_focus();
                         }
-                    }
-                    "lock" => {
-                        if let Some(state) = app.try_state::<AppState>() {
-                            lock::lock_everything(&state.session, &state.mcp);
-                            commands::clear_transfer_and_runtime(&state);
-                        }
-                        let _ = app.emit("lock-now", ());
                     }
                     "quit" => app.exit(0),
                     _ => {}

@@ -132,7 +132,6 @@ async function changeMaster() {
 }
 const syncKind = ref<"webdav" | "s3">("webdav");
 const syncForm = reactive({ endpoint: "", username: "", secret: "", bucket: "", region: "us-east-1", prefix: "", auto: true, autoSecs: 60 });
-const idleSecs = ref(60);
 const busy = ref(false);
 const appVersion = ref("");
 const release = ref<MobileRelease | null>(null);
@@ -657,7 +656,6 @@ async function toggleTrash() {
 
 async function openSettings() {
   const settings = await api.settings();
-  idleSecs.value = settings.idle_secs;
   biometryOn.value = settings.biometry_enabled;
   page.value = "settings";
   if (!appVersion.value) {
@@ -775,11 +773,6 @@ async function openReleasePage() {
   }
 }
 
-async function saveIdle() {
-  await api.saveSettings(Number(idleSecs.value) || 60, 20);
-  showToast("已保存");
-}
-
 async function openSync() {
   sync.value = await api.syncStatus();
   syncKind.value = sync.value.kind ?? "webdav";
@@ -822,29 +815,8 @@ async function saveSync(run: boolean) {
   }
 }
 
-async function lockNow() {
-  clearQueryTimer();
-  await api.lock();
-  page.value = "lock";
-  updateDialogOpen.value = false;
-  entries.value = [];
-  selected.value = null;
-  fields.value = [];
-  revealed.value = "";
-  notes.value = ''; clearEdit(); clearManagement(); syncForm.secret = '';
-}
-
 onMounted(async () => {
   await refreshStatus();
-  await listen("lock-now", () => {
-    clearEdit(); clearManagement(); notes.value = ''; selected.value = null; syncForm.secret = '';
-    clearQueryTimer();
-    fields.value = [];
-    revealed.value = "";
-    page.value = "lock";
-    updateDialogOpen.value = false;
-    entries.value = [];
-  });
   await listen<{ ok: boolean; error: string | null; report: SyncReport | null }>(
     "sync-finished",
     async (event) => {
@@ -861,9 +833,6 @@ onMounted(async () => {
       }
     },
   );
-  window.setInterval(() => {
-    if (page.value !== "lock") void api.tick();
-  }, 5000);
 });
 </script>
 
@@ -889,7 +858,7 @@ onMounted(async () => {
           <p class="hint">.svbak 仍是加密备份，但文件本身要保管好。保存位置由导出流程里的系统对话框决定。</p>
           <div class="field"><label>主密码</label><input v-model="transferPassword" type="password" /></div>
           <div class="group" style="margin:0 0 14px">
-            <label class="set"><span class="t">同时备份空闲锁定和剪贴板秒数（不含设备、指纹、同步凭据）</span><input v-model="includeSettings" type="checkbox" /></label>
+            <label class="set"><span class="t">同时备份剪贴板秒数（不含设备、指纹、同步凭据）</span><input v-model="includeSettings" type="checkbox" /></label>
             <label class="set"><span class="t">我了解 .svbak 仍是加密备份，但文件本身要保管好</span><input v-model="riskConfirmed" type="checkbox" /></label>
           </div>
           <button class="primary" type="button" :disabled="busy" @click="runTransfer">导出</button>
@@ -913,7 +882,7 @@ onMounted(async () => {
           <p v-for="(warning, index) in backupPreview?.summary.warnings || []" :key="index" class="error">{{ warning }}</p>
           <div class="group" style="margin:0 0 14px">
             <label class="set"><span class="t">覆盖已有条目</span><input v-model="overwrite" type="checkbox" /></label>
-            <label class="set"><span class="t">同时恢复空闲锁定和剪贴板秒数</span><input v-model="restoreSettings" type="checkbox" /></label>
+            <label class="set"><span class="t">同时恢复剪贴板秒数</span><input v-model="restoreSettings" type="checkbox" /></label>
             <label v-if="!initialized" class="set"><span class="t">继续使用备份中的主密码</span><input v-model="reuseBackupPassword" type="checkbox" /></label>
           </div>
           <template v-if="!initialized && !reuseBackupPassword">
@@ -1195,8 +1164,6 @@ onMounted(async () => {
         <div class="top"><h1>设置</h1></div>
         <div class="scroll">
           <div class="group">
-            <div class="set"><span class="t">空闲锁定<small>秒，切到后台也会锁定</small></span><input v-model="idleSecs" type="number" style="width:80px" /></div>
-            <button class="set" @click="saveIdle"><span class="t">保存锁定时间</span></button>
             <button class="set" @click="toggleBiometry"><span class="t">指纹解锁<small>{{ biometryOn ? "已打开，包装只在这台手机" : "未打开" }}</small></span></button>
           </div>
           <p v-if="error" class="error" style="padding:0 18px">{{ error }}</p>
@@ -1208,7 +1175,6 @@ onMounted(async () => {
             <button class="set" @click="openManagement('csv-import')"><span class="t">CSV 网站导入<small>明文迁移，仅网站账号</small></span><span>›</span></button>
             <button class="set" @click="openManagement('csv-export')"><span class="t">CSV 网站导出<small>明文迁移，仅网站账号</small></span><span>›</span></button>
             <button class="set" @click="openSync"><span class="t">数据同步<small>WebDAV / S3</small></span><span>›</span></button>
-            <button class="set" @click="lockNow"><span class="t">立即锁定</span></button>
           </div>
           <div class="group">
             <div class="set">

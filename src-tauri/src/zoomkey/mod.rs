@@ -440,7 +440,6 @@ pub fn call_tool_detailed(
     };
     match outcome {
         Ok(outcome) => {
-            session.touch();
             Ok(ZoomkeyCallResult {
                 text: outcome.text,
                 status: 200,
@@ -495,7 +494,6 @@ pub fn test_connection(
     };
     match outcome {
         Ok(outcome) => {
-            session.touch();
             Ok(ZoomkeyCallResult {
                 text: outcome.text,
                 status: 200,

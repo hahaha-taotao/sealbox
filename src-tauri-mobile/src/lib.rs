@@ -19,7 +19,7 @@ mod tests {
     }
 }
 
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -36,7 +36,6 @@ pub fn run() {
             commands::unlock_with_dek,
             commands::export_dek,
             commands::set_biometry_enabled,
-            commands::lock_vault,
             commands::tick_idle,
             commands::list_entries,
             commands::list_counts,
@@ -98,16 +97,11 @@ pub fn run() {
             }
             std::thread::spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                let locked = {
-                    let Some(state) = handle.try_state::<commands::AppState>() else {
-                        continue;
-                    };
-                    auto_sync::tick(&handle, &state);
-                    commands::tick_idle(state).unwrap_or(false)
+                let Some(state) = handle.try_state::<commands::AppState>() else {
+                    continue;
                 };
-                if locked {
-                    let _ = handle.emit("lock-now", ());
-                }
+                auto_sync::tick(&handle, &state);
+                let _ = commands::tick_idle(state);
             });
             Ok(())
         })

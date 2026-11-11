@@ -839,7 +839,6 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
             return Err("MCP 未启用。请先在 Sealbox 的 MCP 页面打开。".into());
         }
         let credentials = list_credentials(session)?;
-        session.touch();
         return serde_json::to_string_pretty(&credentials)
             .map(|text| (200, text))
             .map_err(|e| e.to_string());
@@ -848,7 +847,6 @@ fn call_tool_text(session: &mut Session, name: &str, args: Value) -> Result<(u16
     let name = dispatched.as_str();
     let (token, credential_label) = prepare(session, name, &args)?;
     let result = execute_api_call(name, args, token, credential_label);
-    session.touch();
     result
 }
 

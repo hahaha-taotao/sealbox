@@ -34,7 +34,7 @@ fn sweep_mcp(mcp: &McpState) {
 }
 
 /// Pairing window and HTTP response cache belong with the DEK: any session
-/// lock (idle, tray, command, Drop) must drop them even if the caller only
+/// drop (exit, poison recovery) must drop them even if the caller only
 /// has the session mutex.
 pub fn on_session_locked() {
     crate::confirm::deny_pending();
@@ -43,30 +43,10 @@ pub fn on_session_locked() {
     }
 }
 
-/// Zeroize DEK, clear an owned clipboard secret, close pairing, wipe HTTP logs.
-pub fn lock_everything(session: &Mutex<Session>, mcp: &McpState) {
-    crate::confirm::deny_pending();
-    lock_session(session).lock();
-    let _ = crate::secure_store::clear_dek();
-    sweep_mcp(mcp);
-    let _ = crate::mcp::rebind_locked(mcp);
-}
-
-/// Idle timeout uses the same cleanup as an explicit lock.
-pub fn idle_lock_if_needed(session: &mut Session, mcp: &McpState) -> bool {
-    if session.maybe_idle_lock() {
-        let _ = crate::secure_store::clear_dek();
-        sweep_mcp(mcp);
-        true
-    } else {
-        false
-    }
-}
-
-/// Last-resort cleanup if a panic would otherwise skip `Drop` / idle lock.
-/// Zeroizes the DEK (if the session Arc is still alive) and clears the
-/// clipboard. Uses `try_lock` so a panic that already holds the session
-/// mutex cannot deadlock the hook; poison recovery still zeroizes.
+/// Last-resort cleanup if a panic would otherwise skip `Drop`. Zeroizes the
+/// DEK (if the session Arc is still alive) and clears the clipboard. Uses
+/// `try_lock` so a panic that already holds the session mutex cannot deadlock
+/// the hook; poison recovery still zeroizes.
 pub fn emergency_lock() {
     let weak = recover_lock(active_slot()).clone();
     if let Some(session) = weak.upgrade() {
@@ -155,37 +135,5 @@ mod tests {
         let _held = lock_session(&m);
         emergency_lock();
         assert!(_held.is_unlocked());
-    }
-
-    #[test]
-    fn lock_everything_locks_session_and_closes_pairing() {
-        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
-        let mut session = Session::default();
-        session.set_unlocked(vault, dek);
-        session.clipboard_secs = 120;
-        session.remember_clipboard("alpha");
-        let m = Mutex::new(session);
-        let mcp = crate::mcp::McpState::default();
-        mcp.open_pairing();
-        assert!(mcp.pairing_status().active);
-        lock_everything(&m, &mcp);
-        assert!(!lock_session(&m).is_unlocked());
-        assert!(!lock_session(&m).clipboard_owned("alpha"));
-        assert!(!mcp.pairing_status().active);
-    }
-
-    #[test]
-    fn idle_lock_if_needed_cleans_mcp() {
-        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
-        let mut session = Session::default();
-        session.set_unlocked(vault, dek);
-        session.idle_secs = 1;
-        session.auto_lock = true;
-        session.age_last_active(std::time::Duration::from_secs(2));
-        let mcp = crate::mcp::McpState::default();
-        mcp.open_pairing();
-        assert!(idle_lock_if_needed(&mut session, &mcp));
-        assert!(!session.is_unlocked());
-        assert!(!mcp.pairing_status().active);
     }
 }

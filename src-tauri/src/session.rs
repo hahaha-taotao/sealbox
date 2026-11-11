@@ -6,12 +6,8 @@ use zeroize::Zeroize;
 pub struct Session {
     vault: Option<Vault>,
     dek: Option<[u8; 32]>,
-    last_active: Instant,
-    pub idle_secs: u64,
     pub clipboard_secs: u64,
     pub hotkey: String,
-    /// When false, idle timeout does not lock. Manual lock is unchanged.
-    pub auto_lock: bool,
     clipboard_deadline: Option<Instant>,
     clipboard_hash: Option<[u8; 32]>,
     failed_unlocks: u32,
@@ -28,11 +24,8 @@ impl Default for Session {
         Self {
             vault: None,
             dek: None,
-            last_active: Instant::now(),
-            idle_secs: 15 * 60,
             clipboard_secs: 20,
             hotkey: "Ctrl+Shift+Space".into(),
-            auto_lock: false,
             clipboard_deadline: None,
             clipboard_hash: None,
             failed_unlocks: 0,
@@ -44,28 +37,6 @@ impl Default for Session {
 impl Session {
     pub fn is_unlocked(&self) -> bool {
         self.dek.is_some()
-    }
-
-    pub fn touch(&mut self) {
-        self.last_active = Instant::now();
-    }
-
-    #[cfg(test)]
-    pub fn age_last_active(&mut self, by: Duration) {
-        if let Some(t) = self.last_active.checked_sub(by) {
-            self.last_active = t;
-        }
-    }
-
-    pub fn maybe_idle_lock(&mut self) -> bool {
-        if !self.auto_lock {
-            return false;
-        }
-        if self.dek.is_some() && self.last_active.elapsed() > Duration::from_secs(self.idle_secs) {
-            self.lock();
-            return true;
-        }
-        false
     }
 
     pub fn generation(&self) -> u64 { self.generation }
@@ -100,7 +71,6 @@ impl Session {
         self.vault = Some(vault);
         self.dek = Some(dek);
         self.failed_unlocks = 0;
-        self.touch();
     }
 
     pub fn note_failed_unlock(&mut self) {
@@ -130,9 +100,7 @@ impl Session {
     }
 
     pub fn require_unlocked(&mut self) -> Result<(), VaultError> {
-        self.maybe_idle_lock();
         self.dek()?;
-        self.touch();
         Ok(())
     }
 
@@ -238,20 +206,6 @@ mod tests {
     }
 
     #[test]
-    fn idle_lock_drops_vault_handle() {
-        let (vault, dek) =
-            crate::vault::Vault::create_in_memory("correct horse battery staple extra").unwrap();
-        let mut s = Session::default();
-        s.set_unlocked(vault, dek);
-        s.idle_secs = 2;
-        s.auto_lock = true;
-        s.age_last_active(Duration::from_secs(3));
-        assert!(s.maybe_idle_lock());
-        assert!(matches!(s.vault(), Err(VaultError::Locked)));
-        assert!(!s.is_unlocked());
-    }
-
-    #[test]
     fn clipboard_hash_matches_only_same_payload() {
         let mut s = Session::default();
         s.clipboard_secs = 0;
@@ -337,29 +291,5 @@ mod tests {
         s.lock();
         assert_eq!(crate::clipboard::read_text().unwrap_or_default(), theirs);
         assert!(!s.clipboard_owned(ours));
-    }
-
-    #[test]
-    fn idle_lock_fires_without_touch() {
-        let mut s = Session::default();
-        s.dek = Some([1u8; 32]);
-        s.idle_secs = 2;
-        s.auto_lock = true;
-        s.age_last_active(Duration::from_secs(3));
-        assert!(s.maybe_idle_lock());
-        assert!(s.dek().is_err());
-    }
-
-    #[test]
-    fn touch_resets_idle_timer() {
-        let mut s = Session::default();
-        s.dek = Some([1u8; 32]);
-        s.idle_secs = 2;
-        s.auto_lock = true;
-        s.age_last_active(Duration::from_secs(1));
-        s.touch();
-        s.age_last_active(Duration::from_millis(1500));
-        assert!(!s.maybe_idle_lock());
-        assert!(s.dek().is_ok());
     }
 }
