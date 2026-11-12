@@ -69,7 +69,7 @@ fn action_prop() -> Value {
 pub fn tool_definitions() -> Vec<Value> {
     vec![tool(
         "git",
-        "本机 git。action 取 status、diff、log、branches、fetch、pull、commit、push、clone。除 clone 外 path 是仓库绝对路径；clone 的 path 是已存在的父目录。普通写动作默认放行，仅强制推送（force push）需桌面确认。",
+        "本机 git。action 取 status、diff、log、branches、fetch、pull、commit、push、clone。除 clone 外 path 是仓库绝对路径；clone 的 path 是已存在的父目录。授权跟随当前 MCP 会话自动生效，不逐次打断；只有强制推送（force push）和覆盖已有标签这类会改写远端历史的操作需要桌面确认。不能改写 .git/ 内部文件与 CI 工作流定义。",
         schema(
             &[
                 ("action", action_prop()),
@@ -396,6 +396,9 @@ fn prepare_commit(session: &Session, args: &Value) -> Result<PreparedGitOp, Stri
     } else {
         format!("git add -- {}", files.join(" "))
     };
+    // `git add -A` bypasses rel_path, so the protected set is re-checked
+    // against whatever the index/worktree actually contains at exec time.
+    let guard_root = root.clone();
     let payload = git_confirm_payload(
         "创建 git 提交",
         "允许这次本地 git 写操作？",
@@ -410,16 +413,31 @@ fn prepare_commit(session: &Session, args: &Value) -> Result<PreparedGitOp, Stri
         deny: "用户拒绝了这次 git 写操作".into(),
         exec: Box::new(move |_session| {
             if all {
-                git_output(&root, &["add", "-A"], None)?;
+                refuse_protected_changes(&guard_root)?;
+                git_output(&guard_root, &["add", "-A"], None)?;
             } else if !files.is_empty() {
                 let mut cmd = vec!["add".to_string(), "--".to_string()];
                 cmd.extend(files);
                 let add_args = cmd.iter().map(String::as_str).collect::<Vec<_>>();
-                git_output(&root, &add_args, None)?;
+                git_output(&guard_root, &add_args, None)?;
             }
-            git_output(&root, &["commit", "-m", &message], None)
+            refuse_protected_changes(&guard_root)?;
+            git_output(&guard_root, &["commit", "-m", &message], None)
         }),
     })
+}
+
+/// Refuse a commit that would carry protected paths into history.
+fn refuse_protected_changes(root: &Path) -> Result<(), String> {
+    let staged = git_output(root, &["diff", "--cached", "--name-only", "-z"], None)?;
+    for path in staged.split('\0').map(str::trim).filter(|p| !p.is_empty()) {
+        if protected_reason(&path.replace('\\', "/")).is_some() {
+            return Err(format!(
+                "拒绝提交：暂存区包含受保护路径 {path}。.git/ 内部文件与 CI 工作流不能通过本工具提交。"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn prepare_fetch(session: &Session, args: &Value) -> Result<PreparedGitOp, String> {
@@ -461,6 +479,15 @@ fn prepare_push(session: &Session, args: &Value) -> Result<PreparedGitOp, String
         return Err("只推标签时不能使用 force_with_lease".into());
     }
     let token = github_token(session, args)?;
+    // 覆盖已有标签会移动远端 ref，等同于破坏性操作。检查失败（离线、认证不可用）
+    // 时按破坏性处理：宁可多弹一次确认，也不静默改写远端历史。
+    let rewrites_history = force_with_lease
+        || match tag.as_ref() {
+            Some(tag_name) => ls_remote_sha(&root, &token, &push_urls[0], &format!("refs/tags/{tag_name}"))
+                .map(|existing| !existing.is_empty())
+                .unwrap_or(true),
+            None => false,
+        };
     let mut cmd = vec!["push".to_string(), push_urls[0].clone()];
     let branch;
     let target_label;
@@ -508,8 +535,10 @@ fn prepare_push(session: &Session, args: &Value) -> Result<PreparedGitOp, String
             ),
         ],
     );
-    // 强制推送会改写远端历史，属于破坏性写操作，保留桌面确认；普通 push 默认放行。
-    payload.dangerous = force_with_lease;
+    // 授权跟随当前 MCP 会话，不额外打断：commit / 普通 push / pull / fetch / clone
+    // 都在会话授权内自动执行。只有会改写远端历史的强制推送和改写提交历史的操作
+    // 才标为 dangerous，走桌面确认。
+    payload.dangerous = force_with_lease || rewrites_history;
     Ok(PreparedGitOp::Pending {
         payload,
         deny: "用户拒绝了这次 git 写操作".into(),
@@ -733,6 +762,33 @@ fn optional_rel_path(args: &Value, key: &str) -> Result<Option<String>, String> 
     Ok(Some(rel_path(raw)?))
 }
 
+/// Paths whose contents the model may never change through the `git` tool.
+///
+/// Writing `.git/hooks/*` turns the next git write into arbitrary local code
+/// execution, and rewriting `.github/workflows/*` executes model-chosen
+/// commands inside CI where repository secrets live. Both are outside what a
+/// "local git" tool should be able to do, so they are refused at the path
+/// level rather than relying on a confirmation prompt.
+const PROTECTED_PREFIXES: &[&str] = &[
+    ".git/",
+    ".github/workflows/",
+    ".github/actions/",
+];
+
+fn protected_reason(path: &str) -> Option<&'static str> {
+    let lowered = path.to_ascii_lowercase();
+    PROTECTED_PREFIXES
+        .iter()
+        .find(|prefix| {
+            let dir = &prefix[..prefix.len() - 1];
+            lowered == dir || lowered.starts_with(*prefix)
+        })
+        .map(|prefix| match *prefix {
+            ".git/" => "不能通过 git 工具改写 .git/ 内部文件（hooks 会在下次 git 操作时执行）",
+            _ => "不能通过 git 工具改写 CI 工作流定义（会在持有凭据的环境里执行）",
+        })
+}
+
 fn rel_path(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim().replace('\\', "/");
     if trimmed.is_empty() {
@@ -746,6 +802,9 @@ fn rel_path(raw: &str) -> Result<String, String> {
         .any(|component| !matches!(component, Component::Normal(_)))
     {
         return Err("路径不能包含 .. 或绝对前缀".into());
+    }
+    if let Some(reason) = protected_reason(&trimmed) {
+        return Err(reason.into());
     }
     Ok(trimmed)
 }
@@ -1238,6 +1297,37 @@ mod tests {
         assert!(rel_path("../secret").is_err());
         assert!(rel_path("/etc/passwd").is_err());
         assert_eq!(rel_path("src/lib.rs").unwrap(), "src/lib.rs");
+    }
+
+    #[test]
+    #[test]
+    fn only_history_rewriting_git_ops_need_desktop_confirmation() {
+        // Ordinary writes run inside the session authorization without a prompt.
+        let plain = git_confirm_payload("t", "p", &[]);
+        assert!(!plain.dangerous);
+        // Force push is destructive and must be flagged for the desktop prompt.
+        let mut forced = git_confirm_payload("t", "p", &[]);
+        forced.dangerous = true;
+        assert!(forced.dangerous);
+    }
+
+    fn rel_path_refuses_hooks_and_ci_definitions() {
+        // A model-writable hook becomes code execution on the next git write.
+        for path in [
+            ".git/hooks/pre-commit",
+            ".git/hooks/post-checkout",
+            ".git/config",
+            ".git/info/attributes",
+            ".GIT/hooks/pre-push",
+            ".github/workflows/release.yml",
+            ".github/actions/step/action.yml",
+        ] {
+            assert!(rel_path(path).is_err(), "{path} must be refused");
+        }
+        // Protected-looking names that are not the protected directories pass.
+        assert_eq!(rel_path("src/.gitignore").unwrap(), "src/.gitignore");
+        assert_eq!(rel_path("docs/git.md").unwrap(), "docs/git.md");
+        assert_eq!(rel_path(".github/CODEOWNERS").unwrap(), ".github/CODEOWNERS");
     }
 
     #[test]

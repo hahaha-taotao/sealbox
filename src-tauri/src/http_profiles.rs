@@ -361,6 +361,8 @@ fn prepare_builtin_inner(
             .into_iter().find(|entry| entry.id == credential_id).ok_or("所选凭据不存在")?.title;
         let summary = serde_json::to_string_pretty(&params).map_err(|e| e.to_string())?;
         let summary = crate::redact::redact_text(&summary, &[token.as_str()]);
+        // 会话授权内自动放行；只有 DELETE 这类不可撤回的破坏性操作才弹确认。
+        let destructive = selected.method.eq_ignore_ascii_case("DELETE");
         Some(ConfirmPayload {
             title: "允许凭据 HTTP 操作？".into(),
             prompt: format!("{}（风险：{}）", selected.description, selected.risk),
@@ -370,7 +372,7 @@ fn prepare_builtin_inner(
                 ConfirmField { label: "操作".into(), value: format!("{} {} {}", selected.name, selected.method, selected.path_template) },
                 ConfirmField { label: "参数".into(), value: summary },
             ],
-            dangerous: false,
+            dangerous: destructive,
         })
     } else { None };
     let inner = if profile.adapter == "github" {

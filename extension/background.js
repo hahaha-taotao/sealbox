@@ -846,9 +846,9 @@ function paintOverlayFunc(payload) {
       runtime.sendMessage(message, done);
       return;
     }
-    if (message.type === "fill-tab") {
-      window.postMessage({ source: "sealbox-overlay", type: "fill-tab", id: message.id }, "*");
-    }
+    // No page-mediated fallback: `window.postMessage` is forgeable by page
+    // script, so a fill request must always travel the extension runtime.
+    if (typeof done === "function") done({ ok: false, error: "扩展通道不可用，请刷新页面" });
   };
 
   document.getElementById(HOST_ID)?.remove();
@@ -1145,6 +1145,10 @@ chrome.commands?.onCommand.addListener((command) => {
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // Only this extension's own pages and content scripts may talk to the bus.
+  // Without this check any sender that reaches the service worker could drive
+  // pair / save / secret, which is how a page-driven fill would start.
+  if (sender.id !== chrome.runtime.id) return false;
   (async () => {
     const pageUrl = senderPageUrl(sender, msg.url);
     if (msg.type === "pair") return pair(msg.code);

@@ -123,6 +123,8 @@ pub fn prepare(
     let (auth_header, tls) = compile_auth(session, credential_id, &profile.auth, &payload, &mut secrets)?;
     secrets.finish();
     let confirmation = if !op.read_only || mutating_method(method) {
+        // 会话授权内自动放行；只有 DELETE 这类不可撤回的破坏性操作才弹确认。
+        let destructive = method.eq_ignore_ascii_case("DELETE");
         Some(ConfirmPayload {
             title: "确认 Profile HTTPS 请求".into(),
             prompt: "此操作可能修改远端数据。确认后仅发送已经编译的固定请求。".into(),
@@ -132,7 +134,7 @@ pub fn prepare(
                 ConfirmField { label: "目标 origin".into(), value: secrets.sanitize(&origin) },
                 ConfirmField { label: "风险".into(), value: secrets.sanitize(&op.risk) },
             ],
-            dangerous: false,
+            dangerous: destructive,
         })
     } else { None };
     Ok(PreparedHttp {

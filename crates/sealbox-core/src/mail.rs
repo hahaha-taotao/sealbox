@@ -1594,6 +1594,39 @@ pub fn fetch_attachment(
     Ok(decoded)
 }
 
+/// Directories an attachment may never be written into, matched on the
+/// canonicalized parent. These are the places where dropping a file changes
+/// what the machine executes on next login or next application launch.
+fn forbidden_save_dir(parent: &std::path::Path) -> bool {
+    let mut lowered = parent.to_string_lossy().to_ascii_lowercase().replace('\\', "/");
+    // Normalize away a trailing slash so "/usr/bin" and "/usr/bin/" match alike.
+    while lowered.len() > 1 && lowered.ends_with('/') {
+        lowered.pop();
+    }
+    const FORBIDDEN_FRAGMENTS: &[&str] = &[
+        "/start menu/programs/startup",
+        "/microsoft/windows/start menu",
+        "/programdata/microsoft/windows/start menu",
+        "/appdata/roaming/microsoft/windows/start menu",
+        "/desktop",
+        "/com.sealbox.app",
+        "/.config/autostart",
+        "/etc",
+        "/bin",
+        "/sbin",
+        "/usr/bin",
+        "/usr/local/bin",
+        "/usr/sbin",
+    ];
+    FORBIDDEN_FRAGMENTS.iter().any(|fragment| {
+        lowered == *fragment
+            || lowered.ends_with(fragment)
+            || lowered.contains(&format!("{fragment}/"))
+    })
+        // Any hidden (dot) directory in the path.
+        || lowered.contains("/.")
+}
+
 /// Writes `bytes` to a new absolute file. The parent must already exist and the destination must not.
 /// Bytes land in a sibling temporary file first and are renamed into place. Failures use a fixed
 /// sentence so the caller never sees a path or an OS error.
@@ -1606,6 +1639,13 @@ pub fn write_exclusive(path: &str, bytes: &[u8]) -> Result<u64, &'static str> {
     if !parent.is_dir() || path.exists() || path.file_name().is_none() {
         return Err("无法保存附件");
     }
+    // Resolve symlinks before the policy check so a link into a forbidden
+    // directory cannot smuggle the write past it.
+    let canonical_parent = parent.canonicalize().map_err(|_| "无法保存附件")?;
+    if forbidden_save_dir(&canonical_parent) {
+        return Err("不能保存到该目录");
+    }
+    let parent = canonical_parent.as_path();
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
@@ -2503,5 +2543,28 @@ mod tests {
         assert_eq!(write_exclusive(escaped.to_str().unwrap(), b"x").unwrap_err(), "无法保存附件");
         assert_eq!(write_exclusive("note.pdf", b"x").unwrap_err(), "无法保存附件");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forbidden_save_dir_blocks_autostart_locations() {
+        for parent in [
+            "C:\\Users\\me\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup",
+            "/home/me/Desktop",
+            "/home/me/.config/autostart",
+            "/home/me/.local/share/com.sealbox.app",
+            "/usr/local/bin",
+            "/etc",
+        ] {
+            assert!(
+                forbidden_save_dir(std::path::Path::new(parent)),
+                "{parent} must be refused"
+            );
+        }
+        for parent in ["/home/me/Downloads", "D:\\Documents\\invoices", "/tmp"] {
+            assert!(
+                !forbidden_save_dir(std::path::Path::new(parent)),
+                "{parent} must stay allowed"
+            );
+        }
     }
 }

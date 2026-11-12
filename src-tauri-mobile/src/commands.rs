@@ -473,6 +473,8 @@ pub fn copy_secret(state: State<AppState>, id: String, field: String) -> Result<
     clipboard::write_text(&text)?;
     session.remember_clipboard(&text);
     let _ = session.vault().map_err(map_err)?.bump_use(&id);
+    // 桌面端同样记录复制动作；手机端缺了这条，秘密外流就完全无痕。
+    let _ = session.vault().map_err(map_err)?.audit("copy", Some(&id), &field);
     Ok(())
 }
 
@@ -485,6 +487,7 @@ pub fn reveal_secret(state: State<AppState>, id: String) -> Result<SecretPayload
     if matches!(payload, SecretPayload::ClientCert { .. }) {
         return Err("客户端证书私钥不返回到界面".into());
     }
+    let _ = session.vault().map_err(map_err)?.audit("reveal", Some(&id), "ok");
     Ok(payload)
 }
 

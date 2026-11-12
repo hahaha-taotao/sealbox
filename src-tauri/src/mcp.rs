@@ -23,6 +23,12 @@ pub const LISTEN_MODE_ADDRESS: &str = "address";
 pub const LISTEN_CONFIG_KEY: &str = "mcp_listen_config";
 const PAIRING_SECS: u64 = 60;
 const PAIRING_MAX_FAILURES: u32 = 5;
+/// Absolute lifetime of one MCP session ticket. Clients re-`initialize`
+/// transparently, so this bounds how long a leaked session id stays useful.
+const SESSION_ABS_TTL_SECS: u64 = 24 * 60 * 60;
+/// Idle lifetime. A ticket that stops being used expires even before the
+/// absolute deadline, so a stolen id cannot be parked and replayed later.
+const SESSION_IDLE_TTL_SECS: u64 = 2 * 60 * 60;
 const MAX_HTTP_LINE: usize = 8192;
 const MAX_HTTP_HEADERS: usize = 64 * 1024;
 const MAX_HTTP_BODY: usize = 1_000_000;
@@ -183,7 +189,7 @@ pub struct McpState {
     /// the UI instead of failing silently.
     last_error: Arc<Mutex<Option<String>>>,
     pairing: Arc<Mutex<Option<PairingWindow>>>,
-    callers: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    callers: Arc<Mutex<HashMap<String, Arc<Caller>>>>,
 }
 
 impl Default for McpState {
@@ -442,32 +448,70 @@ pub struct PairingStatus {
     pub port: u16,
 }
 
+/// One MCP session ticket. Carries its own lifetime and capability scope so a
+/// request is authorized per session instead of by a single global switch.
+struct Caller {
+    active: AtomicBool,
+    /// Absolute deadline; a client must `initialize` again after this.
+    expires_at: Instant,
+    /// Deadline extended on every accepted call; stops parked tickets.
+    idle_deadline: Mutex<Instant>,
+    /// Tool names this session may call.
+    tools: std::collections::HashSet<&'static str>,
+}
+
+impl Caller {
+    fn alive(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+            && Instant::now() < self.expires_at
+            && Instant::now() < *recover_lock(&self.idle_deadline)
+    }
+
+    fn touch(&self) {
+        *recover_lock(&self.idle_deadline) = Instant::now() + Duration::from_secs(SESSION_IDLE_TTL_SECS);
+    }
+
+    fn allows_tool(&self, tool: &str) -> bool {
+        self.tools.contains(tool)
+    }
+}
+
 impl McpState {
     fn open_caller(&self) -> Result<String, String> {
         let mut callers = recover_lock(&self.callers);
-        callers.retain(|_, active| active.load(Ordering::SeqCst));
+        callers.retain(|_, caller| caller.alive());
         if callers.len() >= 128 {
             return Err("MCP 会话过多，请在 Sealbox 重启 MCP".into());
         }
         let id = Uuid::new_v4().to_string();
-        callers.insert(id.clone(), Arc::new(AtomicBool::new(true)));
+        callers.insert(id.clone(), Arc::new(Caller {
+            active: AtomicBool::new(true),
+            expires_at: Instant::now() + Duration::from_secs(SESSION_ABS_TTL_SECS),
+            idle_deadline: Mutex::new(Instant::now() + Duration::from_secs(SESSION_IDLE_TTL_SECS)),
+            // Every session starts with the full stable six-tool surface and
+            // narrows through per-call scope checks; `vault_revoke` can only
+            // ever end the caller's own ticket.
+            tools: crate::credential_mcp::TOOL_NAMES.iter().copied().collect(),
+        }));
         Ok(id)
     }
 
-    fn caller_permit(&self, id: &str) -> Result<Arc<AtomicBool>, String> {
-        recover_lock(&self.callers).get(id).cloned()
-            .filter(|active| active.load(Ordering::SeqCst))
-            .ok_or_else(|| "MCP 调用会话无效或已撤销，请重新 initialize".into())
+    fn caller_permit(&self, id: &str) -> Result<Arc<Caller>, String> {
+        let caller = recover_lock(&self.callers).get(id).cloned()
+            .filter(|caller| caller.alive())
+            .ok_or_else(|| String::from("MCP 调用会话无效或已过期，请重新 initialize"))?;
+        caller.touch();
+        Ok(caller)
     }
 
     fn revoke_caller(&self, id: &str) -> Result<(), String> {
-        self.caller_permit(id)?.store(false, Ordering::SeqCst);
+        self.caller_permit(id)?.active.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     pub fn invalidate_callers(&self) {
         let mut callers = recover_lock(&self.callers);
-        for active in callers.values() { active.store(false, Ordering::SeqCst); }
+        for caller in callers.values() { caller.active.store(false, Ordering::SeqCst); }
         callers.clear();
     }
 
@@ -746,7 +790,7 @@ fn load_mail_secret(session: &crate::session::Session, entry_id: &str) -> Result
     }
 }
 
-fn call_mail_tool(session: &Mutex<Session>, name: &str, args: Value, permit: &AtomicBool, generation: u64) -> Result<String, String> {
+fn call_mail_tool(session: &Mutex<Session>, name: &str, args: Value, permit: &Caller, generation: u64) -> Result<String, String> {
     let entry = args.get("entryId").and_then(Value::as_str).unwrap_or("-").to_string();
     let secrets = {
         let s=lock_session(session);
@@ -901,7 +945,14 @@ fn call_mail_inner(session: &Mutex<Session>, name: &str, args: &Value, guard: &d
             drop(auth_code);
             guard()?;
             let saved = sealbox_core::mail::write_exclusive(&path, &bytes).map_err(str::to_string)?;
-            serde_json::to_string(&json!({"bytes": saved, "path": path})).map_err(|_| "参数无效".into())
+            // Echo only the file name: the absolute path is host layout the
+            // model has no need to learn.
+            let name = std::path::Path::new(&path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            serde_json::to_string(&json!({"bytes": saved, "name": name})).map_err(|_| "参数无效".into())
         }
         _ => Err(format!(
             "mail 不支持 action={action}。可用 {}",
@@ -1050,7 +1101,7 @@ fn handle_rpc(session: &Mutex<Session>, mcp: &McpState, req: JsonRpcReq, caller:
     Some(out)
 }
 
-fn call_git_tool(session: &Mutex<Session>, name: &str, args: Value, permit: &AtomicBool, generation: u64) -> Result<String, String> {
+fn call_git_tool(session: &Mutex<Session>, name: &str, args: Value, permit: &Caller, generation: u64) -> Result<String, String> {
     let context = github_mcp::GithubAuditContext {
         path: args.get("path").and_then(Value::as_str).map(str::to_string),
         reference: args
@@ -1108,8 +1159,8 @@ fn call_git_tool(session: &Mutex<Session>, name: &str, args: Value, permit: &Ato
     text
 }
 
-fn require_call_authorized(s: &Session, permit: &AtomicBool, generation: u64) -> Result<(), String> {
-    if !permit.load(Ordering::SeqCst) { return Err("当前调用方的授权已撤销".into()); }
+fn require_call_authorized(s: &Session, permit: &Caller, generation: u64) -> Result<(), String> {
+    if !permit.alive() { return Err("当前调用方的授权已撤销或过期".into()); }
     if s.generation() != generation {
         return Err("解锁会话已改变，请重新调用".into());
     }
@@ -1139,7 +1190,7 @@ impl PreparedRemote {
     }
 }
 
-fn call_http_tool(session: &Mutex<Session>, permit: &AtomicBool, args: Value) -> Result<String, String> {
+fn call_http_tool(session: &Mutex<Session>, permit: &Caller, args: Value) -> Result<String, String> {
     // Resolve only registered metadata for audit; never log an attacker supplied
     // operation name, URL, body or query when validation itself fails.
     let id=args.get("credential_id").and_then(Value::as_str).unwrap_or("").to_string();
@@ -1163,7 +1214,7 @@ fn call_http_tool(session: &Mutex<Session>, permit: &AtomicBool, args: Value) ->
     result.map(|(_,text)|text)
 }
 
-fn call_http_tool_inner(session: &Mutex<Session>, permit: &AtomicBool, args: Value) -> Result<(u16, String), String> {
+fn call_http_tool_inner(session: &Mutex<Session>, permit: &Caller, args: Value) -> Result<(u16, String), String> {
     crate::credential_mcp::validate_tool("http_call", &args)?;
     let id = args["credential_id"].as_str().ok_or("缺少凭据 ID")?;
     let op_name = args["op"].as_str().ok_or("缺少操作名")?;
@@ -1251,6 +1302,16 @@ fn call_tool(
     let permit = mcp.caller_permit(caller)?;
     if !crate::credential_mcp::TOOL_NAMES.contains(&name) {
         return Err(format!("未知 MCP 工具。可用 {}", crate::credential_mcp::TOOL_NAMES.join("、")));
+    }
+    // The session ticket is the authorization unit: a valid ticket that does
+    // not cover this tool is a denial, not an unknown error. Audited so a
+    // narrowed ticket cannot be probed silently.
+    if !permit.allows_tool(name) {
+        let s=lock_session(session);
+        if let Ok(vault)=s.vault() {
+            let _=vault.audit("mcp_scope",None,&format!("tool={name} decision=deny reason=not_granted"));
+        }
+        return Err(format!("当前会话未获授权调用 {name}，请重新 initialize"));
     }
     if name == "vault_revoke" {
         crate::credential_mcp::validate_tool(name,&args)?;

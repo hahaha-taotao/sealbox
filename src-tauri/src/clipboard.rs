@@ -30,6 +30,66 @@ fn retrying<T>(mut f: impl FnMut(&mut Clipboard) -> Result<T, String>, attempts:
     Err(last)
 }
 
+/// Ask Windows not to record the next clipboard write in clipboard history
+/// (Win+V) or sync it to the user's Microsoft account.
+///
+/// `arboard` writes plain text with no format opt-out, so a copied password
+/// stays readable in the history list and in the cloud long after the 20-second
+/// sweep empties the live clipboard. Windows exposes this as two registered
+/// clipboard formats carrying a DWORD; setting `1` marks the write as private.
+#[cfg(windows)]
+fn exclude_from_history() {
+    use std::ffi::c_void;
+    use std::ptr::null_mut;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{HANDLE, HWND};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+
+    // Formats documented for clipboard history exclusion.
+    const FORMATS: [&str; 2] = [
+        "ExcludeClipboardContentFromMonitorProcessing",
+        "CanIncludeInClipboardHistory",
+    ];
+    let wide: Vec<Vec<u16>> = FORMATS
+        .iter()
+        .map(|name| name.encode_utf16().chain(std::iter::once(0)).collect())
+        .collect();
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut::<c_void>() as HWND).is_err() {
+            return;
+        }
+        for slot in &wide {
+            let Ok(format) = RegisterClipboardFormatW(PCWSTR(slot.as_ptr())) else {
+                continue;
+            };
+            if format == 0 {
+                continue;
+            }
+            // Private memory block owned by the clipboard after SetClipboardData.
+            let Ok(ptr) = GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of::<u32>()) else {
+                continue;
+            };
+            let locked = GlobalLock(ptr) as *mut u32;
+            if locked.is_null() {
+                let _ = windows::Win32::Foundation::GlobalFree(ptr);
+                continue;
+            }
+            *locked = 1;
+            let _ = GlobalUnlock(ptr);
+            if SetClipboardData(format, HANDLE(ptr.0)).is_err() {
+                let _ = windows::Win32::Foundation::GlobalFree(ptr);
+            }
+        }
+        let _ = CloseClipboard();
+    }
+}
+
+#[cfg(not(windows))]
+fn exclude_from_history() {}
+
 /// Write `text` and read it back before reporting success.
 ///
 /// `arboard::set_text` can return `Ok` while the content never reaches the
@@ -42,6 +102,9 @@ pub fn write_text(text: &str) -> Result<(), String> {
     let written = retrying(
         |cb| {
             cb.set_text(text.to_string()).map_err(|e| e.to_string())?;
+            // Mark right after the write: history exclusion applies to the
+            // content currently on the clipboard.
+            exclude_from_history();
             match cb.get_text() {
                 Ok(read_back) if read_back == text => Ok(()),
                 Ok(_) => Err("剪贴板内容与写入的不一致".to_string()),

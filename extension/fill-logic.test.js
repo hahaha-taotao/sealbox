@@ -381,6 +381,26 @@ test("background.js persists fillToken in chrome.storage.local", async () => {
   assert.match(src, /storage\.session\.remove\(\s*(?:\[\s*"fillToken"|"fillToken")/);
 });
 
+test("background.js rejects messages from outside the extension", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(new URL("./background.js", import.meta.url), "utf8");
+  // The bus drives pair/save/secret; an unauthenticated sender must be dropped.
+  assert.match(src, /sender\.id\s*!==\s*chrome\.runtime\.id/);
+});
+
+test("background.js has no page-mediated postMessage fallback", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(new URL("./background.js", import.meta.url), "utf8");
+  // window.postMessage is forgeable by page script, so fills must not use it.
+  assert.doesNotMatch(src, /window\.postMessage\(\s*\{\s*source:\s*"sealbox-overlay"/);
+});
+
+test("content.js only accepts overlay messages carrying the load nonce", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(new URL("./content.js", import.meta.url), "utf8");
+  assert.match(src, /data\.nonce\s*!==\s*OVERLAY_NONCE/);
+});
+
 test("isOtpField matches 2FA fields and rejects password or username fields", () => {
   assert.equal(fill.isOtpField({ type: "text", autocomplete: "one-time-code", maxlength: "6" }), true);
   assert.equal(fill.isOtpField({ type: "tel", name: "totp", maxlength: "6" }), true);

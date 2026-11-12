@@ -90,7 +90,7 @@ fn revocation_is_caller_scoped_invalidates_pending_grants_and_survives_locked_va
     let alice=mcp.open_caller().unwrap();let bob=mcp.open_caller().unwrap();let pending=mcp.caller_permit(&alice).unwrap();
     let result=rpc(&session,&mcp,&alice,"vault_revoke",json!({}));assert_eq!(result["isError"],false);
     assert_eq!(result["structuredContent"]["scope"],"current_caller");
-    assert!(!pending.load(Ordering::SeqCst));assert!(mcp.caller_permit(&alice).is_err());assert!(mcp.caller_permit(&bob).is_ok());
+    assert!(!pending.alive());assert!(mcp.caller_permit(&alice).is_err());assert!(mcp.caller_permit(&bob).is_ok());
     assert_eq!(rpc(&session,&mcp,&alice,"vault_list",json!({}))["isError"],true);
     mcp.invalidate_callers();assert!(mcp.caller_permit(&bob).is_err());
 }
@@ -138,7 +138,8 @@ fn generation_or_revoke_changes_invalidate_confirmation_permits() {
     let generation=lock_session(&session).generation();
     assert!(require_call_authorized(&lock_session(&session),&permit,generation).is_ok());
     mcp.revoke_caller(&caller).unwrap();assert!(require_call_authorized(&lock_session(&session),&permit,generation).is_err());
-    let permit=AtomicBool::new(true);lock_session(&session).lock();assert!(require_call_authorized(&lock_session(&session),&permit,generation).is_err());
+    let other=mcp.open_caller().unwrap();let permit=mcp.caller_permit(&other).unwrap();lock_session(&session).lock();
+    assert!(require_call_authorized(&lock_session(&session),&permit,generation).is_err());
 }
 
 #[test]
@@ -182,3 +183,26 @@ fn lan_host_and_peer_policy_is_exact_and_loopback_fill_only(){
 
 #[test]
 fn start_while_locked_does_not_mint_tokens(){let mcp=McpState::default();let port=start(&mcp,Arc::new(Mutex::new(Session::default()))).unwrap();assert_ne!(port,0);assert!(recover_lock(&mcp.token).is_empty());assert!(recover_lock(&mcp.fill_token).is_empty());stop(&mcp);}
+
+#[test]
+fn expired_session_ticket_is_rejected_before_any_tool_runs() {
+    let (session,_)=session_with_token(true,"github");let mcp=McpState::default();
+    let caller=mcp.open_caller().unwrap();
+    // Fresh ticket works, then the absolute deadline is forced into the past.
+    assert!(mcp.caller_permit(&caller).is_ok());
+    { let ticket=recover_lock(&mcp.callers).get(&caller).cloned().unwrap(); *recover_lock(&ticket.idle_deadline)=Instant::now()-Duration::from_secs(1); }
+    assert!(mcp.caller_permit(&caller).is_err());
+    assert_eq!(rpc(&session,&mcp,&caller,"vault_list",json!({}))["isError"],true);
+}
+
+#[test]
+fn session_without_a_tool_grant_is_denied() {
+    let (session,_)=session_with_token(true,"github");let mcp=McpState::default();
+    let caller=mcp.open_caller().unwrap();
+    assert_eq!(rpc(&session,&mcp,&caller,"vault_list",json!({}))["isError"],false);
+    // Revoke the ticket: every tool must refuse, not just the ones with scopes.
+    mcp.revoke_caller(&caller).unwrap();
+    for tool in crate::credential_mcp::TOOL_NAMES {
+        assert_eq!(rpc(&session,&mcp,&caller,tool,json!({}))["isError"],true,"{tool} must be denied");
+    }
+}

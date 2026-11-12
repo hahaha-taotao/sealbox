@@ -1,5 +1,5 @@
 (() => {
-const SCRIPT_VERSION = 8;
+const SCRIPT_VERSION = 9;
 if (globalThis.__sealboxContent === SCRIPT_VERSION) return;
 const Fill = globalThis.SealboxFill;
 const PageFill = globalThis.SealboxPageFill;
@@ -91,14 +91,24 @@ window.addEventListener(
   },
   true,
 );
-window.addEventListener("message", (e) => {
-  if (e.source !== window) return;
-  const data = e.data;
-  if (!data || data.source !== "sealbox-overlay" || data.type !== "fill-tab") return;
-  chrome.runtime.sendMessage({ type: "fill-tab", id: data.id }, (res) => {
-    if (res?.ok) document.getElementById("sealbox-overlay-host")?.remove();
+// The fill overlay runs in the page and used to hand its choice back over
+// `window.postMessage`. That channel is readable and forgeable by page script:
+// any caller could replay `{source:"sealbox-overlay", type:"fill-tab"}` and
+// drive a fill. The overlay now talks to the background worker directly, and
+// this listener only accepts messages stamped with the per-load nonce the
+// overlay receives from the background, never from the page.
+const OVERLAY_NONCE = globalThis.__sealboxOverlayNonce || "";
+if (OVERLAY_NONCE) {
+  window.addEventListener("message", (e) => {
+    if (e.source !== window) return;
+    const data = e.data;
+    if (!data || data.source !== "sealbox-overlay" || data.type !== "fill-tab") return;
+    if (data.nonce !== OVERLAY_NONCE) return;
+    chrome.runtime.sendMessage({ type: "fill-tab", id: data.id }, (res) => {
+      if (res?.ok) document.getElementById("sealbox-overlay-host")?.remove();
+    });
   });
-});
+}
 
 function detect() {
   if (!findFieldsInFrames()) return;
