@@ -30,65 +30,92 @@ fn retrying<T>(mut f: impl FnMut(&mut Clipboard) -> Result<T, String>, attempts:
     Err(last)
 }
 
-/// Ask Windows not to record the next clipboard write in clipboard history
-/// (Win+V) or sync it to the user's Microsoft account.
+/// Write `text` to the clipboard while telling Windows not to archive it.
 ///
 /// `arboard` writes plain text with no format opt-out, so a copied password
-/// stays readable in the history list and in the cloud long after the 20-second
-/// sweep empties the live clipboard. Windows exposes this as two registered
-/// clipboard formats carrying a DWORD; setting `1` marks the write as private.
+/// stays readable in clipboard history (Win+V) and in the user's Microsoft
+/// account long after the 20-second sweep empties the live clipboard. Windows
+/// exposes this as two registered clipboard formats carrying a DWORD; setting
+/// `1` marks the write as private.
+///
+/// All formats must go into the *same* clipboard session: `SetClipboardData`
+/// empties the clipboard on every call, so writing the text first and then
+/// adding the exclusion formats would delete the text. Returns `false` when
+/// this platform cannot do it, so the caller falls back to `arboard`.
 #[cfg(windows)]
-fn exclude_from_history() {
+fn write_text_private(text: &str) -> bool {
     use std::ffi::c_void;
-    use std::ptr::null_mut;
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{HANDLE, HWND};
+    use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
     use windows::Win32::System::DataExchange::{
-        CloseClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+        CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
     };
     use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
 
-    // Formats documented for clipboard history exclusion.
-    const FORMATS: [&str; 2] = [
+    /// Formats documented for clipboard history exclusion.
+    const PRIVATE_FORMATS: [&str; 2] = [
         "ExcludeClipboardContentFromMonitorProcessing",
         "CanIncludeInClipboardHistory",
     ];
-    let wide: Vec<Vec<u16>> = FORMATS
+
+    /// Copy `bytes` into a moveable global block the clipboard can own.
+    unsafe fn owned_block(bytes: &[u8]) -> Option<HGLOBAL> {
+        let handle = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1)).ok()?;
+        let dest = GlobalLock(handle) as *mut u8;
+        if dest.is_null() {
+            let _ = GlobalFree(handle);
+            return None;
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, bytes.len());
+        let _ = GlobalUnlock(handle);
+        Some(handle)
+    }
+
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let bytes: Vec<u8> = utf16.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+    let names: Vec<Vec<u16>> = PRIVATE_FORMATS
         .iter()
         .map(|name| name.encode_utf16().chain(std::iter::once(0)).collect())
         .collect();
+
     unsafe {
-        if OpenClipboard(std::ptr::null_mut::<c_void>() as HWND).is_err() {
-            return;
+        if OpenClipboard(HWND(std::ptr::null_mut::<c_void>())).is_err() {
+            return false;
         }
-        for slot in &wide {
-            let Ok(format) = RegisterClipboardFormatW(PCWSTR(slot.as_ptr())) else {
-                continue;
-            };
-            if format == 0 {
-                continue;
+        let mut ok = false;
+        if EmptyClipboard().is_ok() {
+            if let Some(handle) = owned_block(&bytes) {
+                if SetClipboardData(u32::from(CF_UNICODETEXT.0), HANDLE(handle.0)).is_ok() {
+                    ok = true;
+                } else {
+                    let _ = GlobalFree(handle);
+                }
             }
-            // Private memory block owned by the clipboard after SetClipboardData.
-            let Ok(ptr) = GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of::<u32>()) else {
-                continue;
-            };
-            let locked = GlobalLock(ptr) as *mut u32;
-            if locked.is_null() {
-                let _ = windows::Win32::Foundation::GlobalFree(ptr);
-                continue;
-            }
-            *locked = 1;
-            let _ = GlobalUnlock(ptr);
-            if SetClipboardData(format, HANDLE(ptr.0)).is_err() {
-                let _ = windows::Win32::Foundation::GlobalFree(ptr);
+            // A failure here only costs history protection, not the copy.
+            if ok {
+                for name in &names {
+                    let format = RegisterClipboardFormatW(PCWSTR(name.as_ptr()));
+                    if format == 0 {
+                        continue;
+                    }
+                    if let Some(handle) = owned_block(&1u32.to_le_bytes()) {
+                        if SetClipboardData(format, HANDLE(handle.0)).is_err() {
+                            let _ = GlobalFree(handle);
+                        }
+                    }
+                }
             }
         }
         let _ = CloseClipboard();
+        ok
     }
 }
 
 #[cfg(not(windows))]
-fn exclude_from_history() {}
+fn write_text_private(_text: &str) -> bool {
+    false
+}
 
 /// Write `text` and read it back before reporting success.
 ///
@@ -101,10 +128,11 @@ pub fn write_text(text: &str) -> Result<(), String> {
     let _guard = clipboard_mutex().lock().unwrap_or_else(|e| e.into_inner());
     let written = retrying(
         |cb| {
-            cb.set_text(text.to_string()).map_err(|e| e.to_string())?;
-            // Mark right after the write: history exclusion applies to the
-            // content currently on the clipboard.
-            exclude_from_history();
+            // Windows writes every format in one clipboard session so the
+            // history opt-out cannot erase the text it accompanies.
+            if !write_text_private(text) {
+                cb.set_text(text.to_string()).map_err(|e| e.to_string())?;
+            }
             match cb.get_text() {
                 Ok(read_back) if read_back == text => Ok(()),
                 Ok(_) => Err("剪贴板内容与写入的不一致".to_string()),
