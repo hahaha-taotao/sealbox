@@ -252,10 +252,26 @@ fn hoist_literals(raw: &str) -> (String, Vec<String>) {
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // Advance by whole UTF-8 characters. `bytes[i] as char` would reinterpret each byte as a
+        // code point, which silently mangles non-ASCII bytes such as a Chinese folder name.
+        let width = utf8_width(bytes[i]);
+        let end = (i + width).min(bytes.len());
+        out.push_str(&String::from_utf8_lossy(&bytes[i..end]));
+        i = end;
     }
     (out, literals)
+}
+
+/// Byte length of the UTF-8 character that starts with `lead`, defaulting to 1 for a stray
+/// continuation byte so the scan always makes progress.
+fn utf8_width(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => 1,
+    }
 }
 
 /// `(index_of_closing_brace_plus_one, byte_length)` for a `{digits}` token starting at `at`.
@@ -386,5 +402,16 @@ mod tests {
         assert_eq!(literal_len(bytes, 0), Some((4, 11)));
         assert_eq!(literal_len(b"{x}", 0), None);
         assert_eq!(literal_len(b"{}", 0), None);
+    }
+
+    #[test]
+    fn hoisting_preserves_non_ascii_folder_names_byte_for_byte() {
+        let raw = "* LIST () \"/\" \"已发送\"\r\n* LIST () \"/\" {10}\r\n草稿箱\r\nA2 OK\r\n";
+        let (hoisted, literals) = hoist_literals(raw);
+        assert!(hoisted.contains("\"已发送\""), "{hoisted}");
+        assert_eq!(literals, vec!["草稿箱".to_string()]);
+        let folders = parse_folders(raw).unwrap();
+        let names: Vec<&str> = folders.iter().map(|folder| folder.name.as_str()).collect();
+        assert_eq!(names, vec!["已发送", "草稿箱"]);
     }
 }

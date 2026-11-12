@@ -100,20 +100,24 @@ fn guess_from_domain(domain: &str) -> Option<DiscoveredServer> {
 /// first `<hostname>` and `<port>` that follow it, and ignores everything else. A document
 /// with no IMAP server, or with a host that fails [`valid_host`], yields `None`.
 pub fn parse_autoconfig(xml: &str) -> Option<(String, u16)> {
+    // All offsets stay inside `lower`; the matching text is sliced out of `xml` with the same
+    // offsets, which is only sound because `to_ascii_lowercase` preserves byte lengths. Anything
+    // that would make an offset land mid-character returns `None` instead of panicking.
     let lower = xml.to_ascii_lowercase();
     let mut search = 0usize;
     // Prefer an explicit imap server; fall back to an untyped one, which autoconfig uses for
     // providers that only offer IMAP.
     let mut section = None;
-    while let Some(at) = lower[search..].find("<incomingserver") {
+    while let Some(at) = lower.get(search..)?.find("<incomingserver") {
         let start = search + at;
-        let Some(close) = lower[start..].find('>') else { return None };
-        let open_tag = &lower[start..start + close + 1];
-        let end = match lower[start..].find("</incomingserver>") {
-            Some(end) => start + end,
-            None => lower.len(),
-        };
-        let body = &xml[start + close + 1..end];
+        let close = lower.get(start..)?.find('>')?;
+        let open_tag = lower.get(start..start + close + 1)?;
+        let section_end = lower
+            .get(start..)?
+            .find("</incomingserver>")
+            .map(|end| start + end)
+            .unwrap_or(lower.len());
+        let body = xml.get(start + close + 1..section_end)?;
         if open_tag.contains("type=\"imap\"") || open_tag.contains("type='imap'") {
             section = Some(body);
             break;
@@ -121,7 +125,7 @@ pub fn parse_autoconfig(xml: &str) -> Option<(String, u16)> {
         if !open_tag.contains("type=") && section.is_none() {
             section = Some(body);
         }
-        search = end.max(start + close + 1);
+        search = section_end.max(start + close + 1);
         if search >= lower.len() {
             break;
         }
@@ -143,9 +147,9 @@ fn element_text(body: &str, name: &str) -> Option<String> {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
     let start = lower.find(&open)? + open.len();
-    let rest = &lower[start..];
+    let rest = lower.get(start..)?;
     let end = rest.find(&close)?;
-    let value = body[start..start + end].trim();
+    let value = body.get(start..start + end)?.trim();
     if value.is_empty() {
         None
     } else {
@@ -341,5 +345,18 @@ mod tests {
         assert_eq!(server_for_provider("custom"), None);
         assert_eq!(server_for_provider("IMAP.QQ.COM"), None);
         assert_eq!(provider_label("custom"), "其他邮箱");
+    }
+
+    #[test]
+    fn non_ascii_and_malformed_autoconfig_never_panics() {
+        // A CJK comment before the element exercises byte offsets in a multi-byte document.
+        let xml = "<!-- 公共配置 --><clientConfig><emailProvider>\
+                   <incomingServer type=\"imap\"><hostname>imap.example.com</hostname></incomingServer>\
+                   </emailProvider></clientConfig>";
+        assert_eq!(parse_autoconfig(xml), Some(("imap.example.com".into(), 993)));
+        for malformed in ["", "<", "<incomingserver", "<incomingserver>", "已发送 <incomingserver"] {
+            assert_eq!(parse_autoconfig(malformed), None, "{malformed}");
+        }
+        assert_eq!(element_text("<hostname>中文主机</hostname>", "hostname").as_deref(), Some("中文主机"));
     }
 }
