@@ -136,6 +136,24 @@ pub struct MailMessage {
     pub subject: String,
     pub date: String,
     pub has_attachment: bool,
+    /// `\Seen`. The reader never sets it; it only reports what the server already says.
+    pub seen: bool,
+    /// `\Flagged` (starred).
+    pub flagged: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailFolder {
+    /// The server's own name; this is the handle used for every later command.
+    pub name: String,
+    /// Normalised role: inbox / sent / drafts / archive / trash / other.
+    pub role: &'static str,
+    /// Short Chinese label for a standard role; empty for `other`.
+    pub display: &'static str,
+    /// Unread count from the local cache. Zero right after discovery, until a sync fills it in;
+    /// the server is never asked for it here, so opening the page stays cheap.
+    pub unread: u32,
 }
 
 /// Splits an IMAP status line into its tag and upper-cased status word.
@@ -513,6 +531,21 @@ fn has_attachment(body: &Item) -> bool {
     }
 }
 
+fn flags_of(item: &Item) -> (bool, bool) {
+    let Item::List(flags) = item else { return (false, false) };
+    let mut seen = false;
+    let mut flagged = false;
+    for flag in flags {
+        let text = text(flag);
+        if text.eq_ignore_ascii_case("\\Seen") {
+            seen = true;
+        } else if text.eq_ignore_ascii_case("\\Flagged") {
+            flagged = true;
+        }
+    }
+    (seen, flagged)
+}
+
 fn message_from_fetch(items: &[Item]) -> Result<Option<MailMessage>, MailFailure> {
     if items.len() % 2 != 0 {
         return Err(MailFailure::Protocol);
@@ -520,6 +553,7 @@ fn message_from_fetch(items: &[Item]) -> Result<Option<MailMessage>, MailFailure
     let mut uid = None;
     let mut envelope = None;
     let mut body = None;
+    let mut flags = (false, false);
     for pair in items.chunks(2) {
         let Item::Str(key) = &pair[0] else {
             return Err(MailFailure::Protocol);
@@ -540,6 +574,8 @@ fn message_from_fetch(items: &[Item]) -> Result<Option<MailMessage>, MailFailure
             envelope = Some(&pair[1]);
         } else if key.eq_ignore_ascii_case(b"BODYSTRUCTURE") {
             body = Some(&pair[1]);
+        } else if key.eq_ignore_ascii_case(b"FLAGS") {
+            flags = flags_of(&pair[1]);
         }
     }
     // Unsolicited updates such as `* 5 FETCH (FLAGS (\Seen))` carry no envelope; skip them.
@@ -558,6 +594,8 @@ fn message_from_fetch(items: &[Item]) -> Result<Option<MailMessage>, MailFailure
         subject: decode_header(&text(&envelope[1])),
         date: text(&envelope[0]),
         has_attachment: body.is_some_and(has_attachment),
+        seen: flags.0,
+        flagged: flags.1,
     }))
 }
 
@@ -597,6 +635,8 @@ pub struct MailAccount {
     pub title: String,
     pub email: String,
     pub provider: String,
+    /// Human label for the provider, e.g. "QQ 邮箱" or "其他邮箱".
+    pub provider_label: String,
     pub supported: bool,
 }
 
@@ -630,6 +670,12 @@ pub trait ImapIo {
 const MAX_BODY_BYTES: usize = 200 * 1024;
 
 /// IMAP quoted string. CR, LF and NUL cannot appear in a quoted string, so callers reject them first.
+/// IMAP quoted string, exposed so sibling modules can build their own SEARCH terms through the
+/// same escaping instead of duplicating it.
+pub(crate) fn quote_for_search(value: &str) -> String {
+    quote(value)
+}
+
 fn quote(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
@@ -659,16 +705,28 @@ fn check_completion(response: &str, tag: &str, failure: MailFailure) -> Result<(
     Err(MailFailure::Protocol)
 }
 
-/// Sends `A1 LOGIN` and `A2 EXAMINE INBOX`. EXAMINE opens the mailbox read-only so nothing is marked seen.
-fn open_inbox(io: &mut impl ImapIo, email: &str, auth: &str) -> Result<(), MailFailure> {
+/// Sends `A1 LOGIN` and `A2 EXAMINE <folder>`. EXAMINE opens the mailbox read-only, so nothing
+/// is marked seen — this keeps the reader side-effect free on every folder, including
+/// sent/drafts/trash.
+fn open_folder(io: &mut impl ImapIo, email: &str, auth: &str, folder: &str) -> Result<(), MailFailure> {
     let unsafe_char = |ch: char| matches!(ch, '\r' | '\n' | '\0');
     if email.contains(unsafe_char) || auth.contains(unsafe_char) {
         return Err(MailFailure::Login);
     }
+    let mailbox = mailbox_name(folder).ok_or(MailFailure::Protocol)?;
     let login = io.transact(&format!("A1 LOGIN {} {}", quote(email), quote(auth)))?;
     check_completion(&login, "A1", MailFailure::Login)?;
-    let examine = io.transact("A2 EXAMINE INBOX")?;
+    let examine = io.transact(&format!("A2 EXAMINE {mailbox}"))?;
     check_completion(&examine, "A2", MailFailure::Protocol)
+}
+
+/// Quotes a folder name for an IMAP command. The name comes from the server's own `LIST` reply,
+/// but it is still untrusted input, so CR/LF/NUL are rejected and the rest is quoted.
+fn mailbox_name(folder: &str) -> Option<String> {
+    if folder.is_empty() || folder.len() > 512 || folder.chars().any(|ch| matches!(ch, '\r' | '\n' | '\0')) {
+        return None;
+    }
+    Some(quote(folder))
 }
 
 pub fn list_inbox(
@@ -678,18 +736,73 @@ pub fn list_inbox(
     before: Option<u32>,
     limit: usize,
 ) -> Result<Vec<MailMessage>, MailFailure> {
-    open_inbox(io, email, auth)?;
-    let search = io.transact("A3 UID SEARCH ALL")?;
+    list_folder(io, email, auth, "INBOX", before, limit, crate::mail_folder::MailFilter::All, "")
+}
+
+pub fn list_folder(
+    io: &mut impl ImapIo,
+    email: &str,
+    auth: &str,
+    folder: &str,
+    before: Option<u32>,
+    limit: usize,
+    filter: crate::mail_folder::MailFilter,
+    keyword: &str,
+) -> Result<Vec<MailMessage>, MailFailure> {
+    open_folder(io, email, auth, folder)?;
+    // Filtering happens in `UID SEARCH` rather than locally, so "unread" and a keyword cover the
+    // whole folder instead of whichever page happens to be loaded.
+    let query = crate::mail_folder::search_command(filter, keyword)?;
+    let search = io.transact(&format!("A3 {query}"))?;
     check_completion(&search, "A3", MailFailure::Protocol)?;
     let uids = recent_uids(parse_search(&search)?, before, limit);
     if uids.is_empty() {
         return Ok(Vec::new());
     }
     let set = uids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-    let fetch = io.transact(&format!("A4 UID FETCH {set} (UID ENVELOPE BODYSTRUCTURE)"))?;
+    let fetch = io.transact(&format!("A4 UID FETCH {set} (UID ENVELOPE FLAGS BODYSTRUCTURE)"))?;
     check_completion(&fetch, "A4", MailFailure::Protocol)?;
     parse_fetch(&fetch)
 }
+
+/// Logs in, lists every folder the account exposes and maps each to a standard role.
+pub fn list_folders(io: &mut impl ImapIo, email: &str, auth: &str) -> Result<Vec<MailFolder>, MailFailure> {
+    let unsafe_char = |ch: char| matches!(ch, '\r' | '\n' | '\0');
+    if email.contains(unsafe_char) || auth.contains(unsafe_char) {
+        return Err(MailFailure::Login);
+    }
+    let login = io.transact(&format!("A1 LOGIN {} {}", quote(email), quote(auth)))?;
+    check_completion(&login, "A1", MailFailure::Login)?;
+    let list = io.transact("A2 LIST \"\" \"*\"")?;
+    crate::mail_folder::parse_folders(&list)
+}
+
+/// Counts unread messages in one folder without fetching any message headers.
+pub fn unread_count(io: &mut impl ImapIo, email: &str, auth: &str, folder: &str) -> Result<u32, MailFailure> {
+    open_folder(io, email, auth, folder)?;
+    let search = io.transact("A3 UID SEARCH UNSEEN")?;
+    check_completion(&search, "A3", MailFailure::Protocol)?;
+    Ok(parse_search(&search)?.len() as u32)
+}
+
+/// What the "test connection" button reports back: the folders that were found and how many are
+/// unread in the two folders that feed the badge.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailProbeResult {
+    pub folders: Vec<MailFolder>,
+    pub unread: u32,
+}
+
+pub fn probe_account(io: &mut impl ImapIo, email: &str, auth: &str) -> Result<MailProbeResult, MailFailure> {
+    let folders = list_folders(io, email, auth)?;
+    let mut unread = 0u32;
+    for folder in folders.iter().filter(|folder| matches!(folder.role, "inbox" | "archive")) {
+        unread += unread_count(io, email, auth, &folder.name).unwrap_or(0);
+    }
+    Ok(MailProbeResult { folders, unread })
+}
+
 
 /// Returns the `BODY[]` value of the FETCH response for `uid`.
 fn body_literal(raw: &str, uid: u32) -> Result<Vec<u8>, MailFailure> {
@@ -1296,7 +1409,19 @@ fn extract_body_with_inline(message: &[u8]) -> (String, Option<String>, usize) {
 }
 
 pub fn fetch_body(io: &mut impl ImapIo, email: &str, auth: &str, uid: u32) -> Result<MailBody, MailFailure> {
-    open_inbox(io, email, auth)?;
+    fetch_body_in(io, email, auth, "INBOX", uid)
+}
+
+/// Same as [`fetch_body`] for a message outside the inbox. Still `BODY.PEEK`, so opening a draft
+/// or a sent message never marks it seen.
+pub fn fetch_body_in(
+    io: &mut impl ImapIo,
+    email: &str,
+    auth: &str,
+    folder: &str,
+    uid: u32,
+) -> Result<MailBody, MailFailure> {
+    open_folder(io, email, auth, folder)?;
     let fetch = io.transact(&format!("A3 UID FETCH {uid} (BODY.PEEK[])"))?;
     check_completion(&fetch, "A3", MailFailure::Protocol)?;
     let message = body_literal(&fetch, uid)?;
@@ -1502,8 +1627,14 @@ fn item_bytes(item: Item) -> Result<Vec<u8>, MailFailure> {
     }
 }
 
-fn read_structure(io: &mut impl ImapIo, email: &str, auth: &str, uid: u32) -> Result<Item, MailFailure> {
-    open_inbox(io, email, auth)?;
+fn read_structure(
+    io: &mut impl ImapIo,
+    email: &str,
+    auth: &str,
+    folder: &str,
+    uid: u32,
+) -> Result<Item, MailFailure> {
+    open_folder(io, email, auth, folder)?;
     let response = io.transact(&format!("A3 UID FETCH {uid} (BODYSTRUCTURE)"))?;
     check_completion(&response, "A3", MailFailure::Protocol)?;
     fetch_item(&response, uid, |key| key.eq_ignore_ascii_case(b"BODYSTRUCTURE"))?
@@ -1516,7 +1647,17 @@ pub fn list_attachments(
     auth: &str,
     uid: u32,
 ) -> Result<Vec<MailAttachment>, MailFailure> {
-    let structure = read_structure(io, email, auth, uid)?;
+    list_attachments_in(io, email, auth, "INBOX", uid)
+}
+
+pub fn list_attachments_in(
+    io: &mut impl ImapIo,
+    email: &str,
+    auth: &str,
+    folder: &str,
+    uid: u32,
+) -> Result<Vec<MailAttachment>, MailFailure> {
+    let structure = read_structure(io, email, auth, folder, uid)?;
     let mut attachments = Vec::new();
     walk_body(&structure, &mut |part, fields| {
         if let Some(attachment) = attachment_of(part, fields) {
@@ -1566,10 +1707,21 @@ pub fn fetch_attachment(
     uid: u32,
     part: &str,
 ) -> Result<Vec<u8>, MailFailure> {
+    fetch_attachment_in(io, email, auth, "INBOX", uid, part)
+}
+
+pub fn fetch_attachment_in(
+    io: &mut impl ImapIo,
+    email: &str,
+    auth: &str,
+    folder: &str,
+    uid: u32,
+    part: &str,
+) -> Result<Vec<u8>, MailFailure> {
     if !valid_section(part) {
         return Err(MailFailure::Protocol);
     }
-    let structure = read_structure(io, email, auth, uid)?;
+    let structure = read_structure(io, email, auth, folder, uid)?;
     if leaf_size(&structure, part).is_some_and(|size| size as usize > MAX_ATTACHMENT_BYTES) {
         return Err(MailFailure::TooLarge);
     }
@@ -1764,8 +1916,15 @@ impl ImapIo for TlsImap {
     }
 }
 
+/// Opens an implicit-TLS IMAP connection.
+///
+/// `host` is never taken from a raw request: callers resolve it through
+/// [`crate::mail_provider::server_for_provider`] or
+/// [`crate::mail_provider::server_for_mailbox`], which only ever yield a built-in preset host or
+/// a host that passed [`crate::mail_provider::valid_host`]. This check re-asserts that invariant
+/// so a future caller cannot reintroduce an arbitrary endpoint by passing a stray string.
 pub fn connect_tls(host: &str, port: u16, timeout: Duration) -> Result<TlsImap, MailFailure> {
-    if endpoint("qq") != Some((host, port)) && endpoint("gmail") != Some((host, port)) {
+    if !crate::mail_provider::valid_host(host) || port == 0 {
         return Err(MailFailure::Unsupported);
     }
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1875,7 +2034,7 @@ mod tests {
         let mut io = ScriptIo {
             steps: vec![
                 ("LOGIN", "A1 OK\r\n"),
-                ("EXAMINE INBOX", "* FLAGS (\\Seen)\r\nA2 OK [READ-ONLY]\r\n"),
+                ("EXAMINE \"INBOX\"", "* FLAGS (\\Seen)\r\nA2 OK [READ-ONLY]\r\n"),
                 ("UID SEARCH ALL", "* SEARCH 1 2 3\r\nA3 OK\r\n"),
                 ("UID FETCH 2,3 (", "* 1 FETCH (UID 2 ENVELOPE (NIL \"One\" ((NIL NIL \"a\" \"b.com\")) NIL NIL NIL NIL NIL NIL) BODYSTRUCTURE (\"TEXT\" \"PLAIN\" NIL NIL NIL \"8BIT\" 1 1 NIL NIL NIL NIL))\r\n* 2 FETCH (UID 3 ENVELOPE (NIL \"Two\" ((NIL NIL \"c\" \"d.com\")) NIL NIL NIL NIL NIL NIL) BODYSTRUCTURE (\"TEXT\" \"PLAIN\" NIL NIL NIL \"8BIT\" 1 1 NIL NIL NIL NIL))\r\nA4 OK\r\n"),
             ],
@@ -1885,7 +2044,7 @@ mod tests {
         assert_eq!(page.iter().map(|message| message.uid).collect::<Vec<_>>(), vec![2, 3]);
         assert!(io.seen.iter().all(|line| !line.contains("SELECT")));
         assert!(io.seen[0].starts_with("A1 LOGIN"));
-        assert!(io.seen[1].contains("EXAMINE INBOX"));
+        assert!(io.seen[1].contains("EXAMINE \"INBOX\""));
     }
 
     #[test]
@@ -1893,7 +2052,7 @@ mod tests {
         let mut io = ScriptIo {
             steps: vec![
                 ("LOGIN", "A1 OK\r\n"),
-                ("EXAMINE INBOX", "A2 OK [READ-ONLY]\r\n"),
+                ("EXAMINE \"INBOX\"", "A2 OK [READ-ONLY]\r\n"),
                 ("BODY.PEEK[]", "* 1 FETCH (UID 9 BODY[] {40}\r\nContent-Type: text/html\r\n\r\n<p>你好</p>)\r\nA3 OK\r\n"),
             ],
             seen: vec![],
@@ -1956,10 +2115,19 @@ mod tests {
     }
 
     #[test]
-    fn connect_rejects_hosts_outside_qq_and_gmail() {
+    fn connect_rejects_hosts_that_are_not_bare_hostnames() {
         use std::time::Duration;
+        // Anything that is not a bare host name is refused before a socket exists, so this
+        // test never touches the network.
+        for host in ["", "https://evil.example", "imap.qq.com:993", "user@evil.example", "a b"] {
+            assert_eq!(
+                connect_tls(host, 993, Duration::from_millis(50)).err(),
+                Some(MailFailure::Unsupported),
+                "{host}"
+            );
+        }
         assert_eq!(
-            connect_tls("imap.163.com", 993, Duration::from_millis(50)).err(),
+            connect_tls("imap.qq.com", 0, Duration::from_millis(50)).err(),
             Some(MailFailure::Unsupported)
         );
     }
@@ -1988,7 +2156,7 @@ mod tests {
         ScriptIo {
             steps: vec![
                 ("LOGIN", "A1 OK\r\n"),
-                ("EXAMINE INBOX", "A2 OK [READ-ONLY]\r\n"),
+                ("EXAMINE \"INBOX\"", "A2 OK [READ-ONLY]\r\n"),
                 ("BODY.PEEK[]", fetch_response(message, 9)),
             ],
             seen: vec![],
@@ -2456,7 +2624,7 @@ mod tests {
     fn logged_in(extra: Vec<(&str, &str)>) -> OwnedIo {
         let mut steps = vec![
             ("LOGIN".to_string(), "A1 OK\r\n".to_string()),
-            ("EXAMINE INBOX".to_string(), "A2 OK [READ-ONLY]\r\n".to_string()),
+            ("EXAMINE \"INBOX\"".to_string(), "A2 OK [READ-ONLY]\r\n".to_string()),
         ];
         for (expect, response) in extra {
             steps.push((expect.to_string(), response.to_string()));

@@ -678,18 +678,21 @@ fn negotiated_protocol(params: &Value) -> String {
         .to_string()
 }
 
-const MAIL_ACTIONS: &[&str] = &["accounts", "list", "read", "save"];
+const MAIL_ACTIONS: &[&str] = &["accounts", "folders", "list", "search", "read", "save"];
 
 fn mail_tool_definitions() -> Vec<Value> {
     vec![json!({
         "name": "mail",
-        "description": "邮箱。action：accounts 列出账号（不含授权码）；list 只读收件箱，最多 50 封，可带 beforeUid；read 读取纯文本和附件清单；save 把一个附件保存到已有目录中的新文件，不覆盖。entryId 用于 list/read/save，uid 用于 read/save，part 与 path 仅 save。",
+        "description": "邮箱（只读）。action：accounts 列出账号（不含授权码）；folders 列出账号的文件夹与角色；list 只读一个文件夹，最多 50 封，可带 folder、beforeUid、filter、keyword；search 只在已同步的本地缓存里按主题/发件人搜，不联网；read 读取纯文本和附件清单；save 把一个附件保存到已有目录中的新文件，不覆盖。entryId 用于除 accounts 外的动作，folder 省略时为收件箱，uid 用于 read/save，part 与 path 仅 save。不能发信、删信、标记或移动邮件。",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": MAIL_ACTIONS, "description": "accounts、list、read、save"},
-                "entryId": {"type": "string", "minLength": 1, "maxLength": 128, "description": "list、read、save"},
+                "action": {"type": "string", "enum": MAIL_ACTIONS, "description": "accounts、folders、list、search、read、save"},
+                "entryId": {"type": "string", "minLength": 1, "maxLength": 128, "description": "除 accounts 外的动作"},
+                "folder": {"type": "string", "minLength": 1, "maxLength": 512, "description": "list、read、save；省略时为 INBOX"},
                 "beforeUid": {"type": "integer", "minimum": 1, "maximum": 4294967295u64, "description": "仅 list"},
+                "filter": {"type": "string", "enum": ["all", "unread", "attached", "flagged"], "description": "仅 list"},
+                "keyword": {"type": "string", "maxLength": 200, "description": "list 按主题/发件人在服务器搜索；search 搜本地缓存"},
                 "uid": {"type": "integer", "minimum": 1, "maximum": 4294967295u64, "description": "read、save"},
                 "part": {"type": "string", "minLength": 1, "maxLength": 32, "description": "仅 save"},
                 "path": {"type": "string", "minLength": 1, "maxLength": 1024, "description": "仅 save"}
@@ -858,64 +861,129 @@ fn call_mail_inner(session: &Mutex<Session>, name: &str, args: &Value, guard: &d
             let dek = *session.dek().map_err(|error| error.to_string())?;
             let vault = session.vault().map_err(|error| error.to_string())?;
             let entries = vault
-                .list_entries(&crate::vault::ListFilter {
-                    kind: Some(crate::vault::EntryKind::MailAuth),
-                    ..crate::vault::ListFilter::default()
-                })
+                .list_entries(&crate::vault::ListFilter::default())
                 .map_err(|error| error.to_string())?;
             let mut accounts = Vec::new();
             for entry in entries {
+                if entry.kind != crate::vault::EntryKind::MailAuth
+                    && entry.kind != crate::vault::EntryKind::Mailbox
+                {
+                    continue;
+                }
                 let payload = vault.get_active_secret(&dek, &entry.id).map_err(|error| error.to_string())?;
-                let crate::vault::SecretPayload::MailAuth { email, provider, auth_code } = payload else {
-                    return Err("不是邮箱授权码".into());
+                let supported = crate::commands::mail_endpoint_for_payload(&payload).is_some();
+                let (email, provider) = match &payload {
+                    crate::vault::SecretPayload::MailAuth { email, provider, .. } => {
+                        (email.clone(), provider.clone())
+                    }
+                    crate::vault::SecretPayload::Mailbox { email, .. } => {
+                        (email.clone(), "custom".to_string())
+                    }
+                    _ => continue,
                 };
-                drop(auth_code);
                 accounts.push(sealbox_core::mail::MailAccount {
                     id: entry.id,
                     title: entry.title,
                     email,
                     provider: provider.clone(),
-                    supported: sealbox_core::mail::endpoint(&provider).is_some(),
+                    provider_label: sealbox_core::mail_provider::provider_label(&provider).to_string(),
+                    supported,
                 });
             }
             serde_json::to_string(&accounts).map_err(|_| "参数无效".into())
         }
+        "folders" => {
+            ensure_mail_keys(&args, &["entryId"])?;
+            let entry_id = mail_arg_str(&args, "entryId", true)?.unwrap_or("");
+            let (email, auth_code, host, port) = {
+                let session = lock_session(session);
+                load_mail_resolved(&session, entry_id)?
+            };
+            let mut io = sealbox_core::mail::connect_tls(&host, port, std::time::Duration::from_secs(20))
+                .map_err(sealbox_core::mail::failure_message)?;
+            let folders = sealbox_core::mail::list_folders(&mut io, &email, &auth_code)
+                .map_err(sealbox_core::mail::failure_message)?;
+            drop(auth_code);
+            serde_json::to_string(&folders).map_err(|_| "参数无效".into())
+        }
+        "search" => {
+            // Reads the local cache only: an AI caller cannot turn a search into a mailbox
+            // download or use it to probe folders that were never synced.
+            ensure_mail_keys(&args, &["entryId", "keyword"])?;
+            let entry_id = mail_arg_str(&args, "entryId", true)?.unwrap_or("");
+            let keyword = mail_arg_str(&args, "keyword", true)?.unwrap_or("");
+            let session = lock_session(session);
+            session
+                .vault()
+                .map_err(|error| error.to_string())?
+                .get_active_secret(&*session.dek().map_err(|error| error.to_string())?, entry_id)
+                .map_err(|_| "不是邮箱账号".to_string())?;
+            let hits = session
+                .vault()
+                .map_err(|error| error.to_string())?
+                .mail_search_cached(entry_id, keyword, 50)
+                .map_err(|error| error.to_string())?;
+            let payload: Vec<Value> = hits
+                .into_iter()
+                .map(|(folder, message)| {
+                    json!({
+                        "folder": folder,
+                        "uid": message.uid,
+                        "from": message.from,
+                        "subject": message.subject,
+                        "date": message.date,
+                        "seen": message.seen,
+                    })
+                })
+                .collect();
+            serde_json::to_string(&payload).map_err(|_| "参数无效".into())
+        }
         "list" => {
-            ensure_mail_keys(&args, &["entryId", "beforeUid"])?;
+            ensure_mail_keys(&args, &["entryId", "beforeUid", "folder", "filter", "keyword"])?;
             let entry_id = mail_arg_str(&args, "entryId", true)?.unwrap_or("");
             let before = mail_arg_u32(&args, "beforeUid", false)?;
-            let (email, provider, auth_code) = {
+            let folder = mail_arg_str(&args, "folder", false)?.unwrap_or("INBOX").to_string();
+            let keyword = mail_arg_str(&args, "keyword", false)?.unwrap_or("").to_string();
+            let filter = sealbox_core::mail_folder::MailFilter::parse(
+                mail_arg_str(&args, "filter", false)?.unwrap_or(""),
+            )
+            .ok_or("参数无效")?;
+            let (email, auth_code, host, port) = {
                 let session = lock_session(session);
-                load_mail_secret(&session, entry_id)?
+                load_mail_resolved(&session, entry_id)?
             };
-            let Some((host, port)) = sealbox_core::mail::endpoint(&provider) else {
-                return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
-            };
-            let mut io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
+            let mut io = sealbox_core::mail::connect_tls(&host, port, std::time::Duration::from_secs(20))
                 .map_err(sealbox_core::mail::failure_message)?;
-            let messages = sealbox_core::mail::list_inbox(&mut io, &email, &auth_code, before, 50)
-                .map_err(sealbox_core::mail::failure_message)?;
+            let messages = sealbox_core::mail::list_folder(
+                &mut io,
+                &email,
+                &auth_code,
+                &folder,
+                before,
+                50,
+                filter,
+                &keyword,
+            )
+            .map_err(sealbox_core::mail::failure_message)?;
             drop(auth_code);
             serde_json::to_string(&messages).map_err(|_| "参数无效".into())
         }
         "read" => {
-            ensure_mail_keys(&args, &["entryId", "uid"])?;
+            ensure_mail_keys(&args, &["entryId", "uid", "folder"])?;
             let entry_id = mail_arg_str(&args, "entryId", true)?.unwrap_or("");
             let uid = mail_arg_u32(&args, "uid", true)?.ok_or("参数无效")?;
-            let (email, provider, auth_code) = {
+            let folder = mail_arg_str(&args, "folder", false)?.unwrap_or("INBOX").to_string();
+            let (email, auth_code, host, port) = {
                 let session = lock_session(session);
-                load_mail_secret(&session, entry_id)?
+                load_mail_resolved(&session, entry_id)?
             };
-            let Some((host, port)) = sealbox_core::mail::endpoint(&provider) else {
-                return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
-            };
-            let mut text_io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
+            let mut text_io = sealbox_core::mail::connect_tls(&host, port, std::time::Duration::from_secs(20))
                 .map_err(sealbox_core::mail::failure_message)?;
-            let body = sealbox_core::mail::fetch_body(&mut text_io, &email, &auth_code, uid)
+            let body = sealbox_core::mail::fetch_body_in(&mut text_io, &email, &auth_code, &folder, uid)
                 .map_err(sealbox_core::mail::failure_message)?;
-            let mut list_io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
+            let mut list_io = sealbox_core::mail::connect_tls(&host, port, std::time::Duration::from_secs(20))
                 .map_err(sealbox_core::mail::failure_message)?;
-            let attachments = sealbox_core::mail::list_attachments(&mut list_io, &email, &auth_code, uid)
+            let attachments = sealbox_core::mail::list_attachments_in(&mut list_io, &email, &auth_code, &folder, uid)
                 .map_err(sealbox_core::mail::failure_message)?;
             drop(auth_code);
             serde_json::to_string(&json!({
@@ -926,21 +994,19 @@ fn call_mail_inner(session: &Mutex<Session>, name: &str, args: &Value, guard: &d
             .map_err(|_| "参数无效".into())
         }
         "save" => {
-            ensure_mail_keys(&args, &["entryId", "uid", "part", "path"])?;
+            ensure_mail_keys(&args, &["entryId", "uid", "part", "path", "folder"])?;
             let entry_id = mail_arg_str(&args, "entryId", true)?.unwrap_or("");
             let uid = mail_arg_u32(&args, "uid", true)?.ok_or("参数无效")?;
             let part = mail_arg_str(&args, "part", true)?.unwrap_or("").to_string();
             let path = mail_arg_str(&args, "path", true)?.unwrap_or("").to_string();
-            let (email, provider, auth_code) = {
+            let folder = mail_arg_str(&args, "folder", false)?.unwrap_or("INBOX").to_string();
+            let (email, auth_code, host, port) = {
                 let session = lock_session(session);
-                load_mail_secret(&session, entry_id)?
+                load_mail_resolved(&session, entry_id)?
             };
-            let Some((host, port)) = sealbox_core::mail::endpoint(&provider) else {
-                return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
-            };
-            let mut io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
+            let mut io = sealbox_core::mail::connect_tls(&host, port, std::time::Duration::from_secs(20))
                 .map_err(sealbox_core::mail::failure_message)?;
-            let bytes = sealbox_core::mail::fetch_attachment(&mut io, &email, &auth_code, uid, &part)
+            let bytes = sealbox_core::mail::fetch_attachment_in(&mut io, &email, &auth_code, &folder, uid, &part)
                 .map_err(sealbox_core::mail::failure_message)?;
             drop(auth_code);
             guard()?;
@@ -959,6 +1025,41 @@ fn call_mail_inner(session: &Mutex<Session>, name: &str, args: &Value, guard: &d
             MAIL_ACTIONS.join("、")
         )),
     }
+}
+
+/// Resolves an entry to `(email, credential, imap_host, imap_port)`. The host comes from the
+/// vault entry — a built-in preset for `mail_auth`, the stored host for `mailbox` — never from
+/// the tool arguments.
+fn load_mail_resolved(
+    session: &crate::session::Session,
+    entry_id: &str,
+) -> Result<(String, zeroize::Zeroizing<String>, String, u16), String> {
+    let dek = *session.dek().map_err(|error| error.to_string())?;
+    let payload = session
+        .vault()
+        .map_err(|error| error.to_string())?
+        .get_active_secret(&dek, entry_id)
+        .map_err(|error| error.to_string())?;
+    let (email, endpoint) = match &payload {
+        crate::vault::SecretPayload::MailAuth { email, provider, .. } => (
+            email.clone(),
+            sealbox_core::mail_provider::server_for_provider(provider),
+        ),
+        crate::vault::SecretPayload::Mailbox { email, imap_host, imap_port, .. } => (
+            email.clone(),
+            sealbox_core::mail_provider::server_for_mailbox(email, imap_host.as_deref(), *imap_port),
+        ),
+        _ => return Err("不是邮箱账号".into()),
+    };
+    let secret = match payload {
+        crate::vault::SecretPayload::MailAuth { auth_code, .. } => auth_code,
+        crate::vault::SecretPayload::Mailbox { password, .. } => password,
+        _ => return Err("不是邮箱账号".into()),
+    };
+    let Some((host, port)) = endpoint else {
+        return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
+    };
+    Ok((email, zeroize::Zeroizing::new(secret), host, port))
 }
 
 #[derive(Clone, Serialize)]

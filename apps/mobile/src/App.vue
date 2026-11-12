@@ -5,14 +5,15 @@ import { onBackButtonPress } from "@tauri-apps/api/app";
 import type { PluginListener } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { authenticate, checkStatus, getData, hasData, removeData, setData } from "@choochmeque/tauri-plugin-biometry-api";
-import { KINDS, api, kindLabel, type BackupPreview, type CsvPreview, type DocumentRef, type Counts, type EntryDto, type EntryField, type EntryKind, type Folder, type MobileRelease, type SyncReport, type SyncView } from "./api";
+import { KINDS, api, kindLabel, type BackupPreview, type CsvPreview, type DocumentRef, type Counts, type EntryDto, type EntryField, type EntryKind, type Folder, type MailAccount, type MailAttachment, type MailFilter, type MailFolder, type MailMessage, type MobileRelease, type SyncReport, type SyncView } from "./api";
+import { buildMailDocument, hasRemoteImages } from "../../../src/lib/mail-html";
 import { DB_ENGINES, SERVER_PROTOCOLS, optionsWithStored, databaseFields, defaultPort } from "../../../src/lib/entry-options";
 import { preservePayload } from "../../../src/lib/entry-patch.mjs";
 import CredentialProfileEditor from "../../../src/components/CredentialProfileEditor.vue";
 import { credentialProfileApi } from "./lib/credential-profile";
 import { completeChoices, buildResolutions, type SyncChoice } from '../../../src/lib/sync-choice.mjs';
 
-type Page = "lock" | "vault" | "detail" | "edit" | "settings" | "sync";
+type Page = "lock" | "vault" | "detail" | "edit" | "settings" | "sync" | "mail";
 const page = ref<Page>("lock");
 const initialized = ref(false);
 const biometryOn = ref(false);
@@ -127,6 +128,8 @@ async function changeMaster() {
     try { await removeData({ domain: DOMAIN, name: DEK_NAME }); } catch { showToast('请在系统设置中清除旧指纹凭据；本机已禁用指纹', 4000); }
     clearManagement(); clearEdit(); clearSyncPreview(); biometryOn.value = false; biometryReady.value = false;
     page.value = 'lock'; entries.value = []; selected.value = null; fields.value = []; notes.value = ''; revealed.value = '';
+    mailSeq += 1; mailBodySeq += 1; mailAccounts.value = []; mailAccountId.value = ''; mailFolders.value = [];
+    mailMessages.value = []; mailOpenMessage.value = null; mailBodyText.value = ''; mailHtml.value = ''; mailHtmlSource.value = '';
     showToast('主密码已修改，请用新主密码解锁');
   } catch (caught) { showError(caught); } finally { transferPassword.value = ''; busy.value = false; }
 }
@@ -172,6 +175,7 @@ let backQueue: Promise<void> = Promise.resolve();
 function canGoBackInApp() {
   if (management.value) return true;
   if (page.value === "vault") return filtersOpen.value;
+  if (page.value === "mail") return Boolean(mailOpenMessage.value);
   return page.value === "detail" || page.value === "edit" || page.value === "settings" || page.value === "sync";
 }
 
@@ -184,6 +188,10 @@ function goBack() {
   if (management.value) { clearManagement(); return; }
   if (page.value === 'edit') clearEdit();
   switch (page.value) {
+    case "mail":
+      // The reading view is a pushed page; closing it returns to the list.
+      closeMailMessage();
+      break;
     case "detail":
       page.value = "vault";
       break;
@@ -222,6 +230,298 @@ function syncBackListener() {
 
 watch([page, filtersOpen, management], syncBackListener);
 watch(page, (next) => { if (next !== "detail") credentialProfileOpen.value = false; });
+
+// ==== 邮箱（只读） ============================================================
+// 手机端与桌面共用同一套后端命令；这里只做只读浏览，不提供发信、删除或标已读。
+
+const MAIL_ROLES: { role: string; label: string }[] = [
+  { role: "inbox", label: "收件箱" },
+  { role: "sent", label: "已发送" },
+  { role: "drafts", label: "草稿" },
+  { role: "archive", label: "归档" },
+  { role: "trash", label: "垃圾箱" },
+];
+
+const MAIL_FILTERS: { id: MailFilter; label: string }[] = [
+  { id: "all", label: "全部" },
+  { id: "unread", label: "未读" },
+  { id: "attached", label: "附件" },
+  { id: "flagged", label: "星标" },
+];
+
+const mailAccounts = ref<MailAccount[]>([]);
+const mailAccountId = ref("");
+const mailFolders = ref<MailFolder[]>([]);
+const mailRole = ref("inbox");
+const mailOtherFolder = ref("");
+const mailFilter = ref<MailFilter>("all");
+const mailKeyword = ref("");
+const mailAppliedKeyword = ref("");
+const mailMessages = ref<MailMessage[]>([]);
+const mailBusy = ref(false);
+const mailMoreBusy = ref(false);
+const mailError = ref("");
+const mailNote = ref("");
+const mailEmpty = ref(false);
+const mailOpenMessage = ref<MailMessage | null>(null);
+const mailBodyText = ref("");
+const mailHtml = ref("");
+const mailHtmlSource = ref("");
+const mailRemoteImages = ref(false);
+const mailImagesAllowed = ref(false);
+const mailTruncated = ref(false);
+const mailBodyBusy = ref(false);
+const mailAttachments = ref<MailAttachment[]>([]);
+const mailSavingPart = ref("");
+let mailSeq = 0;
+let mailBodySeq = 0;
+
+const mailCurrentAccount = computed(
+  () => mailAccounts.value.find((account) => account.id === mailAccountId.value) ?? null,
+);
+
+const mailFolderName = computed(() => {
+  if (mailRole.value === "other") return mailOtherFolder.value;
+  const match = mailFolders.value.find((folder) => folder.role === mailRole.value);
+  return match?.name ?? (mailRole.value === "inbox" ? "INBOX" : "");
+});
+
+const mailVisibleRoles = computed(() => {
+  const present = new Set(mailFolders.value.map((folder) => folder.role));
+  return MAIL_ROLES.filter((entry) => present.has(entry.role));
+});
+
+const mailOtherFolders = computed(() => mailFolders.value.filter((folder) => folder.role === "other"));
+
+/** 列表页还是正文页：正文页全屏 push，返回键先回列表。 */
+const mailReading = computed(() => mailOpenMessage.value !== null);
+
+function resetMailList() {
+  mailBodySeq += 1;
+  mailMessages.value = [];
+  mailError.value = "";
+  mailNote.value = "";
+  mailEmpty.value = false;
+  mailOpenMessage.value = null;
+  mailBodyText.value = "";
+  mailHtml.value = "";
+  mailHtmlSource.value = "";
+  mailRemoteImages.value = false;
+  mailImagesAllowed.value = false;
+  mailTruncated.value = false;
+  mailAttachments.value = [];
+  mailBodyBusy.value = false;
+  mailSavingPart.value = "";
+}
+
+async function openMail() {
+  page.value = "mail";
+  mailAccountId.value = "";
+  mailFolders.value = [];
+  mailRole.value = "inbox";
+  mailOtherFolder.value = "";
+  mailFilter.value = "all";
+  mailKeyword.value = "";
+  mailAppliedKeyword.value = "";
+  resetMailList();
+  const seq = ++mailSeq;
+  mailBusy.value = true;
+  try {
+    const accounts = await api.mailAccounts();
+    if (seq !== mailSeq) return;
+    mailAccounts.value = accounts;
+    const next = accounts.find((account) => account.supported);
+    if (next) await selectMailAccount(next, seq);
+  } catch (e) {
+    if (seq === mailSeq) mailError.value = String(e);
+  } finally {
+    if (seq === mailSeq) mailBusy.value = false;
+  }
+}
+
+async function selectMailAccount(account: MailAccount, seq = ++mailSeq) {
+  if (!account.supported) return;
+  mailAccountId.value = account.id;
+  mailRole.value = "inbox";
+  mailOtherFolder.value = "";
+  resetMailList();
+  mailBusy.value = true;
+  try {
+    const folders = await api.mailFolders(account.id);
+    if (seq !== mailSeq) return;
+    mailFolders.value = folders;
+  } catch (e) {
+    if (seq === mailSeq) mailError.value = String(e);
+  } finally {
+    if (seq === mailSeq) mailBusy.value = false;
+  }
+  if (seq === mailSeq) await loadMail(seq);
+}
+
+/** 筛选和关键词都交给服务器，覆盖整个文件夹而不只是已加载的一页。 */
+async function loadMail(seq = ++mailSeq) {
+  const entryId = mailAccountId.value;
+  const folder = mailFolderName.value;
+  resetMailList();
+  if (!entryId || !folder) return;
+  mailBusy.value = true;
+  try {
+    const messages = await api.mailList(entryId, folder, {
+      filter: mailFilter.value,
+      keyword: mailAppliedKeyword.value,
+    });
+    if (seq !== mailSeq) return;
+    mailMessages.value = messages.slice().reverse();
+    mailEmpty.value = messages.length === 0;
+  } catch (e) {
+    if (seq === mailSeq) mailError.value = String(e);
+  } finally {
+    if (seq === mailSeq) mailBusy.value = false;
+  }
+}
+
+async function loadOlderMail() {
+  const entryId = mailAccountId.value;
+  const folder = mailFolderName.value;
+  const oldest = mailMessages.value[mailMessages.value.length - 1]?.uid;
+  if (!entryId || !folder || oldest == null || mailMoreBusy.value) return;
+  const seq = mailSeq;
+  mailMoreBusy.value = true;
+  mailError.value = "";
+  try {
+    const older = await api.mailList(entryId, folder, {
+      beforeUid: oldest,
+      filter: mailFilter.value,
+      keyword: mailAppliedKeyword.value,
+    });
+    if (seq !== mailSeq) return;
+    const seen = new Set(mailMessages.value.map((message) => message.uid));
+    mailMessages.value = [...mailMessages.value, ...older.filter((message) => !seen.has(message.uid)).reverse()];
+    if (!older.length) mailNote.value = "没有更早的邮件";
+  } catch (e) {
+    if (seq === mailSeq) mailError.value = String(e);
+  } finally {
+    if (seq === mailSeq) mailMoreBusy.value = false;
+  }
+}
+
+function chooseMailRole(role: string) {
+  if (mailRole.value === role || mailBusy.value) return;
+  mailRole.value = role;
+  mailOtherFolder.value = "";
+  void loadMail();
+}
+
+function chooseMailOtherFolder(name: string) {
+  mailRole.value = "other";
+  mailOtherFolder.value = name;
+  void loadMail();
+}
+
+function chooseMailFilter(filter: MailFilter) {
+  if (mailFilter.value === filter) return;
+  mailFilter.value = filter;
+  void loadMail();
+}
+
+function submitMailSearch() {
+  mailAppliedKeyword.value = mailKeyword.value.trim();
+  void loadMail();
+}
+
+function clearMailSearch() {
+  mailKeyword.value = "";
+  mailAppliedKeyword.value = "";
+  void loadMail();
+}
+
+async function openMailMessage(message: MailMessage) {
+  const entryId = mailAccountId.value;
+  const folder = mailFolderName.value;
+  const seq = ++mailBodySeq;
+  mailOpenMessage.value = message;
+  mailBodyText.value = "";
+  mailHtml.value = "";
+  mailHtmlSource.value = "";
+  mailRemoteImages.value = false;
+  mailImagesAllowed.value = false;
+  mailTruncated.value = false;
+  mailAttachments.value = [];
+  mailBodyBusy.value = true;
+  mailError.value = "";
+  try {
+    const [bodyResult, attachmentResult] = await Promise.allSettled([
+      api.mailBody(entryId, message.uid, folder),
+      api.mailAttachments(entryId, message.uid, folder),
+    ]);
+    if (seq !== mailBodySeq) return;
+    if (bodyResult.status === "fulfilled") {
+      const body = bodyResult.value;
+      mailBodyText.value = body.text;
+      mailHtmlSource.value = body.html ?? "";
+      mailRemoteImages.value = body.html ? hasRemoteImages(body.html) : false;
+      mailHtml.value = body.html ? buildMailDocument(body.html) : "";
+      mailTruncated.value = body.truncated;
+    } else {
+      mailError.value = String(bodyResult.reason);
+    }
+    if (attachmentResult.status === "fulfilled") {
+      mailAttachments.value = attachmentResult.value;
+    }
+  } catch (e) {
+    if (seq === mailBodySeq) mailError.value = String(e);
+  } finally {
+    if (seq === mailBodySeq) mailBodyBusy.value = false;
+  }
+}
+
+function closeMailMessage() {
+  mailBodySeq += 1;
+  mailOpenMessage.value = null;
+  mailBodyBusy.value = false;
+}
+
+function showMailImages() {
+  if (mailImagesAllowed.value || mailHtmlSource.value === "") return;
+  mailImagesAllowed.value = true;
+  mailHtml.value = buildMailDocument(mailHtmlSource.value, { allowRemoteImages: true });
+}
+
+/** 附件走系统文档选择器保存；SAF 的 content:// URI 由原生端写入。 */
+async function saveMailAttachment(item: MailAttachment) {
+  const entryId = mailAccountId.value;
+  const message = mailOpenMessage.value;
+  const folder = mailFolderName.value;
+  if (!entryId || !message || mailSavingPart.value) return;
+  const seq = mailBodySeq;
+  const filename = item.filename.split(/[/\\]/).filter(Boolean).pop() || "attachment";
+  try {
+    const picked = await api.documentSave(filename, item.mime);
+    if (!picked || seq !== mailBodySeq) return;
+    mailSavingPart.value = item.part;
+    await api.mailSaveAttachment(entryId, message.uid, item.part, picked.uri, folder);
+    showToast("附件已保存");
+  } catch (e) {
+    if (seq === mailBodySeq) mailError.value = String(e);
+  } finally {
+    if (seq === mailBodySeq) mailSavingPart.value = "";
+  }
+}
+
+function formatMailSize(size: number | null): string {
+  if (size == null) return "大小未知";
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/** `Wed, 12 Nov 2026 09:12:00 +0800` -> `11-12 09:12`。 */
+function formatMailDate(raw: string): string {
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return raw;
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
+}
 
 const DOMAIN = "com.sealbox.mobile";
 const DEK_NAME = "vault-dek";
@@ -1043,6 +1343,13 @@ onMounted(async () => {
             </svg>
             <span>保险库</span>
           </button>
+          <button class="tab" @click="openMail">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="3" y="5" width="18" height="14" rx="2" />
+              <path d="m4 7 8 6 8-6" />
+            </svg>
+            <span>邮箱</span>
+          </button>
           <button class="tab" @click="openSettings">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="12" cy="12" r="3" />
@@ -1053,6 +1360,129 @@ onMounted(async () => {
         </div>
       </div>
       <button class="fab" @click="startCreate('website')">+</button>
+    </template>
+
+    <template v-else-if="page === 'mail'">
+      <div class="view">
+        <div class="top">
+          <button class="link" type="button" @click="page = 'vault'">返回</button>
+          <h1>{{ mailReading ? (mailOpenMessage?.subject || '(无主题)') : '邮箱' }}</h1>
+        </div>
+
+        <div v-if="!mailReading" class="scroll">
+          <div v-if="mailError" class="pad"><p class="error">{{ mailError }}</p></div>
+          <div v-if="!mailAccounts.length" class="pad">
+            <p class="hint">还没有邮箱账号。先在保险库里新增「邮箱授权码」或「邮箱」条目。</p>
+          </div>
+          <template v-else>
+            <div class="chips folders">
+              <button
+                v-for="account in mailAccounts"
+                :key="account.id"
+                class="chip"
+                :class="{ on: account.id === mailAccountId }"
+                :disabled="!account.supported"
+                @click="selectMailAccount(account)"
+              >
+                {{ account.title || account.email }}
+              </button>
+            </div>
+            <div v-if="mailVisibleRoles.length" class="chips">
+              <button
+                v-for="entry in mailVisibleRoles"
+                :key="entry.role"
+                class="chip"
+                :class="{ on: mailRole === entry.role }"
+                @click="chooseMailRole(entry.role)"
+              >
+                {{ entry.label }}<template v-if="entry.role === 'inbox' && mailCurrentAccount"> {{ mailFolders.find((folder) => folder.role === 'inbox')?.unread || '' }}</template>
+              </button>
+            </div>
+            <div v-if="mailOtherFolders.length" class="chips">
+              <button
+                v-for="folder in mailOtherFolders"
+                :key="folder.name"
+                class="chip"
+                :class="{ on: mailRole === 'other' && mailOtherFolder === folder.name }"
+                @click="chooseMailOtherFolder(folder.name)"
+              >
+                {{ folder.name }}
+              </button>
+            </div>
+            <div class="chips">
+              <button
+                v-for="option in MAIL_FILTERS"
+                :key="option.id"
+                class="chip"
+                :class="{ on: mailFilter === option.id }"
+                @click="chooseMailFilter(option.id)"
+              >
+                {{ option.label }}
+              </button>
+            </div>
+            <div class="searchbar">
+              <input v-model="mailKeyword" placeholder="搜索主题或发件人" maxlength="200" @keyup.enter="submitMailSearch" />
+              <button class="ghost" type="button" @click="submitMailSearch">搜索</button>
+              <button v-if="mailAppliedKeyword" class="ghost" type="button" @click="clearMailSearch">清除</button>
+            </div>
+            <p v-if="mailBusy" class="hint pad">正在读取…</p>
+            <p v-if="mailNote" class="hint pad">{{ mailNote }}</p>
+            <p v-if="mailEmpty && !mailBusy" class="hint pad">
+              {{ mailAppliedKeyword || mailFilter !== 'all' ? '没有符合条件的邮件' : '这个文件夹是空的' }}
+            </p>
+            <div class="scroll">
+              <div class="list">
+                <button v-for="message in mailMessages" :key="message.uid" class="item" @click="openMailMessage(message)">
+                  <span class="letter" :style="{ background: message.seen ? '#c9ccd4' : '#5b5bd6' }">{{ (message.from || '?').slice(0, 1).toUpperCase() }}</span>
+                  <span class="meta">
+                    <span class="name">{{ message.subject || '(无主题)' }}</span>
+                    <span class="line">{{ message.from }}</span>
+                    <span class="line">
+                      {{ formatMailDate(message.date) }}
+                      <template v-if="message.flagged"> · ★</template>
+                      <template v-if="message.hasAttachment"> · 有附件</template>
+                    </span>
+                  </span>
+                </button>
+              </div>
+            </div>
+            <div class="pad">
+              <button class="ghost" type="button" :disabled="mailMoreBusy || !mailMessages.length" @click="loadOlderMail">加载更早</button>
+            </div>
+          </template>
+        </div>
+
+        <div v-else class="scroll">
+          <div class="pad">
+            <p v-if="mailError" class="error">{{ mailError }}</p>
+            <p class="hint">{{ mailOpenMessage?.from }} · {{ formatMailDate(mailOpenMessage?.date || '') }}</p>
+            <p v-if="mailTruncated" class="hint">正文过长，已截断。</p>
+            <template v-if="mailAttachments.length">
+              <div class="lbl">附件</div>
+              <div v-for="item in mailAttachments" :key="item.part" class="set">
+                <span class="t">{{ item.filename }}</span>
+                <span>{{ formatMailSize(item.size) }}</span>
+                <button class="ghost" type="button" :disabled="mailSavingPart === item.part" @click="saveMailAttachment(item)">保存</button>
+              </div>
+            </template>
+            <div v-if="mailHtml && mailRemoteImages && !mailImagesAllowed" class="set">
+              <span class="t">远程图片已屏蔽，避免发件人通过追踪像素得知你已读。</span>
+              <button class="ghost" type="button" @click="showMailImages">显示图片</button>
+            </div>
+            <iframe
+              v-if="mailHtml"
+              class="mail-frame"
+              :srcdoc="mailHtml"
+              sandbox="allow-same-origin"
+              referrerpolicy="no-referrer"
+              title="邮件正文"
+            />
+            <pre v-else-if="mailBodyText" class="mail-text">{{ mailBodyText }}</pre>
+            <p v-else-if="mailBodyBusy" class="hint">正在读取正文…</p>
+            <p v-else class="hint">这封邮件没有可显示的正文。</p>
+          </div>
+        </div>
+      </div>
     </template>
 
     <section v-else-if="page === 'detail' && selected" class="view">

@@ -1042,28 +1042,161 @@ fn open_unlocked_copy(app: &AppHandle, state: &AppState) -> Result<(Vault, [u8; 
     Ok((vault, dek))
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MailListRequest {
     pub entry_id: String,
+    #[serde(default)]
+    pub folder: Option<String>,
     pub before_uid: Option<u32>,
+    #[serde(default)]
+    pub filter: Option<String>,
+    #[serde(default)]
+    pub keyword: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MailBodyRequest {
     pub entry_id: String,
     pub uid: u32,
+    #[serde(default)]
+    pub folder: Option<String>,
 }
 
-fn load_mail_auth(state: &AppState, id: &str) -> Result<(String, String, zeroize::Zeroizing<String>), String> {
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailFoldersRequest {
+    pub entry_id: String,
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailAttachmentRequest {
+    pub entry_id: String,
+    pub uid: u32,
+    #[serde(default)]
+    pub folder: Option<String>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailSaveAttachmentRequest {
+    pub entry_id: String,
+    pub uid: u32,
+    pub part: String,
+    /// A SAF content URI on Android, or an absolute path when one is supplied.
+    pub path: String,
+    #[serde(default)]
+    pub folder: Option<String>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailProbeRequest {
+    pub entry_id: Option<String>,
+    pub email: Option<String>,
+    pub secret: Option<String>,
+    pub imap_host: Option<String>,
+    pub imap_port: Option<u16>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailProbeReport {
+    pub host: String,
+    pub port: u16,
+    pub folders: Vec<sealbox_core::mail::MailFolder>,
+    pub unread: u32,
+}
+
+/// A resolved mailbox. The IMAP host always comes from the vault entry, never from the request.
+struct MailSession {
+    account: sealbox_core::mail::MailAccount,
+    email: String,
+    secret: zeroize::Zeroizing<String>,
+    host: String,
+    port: u16,
+}
+
+fn mail_endpoint_for(payload: &SecretPayload) -> Option<(String, u16)> {
+    match payload {
+        SecretPayload::MailAuth { provider, .. } => sealbox_core::mail_provider::server_for_provider(provider),
+        SecretPayload::Mailbox { email, imap_host, imap_port, .. } => {
+            sealbox_core::mail_provider::server_for_mailbox(email, imap_host.as_deref(), *imap_port)
+        }
+        _ => None,
+    }
+}
+
+fn mail_session_from(payload: &SecretPayload, id: &str, title: &str) -> Option<MailSession> {
+    let (email, provider, secret) = match payload {
+        SecretPayload::MailAuth { email, provider, auth_code } => {
+            (email.clone(), provider.clone(), auth_code.clone())
+        }
+        SecretPayload::Mailbox { email, password, .. } => (email.clone(), "custom".to_string(), password.clone()),
+        _ => return None,
+    };
+    let endpoint = mail_endpoint_for(payload);
+    let account = sealbox_core::mail::MailAccount {
+        id: id.to_string(),
+        title: title.to_string(),
+        email: email.clone(),
+        provider: provider.clone(),
+        provider_label: sealbox_core::mail_provider::provider_label(&provider).to_string(),
+        supported: endpoint.is_some(),
+    };
+    let (host, port) = endpoint.unwrap_or_default();
+    Some(MailSession { account, email, secret: zeroize::Zeroizing::new(secret), host, port })
+}
+
+fn load_mail_session(state: &AppState, id: &str) -> Result<MailSession, String> {
     let mut session = lock_session(&state.session);
     session.require_unlocked().map_err(map_err)?;
     let dek = *session.dek().map_err(map_err)?;
-    let payload = session.vault().map_err(map_err)?.get_active_secret(&dek, id).map_err(map_err)?;
-    match payload {
-        SecretPayload::MailAuth { email, provider, auth_code } => Ok((email, provider, zeroize::Zeroizing::new(auth_code))),
-        _ => Err("不是邮箱授权码".into()),
+    let vault = session.vault().map_err(map_err)?;
+    let payload = vault.get_active_secret(&dek, id).map_err(map_err)?;
+    let title = vault
+        .list_entries(&sealbox_core::vault::ListFilter::default())
+        .ok()
+        .and_then(|entries| entries.into_iter().find(|entry| entry.id == id))
+        .map(|entry| entry.title)
+        .unwrap_or_default();
+    mail_session_from(&payload, id, &title).ok_or_else(|| "不是邮箱账号".to_string())
+}
+
+fn mail_connect(session: &MailSession) -> Result<sealbox_core::mail::TlsImap, String> {
+    if !session.account.supported {
+        return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
+    }
+    sealbox_core::mail::connect_tls(&session.host, session.port, std::time::Duration::from_secs(20))
+        .map_err(|failure| sealbox_core::mail::failure_message(failure).to_string())
+}
+
+fn mail_audit(state: &AppState, action: &str, entry_id: &str, detail: &str) {
+    let session = lock_session(&state.session);
+    if let Ok(vault) = session.vault() {
+        let _ = vault.audit(action, Some(entry_id), detail);
+    }
+}
+
+fn folder_or_inbox(folder: &Option<String>) -> String {
+    match folder.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => "INBOX".to_string(),
+    }
+}
+
+fn static_role(role: &str) -> &'static str {
+    match role {
+        "inbox" => "inbox",
+        "sent" => "sent",
+        "drafts" => "drafts",
+        "archive" => "archive",
+        "trash" => "trash",
+        _ => "other",
     }
 }
 
@@ -1073,74 +1206,125 @@ pub fn mail_accounts(state: State<AppState>) -> Result<Vec<sealbox_core::mail::M
     session.require_unlocked().map_err(map_err)?;
     let dek = *session.dek().map_err(map_err)?;
     let vault = session.vault().map_err(map_err)?;
-    let filter = ListFilter {
-        kind: Some(sealbox_core::vault::EntryKind::MailAuth),
-        ..ListFilter::default()
-    };
-    let entries = vault.list_entries(&filter).map_err(map_err)?;
-    entries
-        .into_iter()
-        .map(|entry| {
-            let payload = vault.get_active_secret(&dek, &entry.id).map_err(map_err)?;
-            let SecretPayload::MailAuth { email, provider, .. } = payload else {
-                return Err("不是邮箱授权码".into());
-            };
-            Ok(sealbox_core::mail::MailAccount {
-                id: entry.id,
-                title: entry.title,
-                email,
-                provider: provider.clone(),
-                supported: sealbox_core::mail::endpoint(&provider).is_some(),
-            })
-        })
-        .collect()
+    let entries = vault
+        .list_entries(&sealbox_core::vault::ListFilter::default())
+        .map_err(map_err)?;
+    let mut accounts = Vec::new();
+    for entry in entries {
+        if entry.kind != sealbox_core::vault::EntryKind::MailAuth
+            && entry.kind != sealbox_core::vault::EntryKind::Mailbox
+        {
+            continue;
+        }
+        let payload = vault.get_active_secret(&dek, &entry.id).map_err(map_err)?;
+        if let Some(found) = mail_session_from(&payload, &entry.id, &entry.title) {
+            accounts.push(found.account);
+        }
+    }
+    Ok(accounts)
+}
+
+#[tauri::command]
+pub fn mail_folders(
+    state: State<AppState>,
+    request: MailFoldersRequest,
+) -> Result<Vec<sealbox_core::mail::MailFolder>, String> {
+    let mail = load_mail_session(&state, &request.entry_id)?;
+    if !request.refresh {
+        let session = lock_session(&state.session);
+        let cached = session
+            .vault()
+            .map_err(map_err)?
+            .mail_cached_folders(&request.entry_id)
+            .map_err(map_err)?;
+        if !cached.is_empty() {
+            return Ok(cached
+                .into_iter()
+                .map(|folder| sealbox_core::mail::MailFolder {
+                    display: sealbox_core::mail_folder::role_display(&folder.role),
+                    name: folder.name,
+                    role: static_role(&folder.role),
+                    unread: folder.unread,
+                })
+                .collect());
+        }
+    }
+    let mut io = mail_connect(&mail)?;
+    let mut folders = sealbox_core::mail::list_folders(&mut io, &mail.email, &mail.secret)
+        .map_err(sealbox_core::mail::failure_message)?;
+    {
+        let session = lock_session(&state.session);
+        let vault = session.vault().map_err(map_err)?;
+        vault.mail_save_folders(&request.entry_id, &folders).map_err(map_err)?;
+        let counts = vault.mail_cached_folders(&request.entry_id).map_err(map_err)?;
+        for folder in folders.iter_mut() {
+            folder.unread = counts
+                .iter()
+                .find(|cached| cached.name == folder.name)
+                .map(|cached| cached.unread)
+                .unwrap_or(0);
+        }
+    }
+    mail_audit(&state, "mail_folders", &request.entry_id, "");
+    Ok(folders)
 }
 
 #[tauri::command]
 pub fn mail_list(state: State<AppState>, request: MailListRequest) -> Result<Vec<sealbox_core::mail::MailMessage>, String> {
-    let (email, provider, auth_code) = load_mail_auth(&state, &request.entry_id)?;
-    let Some((host, port)) = sealbox_core::mail::endpoint(&provider) else {
-        return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
-    };
-    let mut io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
-        .map_err(sealbox_core::mail::failure_message)?;
-    let messages = sealbox_core::mail::list_inbox(&mut io, &email, &auth_code, request.before_uid, 50)
-        .map_err(sealbox_core::mail::failure_message)?;
-    drop(auth_code);
-    let session = lock_session(&state.session);
-    session.vault().map_err(map_err)?.audit("mail_list", Some(&request.entry_id), "").map_err(map_err)?;
+    let mail = load_mail_session(&state, &request.entry_id)?;
+    let folder = folder_or_inbox(&request.folder);
+    let filter = sealbox_core::mail_folder::MailFilter::parse(request.filter.as_deref().unwrap_or(""))
+        .ok_or_else(|| "未知的筛选条件".to_string())?;
+    let keyword = request.keyword.clone().unwrap_or_default();
+    let mut io = mail_connect(&mail)?;
+    let messages = sealbox_core::mail::list_folder(
+        &mut io,
+        &mail.email,
+        &mail.secret,
+        &folder,
+        request.before_uid,
+        50,
+        filter,
+        &keyword,
+    )
+    .map_err(sealbox_core::mail::failure_message)?;
+    {
+        let session = lock_session(&state.session);
+        let vault = session.vault().map_err(map_err)?;
+        let previews = vec![String::new(); messages.len()];
+        vault
+            .mail_upsert_messages(&request.entry_id, &folder, &messages, &previews)
+            .map_err(map_err)?;
+    }
+    mail_audit(&state, "mail_list", &request.entry_id, "");
     Ok(messages)
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MailAttachmentRequest {
-    pub entry_id: String,
-    pub uid: u32,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MailSaveAttachmentRequest {
-    pub entry_id: String,
-    pub uid: u32,
-    pub part: String,
-    pub path: String,
 }
 
 #[tauri::command]
 pub fn mail_body(state: State<AppState>, request: MailBodyRequest) -> Result<sealbox_core::mail::MailBody, String> {
-    let (email, provider, auth_code) = load_mail_auth(&state, &request.entry_id)?;
-    let Some((host, port)) = sealbox_core::mail::endpoint(&provider) else {
-        return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
-    };
-    let mut io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
+    let folder = folder_or_inbox(&request.folder);
+    {
+        let session = lock_session(&state.session);
+        if let Ok(vault) = session.vault() {
+            if let Some(body) = vault
+                .mail_cached_body(&request.entry_id, &folder, request.uid)
+                .map_err(map_err)?
+            {
+                return Ok(body);
+            }
+        }
+    }
+    let mail = load_mail_session(&state, &request.entry_id)?;
+    let mut io = mail_connect(&mail)?;
+    let body = sealbox_core::mail::fetch_body_in(&mut io, &mail.email, &mail.secret, &folder, request.uid)
         .map_err(sealbox_core::mail::failure_message)?;
-    let body = sealbox_core::mail::fetch_body(&mut io, &email, &auth_code, request.uid)
-        .map_err(sealbox_core::mail::failure_message)?;
-    drop(auth_code);
-    let session = lock_session(&state.session);
-    session.vault().map_err(map_err)?.audit("mail_body", Some(&request.entry_id), "").map_err(map_err)?;
+    {
+        let session = lock_session(&state.session);
+        if let Ok(vault) = session.vault() {
+            let _ = vault.mail_save_body(&request.entry_id, &folder, request.uid, &body);
+        }
+    }
+    mail_audit(&state, "mail_body", &request.entry_id, "");
     Ok(body)
 }
 
@@ -1149,39 +1333,120 @@ pub fn mail_attachments(
     state: State<AppState>,
     request: MailAttachmentRequest,
 ) -> Result<Vec<sealbox_core::mail::MailAttachment>, String> {
-    let (email, provider, auth_code) = load_mail_auth(&state, &request.entry_id)?;
-    let Some((host, port)) = sealbox_core::mail::endpoint(&provider) else {
-        return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
-    };
-    let mut io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
+    let mail = load_mail_session(&state, &request.entry_id)?;
+    let folder = folder_or_inbox(&request.folder);
+    let mut io = mail_connect(&mail)?;
+    let attachments = sealbox_core::mail::list_attachments_in(&mut io, &mail.email, &mail.secret, &folder, request.uid)
         .map_err(sealbox_core::mail::failure_message)?;
-    let attachments = sealbox_core::mail::list_attachments(&mut io, &email, &auth_code, request.uid)
-        .map_err(sealbox_core::mail::failure_message)?;
-    drop(auth_code);
-    let session = lock_session(&state.session);
-    session.vault().map_err(map_err)?.audit("mail_attachments", Some(&request.entry_id), "").map_err(map_err)?;
+    mail_audit(&state, "mail_attachments", &request.entry_id, "");
     Ok(attachments)
 }
 
 #[tauri::command]
-pub fn mail_save_attachment(state: State<AppState>, request: MailSaveAttachmentRequest) -> Result<u64, String> {
-    let (email, provider, auth_code) = load_mail_auth(&state, &request.entry_id)?;
-    let Some((host, port)) = sealbox_core::mail::endpoint(&provider) else {
-        return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
+pub fn mail_save_attachment(
+    app: AppHandle,
+    state: State<AppState>,
+    request: MailSaveAttachmentRequest,
+) -> Result<u64, String> {
+    let mail = load_mail_session(&state, &request.entry_id)?;
+    let folder = folder_or_inbox(&request.folder);
+    let mut io = mail_connect(&mail)?;
+    let bytes = sealbox_core::mail::fetch_attachment_in(&mut io, &mail.email, &mail.secret, &folder, request.uid, &request.part)
+        .map_err(sealbox_core::mail::failure_message)?;
+    // The picker hands back a `content://` URI, so the write goes through SAF, same as the other
+    // document exports.
+    let len = bytes.len() as u64;
+    tauri::async_runtime::block_on(crate::saf::write_new(&app, &request.path, bytes))?;
+    mail_audit(
+        &state,
+        "mail_save_attachment",
+        &request.entry_id,
+        &format!("part={}", request.part),
+    );
+    Ok(len)
+}
+
+#[tauri::command]
+pub fn mail_discover(request: MailDiscoverRequest) -> Result<sealbox_core::mail_provider::DiscoveredServer, String> {
+    sealbox_core::mail_provider::auto_detect(request.email.trim()).ok_or_else(|| "请输入有效的邮箱地址".to_string())
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailDiscoverRequest {
+    pub email: String,
+}
+
+#[tauri::command]
+pub fn mail_test(state: State<AppState>, request: MailProbeRequest) -> Result<MailProbeReport, String> {
+    let (email, secret, host, port) = match request.entry_id.as_deref().filter(|id| !id.is_empty()) {
+        Some(id) => {
+            let mail = load_mail_session(&state, id)?;
+            (mail.email.clone(), mail.secret.to_string(), mail.host.clone(), mail.port)
+        }
+        None => {
+            let email = request.email.clone().unwrap_or_default();
+            let secret = request.secret.clone().unwrap_or_default();
+            let (host, port) = sealbox_core::mail_provider::server_for_mailbox(
+                &email,
+                request.imap_host.as_deref(),
+                request.imap_port,
+            )
+            .ok_or_else(|| "请填写 IMAP 主机".to_string())?;
+            (email, secret, host, port)
+        }
     };
-    let mut io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
+    if email.trim().is_empty() || secret.trim().is_empty() {
+        return Err("请填写邮箱地址和授权码".into());
+    }
+    let mut io = sealbox_core::mail::connect_tls(&host, port, std::time::Duration::from_secs(20))
         .map_err(sealbox_core::mail::failure_message)?;
-    let bytes = sealbox_core::mail::fetch_attachment(&mut io, &email, &auth_code, request.uid, &request.part)
+    let probe = sealbox_core::mail::probe_account(&mut io, email.trim(), &secret)
         .map_err(sealbox_core::mail::failure_message)?;
-    drop(auth_code);
-    let saved = sealbox_core::mail::write_exclusive(&request.path, &bytes).map_err(str::to_string)?;
+    Ok(MailProbeReport { host, port, folders: probe.folders, unread: probe.unread })
+}
+
+#[tauri::command]
+pub fn mail_unread_count(state: State<AppState>) -> Result<u32, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    session.vault().map_err(map_err)?.mail_badge_unread().map_err(map_err)
+}
+
+/// Pulls the newest page of the badge folders for every account so the mobile list can show
+/// cached mail without a live connection. There is no background poller on Android; this runs
+/// only when the page asks for it.
+#[tauri::command]
+pub fn mail_sync(state: State<AppState>) -> Result<u32, String> {
+    let accounts = mail_accounts(state.clone())?;
+    for account in accounts.iter().filter(|account| account.supported) {
+        let Ok(mail) = load_mail_session(&state, &account.id) else { continue };
+        let Ok(mut io) = mail_connect(&mail) else { continue };
+        let Ok(folders) = sealbox_core::mail::list_folders(&mut io, &mail.email, &mail.secret) else { continue };
+        for folder in folders.iter().filter(|folder| matches!(folder.role, "inbox" | "archive")) {
+            let Ok(messages) = sealbox_core::mail::list_folder(
+                &mut io,
+                &mail.email,
+                &mail.secret,
+                &folder.name,
+                None,
+                50,
+                sealbox_core::mail_folder::MailFilter::All,
+                "",
+            ) else {
+                continue;
+            };
+            let unread = sealbox_core::mail::unread_count(&mut io, &mail.email, &mail.secret, &folder.name)
+                .unwrap_or(0);
+            let session = lock_session(&state.session);
+            let Ok(vault) = session.vault() else { continue };
+            let previews = vec![String::new(); messages.len()];
+            let _ = vault.mail_upsert_messages(&account.id, &folder.name, &messages, &previews);
+            let _ = vault.mail_save_folders_unread(&account.id, &folder.name, folder.role, unread);
+        }
+    }
     let session = lock_session(&state.session);
-    session
-        .vault()
-        .map_err(map_err)?
-        .audit("mail_save_attachment", Some(&request.entry_id), &format!("part={}", request.part))
-        .map_err(map_err)?;
-    Ok(saved)
+    session.vault().map_err(map_err)?.mail_badge_unread().map_err(map_err)
 }
 
 #[tauri::command]

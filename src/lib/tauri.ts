@@ -360,8 +360,23 @@ export interface MailAccount {
   title: string;
   email: string;
   provider: string;
+  providerLabel: string;
+  /** False when the provider has no IMAP preset and the entry carries no usable host. */
   supported: boolean;
 }
+
+export interface MailFolder {
+  /** The server's own folder name; pass it back verbatim. */
+  name: string;
+  /** inbox / sent / drafts / archive / trash / other. */
+  role: string;
+  /** Chinese label for a standard role; empty for other. */
+  display: string;
+  /** Unread count from the local cache; 0 until a sync has counted the folder. */
+  unread: number;
+}
+
+export type MailFilter = "all" | "unread" | "attached" | "flagged";
 
 export interface MailMessage {
   uid: number;
@@ -369,6 +384,44 @@ export interface MailMessage {
   subject: string;
   date: string;
   hasAttachment: boolean;
+  seen: boolean;
+  flagged: boolean;
+}
+
+export interface MailSyncAccount {
+  entryId: string;
+  title: string;
+  newCount: number;
+  samples: string[];
+  failed: boolean;
+}
+
+export interface MailSyncReport {
+  accounts: MailSyncAccount[];
+  unread: number;
+}
+
+export interface MailProbeReport {
+  host: string;
+  port: number;
+  folders: MailFolder[];
+  unread: number;
+}
+
+export interface MailDiscoveredServer {
+  host: string;
+  port: number;
+  /** preset / autoconfig / guess. */
+  source: string;
+}
+
+export interface MailSearchHit {
+  folder: string;
+  uid: number;
+  from: string;
+  subject: string;
+  date: string;
+  seen: boolean;
 }
 
 export interface MailBody {
@@ -505,8 +558,8 @@ export const api = {
   csvExport: (args: { path: string; password: string; riskConfirmed: boolean }) =>
     invoke<void>("csv_export", args),
   settingsGet: () =>
-    invoke<{ clipboard_secs: number; hotkey: string }>("settings_get"),
-  settingsSet: (settings: { clipboard_secs: number; hotkey: string }) =>
+    invoke<{ clipboard_secs: number; hotkey: string; mail_auto_sync_secs: number }>("settings_get"),
+  settingsSet: (settings: { clipboard_secs: number; hotkey: string; mail_auto_sync_secs: number }) =>
     invoke("settings_set", { settings }),
   syncStatus: () => invoke<SyncView>("sync_status"),
   syncSave: (input: SyncSaveInput) => invoke<SyncView>("sync_save", { input }),
@@ -549,12 +602,34 @@ export const api = {
   zoomkeyCandidates: () => invoke<ZoomkeyCandidates>("zoomkey_candidates"),
   zoomkeyTest: (endpoint: "jira" | "crm") => invoke<string>("zoomkey_test_connection", { endpoint }),
   mailAccounts: () => invoke<MailAccount[]>("mail_accounts"),
-  mailList: (entryId: string, beforeUid?: number) =>
-    invoke<MailMessage[]>("mail_list", { request: { entryId, beforeUid: beforeUid ?? null } }),
-  mailBody: (entryId: string, uid: number) =>
-    invoke<MailBody>("mail_body", { request: { entryId, uid } }),
-  mailAttachments: (entryId: string, uid: number) =>
-    invoke<MailAttachment[]>("mail_attachments", { request: { entryId, uid } }),
-  mailSaveAttachment: (entryId: string, uid: number, part: string, path: string) =>
-    invoke<number>("mail_save_attachment", { request: { entryId, uid, part, path } }),
+  mailFolders: (entryId: string, refresh = false) =>
+    invoke<MailFolder[]>("mail_folders", { request: { entryId, refresh } }),
+  mailList: (entryId: string, folder: string, options: { beforeUid?: number; filter?: MailFilter; keyword?: string } = {}) =>
+    invoke<MailMessage[]>("mail_list", {
+      request: {
+        entryId,
+        folder,
+        beforeUid: options.beforeUid ?? null,
+        filter: options.filter ?? "all",
+        keyword: options.keyword ?? "",
+      },
+    }),
+  mailBody: (entryId: string, uid: number, folder: string) =>
+    invoke<MailBody>("mail_body", { request: { entryId, uid, folder } }),
+  mailAttachments: (entryId: string, uid: number, folder: string) =>
+    invoke<MailAttachment[]>("mail_attachments", { request: { entryId, uid, folder } }),
+  mailSaveAttachment: (entryId: string, uid: number, part: string, path: string, folder: string) =>
+    invoke<number>("mail_save_attachment", { request: { entryId, uid, part, path, folder } }),
+  mailDiscover: (email: string) => invoke<MailDiscoveredServer>("mail_discover", { request: { email } }),
+  mailTest: (request: {
+    entryId?: string | null;
+    email?: string;
+    secret?: string;
+    imapHost?: string | null;
+    imapPort?: number | null;
+  }) => invoke<MailProbeReport>("mail_test", { request }),
+  mailSync: () => invoke<MailSyncReport>("mail_sync"),
+  mailUnreadCount: () => invoke<number>("mail_unread_count"),
+  mailSearch: (entryId: string, keyword: string) =>
+    invoke<MailSearchHit[]>("mail_search", { request: { entryId, keyword } }),
 };

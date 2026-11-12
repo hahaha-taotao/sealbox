@@ -187,3 +187,25 @@ textarea { min-height: 72px; resize: vertical; }
 .update-background-hint { margin: 12px 0 0; }
 .update-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 16px; }
 .release-link { display: block; margin: 8px auto 0; font-size: 13px; }
+
+/* 邮箱（只读）：正文 iframe 用固定高度，避免跨域文档量高失败时塌成 0。 */
+.mail-frame {
+  width: 100%;
+  height: 70vh;
+  min-height: 240px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  margin-top: 10px;
+}
+.mail-text {
+  margin: 10px 0 0;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  font-size: 13px;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

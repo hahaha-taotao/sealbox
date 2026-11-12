@@ -23,6 +23,7 @@ pub struct AppState {
     pub session: Arc<Mutex<Session>>,
     pub mcp: McpState,
     pub auto: Mutex<crate::auto_sync::AutoSync>,
+    pub auto_mail: Mutex<crate::auto_mail::AutoMail>,
     pub db_path: Mutex<Option<PathBuf>>,
     pub transfer: Mutex<crate::transfer::TransferCache>,
     pub sync_runtime: Mutex<crate::sync::SyncRuntime>,
@@ -38,6 +39,7 @@ impl AppState {
             session,
             mcp,
             auto: Mutex::new(crate::auto_sync::AutoSync::default()),
+            auto_mail: Mutex::new(crate::auto_mail::AutoMail::default()),
             db_path: Mutex::new(None),
             transfer: Mutex::new(crate::transfer::TransferCache::default()),
             sync_runtime: Mutex::new(crate::sync::SyncRuntime::default()),
@@ -124,6 +126,13 @@ fn normalize_settings(settings: Settings) -> Settings {
         } else {
             settings.hotkey
         },
+        // 0 stays 0 (polling off). Anything else is either the floor or above it; a value
+        // between 0 and the floor becomes the floor rather than silently disabling polling.
+        mail_auto_sync_secs: match settings.mail_auto_sync_secs {
+            0 => 0,
+            secs if secs < crate::auto_mail::MIN_SECS => crate::auto_mail::MIN_SECS,
+            secs => secs,
+        },
     }
 }
 
@@ -138,6 +147,7 @@ fn settings_from_vault(vault: &Vault) -> Settings {
     normalize_settings(Settings {
         clipboard_secs: clip.unwrap_or(defaults.clipboard_secs),
         hotkey: hotkey.unwrap_or(defaults.hotkey),
+        mail_auto_sync_secs: defaults.mail_auto_sync_secs,
     })
 }
 
@@ -1341,6 +1351,9 @@ pub fn csv_export(
 pub struct Settings {
     pub clipboard_secs: u64,
     pub hotkey: String,
+    /// 0 disables background mail polling. Values below the floor are clamped up.
+    #[serde(default)]
+    pub mail_auto_sync_secs: u64,
 }
 
 impl Default for Settings {
@@ -1348,6 +1361,7 @@ impl Default for Settings {
         Self {
             clipboard_secs: 20,
             hotkey: "Ctrl+Shift+Space".into(),
+            mail_auto_sync_secs: crate::auto_mail::DEFAULT_SECS,
         }
     }
 }
@@ -1358,9 +1372,19 @@ pub fn settings_get(state: State<AppState>) -> Settings {
     if s.is_unlocked() {
         apply_vault_settings(&mut s);
     }
+    let mail_auto_sync_secs = if s.is_unlocked() {
+        s.vault()
+            .ok()
+            .and_then(|vault| vault.get_setting("mail_auto_sync_secs").ok().flatten())
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(crate::auto_mail::DEFAULT_SECS)
+    } else {
+        0
+    };
     Settings {
         clipboard_secs: s.clipboard_secs,
         hotkey: s.hotkey.clone(),
+        mail_auto_sync_secs,
     }
 }
 
@@ -1379,8 +1403,17 @@ pub fn settings_set(
         s.clipboard_secs = settings.clipboard_secs;
         s.hotkey = settings.hotkey.clone();
         persist_session_settings(&s)?;
+        s.vault()
+            .map_err(map_err)?
+            .set_setting("mail_auto_sync_secs", &settings.mail_auto_sync_secs.to_string())
+            .map_err(map_err)?;
         sync_auto_unlock_credential(&s);
     }
+    crate::auto_mail::apply(
+        &state,
+        settings.mail_auto_sync_secs >= crate::auto_mail::MIN_SECS,
+        settings.mail_auto_sync_secs,
+    );
     register_hotkey(&app, &settings.hotkey)
 }
 
@@ -2007,113 +2040,361 @@ pub fn window_control(app: AppHandle, action: String) -> Result<(), String> {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MailListRequest {
     pub entry_id: String,
+    /// A folder name from `mail.folders`. Empty means the inbox.
+    #[serde(default)]
+    pub folder: Option<String>,
     pub before_uid: Option<u32>,
+    /// all / unread / attached / flagged.
+    #[serde(default)]
+    pub filter: Option<String>,
+    #[serde(default)]
+    pub keyword: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MailBodyRequest {
     pub entry_id: String,
     pub uid: u32,
+    #[serde(default)]
+    pub folder: Option<String>,
 }
 
-fn load_mail_auth(state: &AppState, id: &str) -> Result<(String, String, zeroize::Zeroizing<String>), String> {
+/// A resolved mailbox: the address and credential plus the server they belong to. Resolved once
+/// per command so the IMAP host always comes from the vault entry, never from the request.
+pub struct MailSession {
+    pub account: sealbox_core::mail::MailAccount,
+    pub email: String,
+    pub secret: zeroize::Zeroizing<String>,
+    pub host: String,
+    pub port: u16,
+}
+
+/// IMAP endpoint for a mailbox payload. Public so the MCP tool reports the same
+/// "supported" verdict as the UI instead of re-deriving it.
+pub fn mail_endpoint_for_payload(payload: &SecretPayload) -> Option<(String, u16)> {
+    match payload {
+        SecretPayload::MailAuth { provider, .. } => sealbox_core::mail_provider::server_for_provider(provider),
+        SecretPayload::Mailbox { email, imap_host, imap_port, .. } => {
+            sealbox_core::mail_provider::server_for_mailbox(email, imap_host.as_deref(), *imap_port)
+        }
+        _ => None,
+    }
+}
+
+/// Reads one credential into a `MailSession`, or `None` when the entry is not a mailbox.
+fn mail_session_from(payload: &SecretPayload, id: &str, title: &str) -> Option<MailSession> {
+    let (email, provider, secret) = match payload {
+        SecretPayload::MailAuth { email, provider, auth_code } => {
+            (email.clone(), provider.clone(), auth_code.clone())
+        }
+        SecretPayload::Mailbox { email, password, .. } => {
+            (email.clone(), "custom".to_string(), password.clone())
+        }
+        _ => return None,
+    };
+    let endpoint = mail_endpoint_for_payload(payload);
+    let account = sealbox_core::mail::MailAccount {
+        id: id.to_string(),
+        title: title.to_string(),
+        email: email.clone(),
+        provider: provider.clone(),
+        provider_label: sealbox_core::mail_provider::provider_label(&provider).to_string(),
+        supported: endpoint.is_some(),
+    };
+    let (host, port) = endpoint.unwrap_or_default();
+    Some(MailSession {
+        account,
+        email,
+        secret: zeroize::Zeroizing::new(secret),
+        host,
+        port,
+    })
+}
+
+/// Loads the mailbox behind an entry id. Errors are fixed Chinese sentences: the credential and
+/// the server's own reply never reach the caller.
+fn load_mail_session(state: &AppState, id: &str) -> Result<MailSession, String> {
     let mut session = lock_session(&state.session);
     session.require_unlocked().map_err(map_err)?;
     let dek = *session.dek().map_err(map_err)?;
-    let payload = session.vault().map_err(map_err)?.get_active_secret(&dek, id).map_err(map_err)?;
-    match payload {
-        SecretPayload::MailAuth { email, provider, auth_code } => Ok((email, provider, zeroize::Zeroizing::new(auth_code))),
-        _ => Err("不是邮箱授权码".into()),
+    let vault = session.vault().map_err(map_err)?;
+    let payload = vault.get_active_secret(&dek, id).map_err(map_err)?;
+    let title = vault
+        .list_entries(&crate::vault::ListFilter::default())
+        .map_err(map_err)?
+        .into_iter()
+        .find(|entry| entry.id == id)
+        .map(|entry| entry.title)
+        .unwrap_or_default();
+    mail_session_from(&payload, id, &title).ok_or_else(|| "不是邮箱账号".to_string())
+}
+
+fn mail_connect(session: &MailSession) -> Result<sealbox_core::mail::TlsImap, String> {
+    if !session.account.supported {
+        return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
+    }
+    sealbox_core::mail::connect_tls(&session.host, session.port, std::time::Duration::from_secs(20))
+        .map_err(|failure| sealbox_core::mail::failure_message(failure).to_string())
+}
+
+fn mail_audit(state: &AppState, action: &str, entry_id: &str, detail: &str) {
+    let session = lock_session(&state.session);
+    if let Ok(vault) = session.vault() {
+        let _ = vault.audit(action, Some(entry_id), detail);
+    }
+}
+
+fn folder_or_inbox(folder: &Option<String>) -> String {
+    match folder.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => "INBOX".to_string(),
     }
 }
 
 #[tauri::command]
 pub fn mail_accounts(state: State<AppState>) -> Result<Vec<sealbox_core::mail::MailAccount>, String> {
+    mail_accounts_ref(&state)
+}
+
+fn mail_accounts_ref(state: &AppState) -> Result<Vec<sealbox_core::mail::MailAccount>, String> {
     let mut session = lock_session(&state.session);
     session.require_unlocked().map_err(map_err)?;
     let dek = *session.dek().map_err(map_err)?;
     let vault = session.vault().map_err(map_err)?;
-    let filter = ListFilter {
-        kind: Some(crate::vault::EntryKind::MailAuth),
-        ..ListFilter::default()
-    };
-    let entries = vault.list_entries(&filter).map_err(map_err)?;
-    entries
-        .into_iter()
-        .map(|entry| {
-            let payload = vault.get_active_secret(&dek, &entry.id).map_err(map_err)?;
-            let SecretPayload::MailAuth { email, provider, .. } = payload else {
-                return Err("不是邮箱授权码".into());
-            };
-            Ok(sealbox_core::mail::MailAccount {
-                id: entry.id,
-                title: entry.title,
-                email,
-                provider: provider.clone(),
-                supported: sealbox_core::mail::endpoint(&provider).is_some(),
-            })
-        })
-        .collect()
+    let entries = vault.list_entries(&crate::vault::ListFilter::default()).map_err(map_err)?;
+    let mut accounts = Vec::new();
+    for entry in entries {
+        if entry.kind != crate::vault::EntryKind::MailAuth && entry.kind != crate::vault::EntryKind::Mailbox {
+            continue;
+        }
+        let payload = vault.get_active_secret(&dek, &entry.id).map_err(map_err)?;
+        if let Some(found) = mail_session_from(&payload, &entry.id, &entry.title) {
+            accounts.push(found.account);
+        }
+    }
+    Ok(accounts)
 }
 
+/// The folders of one account plus the cached unread counts. Reads the cache first so the page
+/// paints immediately; `refresh` forces a server round trip.
 #[tauri::command]
-pub fn mail_list(state: State<AppState>, request: MailListRequest) -> Result<Vec<sealbox_core::mail::MailMessage>, String> {
-    let (email, provider, auth_code) = load_mail_auth(&state, &request.entry_id)?;
-    let Some((host, port)) = sealbox_core::mail::endpoint(&provider) else {
-        return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
-    };
-    let mut io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
+pub fn mail_folders(
+    state: State<AppState>,
+    request: MailFoldersRequest,
+) -> Result<Vec<sealbox_core::mail::MailFolder>, String> {
+    let mail = load_mail_session(&state, &request.entry_id)?;
+    if !request.refresh {
+        let session = lock_session(&state.session);
+        let cached = session
+            .vault()
+            .map_err(map_err)?
+            .mail_cached_folders(&request.entry_id)
+            .map_err(map_err)?;
+        if !cached.is_empty() {
+            return Ok(cached
+                .into_iter()
+                .map(|folder| sealbox_core::mail::MailFolder {
+                    display: sealbox_core::mail_folder::role_display(&folder.role),
+                    name: folder.name,
+                    role: static_role(&folder.role),
+                    unread: folder.unread,
+                })
+                .collect());
+        }
+    }
+    let mut io = mail_connect(&mail)?;
+    let mut folders = sealbox_core::mail::list_folders(&mut io, &mail.email, &mail.secret)
         .map_err(sealbox_core::mail::failure_message)?;
-    let messages = sealbox_core::mail::list_inbox(&mut io, &email, &auth_code, request.before_uid, 50)
-        .map_err(sealbox_core::mail::failure_message)?;
-    drop(auth_code);
-    let session = lock_session(&state.session);
-    session
-        .vault()
-        .map_err(map_err)?
-        .audit("mail_list", Some(&request.entry_id), "")
-        .map_err(map_err)?;
-    Ok(messages)
+    {
+        let session = lock_session(&state.session);
+        let vault = session.vault().map_err(map_err)?;
+        vault
+            .mail_save_folders(&request.entry_id, &folders)
+            .map_err(map_err)?;
+        // Discovery itself carries no counts, so fill them from whatever the cache already knows.
+        // The badge and the per-folder numbers therefore stay populated across restarts.
+        let counts = vault.mail_cached_folders(&request.entry_id).map_err(map_err)?;
+        for folder in folders.iter_mut() {
+            folder.unread = counts
+                .iter()
+                .find(|cached| cached.name == folder.name)
+                .map(|cached| cached.unread)
+                .unwrap_or(0);
+        }
+    }
+    mail_audit(&state, "mail_folders", &request.entry_id, "");
+    Ok(folders)
 }
 
-#[derive(Deserialize)]
+/// Roles are a closed set, so the cached string can be mapped back to the static one.
+fn static_role(role: &str) -> &'static str {
+    match role {
+        "inbox" => "inbox",
+        "sent" => "sent",
+        "drafts" => "drafts",
+        "archive" => "archive",
+        "trash" => "trash",
+        _ => "other",
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailFoldersRequest {
+    pub entry_id: String,
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MailAttachmentRequest {
     pub entry_id: String,
     pub uid: u32,
+    #[serde(default)]
+    pub folder: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MailSaveAttachmentRequest {
     pub entry_id: String,
     pub uid: u32,
     pub part: String,
     pub path: String,
+    #[serde(default)]
+    pub folder: Option<String>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailProbeRequest {
+    /// The address is only used to derive the domain; the credential is the one being tested.
+    pub entry_id: Option<String>,
+    pub email: Option<String>,
+    pub secret: Option<String>,
+    pub imap_host: Option<String>,
+    pub imap_port: Option<u16>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailProbeReport {
+    pub host: String,
+    pub port: u16,
+    pub folders: Vec<sealbox_core::mail::MailFolder>,
+    pub unread: u32,
+}
+
+/// Resolves the IMAP server for an address without storing anything, so the form can prefill
+/// `imapHost` / `imapPort` and tell the user which of the three detection steps answered.
+#[tauri::command]
+pub fn mail_discover(request: MailDiscoverRequest) -> Result<sealbox_core::mail_provider::DiscoveredServer, String> {
+    sealbox_core::mail_provider::auto_detect(request.email.trim()).ok_or_else(|| "请输入有效的邮箱地址".to_string())
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailDiscoverRequest {
+    pub email: String,
+}
+
+/// "Test connection": opens one real IMAP session and reports what it found. Accepts either a
+/// stored entry (the usual case) or the values typed into the form, so the button works before
+/// the credential is saved.
+#[tauri::command]
+pub fn mail_test(state: State<AppState>, request: MailProbeRequest) -> Result<MailProbeReport, String> {
+    let (email, secret, host, port) = match request.entry_id.as_deref().filter(|id| !id.is_empty()) {
+        Some(id) => {
+            let mail = load_mail_session(&state, id)?;
+            let (host, port) = (mail.host.clone(), mail.port);
+            (mail.email.clone(), zeroize::Zeroizing::new(mail.secret.to_string()), host, port)
+        }
+        None => {
+            let email = request.email.clone().unwrap_or_default();
+            let secret = zeroize::Zeroizing::new(request.secret.clone().unwrap_or_default());
+            let (host, port) = sealbox_core::mail_provider::server_for_mailbox(
+                &email,
+                request.imap_host.as_deref(),
+                request.imap_port,
+            )
+            .ok_or_else(|| "请填写 IMAP 主机".to_string())?;
+            (email, secret, host, port)
+        }
+    };
+    if email.trim().is_empty() || secret.trim().is_empty() {
+        return Err("请填写邮箱地址和授权码".into());
+    }
+    let mut io = sealbox_core::mail::connect_tls(&host, port, std::time::Duration::from_secs(20))
+        .map_err(sealbox_core::mail::failure_message)?;
+    let probe = sealbox_core::mail::probe_account(&mut io, email.trim(), &secret)
+        .map_err(sealbox_core::mail::failure_message)?;
+    Ok(MailProbeReport { host, port, folders: probe.folders, unread: probe.unread })
+}
+
+#[tauri::command]
+pub fn mail_list(state: State<AppState>, request: MailListRequest) -> Result<Vec<sealbox_core::mail::MailMessage>, String> {
+    let mail = load_mail_session(&state, &request.entry_id)?;
+    let folder = folder_or_inbox(&request.folder);
+    let filter = sealbox_core::mail_folder::MailFilter::parse(request.filter.as_deref().unwrap_or(""))
+        .ok_or_else(|| "未知的筛选条件".to_string())?;
+    let keyword = request.keyword.clone().unwrap_or_default();
+    let mut io = mail_connect(&mail)?;
+    let messages = sealbox_core::mail::list_folder(
+        &mut io,
+        &mail.email,
+        &mail.secret,
+        &folder,
+        request.before_uid,
+        50,
+        filter,
+        &keyword,
+    )
+    .map_err(sealbox_core::mail::failure_message)?;
+    {
+        let session = lock_session(&state.session);
+        let vault = session.vault().map_err(map_err)?;
+        let previews = vec![String::new(); messages.len()];
+        vault
+            .mail_upsert_messages(&request.entry_id, &folder, &messages, &previews)
+            .map_err(map_err)?;
+    }
+    mail_audit(&state, "mail_list", &request.entry_id, "");
+    Ok(messages)
 }
 
 #[tauri::command]
 pub fn mail_body(state: State<AppState>, request: MailBodyRequest) -> Result<sealbox_core::mail::MailBody, String> {
-    let (email, provider, auth_code) = load_mail_auth(&state, &request.entry_id)?;
-    let Some((host, port)) = sealbox_core::mail::endpoint(&provider) else {
-        return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
-    };
-    let mut io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
+    let folder = folder_or_inbox(&request.folder);
+    // A cached body is served without touching the network, so reopening a message is instant
+    // and works offline. It is still only ever what the server returned earlier.
+    {
+        let session = lock_session(&state.session);
+        if let Ok(vault) = session.vault() {
+            if let Some(body) = vault
+                .mail_cached_body(&request.entry_id, &folder, request.uid)
+                .map_err(map_err)?
+            {
+                return Ok(body);
+            }
+        }
+    }
+    let mail = load_mail_session(&state, &request.entry_id)?;
+    let mut io = mail_connect(&mail)?;
+    let body = sealbox_core::mail::fetch_body_in(&mut io, &mail.email, &mail.secret, &folder, request.uid)
         .map_err(sealbox_core::mail::failure_message)?;
-    let body = sealbox_core::mail::fetch_body(&mut io, &email, &auth_code, request.uid)
-        .map_err(sealbox_core::mail::failure_message)?;
-    drop(auth_code);
-    let session = lock_session(&state.session);
-    session
-        .vault()
-        .map_err(map_err)?
-        .audit("mail_body", Some(&request.entry_id), "")
-        .map_err(map_err)?;
+    {
+        let session = lock_session(&state.session);
+        if let Ok(vault) = session.vault() {
+            let _ = vault.mail_save_body(&request.entry_id, &folder, request.uid, &body);
+        }
+    }
+    mail_audit(&state, "mail_body", &request.entry_id, "");
     Ok(body)
 }
 
@@ -2122,43 +2403,188 @@ pub fn mail_attachments(
     state: State<AppState>,
     request: MailAttachmentRequest,
 ) -> Result<Vec<sealbox_core::mail::MailAttachment>, String> {
-    let (email, provider, auth_code) = load_mail_auth(&state, &request.entry_id)?;
-    let Some((host, port)) = sealbox_core::mail::endpoint(&provider) else {
-        return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
-    };
-    let mut io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
+    let mail = load_mail_session(&state, &request.entry_id)?;
+    let folder = folder_or_inbox(&request.folder);
+    let mut io = mail_connect(&mail)?;
+    let attachments = sealbox_core::mail::list_attachments_in(&mut io, &mail.email, &mail.secret, &folder, request.uid)
         .map_err(sealbox_core::mail::failure_message)?;
-    let attachments = sealbox_core::mail::list_attachments(&mut io, &email, &auth_code, request.uid)
-        .map_err(sealbox_core::mail::failure_message)?;
-    drop(auth_code);
-    let session = lock_session(&state.session);
-    session
-        .vault()
-        .map_err(map_err)?
-        .audit("mail_attachments", Some(&request.entry_id), "")
-        .map_err(map_err)?;
+    mail_audit(&state, "mail_attachments", &request.entry_id, "");
     Ok(attachments)
 }
 
 #[tauri::command]
 pub fn mail_save_attachment(state: State<AppState>, request: MailSaveAttachmentRequest) -> Result<u64, String> {
-    let (email, provider, auth_code) = load_mail_auth(&state, &request.entry_id)?;
-    let Some((host, port)) = sealbox_core::mail::endpoint(&provider) else {
-        return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
-    };
-    let mut io = sealbox_core::mail::connect_tls(host, port, std::time::Duration::from_secs(20))
+    let mail = load_mail_session(&state, &request.entry_id)?;
+    let folder = folder_or_inbox(&request.folder);
+    let mut io = mail_connect(&mail)?;
+    let bytes = sealbox_core::mail::fetch_attachment_in(&mut io, &mail.email, &mail.secret, &folder, request.uid, &request.part)
         .map_err(sealbox_core::mail::failure_message)?;
-    let bytes = sealbox_core::mail::fetch_attachment(&mut io, &email, &auth_code, request.uid, &request.part)
-        .map_err(sealbox_core::mail::failure_message)?;
-    drop(auth_code);
     let saved = sealbox_core::mail::write_exclusive(&request.path, &bytes).map_err(str::to_string)?;
+    mail_audit(
+        &state,
+        "mail_save_attachment",
+        &request.entry_id,
+        &format!("part={}", request.part),
+    );
+    Ok(saved)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailSyncReport {
+    /// New messages per account, for the notification text.
+    pub accounts: Vec<MailSyncAccount>,
+    pub unread: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailSyncAccount {
+    pub entry_id: String,
+    pub title: String,
+    pub new_count: usize,
+    /// Up to two `sender · subject` lines, so the notification reads like an inbox.
+    pub samples: Vec<String>,
+    pub failed: bool,
+}
+
+/// Pulls the newest page of the two badge folders for every account and refreshes the unread
+/// counts. Used by both the background timer and the manual refresh; a failure on one account is
+/// reported and never stops the others.
+#[tauri::command]
+pub fn mail_sync(state: State<AppState>) -> Result<MailSyncReport, String> {
+    mail_sync_blocking(&state)
+}
+
+/// The body of [`mail_sync`], callable from the background poller where there is no `State`.
+pub fn mail_sync_blocking(state: &AppState) -> Result<MailSyncReport, String> {
+    let accounts = mail_accounts_ref(state)?;
+    let mut report = MailSyncReport { accounts: Vec::new(), unread: 0 };
+    for account in accounts.iter().filter(|account| account.supported) {
+        let mut entry = MailSyncAccount {
+            entry_id: account.id.clone(),
+            title: if account.title.is_empty() { account.email.clone() } else { account.title.clone() },
+            new_count: 0,
+            samples: Vec::new(),
+            failed: false,
+        };
+        match sync_account(state, &account.id, &mut entry) {
+            Ok(()) => {}
+            Err(_) => entry.failed = true,
+        }
+        report.accounts.push(entry);
+    }
     let session = lock_session(&state.session);
-    session
+    report.unread = session
         .vault()
         .map_err(map_err)?
-        .audit("mail_save_attachment", Some(&request.entry_id), &format!("part={}", request.part))
+        .mail_badge_unread()
         .map_err(map_err)?;
-    Ok(saved)
+    Ok(report)
+}
+
+/// One account: list its folders, then the newest page of each badge folder, then the unread
+/// counts. `MailListFilter` is not reused on purpose — this only ever needs the default page.
+fn sync_account(state: &AppState, entry_id: &str, report: &mut MailSyncAccount) -> Result<(), String> {
+    let mail = load_mail_session(state, entry_id)?;
+    let mut io = mail_connect(&mail)?;
+    let folders = sealbox_core::mail::list_folders(&mut io, &mail.email, &mail.secret)
+        .map_err(sealbox_core::mail::failure_message)?;
+    let mut io = mail_connect(&mail)?;
+    for folder in folders.iter().filter(|folder| matches!(folder.role, "inbox" | "archive")) {
+        let known: Vec<u32> = {
+            let session = lock_session(&state.session);
+            let vault = session.vault().map_err(map_err)?;
+            vault
+                .mail_recent_messages(entry_id, &folder.name, None, 50)
+                .map_err(map_err)?
+                .into_iter()
+                .map(|cached| cached.uid)
+                .collect()
+        };
+        let messages = sealbox_core::mail::list_folder(
+            &mut io,
+            &mail.email,
+            &mail.secret,
+            &folder.name,
+            None,
+            50,
+            sealbox_core::mail_folder::MailFilter::All,
+            "",
+        )
+        .map_err(sealbox_core::mail::failure_message)?;
+        if folder.role == "inbox" {
+            for message in messages.iter().filter(|message| !known.contains(&message.uid)).take(2) {
+                report.samples.push(format!("{} · {}", message.from, message.subject));
+            }
+            report.new_count += messages.iter().filter(|message| !known.contains(&message.uid)).count();
+        }
+        let unread = sealbox_core::mail::unread_count(&mut io, &mail.email, &mail.secret, &folder.name)
+            .unwrap_or(0);
+        let session = lock_session(&state.session);
+        let vault = session.vault().map_err(map_err)?;
+        let previews = vec![String::new(); messages.len()];
+        vault
+            .mail_upsert_messages(entry_id, &folder.name, &messages, &previews)
+            .map_err(map_err)?;
+        vault
+            .mail_save_folders_unread(entry_id, &folder.name, &folder.role, unread)
+            .map_err(map_err)?;
+    }
+    mail_audit(state, "mail_sync", entry_id, "");
+    Ok(())
+}
+
+#[tauri::command]
+pub fn mail_unread_count(state: State<AppState>) -> Result<u32, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    session.vault().map_err(map_err)?.mail_badge_unread().map_err(map_err)
+}
+
+/// SEARCH over the local cache only. The MCP surface and the offline path both use this, so no
+/// caller can turn a search into a mailbox download.
+#[tauri::command]
+pub fn mail_search(
+    state: State<AppState>,
+    request: MailSearchRequest,
+) -> Result<Vec<SealboxMailSearchHit>, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    let hits = session
+        .vault()
+        .map_err(map_err)?
+        .mail_search_cached(&request.entry_id, &request.keyword, 50)
+        .map_err(map_err)?;
+    Ok(hits
+        .into_iter()
+        .map(|(folder, message)| SealboxMailSearchHit {
+            folder,
+            uid: message.uid,
+            from: message.from,
+            subject: message.subject,
+            date: message.date,
+            seen: message.seen,
+        })
+        .collect())
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailSearchRequest {
+    pub entry_id: String,
+    pub keyword: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SealboxMailSearchHit {
+    pub folder: String,
+    pub uid: u32,
+    pub from: String,
+    pub subject: String,
+    pub date: String,
+    pub seen: bool,
 }
 
 #[cfg(test)]
@@ -2316,6 +2742,7 @@ mod tests {
         let stored = normalize_settings(Settings {
             clipboard_secs: 1,
             hotkey: "  ".into(),
+            mail_auto_sync_secs: 300,
         });
         session.clipboard_secs = stored.clipboard_secs;
         session.hotkey = stored.hotkey;
@@ -2408,6 +2835,7 @@ mod tests {
             session: Arc::new(Mutex::new(session)),
             mcp: McpState::default(),
             auto: Mutex::new(crate::auto_sync::AutoSync::default()),
+            auto_mail: Mutex::new(crate::auto_mail::AutoMail::default()),
             db_path: Mutex::new(None),
             transfer: Mutex::new(crate::transfer::TransferCache::default()),
             sync_runtime: Mutex::new(crate::sync::SyncRuntime::default()),
@@ -2439,6 +2867,7 @@ mod tests {
             session: Arc::new(Mutex::new(Session::default())),
             mcp: McpState::default(),
             auto: Mutex::new(crate::auto_sync::AutoSync::default()),
+            auto_mail: Mutex::new(crate::auto_mail::AutoMail::default()),
             db_path: Mutex::new(None),
             transfer: Mutex::new(crate::transfer::TransferCache::default()),
             sync_runtime: Mutex::new(crate::sync::SyncRuntime::default()),
@@ -2464,6 +2893,7 @@ mod tests {
             session: Arc::new(Mutex::new(Session::default())),
             mcp: McpState::default(),
             auto: Mutex::new(crate::auto_sync::AutoSync::default()),
+            auto_mail: Mutex::new(crate::auto_mail::AutoMail::default()),
             db_path: Mutex::new(None),
             transfer: Mutex::new(crate::transfer::TransferCache::default()),
             sync_runtime: Mutex::new(crate::sync::SyncRuntime::default()),
@@ -2487,6 +2917,7 @@ mod tests {
             session: Arc::new(Mutex::new(Session::default())),
             mcp: McpState::default(),
             auto: Mutex::new(crate::auto_sync::AutoSync::default()),
+            auto_mail: Mutex::new(crate::auto_mail::AutoMail::default()),
             db_path: Mutex::new(None),
             transfer: Mutex::new(crate::transfer::TransferCache::default()),
             sync_runtime: Mutex::new(crate::sync::SyncRuntime::default()),
@@ -2566,6 +2997,7 @@ mod tests {
             session: Arc::new(Mutex::new(session)),
             mcp: McpState::default(),
             auto: Mutex::new(crate::auto_sync::AutoSync::default()),
+            auto_mail: Mutex::new(crate::auto_mail::AutoMail::default()),
             db_path: Mutex::new(None),
             transfer: Mutex::new(crate::transfer::TransferCache::default()),
             sync_runtime: Mutex::new(crate::sync::SyncRuntime::default()),

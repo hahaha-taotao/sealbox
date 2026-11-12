@@ -1080,8 +1080,16 @@ impl Vault {
                 )",
                 [],
             )?;
+            let purged: Vec<String> = conn
+                .prepare("SELECT id FROM entries WHERE deleted_at IS NOT NULL")?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
             conn.execute("DELETE FROM entries WHERE deleted_at IS NOT NULL", [])?;
             cleanup_orphan_tags(conn)?;
+            // The mail cache belongs to the credential row that just disappeared.
+            for id in &purged {
+                crate::mail_store::clear_account(conn, id)?;
+            }
             audit_on(conn, "empty_trash", None, &format!("purged={n}"))?;
             Ok(n)
         })
@@ -1120,11 +1128,18 @@ impl Vault {
                 )",
                 params![&cutoff],
             )?;
+            let purged: Vec<String> = conn
+                .prepare("SELECT id FROM entries WHERE deleted_at IS NOT NULL AND deleted_at <= ?1")?
+                .query_map(params![&cutoff], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
             conn.execute(
                 "DELETE FROM entries WHERE deleted_at IS NOT NULL AND deleted_at <= ?1",
                 params![&cutoff],
             )?;
             cleanup_orphan_tags(conn)?;
+            for id in &purged {
+                crate::mail_store::clear_account(conn, id)?;
+            }
             Ok(n)
         })
     }
@@ -2254,6 +2269,97 @@ impl Vault {
         ids.into_iter().map(|id| self.get_dto(&id)).collect()
     }
 
+    // ==== Mail cache ============================================================
+    // A cache, never a source of truth: every row below can be rebuilt from the server. It is
+    // deliberately outside the backup snapshot and the sync payload, and rows are dropped when
+    // the credential they belong to is deleted for good.
+
+    pub fn mail_cached_folders(&self, account_id: &str) -> Result<Vec<crate::mail_store::CachedFolder>, VaultError> {
+        Ok(crate::mail_store::folders(&self.conn, account_id)?)
+    }
+
+    pub fn mail_save_folders(
+        &self,
+        account_id: &str,
+        folders: &[crate::mail::MailFolder],
+    ) -> Result<(), VaultError> {
+        let rows = folders
+            .iter()
+            .map(|folder| (folder.name.clone(), folder.role.to_string(), None))
+            .collect::<Vec<_>>();
+        crate::mail_store::save_folders(&self.conn, account_id, &rows)?;
+        Ok(())
+    }
+
+    /// Records a folder discovered during a sync together with its unread count, keeping the
+    /// UIDVALIDITY the cached messages were fetched under.
+    pub fn mail_save_folders_unread(
+        &self,
+        account_id: &str,
+        folder: &str,
+        role: &str,
+        unread: u32,
+    ) -> Result<(), VaultError> {
+        crate::mail_store::save_folders(&self.conn, account_id, &[(folder.to_string(), role.to_string(), None)])?;
+        crate::mail_store::set_unread(&self.conn, account_id, folder, unread)?;
+        Ok(())
+    }
+
+    /// Stores a page of message metadata. Cached bodies are preserved.
+    pub fn mail_upsert_messages(
+        &self,
+        account_id: &str,
+        folder: &str,
+        messages: &[crate::mail::MailMessage],
+        previews: &[String],
+    ) -> Result<(), VaultError> {
+        crate::mail_store::upsert_messages(&self.conn, account_id, folder, messages, previews)?;
+        Ok(())
+    }
+
+    pub fn mail_recent_messages(
+        &self,
+        account_id: &str,
+        folder: &str,
+        before: Option<u32>,
+        limit: usize,
+    ) -> Result<Vec<crate::mail_store::CachedMessage>, VaultError> {
+        Ok(crate::mail_store::recent_messages(&self.conn, account_id, folder, before, limit)?)
+    }
+
+    pub fn mail_cached_body(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uid: u32,
+    ) -> Result<Option<crate::mail::MailBody>, VaultError> {
+        Ok(crate::mail_store::cached_body(&self.conn, account_id, folder, uid)?)
+    }
+
+    pub fn mail_save_body(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uid: u32,
+        body: &crate::mail::MailBody,
+    ) -> Result<(), VaultError> {
+        crate::mail_store::save_body(&self.conn, account_id, folder, uid, body, 120)?;
+        Ok(())
+    }
+
+    pub fn mail_search_cached(
+        &self,
+        account_id: &str,
+        keyword: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, crate::mail_store::CachedMessage)>, VaultError> {
+        Ok(crate::mail_store::search_cached(&self.conn, account_id, keyword, limit)?)
+    }
+
+    pub fn mail_badge_unread(&self) -> Result<u32, VaultError> {
+        Ok(crate::mail_store::badge_unread(&self.conn)?)
+    }
+
     pub fn get_setting(&self, key: &str) -> Result<Option<String>, VaultError> {
         Ok(self
             .conn
@@ -2582,6 +2688,11 @@ pub const TOMBSTONE_FOLDER: &str = "folder";
 
 fn now_rfc3339() -> String {
     Utc::now().to_rfc3339()
+}
+
+/// Timestamp helper for sibling modules (the mail cache) that store their own `at` columns.
+pub(crate) fn now_rfc3339_public() -> String {
+    now_rfc3339()
 }
 
 fn normalize_optional_name(value: &str) -> Option<String> {

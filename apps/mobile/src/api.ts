@@ -148,6 +148,62 @@ export interface BackupPreview { token: string; summary: BackupSummary }
 export interface CsvPreview { token: string; summary: { format: string; total: number; importable: number; skipped_existing: number; skipped_invalid: number; sample: { title: string; url: string; username: string; has_password: boolean; has_totp: boolean }[] } }
 export interface DocumentRef { uri: string; name: string }
 
+export interface MailAccount {
+  id: string;
+  title: string;
+  email: string;
+  provider: string;
+  providerLabel: string;
+  supported: boolean;
+}
+
+export interface MailFolder {
+  name: string;
+  /** inbox / sent / drafts / archive / trash / other. */
+  role: string;
+  display: string;
+  unread: number;
+}
+
+export type MailFilter = "all" | "unread" | "attached" | "flagged";
+
+export interface MailMessage {
+  uid: number;
+  from: string;
+  subject: string;
+  date: string;
+  hasAttachment: boolean;
+  seen: boolean;
+  flagged: boolean;
+}
+
+export interface MailBody {
+  text: string;
+  html: string | null;
+  truncated: boolean;
+}
+
+export interface MailAttachment {
+  part: string;
+  filename: string;
+  mime: string;
+  size: number | null;
+}
+
+export interface MailProbeReport {
+  host: string;
+  port: number;
+  folders: MailFolder[];
+  unread: number;
+}
+
+export interface MailDiscoveredServer {
+  host: string;
+  port: number;
+  /** preset / autoconfig / guess. */
+  source: string;
+}
+
 export const api = {
   documentOpen: (mimeTypes: string[]) => invoke<DocumentRef | null>("document_open", { mimeTypes }),
   documentSave: (suggestedName: string, mime: string) => invoke<DocumentRef | null>("document_save", { suggestedName, mime }),
@@ -196,6 +252,22 @@ export const api = {
   syncCommit: (token: string, resolutions: { id: string; choice: string; confirm_delete_edit: boolean }[]) => invoke<SyncReport>('sync_commit', { token, resolutions }),
   syncVerifyConditional: () => invoke<{ verified: boolean; probe_cleaned: boolean; scope: string }>('sync_verify_conditional'),
   syncNow: () => invoke<SyncReport>("sync_now"),
+  mailAccounts: () => invoke<MailAccount[]>("mail_accounts"),
+  mailFolders: (entryId: string, refresh = false) => invoke<MailFolder[]>("mail_folders", { request: { entryId, refresh } }),
+  mailList: (entryId: string, folder: string, options: { beforeUid?: number; filter?: MailFilter; keyword?: string } = {}) =>
+    invoke<MailMessage[]>("mail_list", {
+      request: { entryId, folder, beforeUid: options.beforeUid ?? null, filter: options.filter ?? "all", keyword: options.keyword ?? "" },
+    }),
+  mailBody: (entryId: string, uid: number, folder: string) => invoke<MailBody>("mail_body", { request: { entryId, uid, folder } }),
+  mailAttachments: (entryId: string, uid: number, folder: string) =>
+    invoke<MailAttachment[]>("mail_attachments", { request: { entryId, uid, folder } }),
+  mailSaveAttachment: (entryId: string, uid: number, part: string, uri: string, folder: string) =>
+    invoke<number>("mail_save_attachment", { request: { entryId, uid, part, path: uri, folder } }),
+  mailDiscover: (email: string) => invoke<MailDiscoveredServer>("mail_discover", { request: { email } }),
+  mailTest: (request: { entryId?: string | null; email?: string; secret?: string; imapHost?: string | null; imapPort?: number | null }) =>
+    invoke<MailProbeReport>("mail_test", { request }),
+  mailSync: () => invoke<number>("mail_sync"),
+  mailUnreadCount: () => invoke<number>("mail_unread_count"),
   appVersion: () => invoke<string>("app_version"),
   checkUpdate: () => invoke<MobileRelease>("check_mobile_update"),
   downloadUpdate: (url: string) => invoke<UpdateDownload>("download_mobile_update", { url }),

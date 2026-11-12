@@ -33,6 +33,8 @@ import {
   type ListFilter,
   type MailAccount,
   type MailAttachment,
+  type MailFilter,
+  type MailFolder,
   type MailMessage,
   type McpStatus,
   type McpToolInfo,
@@ -1530,6 +1532,8 @@ async function runBackupRestore() {
 }
 const settingsClip = ref(20);
 const settingsHotkey = ref("Ctrl+Shift+Space");
+/** Background mail polling interval in seconds; 0 turns it off. */
+const settingsMailSync = ref(300);
 const oldMaster = ref("");
 const newMaster = ref("");
 const newMaster2 = ref("");
@@ -1874,43 +1878,76 @@ function applyLockedUi() {
   mailBodyBusy.value = false;
   mailError.value = "";
   mailOlderError.value = "";
+  mailFolders.value = [];
+  mailRole.value = "inbox";
+  mailOtherFolder.value = "";
+  mailFilter.value = "all";
+  mailKeyword.value = "";
+  mailAppliedKeyword.value = "";
+  mailSearchNote.value = "";
+  mailSyncing.value = false;
+  mailSyncNote.value = "";
+  mailUnread.value = 0;
 }
 
-async function openMail() {
-  goPage("mail");
-  mailError.value = "";
-  mailOlderError.value = "";
-  const seq = ++mailSeq;
-  try {
-    const accounts = await api.mailAccounts();
-    if (seq !== mailSeq) return;
-    mailAccounts.value = accounts;
-    const current = accounts.find((account) => account.id === mailAccountId.value && account.supported);
-    const next = current ?? accounts.find((account) => account.supported);
-    mailAccountId.value = next?.id ?? "";
-    if (next) await loadMail(next.id, seq);
-    else {
-      mailBodySeq += 1;
-      mailBodyBusy.value = false;
-      mailMessages.value = [];
-      mailSelected.value = null;
-      mailBody.value = "";
-      mailHtml.value = "";
-      mailHtmlSource.value = "";
-      mailRemoteImages.value = false;
-      mailImagesAllowed.value = false;
-      mailAttachments.value = [];
-      mailAttachmentBusy.value = "";
-    }
-  } catch (e) {
-    if (seq === mailSeq) mailError.value = String(e);
+/** Standard folders always show in this order, whatever the provider calls them. */
+const MAIL_ROLES: { role: string; label: string }[] = [
+  { role: "inbox", label: "收件箱" },
+  { role: "sent", label: "已发送" },
+  { role: "drafts", label: "草稿" },
+  { role: "archive", label: "归档" },
+  { role: "trash", label: "垃圾箱" },
+];
+
+const MAIL_FILTERS: { id: MailFilter; label: string }[] = [
+  { id: "all", label: "全部" },
+  { id: "unread", label: "未读" },
+  { id: "attached", label: "带附件" },
+  { id: "flagged", label: "星标" },
+];
+
+const mailFolders = ref<MailFolder[]>([]);
+const mailRole = ref("inbox");
+const mailOtherFolder = ref("");
+const mailFilter = ref<MailFilter>("all");
+const mailKeyword = ref("");
+const mailAppliedKeyword = ref("");
+const mailSearchNote = ref("");
+const mailFoldersBusy = ref(false);
+const mailSyncing = ref(false);
+const mailSyncNote = ref("");
+const mailUnread = ref(0);
+
+/** The folder name currently shown: the role's real server name, falling back to the inbox. */
+const mailFolderName = computed(() => {
+  if (mailRole.value === "other") return mailOtherFolder.value;
+  const match = mailFolders.value.find((folder) => folder.role === mailRole.value);
+  return match?.name ?? (mailRole.value === "inbox" ? "INBOX" : "");
+});
+
+/** Roles this account actually exposes, so an absent folder is not offered as a dead tab. */
+const mailVisibleRoles = computed(() => {
+  const present = new Set(mailFolders.value.map((folder) => folder.role));
+  return MAIL_ROLES.filter((entry) => present.has(entry.role));
+});
+
+const mailOtherFolders = computed(() => mailFolders.value.filter((folder) => folder.role === "other"));
+
+const mailCurrentAccount = computed(
+  () => mailAccounts.value.find((account) => account.id === mailAccountId.value) ?? null,
+);
+
+/** Unread per role, from the cached folder counts the sync keeps up to date. */
+const mailRoleUnread = computed(() => {
+  const map: Record<string, number> = {};
+  for (const folder of mailFolders.value) {
+    map[folder.role] = (map[folder.role] ?? 0) + (folder.role === "inbox" || folder.role === "archive" ? (folder.unread ?? 0) : 0);
   }
-}
+  return map;
+});
 
-async function loadMail(entryId: string, seq = ++mailSeq) {
-  mailBusy.value = true;
-  mailError.value = "";
-  mailOlderError.value = "";
+/** Clears every per-message view. Called on account switch, folder switch and lock. */
+function resetMailMessages() {
   mailBodySeq += 1;
   mailBodyBusy.value = false;
   mailMessages.value = [];
@@ -1924,8 +1961,95 @@ async function loadMail(entryId: string, seq = ++mailSeq) {
   mailTruncated.value = false;
   mailAttachments.value = [];
   mailAttachmentBusy.value = "";
+  mailOlderError.value = "";
+}
+
+/** Refreshes the sidebar badge without opening the page. */
+async function refreshMailUnread() {
   try {
-    const messages = await api.mailList(entryId);
+    mailUnread.value = await api.mailUnreadCount();
+  } catch {
+    // Locked or not set up: no badge is the right answer.
+    mailUnread.value = 0;
+  }
+}
+
+async function openMail() {
+  goPage("mail");
+  mailError.value = "";
+  mailOlderError.value = "";
+  mailSyncNote.value = "";
+  const seq = ++mailSeq;
+  try {
+    const accounts = await api.mailAccounts();
+    if (seq !== mailSeq) return;
+    mailAccounts.value = accounts;
+    const current = accounts.find((account) => account.id === mailAccountId.value && account.supported);
+    const next = current ?? accounts.find((account) => account.supported);
+    mailAccountId.value = next?.id ?? "";
+    mailRole.value = "inbox";
+    mailOtherFolder.value = "";
+    if (next) await selectMailAccount(next, seq);
+    else resetMailMessages();
+    void refreshMailUnread();
+  } catch (e) {
+    if (seq === mailSeq) mailError.value = String(e);
+  }
+}
+
+/** Switches account: refresh its folder list, then load the inbox. */
+async function selectMailAccount(account: MailAccount, seq = ++mailSeq) {
+  if (!account.supported) return;
+  mailAccountId.value = account.id;
+  mailRole.value = "inbox";
+  mailOtherFolder.value = "";
+  mailFolders.value = [];
+  mailKeyword.value = "";
+  mailAppliedKeyword.value = "";
+  mailSearchNote.value = "";
+  resetMailMessages();
+  await loadMailFolders(seq);
+  if (seq !== mailSeq) return;
+  await loadMail(seq);
+}
+
+/** Folder list for the current account. `refresh` forces a server round trip. */
+async function loadMailFolders(seq: number, refresh = false) {
+  const entryId = mailAccountId.value;
+  if (!entryId) return;
+  mailFoldersBusy.value = true;
+  try {
+    const folders = await api.mailFolders(entryId, refresh);
+    if (seq !== mailSeq) return;
+    mailFolders.value = folders;
+    // The chosen role may not exist on this provider; fall back to the inbox.
+    if (mailRole.value !== "other" && !folders.some((folder) => folder.role === mailRole.value)) {
+      mailRole.value = "inbox";
+    }
+  } catch (e) {
+    if (seq === mailSeq) mailError.value = String(e);
+  } finally {
+    if (seq === mailSeq) mailFoldersBusy.value = false;
+  }
+}
+
+/**
+ * Loads the first page of the selected folder. The filter and keyword are applied on the server,
+ * so "unread" and a search cover the whole folder rather than the page already loaded.
+ */
+async function loadMail(seq = ++mailSeq) {
+  const entryId = mailAccountId.value;
+  const folder = mailFolderName.value;
+  resetMailMessages();
+  mailError.value = "";
+  mailOlderError.value = "";
+  if (!entryId || !folder) return;
+  mailBusy.value = true;
+  try {
+    const messages = await api.mailList(entryId, folder, {
+      filter: mailFilter.value,
+      keyword: mailAppliedKeyword.value,
+    });
     if (seq !== mailSeq) return;
     mailMessages.value = messages.slice().reverse();
   } catch (e) {
@@ -1937,13 +2061,18 @@ async function loadMail(entryId: string, seq = ++mailSeq) {
 
 async function loadOlderMail() {
   const entryId = mailAccountId.value;
+  const folder = mailFolderName.value;
   const oldest = mailMessages.value[mailMessages.value.length - 1]?.uid;
-  if (!entryId || oldest == null) return;
+  if (!entryId || !folder || oldest == null) return;
   const seq = mailSeq;
   mailBusy.value = true;
   mailOlderError.value = "";
   try {
-    const older = await api.mailList(entryId, oldest);
+    const older = await api.mailList(entryId, folder, {
+      beforeUid: oldest,
+      filter: mailFilter.value,
+      keyword: mailAppliedKeyword.value,
+    });
     if (seq !== mailSeq) return;
     const seen = new Set(mailMessages.value.map((message) => message.uid));
     mailMessages.value = [...mailMessages.value, ...older.filter((message) => !seen.has(message.uid)).reverse()];
@@ -1955,9 +2084,72 @@ async function loadOlderMail() {
   }
 }
 
+function chooseMailRole(role: string) {
+  if (mailRole.value === role || mailBusy.value) return;
+  mailRole.value = role;
+  mailOtherFolder.value = "";
+  void loadMail();
+}
+
+function chooseMailOtherFolder(name: string) {
+  if (mailOtherFolder.value === name && mailRole.value === "other") return;
+  mailRole.value = "other";
+  mailOtherFolder.value = name;
+  void loadMail();
+}
+
+function chooseMailFilter(filter: MailFilter) {
+  if (mailFilter.value === filter) return;
+  mailFilter.value = filter;
+  void loadMail();
+}
+
+/** Runs the keyword search. An empty box clears it back to the plain listing. */
+function submitMailSearch() {
+  const keyword = mailKeyword.value.trim();
+  mailAppliedKeyword.value = keyword;
+  mailSearchNote.value = "";
+  void loadMail();
+}
+
+function clearMailSearch() {
+  if (mailKeyword.value === "" && mailAppliedKeyword.value === "") return;
+  mailKeyword.value = "";
+  mailAppliedKeyword.value = "";
+  void loadMail();
+}
+
+/** Manual refresh: re-sync the cache, then re-read the folder and its unread counts. */
+async function refreshMailNow() {
+  if (mailSyncing.value) return;
+  mailSyncing.value = true;
+  mailSyncNote.value = "";
+  const seq = mailSeq;
+  try {
+    const report = await api.mailSync();
+    if (seq !== mailSeq) return;
+    const failed = report.accounts.filter((account) => account.failed).length;
+    const added = report.accounts.reduce((sum, account) => sum + account.newCount, 0);
+    mailSyncNote.value = failed
+      ? `${failed} 个账号暂时连不上，其余已更新`
+      : added
+        ? `收到 ${added} 封新邮件`
+        : "已是最新";
+    mailUnread.value = report.unread;
+    await loadMailFolders(seq, true);
+    if (seq !== mailSeq) return;
+    await loadMail(seq);
+  } catch (e) {
+    if (seq === mailSeq) mailError.value = String(e);
+  } finally {
+    if (seq === mailSeq) mailSyncing.value = false;
+  }
+}
+
 async function openMailMessage(uid: number) {
   const entryId = mailAccountId.value;
-  // 列表序号与正文序号分开：列表不被正文请求作废，正文也不覆盖新选中邮件。
+  const folder = mailFolderName.value;
+  // List and body sequences are separate so a body reply cannot overwrite a newer selection.
   const seq = ++mailBodySeq;
   mailSelectedUid.value = uid;
   mailSelected.value = mailMessages.value.find((message) => message.uid === uid) ?? null;
@@ -1973,8 +2165,8 @@ async function openMailMessage(uid: number) {
   mailBodyBusy.value = true;
   try {
     const [bodyResult, attachmentResult] = await Promise.allSettled([
-      api.mailBody(entryId, uid),
-      api.mailAttachments(entryId, uid),
+      api.mailBody(entryId, uid, folder),
+      api.mailAttachments(entryId, uid, folder),
     ]);
     if (seq !== mailBodySeq) return;
     if (bodyResult.status === "fulfilled") {
@@ -2010,7 +2202,8 @@ function formatMailSize(size: number | null): string {
 async function downloadMailAttachment(item: MailAttachment) {
   const entryId = mailAccountId.value;
   const uid = mailSelectedUid.value;
-  if (!entryId || uid == null || mailAttachmentBusy.value) return;
+  const folder = mailFolderName.value;
+  if (!entryId || uid == null || !folder || mailAttachmentBusy.value) return;
   const seq = mailBodySeq;
   const filename = item.filename.split(/[/\\]/).filter(Boolean).pop() || "attachment";
   try {
@@ -2020,7 +2213,7 @@ async function downloadMailAttachment(item: MailAttachment) {
     });
     if (!picked || seq !== mailBodySeq) return;
     mailAttachmentBusy.value = item.part;
-    await api.mailSaveAttachment(entryId, uid, item.part, picked);
+    await api.mailSaveAttachment(entryId, uid, item.part, picked, folder);
   } catch (e) {
     if (seq === mailBodySeq) mailError.value = String(e);
   } finally {
@@ -2073,22 +2266,26 @@ function fitMailFrame(event: Event) {
   }
 }
 
-function selectMailAccount(account: MailAccount) {
-  if (!account.supported || mailBusy.value) return;
-  mailAccountId.value = account.id;
-  void loadMail(account.id);
+/** `Wed, 12 Nov 2026 09:12:00 +0800` -> `2026-11-12 09:12`, keeping an unparseable date as-is. */
+function formatMailDate(raw: string): string {
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return raw;
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
 }
 
 async function loadSettings() {
   const s = await api.settingsGet();
   settingsClip.value = s.clipboard_secs;
   settingsHotkey.value = s.hotkey;
+  settingsMailSync.value = s.mail_auto_sync_secs;
 }
 async function saveSettings() {
   try {
     await api.settingsSet({
       clipboard_secs: settingsClip.value,
       hotkey: settingsHotkey.value,
+      mail_auto_sync_secs: settingsMailSync.value,
     });
     showToast("设置已保存");
   } catch (e) {
@@ -2553,6 +2750,7 @@ onMounted(async () => {
             </svg>
           </span>
           <span>邮箱</span>
+          <em v-if="mailUnread > 0" class="rail-badge">{{ mailUnread > 99 ? "99+" : mailUnread }}</em>
         </button>
         <div class="spacer" />
         <button class="rail-btn" :class="{ active: page === 'settings' }" @click="goPage('settings')">
@@ -3110,31 +3308,113 @@ onMounted(async () => {
         <div class="content content-page mail-page">
           <div class="mail-head">
             <h2>邮箱</h2>
+            <p v-if="mailSyncing" class="crumb">正在收取…</p>
+            <p v-else-if="mailSyncNote" class="crumb">{{ mailSyncNote }}</p>
+            <button class="btn" type="button" :disabled="mailSyncing || !mailAccountId" @click="refreshMailNow">
+              立即收取
+            </button>
           </div>
+          <p v-if="mailError" class="error">{{ mailError }}</p>
           <div class="mail-layout">
             <aside class="card mail-accounts">
-              <h3>授权码</h3>
-              <p v-if="!mailAccounts.length" class="crumb">还没有邮箱授权码。先在保险库里新增一条。</p>
-              <button v-for="account in mailAccounts" :key="account.id" type="button" class="mail-account" :class="{ active: account.id === mailAccountId, disabled: !account.supported }" :disabled="!account.supported" @click="selectMailAccount(account)">
+              <h3>账号</h3>
+              <p v-if="!mailAccounts.length" class="crumb">
+                还没有邮箱账号。先在保险库里新增「邮箱授权码」或「邮箱」条目。
+              </p>
+              <button
+                v-for="account in mailAccounts"
+                :key="account.id"
+                type="button"
+                class="mail-account"
+                :class="{ active: account.id === mailAccountId, disabled: !account.supported }"
+                :disabled="!account.supported"
+                @click="selectMailAccount(account)"
+              >
                 <strong>{{ account.title || account.email }}</strong>
-                <span>{{ account.email }}</span>
-                <em v-if="!account.supported">首版不支持</em>
+                <span>{{ account.email }} · {{ account.providerLabel }}</span>
+                <em v-if="!account.supported">未配置 IMAP 主机</em>
               </button>
+
+              <template v-if="mailAccountId && !mailBusy">
+                <h3 class="mail-folders-title">文件夹</h3>
+                <button
+                  v-for="entry in mailVisibleRoles"
+                  :key="entry.role"
+                  type="button"
+                  class="mail-folder"
+                  :class="{ active: mailRole === entry.role }"
+                  @click="chooseMailRole(entry.role)"
+                >
+                  <span>{{ entry.label }}</span>
+                  <em v-if="mailRoleUnread[entry.role]">{{ mailRoleUnread[entry.role] }}</em>
+                </button>
+                <details v-if="mailOtherFolders.length" class="mail-other-folders">
+                  <summary>更多文件夹（{{ mailOtherFolders.length }}）</summary>
+                  <button
+                    v-for="folder in mailOtherFolders"
+                    :key="folder.name"
+                    type="button"
+                    class="mail-folder"
+                    :class="{ active: mailRole === 'other' && mailOtherFolder === folder.name }"
+                    @click="chooseMailOtherFolder(folder.name)"
+                  >
+                    <span>{{ folder.name }}</span>
+                  </button>
+                </details>
+              </template>
+              <p v-if="mailFoldersBusy" class="crumb">正在读取文件夹…</p>
             </aside>
+
             <div class="card mail-list">
               <div class="mail-list-head">
-                <h3>收件箱</h3>
-                <button class="btn" type="button" :disabled="mailBusy || !mailAccountId" @click="loadOlderMail">加载更早</button>
+                <h3>{{ mailCurrentAccount?.title || mailCurrentAccount?.email || "收件箱" }}</h3>
+                <button class="btn" type="button" :disabled="mailBusy || !mailFolderName" @click="loadOlderMail">
+                  加载更早
+                </button>
               </div>
+              <div class="mail-toolbar">
+                <div class="mail-filters">
+                  <button
+                    v-for="option in MAIL_FILTERS"
+                    :key="option.id"
+                    type="button"
+                    class="mail-filter"
+                    :class="{ active: mailFilter === option.id }"
+                    @click="chooseMailFilter(option.id)"
+                  >
+                    {{ option.label }}
+                  </button>
+                </div>
+                <form class="mail-search" @submit.prevent="submitMailSearch">
+                  <input v-model="mailKeyword" placeholder="搜索主题或发件人" maxlength="200" />
+                  <button class="btn" type="submit" :disabled="mailBusy">搜索</button>
+                  <button v-if="mailAppliedKeyword" class="btn" type="button" @click="clearMailSearch">清除</button>
+                </form>
+              </div>
+              <p v-if="mailAppliedKeyword" class="crumb">搜索「{{ mailAppliedKeyword }}」的结果</p>
               <p v-if="mailBusy" class="crumb">正在读取…</p>
-              <p v-if="mailError" class="error">{{ mailError }}</p>
               <p v-if="mailOlderError" class="crumb">{{ mailOlderError }}</p>
-              <button v-for="message in mailMessages" :key="message.uid" type="button" class="mail-row" :class="{ active: message.uid === mailSelectedUid }" @click="openMailMessage(message.uid)">
+              <button
+                v-for="message in mailMessages"
+                :key="message.uid"
+                type="button"
+                class="mail-row"
+                :class="{ active: message.uid === mailSelectedUid, unread: !message.seen }"
+                @click="openMailMessage(message.uid)"
+              >
                 <strong>{{ message.subject || "(无主题)" }}</strong>
                 <span>{{ message.from }}</span>
-                <em>{{ message.date }}<template v-if="message.hasAttachment"> · 有附件</template></em>
+                <em>
+                  {{ formatMailDate(message.date) }}
+                  <template v-if="message.flagged"> · ★</template>
+                  <template v-if="message.hasAttachment"> · 有附件</template>
+                </em>
               </button>
+              <p v-if="!mailBusy && !mailMessages.length && !mailError" class="crumb">
+                {{ mailAppliedKeyword || mailFilter !== "all" ? "没有符合条件的邮件" : "这个文件夹是空的" }}
+              </p>
             </div>
+
             <article class="card mail-body">
               <template v-if="mailSelected">
                 <h3 class="mail-subject">{{ mailSelected?.subject || "(无主题)" }}</h3>
@@ -3142,9 +3422,9 @@ onMounted(async () => {
                   <dt>发件人</dt>
                   <dd>{{ mailSelected?.from || "(未知发件人)" }}</dd>
                   <dt>时间</dt>
-                  <dd>{{ mailSelected?.date || "(未知时间)" }}</dd>
+                  <dd>{{ formatMailDate(mailSelected?.date ?? "") || "(未知时间)" }}</dd>
                   <dt>收件人</dt>
-                  <dd>{{ mailRecipient || "(当前授权码)" }}</dd>
+                  <dd>{{ mailRecipient || "(当前账号)" }}</dd>
                   <template v-if="mailAttachments.length">
                     <dt>附件</dt>
                     <dd>
@@ -3153,7 +3433,9 @@ onMounted(async () => {
                           <span>{{ item.filename }}</span>
                           <span>{{ item.mime }}</span>
                           <span>{{ formatMailSize(item.size) }}</span>
-                          <button class="btn" type="button" :disabled="mailAttachmentBusy === item.part" @click="downloadMailAttachment(item)">下载</button>
+                          <button class="btn" type="button" :disabled="mailAttachmentBusy === item.part" @click="downloadMailAttachment(item)">
+                            下载
+                          </button>
                         </li>
                       </ul>
                     </dd>
@@ -3246,7 +3528,19 @@ onMounted(async () => {
                   <label>全局热键</label>
                   <input v-model="settingsHotkey" placeholder="Ctrl+Shift+Space" />
                 </div>
+                <div class="field">
+                  <label>自动收信</label>
+                  <select v-model.number="settingsMailSync">
+                    <option :value="0">关闭</option>
+                    <option :value="60">每 1 分钟</option>
+                    <option :value="180">每 3 分钟</option>
+                    <option :value="300">每 5 分钟</option>
+                    <option :value="600">每 10 分钟</option>
+                    <option :value="1800">每 30 分钟</option>
+                  </select>
+                </div>
               </div>
+              <p class="crumb">自动收信在后台读取收件箱与归档，有新邮件时发系统通知；间隔下限 1 分钟，再短容易撞上邮箱服务商的登录频率限制。窗口收进托盘、停在其他页面时照常收信。</p>
               <button class="btn primary" type="button" @click="saveSettings">保存</button>
             </div>
           </div>

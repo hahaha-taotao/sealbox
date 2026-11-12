@@ -98,7 +98,7 @@ fn revocation_is_caller_scoped_invalidates_pending_grants_and_survives_locked_va
 #[test]
 fn unknown_actions_return_the_legal_action_list() {
     let (session,_)=session_with_token(true,"github");let mcp=McpState::default();let caller=mcp.open_caller().unwrap();
-    for (tool,actions) in [("git",vec!["status","diff","log","branches","fetch","pull","commit","push","clone"]),("mail",vec!["accounts","list","read","save"])] {
+    for (tool,actions) in [("git",vec!["status","diff","log","branches","fetch","pull","commit","push","clone"]),("mail",vec!["accounts","folders","list","search","read","save"])] {
         let result=rpc(&session,&mcp,&caller,tool,json!({"action":"not-a-real-action","path":"/tmp"}));
         assert_eq!(result["isError"],true);let raw=result.to_string();for action in actions {assert!(raw.contains(action),"missing {action}: {raw}");}
     }

@@ -1,6 +1,7 @@
 pub use sealbox_core::{
     certificate, crypto, db, http_guard, identity, passphrase_words, redact, sync, totp, vault,
 };
+pub mod auto_mail;
 pub mod auto_sync;
 pub mod backup;
 pub mod clipboard;
@@ -38,6 +39,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         // Only size/position/maximized: the quick and confirm windows are
         // transient overlays that must keep their tauri.conf geometry, so they
@@ -137,10 +139,16 @@ pub fn run() {
             commands::extension_open_folder,
             commands::extension_open_browser,
             commands::mail_accounts,
+            commands::mail_folders,
             commands::mail_list,
             commands::mail_body,
             commands::mail_attachments,
             commands::mail_save_attachment,
+            commands::mail_discover,
+            commands::mail_test,
+            commands::mail_sync,
+            commands::mail_unread_count,
+            commands::mail_search,
             commands::window_control,
             commands::confirm_payload,
             commands::confirm_respond,
@@ -181,6 +189,7 @@ pub fn run() {
                 };
                 let _ = commands::tick_security(&state);
                 crate::auto_sync::tick(&handle, &state);
+                crate::auto_mail::tick(&handle, &state);
             });
             let show = MenuItem::with_id(app, "show", "打开", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -216,6 +225,11 @@ pub fn run() {
                 }
                 let _ = mcp::start(&state.mcp, state.session.clone());
                 crate::auto_sync::refresh_from_disk(app.handle(), &state);
+                if let Ok(path) = commands::vault_path_for(app.handle()) {
+                    if let Ok(vault) = crate::vault::Vault::open(path.to_str().unwrap_or_default()) {
+                        crate::auto_mail::refresh_from_vault(&state, &vault);
+                    }
+                }
             }
             let _ = commands::register_hotkey(app.handle(), &startup_hotkey);
             // The confirmation window inherits this at prompt time; start from

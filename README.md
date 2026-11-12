@@ -68,7 +68,7 @@ On Linux x64, install the `.deb` or run the `.AppImage` from the same release. I
 - **MCP** — 本机 `127.0.0.1` 服务，只注册 `vault_list`、`vault_describe`、`http_call`、`git`、`mail`、`vault_revoke` 六个稳定工具。平台的固定 origin、认证、具名操作与参数白名单写在凭据 profile 中，可在凭据详情编辑；远程请求只走 `http_call`。内置 GitHub 与 ZoomKey JIRA/CRM 配方复用已有 DTO 裁剪和受限通道，写操作默认放行，仅强制推送等破坏性写操作逐次桌面确认。
 - **客户端证书 Client cert** — 保险库里可以导入 mTLS 用的客户端证书与私钥（PEM），由 Rust 侧限长、解析并校验证书/私钥匹配后加密保存，随金库一起备份；列表和速查不会显示或复制私钥，退出时会清理 TLS 运行时缓存
 - **插件 Plugin** — Chrome / Edge 从客户端安装后按当前网址填充、填 TOTP 或一键登记；在侧栏「插件」页配对
-- **邮箱 Mail** — 用已保存的 QQ / Gmail 授权码只读打开 INBOX，默认最近 50 封，可继续加载更早；正文按需读取并转成纯文本。MCP 统一使用 `mail(action=accounts/list/read/save)`；保存附件默认放行，且不覆盖文件。仍不发信、不删信、不标已读。163、Outlook 和自定义邮箱只显示、不连接。
+- **邮箱 Mail** — 只读邮件客户端。账号来自「邮箱授权码」和「邮箱」两类条目：18 家内置预设（QQ、163、126、yeah、Gmail、Outlook、Yahoo、iCloud、新浪、搜狐、阿里、139、腾讯企业邮、Yandex、Mail.ru、Zoho、AOL、Fastmail），未收录的域名按 Thunderbird 公共配置库探测，再退化为 `imap.<域名>` 并让你核对；自建邮箱直接填 IMAP 主机。保存前可「测试连接」。收件箱 / 已发送 / 草稿 / 归档 / 垃圾箱按各服务商的叫法（QQ 的 "Sent Messages"、163 的「已发送」、Gmail 的 `[Gmail]/Sent Mail`）自动对上；支持未读 / 带附件 / 星标筛选与按主题、发件人的服务器端搜索，未读角标只算收件箱和归档。列表和正文缓存在本机金库库中，正文按需取；后台按设定间隔（关闭 / 1 / 3 / 5 / 10 / 30 分钟，默认 5 分钟）自动收信并发系统通知，锁屏时只报数量。全部文件夹都用 `EXAMINE` 只读打开、正文一律 `BODY.PEEK`：**不发信、不删信、不标已读、不移动**。MCP 统一使用 `mail(action=accounts/folders/list/search/read/save)`，`search` 只搜本地缓存不联网。桌面和 Android 共用同一套命令。
 
 ## 安全模型 Security
 
@@ -143,7 +143,7 @@ On first launch, set a master password (at least 10 characters). Closing the win
 | `vault_describe` | `credential_id`；返回该凭据已登记操作的方法、路径模板、封闭参数 schema、风险和确认要求 |
 | `http_call` | `credential_id`、`op`、`params`；唯一远程 HTTP 入口。只接受说明书声明的参数 |
 | `git` | `action=status/diff/log/branches/fetch/pull/commit/push/clone`；本机仓库，`path` 必须是绝对路径。clone 的 path 是已存在父目录，另传 `repo=owner/repo` |
-| `mail` | `action=accounts/list/read/save`；list 用 `entryId`、可选 `beforeUid`；read 再传 `uid`；save 再传 `part` 与新文件 `path` |
+| `mail` | `action=accounts/folders/list/search/read/save`；`folders` 用 `entryId`；`list` 用 `entryId`，可选 `folder`、`beforeUid`、`filter`、`keyword`；`search` 用 `entryId`、`keyword`，只搜已同步的本地缓存；`read` 再传 `uid`、可选 `folder`；`save` 再传 `part` 与新文件 `path`。只读，不发信 |
 | `vault_revoke` | 无参数；撤销当前调用会话尚未用完的授权，使未执行的调用失效，不影响其他会话或浏览器填表 |
 
 模型的固定使用顺序（说明书不是第二份工具表）：
