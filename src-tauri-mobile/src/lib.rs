@@ -28,6 +28,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(saf::init())
         .plugin(mobile_context::init())
+        .setup(|#[allow(unused_variables)] app| {
+            // Second chance for the Android context: the plugin's own `load()` hook runs inside
+            // Tauri's registration and can be skipped, while this always has the handle.
+            #[cfg(target_os = "android")]
+            mobile_context::remember_app(app.handle());
+            Ok(())
+        })
         .manage(commands::AppState::new())
         .invoke_handler(tauri::generate_handler![
             commands::get_status,

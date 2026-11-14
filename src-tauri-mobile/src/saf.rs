@@ -157,6 +157,7 @@ mod android {
     fn with_env<T>(
         operation: impl FnOnce(&mut JNIEnv<'_>, &JObject<'_>, &JClass<'_>) -> Result<T>,
     ) -> Result<T> {
+        crate::mobile_context::ensure_ready();
         if !crate::mobile_context::is_ready() {
             return Err("Android 上下文未就绪，SAF 暂不可用".into());
         }

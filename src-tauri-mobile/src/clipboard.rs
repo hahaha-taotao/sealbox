@@ -49,6 +49,7 @@ mod host {
     use jni::JNIEnv;
 
     fn with_env<T>(f: impl FnOnce(&mut JNIEnv) -> Result<T, String>) -> Result<T, String> {
+        crate::mobile_context::ensure_ready();
         if !crate::mobile_context::is_ready() {
             return Err("Android 上下文未就绪，剪贴板不可用".into());
         }
