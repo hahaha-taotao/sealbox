@@ -188,6 +188,26 @@ textarea { min-height: 72px; resize: vertical; }
 .update-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 16px; }
 .release-link { display: block; margin: 8px auto 0; font-size: 13px; }
 
+/* 邮箱列表行：未读左侧 3px 强调条，发件人 + 相对时间在上，主题加粗，摘要一行。 */
+.mail-item { position: relative; border-left: 3px solid transparent; padding-left: 10px; }
+.mail-item.unread { border-left-color: var(--brand); }
+.mail-item.unread .mail-item-subject { font-weight: 700; color: var(--ink); }
+.mail-item.seen .mail-item-subject { font-weight: 500; }
+.mail-item-top { display: flex; align-items: baseline; gap: 8px; }
+.mail-item-from {
+  flex: 1; min-width: 0; font-size: 13px; font-weight: 600; color: var(--ink);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.mail-item-when { flex: 0 0 auto; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.mail-item-subject { font-size: 14px; }
+.mail-item-tags { display: flex; gap: 6px; }
+.mail-item-tags > template { display: contents; }
+/* 缓存态提示：列表来自本地缓存时的一行小字。 */
+.mail-cache { color: var(--warn); }
+/* 正文工具栏：字号 + 纯文本切换，按钮保持胶囊按钮的观感但只有一个屏幕宽的一小段。 */
+.mail-tools { display: flex; gap: 8px; margin: 10px 0; }
+.mail-tools .mail-tool { width: auto; height: 36px; padding: 0 14px; font-size: 13px; font-weight: 600; border-radius: 999px; }
+.mail-tools .mail-tool.on { background: var(--soft); color: var(--brand); border-color: #c9c9f2; }
 /* 邮箱（只读）：正文 iframe 用固定高度，避免跨域文档量高失败时塌成 0。 */
 .mail-frame {
   width: 100%;

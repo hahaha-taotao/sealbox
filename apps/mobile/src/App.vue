@@ -5,13 +5,24 @@ import { onBackButtonPress } from "@tauri-apps/api/app";
 import type { PluginListener } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { authenticate, checkStatus, getData, hasData, removeData, setData } from "@choochmeque/tauri-plugin-biometry-api";
-import { KINDS, api, kindLabel, type BackupPreview, type CsvPreview, type DocumentRef, type Counts, type EntryDto, type EntryField, type EntryKind, type Folder, type MailAccount, type MailAttachment, type MailFilter, type MailFolder, type MailMessage, type MobileRelease, type SyncReport, type SyncView } from "./api";
+import { KINDS, api, kindLabel, normalizeMailList, type BackupPreview, type CsvPreview, type DocumentRef, type Counts, type EntryDto, type EntryField, type EntryKind, type Folder, type MailAccount, type MailAttachment, type MailFilter, type MailFolder, type MailMessage, type MailUnreadByRole, type MobileRelease, type SyncReport, type SyncView } from "./api";
 import { buildMailDocument, hasRemoteImages } from "../../../src/lib/mail-html";
 import { DB_ENGINES, SERVER_PROTOCOLS, optionsWithStored, databaseFields, defaultPort } from "../../../src/lib/entry-options";
 import { preservePayload } from "../../../src/lib/entry-patch.mjs";
 import CredentialProfileEditor from "../../../src/components/CredentialProfileEditor.vue";
 import { credentialProfileApi } from "./lib/credential-profile";
 import { completeChoices, buildResolutions, type SyncChoice } from '../../../src/lib/sync-choice.mjs';
+import {
+  MAIL_FONT_SCALES,
+  MAIL_FONT_DEFAULT,
+  formatMailBadge,
+  formatMailCacheStamp,
+  formatMailFullTime,
+  formatMailRelativeTime,
+  mailFontScale,
+  nextMailFontScale,
+} from "../../../src/lib/mail-view.mjs";
+type MailFontId = (typeof MAIL_FONT_SCALES)[number]["id"];
 
 type Page = "lock" | "vault" | "detail" | "edit" | "settings" | "sync" | "mail";
 const page = ref<Page>("lock");
@@ -273,6 +284,14 @@ const mailTruncated = ref(false);
 const mailBodyBusy = ref(false);
 const mailAttachments = ref<MailAttachment[]>([]);
 const mailSavingPart = ref("");
+/** 列表来自本地缓存（可能断网）：列表顶部显示「离线缓存 · 最近更新 HH:mm」。 */
+const mailCacheCached = ref(false);
+const mailCacheAt = ref("");
+/** 正文显示形态：有 HTML 时默认 HTML，切到纯文本只是本次查看的偏好。 */
+const mailPlainText = ref(false);
+const mailFontId = ref<MailFontId>(MAIL_FONT_DEFAULT);
+/** 各角色未读数，统一来自 mail_unread_by_role；取不到时退回文件夹自带的数字。 */
+const mailRoleCounts = ref<MailUnreadByRole | null>(null);
 let mailSeq = 0;
 let mailBodySeq = 0;
 
@@ -296,12 +315,67 @@ const mailOtherFolders = computed(() => mailFolders.value.filter((folder) => fol
 /** 列表页还是正文页：正文页全屏 push，返回键先回列表。 */
 const mailReading = computed(() => mailOpenMessage.value !== null);
 
+/** 缓存态提示：列表来自本地缓存时那行小字。 */
+const mailCacheLabel = computed(() => {
+  if (!mailCacheCached.value) return "";
+  const stamp = formatMailCacheStamp(mailCacheAt.value);
+  return stamp ? `离线缓存 · 最近更新 ${stamp}` : "离线缓存 · 尚未收取";
+});
+
+const mailFont = computed(() => mailFontScale(mailFontId.value));
+const mailTextStyle = computed(() => ({ fontSize: `${mailFont.value.px}px` }));
+const mailFrameStyle = computed(() => ({ zoom: String(mailFont.value.scale) }));
+
+/** 有 HTML 正文时才给「HTML / 纯文本」切换。 */
+const mailCanShowHtml = computed(() => mailHtml.value !== "");
+const mailShowHtml = computed(() => mailCanShowHtml.value && !mailPlainText.value);
+
+/** 文件夹旁的数字：优先 mail_unread_by_role，退回该角色文件夹的缓存计数之和。 */
+function mailRoleUnread(role: string): number {
+  const counts = mailRoleCounts.value;
+  if (counts !== null) {
+    if (role === "inbox" || role === "archive" || role === "sent" || role === "drafts" || role === "trash") {
+      return counts[role] ?? 0;
+    }
+  }
+  let total = 0;
+  for (const folder of mailFolders.value) {
+    if (folder.role === role) total += folder.unread ?? 0;
+  }
+  return total;
+}
+
+/**
+ * 进入邮箱后静默预热正文：只对收件箱前若干封调 mail_prefetch，失败一律吞掉。
+ * 不 await，也不占 mailBusy，列表渲染不等它。
+ */
+function warmMailBodies() {
+  const entryId = mailAccountId.value;
+  const inbox = mailFolders.value.find((folder) => folder.role === "inbox")?.name;
+  if (!entryId || !inbox) return;
+  // 返回的是「这一趟是否入队」（1=已入队，0=被正在跑的一趟折叠），不是预热到的封数，
+  // 所以这里什么都不显示——预取本就该是静默的。真实条数走 mail-page-refreshed 的 bodies。
+  void api.mailPrefetch(entryId, inbox, 5).catch(() => {
+    // 离线或后端未升级：预热只是加速，失败不打扰用户。
+  });
+}
+
+/** 角标与文件夹数字的唯一来源；接口不在时静默退回原有单一口径。 */
+async function refreshMailCounts() {
+  try {
+    mailRoleCounts.value = await api.mailUnreadByRole();
+  } catch {
+    mailRoleCounts.value = null;
+  }
+}
+
 function resetMailList() {
   mailBodySeq += 1;
   mailMessages.value = [];
   mailError.value = "";
   mailNote.value = "";
   mailEmpty.value = false;
+  mailPlainText.value = false;
   mailOpenMessage.value = null;
   mailBodyText.value = "";
   mailHtml.value = "";
@@ -323,6 +397,8 @@ async function openMail() {
   mailFilter.value = "all";
   mailKeyword.value = "";
   mailAppliedKeyword.value = "";
+  mailCacheCached.value = false;
+  mailCacheAt.value = "";
   resetMailList();
   const seq = ++mailSeq;
   mailBusy.value = true;
@@ -332,6 +408,7 @@ async function openMail() {
     mailAccounts.value = accounts;
     const next = accounts.find((account) => account.supported);
     if (next) await selectMailAccount(next, seq);
+    void refreshMailCounts();
   } catch (e) {
     if (seq === mailSeq) mailError.value = String(e);
   } finally {
@@ -355,7 +432,10 @@ async function selectMailAccount(account: MailAccount, seq = ++mailSeq) {
   } finally {
     if (seq === mailSeq) mailBusy.value = false;
   }
-  if (seq === mailSeq) await loadMail(seq);
+  if (seq !== mailSeq) return;
+  await loadMail(seq);
+  if (seq !== mailSeq) return;
+  warmMailBodies();
 }
 
 /** 筛选和关键词都交给服务器，覆盖整个文件夹而不只是已加载的一页。 */
@@ -363,16 +443,23 @@ async function loadMail(seq = ++mailSeq) {
   const entryId = mailAccountId.value;
   const folder = mailFolderName.value;
   resetMailList();
+  mailCacheCached.value = false;
+  mailCacheAt.value = "";
   if (!entryId || !folder) return;
   mailBusy.value = true;
   try {
-    const messages = await api.mailList(entryId, folder, {
-      filter: mailFilter.value,
-      keyword: mailAppliedKeyword.value,
-    });
+    // 缓存优先：可能先拿到本地缓存，随后后台刷新再返回一次，两次都照收。
+    const result = normalizeMailList(
+      await api.mailList(entryId, folder, {
+        filter: mailFilter.value,
+        keyword: mailAppliedKeyword.value,
+      }),
+    );
     if (seq !== mailSeq) return;
-    mailMessages.value = messages.slice().reverse();
-    mailEmpty.value = messages.length === 0;
+    mailMessages.value = result.messages.slice().reverse();
+    mailEmpty.value = result.messages.length === 0;
+    mailCacheCached.value = result.cached;
+    mailCacheAt.value = result.fetchedAt ?? "";
   } catch (e) {
     if (seq === mailSeq) mailError.value = String(e);
   } finally {
@@ -389,14 +476,19 @@ async function loadOlderMail() {
   mailMoreBusy.value = true;
   mailError.value = "";
   try {
-    const older = await api.mailList(entryId, folder, {
-      beforeUid: oldest,
-      filter: mailFilter.value,
-      keyword: mailAppliedKeyword.value,
-    });
+    const result = normalizeMailList(
+      await api.mailList(entryId, folder, {
+        beforeUid: oldest,
+        filter: mailFilter.value,
+        keyword: mailAppliedKeyword.value,
+      }),
+    );
     if (seq !== mailSeq) return;
     const seen = new Set(mailMessages.value.map((message) => message.uid));
-    mailMessages.value = [...mailMessages.value, ...older.filter((message) => !seen.has(message.uid)).reverse()];
+    const older = result.messages.filter((message) => !seen.has(message.uid)).reverse();
+    mailMessages.value = [...mailMessages.value, ...older];
+    mailCacheCached.value = result.cached && !older.length;
+    mailCacheAt.value = result.fetchedAt ?? mailCacheAt.value;
     if (!older.length) mailNote.value = "没有更早的邮件";
   } catch (e) {
     if (seq === mailSeq) mailError.value = String(e);
@@ -435,6 +527,24 @@ function clearMailSearch() {
   void loadMail();
 }
 
+/**
+ * 打开即本地记已读：列表行立刻变灰、未读数 -1，但不回写服务器（保持只读承诺）。
+ * mail_body(markSeen) 失败也忽略，界面不因此报错。
+ */
+function markMailSeenLocally(uid: number) {
+  const message = mailMessages.value.find((item) => item.uid === uid);
+  if (message === undefined || message.seen) return;
+  message.seen = true;
+  const counts = mailRoleCounts.value;
+  const role = mailRole.value === "other" ? null : mailRole.value;
+  if (counts !== null && role !== null && role in counts) {
+    const key = role as keyof MailUnreadByRole;
+    counts[key] = Math.max(0, (counts[key] ?? 0) - 1);
+  }
+  const folder = mailFolders.value.find((item) => item.role === mailRole.value);
+  if (folder !== undefined && (folder.unread ?? 0) > 0) folder.unread -= 1;
+}
+
 async function openMailMessage(message: MailMessage) {
   const entryId = mailAccountId.value;
   const folder = mailFolderName.value;
@@ -447,11 +557,13 @@ async function openMailMessage(message: MailMessage) {
   mailImagesAllowed.value = false;
   mailTruncated.value = false;
   mailAttachments.value = [];
+  mailPlainText.value = false;
   mailBodyBusy.value = true;
   mailError.value = "";
+  markMailSeenLocally(message.uid);
   try {
     const [bodyResult, attachmentResult] = await Promise.allSettled([
-      api.mailBody(entryId, message.uid, folder),
+      api.mailBody(entryId, message.uid, folder, { markSeen: true }),
       api.mailAttachments(entryId, message.uid, folder),
     ]);
     if (seq !== mailBodySeq) return;
@@ -479,6 +591,18 @@ function closeMailMessage() {
   mailBodySeq += 1;
   mailOpenMessage.value = null;
   mailBodyBusy.value = false;
+  mailPlainText.value = false;
+}
+
+/** 正文工具栏：小/标准/大循环，只影响显示，不改 iframe 文档内容。 */
+function cycleMailFont() {
+  mailFontId.value = nextMailFontScale(mailFontId.value);
+}
+
+/** 「HTML / 纯文本」切换；没有 HTML 正文时按钮不出现。 */
+function toggleMailPlainText() {
+  if (!mailCanShowHtml.value) return;
+  mailPlainText.value = !mailPlainText.value;
 }
 
 function showMailImages() {
@@ -515,12 +639,14 @@ function formatMailSize(size: number | null): string {
   return `${(size / 1024 / 1024).toFixed(1)} MB`;
 }
 
-/** `Wed, 12 Nov 2026 09:12:00 +0800` -> `11-12 09:12`。 */
+/** 列表行时间：今天 HH:mm、昨天「昨天」、7 天内周X、更早 YYYY-MM-DD。 */
 function formatMailDate(raw: string): string {
-  const parsed = new Date(raw);
-  if (Number.isNaN(parsed.getTime())) return raw;
-  const pad = (value: number) => String(value).padStart(2, "0");
-  return `${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())} ${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`;
+  return formatMailRelativeTime(raw);
+}
+
+/** 正文页完整时间：`2026-11-12 09:12`。 */
+function formatMailWhen(raw: string): string {
+  return formatMailFullTime(raw);
 }
 
 const DOMAIN = "com.sealbox.mobile";
@@ -1117,6 +1243,18 @@ async function saveSync(run: boolean) {
 
 onMounted(async () => {
   await refreshStatus();
+  // 后台收取完成后的事件：只刷未读数，列表由用户自己下拉/重进刷新，避免打断阅读。
+  await listen("mail-synced", () => {
+    if (page.value !== "mail") return;
+    void refreshMailCounts();
+  });
+  // 单文件夹后台刷新完成：只更新缓存时间戳，不重排正在读的列表。
+  await listen<{ entryId?: string; folder?: string; bodies?: number }>("mail-page-refreshed", (event) => {
+    if (page.value !== "mail") return;
+    if (event.payload?.entryId !== mailAccountId.value) return;
+    mailCacheCached.value = false;
+    mailCacheAt.value = new Date().toISOString();
+  });
   await listen<{ ok: boolean; error: string | null; report: SyncReport | null }>(
     "sync-finished",
     async (event) => {
@@ -1395,7 +1533,7 @@ onMounted(async () => {
                 :class="{ on: mailRole === entry.role }"
                 @click="chooseMailRole(entry.role)"
               >
-                {{ entry.label }}<template v-if="entry.role === 'inbox' && mailCurrentAccount"> {{ mailFolders.find((folder) => folder.role === 'inbox')?.unread || '' }}</template>
+                {{ entry.label }}<template v-if="mailRoleUnread(entry.role)"> {{ formatMailBadge(mailRoleUnread(entry.role)) }}</template>
               </button>
             </div>
             <div v-if="mailOtherFolders.length" class="chips">
@@ -1406,7 +1544,7 @@ onMounted(async () => {
                 :class="{ on: mailRole === 'other' && mailOtherFolder === folder.name }"
                 @click="chooseMailOtherFolder(folder.name)"
               >
-                {{ folder.name }}
+                {{ folder.name }}<template v-if="folder.unread"> {{ formatMailBadge(folder.unread) }}</template>
               </button>
             </div>
             <div class="chips">
@@ -1425,22 +1563,32 @@ onMounted(async () => {
               <button class="ghost" type="button" @click="submitMailSearch">搜索</button>
               <button v-if="mailAppliedKeyword" class="ghost" type="button" @click="clearMailSearch">清除</button>
             </div>
-            <p v-if="mailBusy" class="hint pad">正在读取…</p>
+            <p v-if="mailCacheLabel" class="hint pad mail-cache">{{ mailCacheLabel }}</p>
+            <p v-if="mailBusy && !mailMessages.length" class="hint pad">正在读取…</p>
             <p v-if="mailNote" class="hint pad">{{ mailNote }}</p>
             <p v-if="mailEmpty && !mailBusy" class="hint pad">
               {{ mailAppliedKeyword || mailFilter !== 'all' ? '没有符合条件的邮件' : '这个文件夹是空的' }}
             </p>
             <div class="scroll">
               <div class="list">
-                <button v-for="message in mailMessages" :key="message.uid" class="item" @click="openMailMessage(message)">
+                <button
+                  v-for="message in mailMessages"
+                  :key="message.uid"
+                  class="item mail-item"
+                  :class="{ unread: !message.seen, seen: message.seen }"
+                  @click="openMailMessage(message)"
+                >
                   <span class="letter" :style="{ background: message.seen ? '#c9ccd4' : '#5b5bd6' }">{{ (message.from || '?').slice(0, 1).toUpperCase() }}</span>
                   <span class="meta">
-                    <span class="name">{{ message.subject || '(无主题)' }}</span>
-                    <span class="line">{{ message.from }}</span>
-                    <span class="line">
-                      {{ formatMailDate(message.date) }}
-                      <template v-if="message.flagged"> · ★</template>
-                      <template v-if="message.hasAttachment"> · 有附件</template>
+                    <span class="mail-item-top">
+                      <span class="mail-item-from">{{ message.from || '(未知发件人)' }}</span>
+                      <span class="mail-item-when">{{ formatMailDate(message.date) }}</span>
+                    </span>
+                    <span class="name mail-item-subject">{{ message.subject || '(无主题)' }}</span>
+                    <span class="line mail-item-tags">
+                      <template v-if="message.flagged">★</template>
+                      <template v-if="message.hasAttachment">📎 有附件</template>
+                      <template v-if="message.preview">{{ message.preview }}</template>
                     </span>
                   </span>
                 </button>
@@ -1455,7 +1603,20 @@ onMounted(async () => {
         <div v-else class="scroll">
           <div class="pad">
             <p v-if="mailError" class="error">{{ mailError }}</p>
-            <p class="hint">{{ mailOpenMessage?.from }} · {{ formatMailDate(mailOpenMessage?.date || '') }}</p>
+            <p class="hint">{{ mailOpenMessage?.from }} · {{ formatMailWhen(mailOpenMessage?.date || '') }}</p>
+            <div class="mail-tools" role="toolbar" aria-label="正文工具栏">
+              <button class="ghost mail-tool" type="button" @click="cycleMailFont">字号：{{ mailFont.label }}</button>
+              <button
+                v-if="mailCanShowHtml"
+                class="ghost mail-tool"
+                type="button"
+                :class="{ on: mailPlainText }"
+                :aria-pressed="mailPlainText"
+                @click="toggleMailPlainText"
+              >
+                {{ mailPlainText ? "HTML" : "纯文本" }}
+              </button>
+            </div>
             <p v-if="mailTruncated" class="hint">正文过长，已截断。</p>
             <template v-if="mailAttachments.length">
               <div class="lbl">附件</div>
@@ -1465,19 +1626,20 @@ onMounted(async () => {
                 <button class="ghost" type="button" :disabled="mailSavingPart === item.part" @click="saveMailAttachment(item)">保存</button>
               </div>
             </template>
-            <div v-if="mailHtml && mailRemoteImages && !mailImagesAllowed" class="set">
+            <div v-if="mailShowHtml && mailRemoteImages && !mailImagesAllowed" class="set">
               <span class="t">远程图片已屏蔽，避免发件人通过追踪像素得知你已读。</span>
               <button class="ghost" type="button" @click="showMailImages">显示图片</button>
             </div>
             <iframe
-              v-if="mailHtml"
+              v-if="mailShowHtml"
               class="mail-frame"
+              :style="mailFrameStyle"
               :srcdoc="mailHtml"
               sandbox="allow-same-origin"
               referrerpolicy="no-referrer"
               title="邮件正文"
             />
-            <pre v-else-if="mailBodyText" class="mail-text">{{ mailBodyText }}</pre>
+            <pre v-else-if="mailBodyText" class="mail-text" :style="mailTextStyle">{{ mailBodyText }}</pre>
             <p v-else-if="mailBodyBusy" class="hint">正在读取正文…</p>
             <p v-else class="hint">这封邮件没有可显示的正文。</p>
           </div>

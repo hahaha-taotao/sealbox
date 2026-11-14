@@ -1062,7 +1062,31 @@ pub struct MailBodyRequest {
     pub uid: u32,
     #[serde(default)]
     pub folder: Option<String>,
+    /// Record the read in the local cache once the body is served. Defaults to true, and never
+    /// reaches the server: the folder is opened read-only and the body is fetched `BODY.PEEK`.
+    #[serde(default = "mail_mark_seen_default")]
+    pub mark_seen: bool,
 }
+
+/// Defaults to `true`: reading a message marks it read locally, as the reader always has.
+fn mail_mark_seen_default() -> bool {
+    true
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailPrefetchRequest {
+    pub entry_id: String,
+    #[serde(default)]
+    pub folder: Option<String>,
+    /// Capped at [`MAIL_PREFETCH_LIMIT`]; omitted uses that same cap.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// How many bodies one prefetch pass may fetch. Eight keeps a pass short enough that the phone
+/// stays responsive while it runs.
+const MAIL_PREFETCH_LIMIT: u32 = 8;
 
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1110,6 +1134,16 @@ pub struct MailProbeReport {
     pub port: u16,
     pub folders: Vec<sealbox_core::mail::MailFolder>,
     pub unread: u32,
+}
+
+/// A page of a folder as the reader receives it. `cached` means the rows came from the local
+/// store, `fetchedAt` is the newest cache write (ISO-8601) or `null` for a live page.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailListResult {
+    pub messages: Vec<sealbox_core::mail::MailMessage>,
+    pub cached: bool,
+    pub fetched_at: Option<String>,
 }
 
 /// A resolved mailbox. The IMAP host always comes from the vault entry, never from the request.
@@ -1167,6 +1201,19 @@ fn load_mail_session(state: &AppState, id: &str) -> Result<MailSession, String> 
     mail_session_from(&payload, id, &title).ok_or_else(|| "不是邮箱账号".to_string())
 }
 
+/// The same resolution for callers that already hold a session guard: the background prefetch
+/// takes the lock itself, so it cannot borrow the `State` version without deadlocking on it.
+fn load_mail_session_with(vault: &Vault, dek: &[u8; 32], id: &str) -> Result<MailSession, String> {
+    let payload = vault.get_active_secret(dek, id).map_err(map_err)?;
+    let title = vault
+        .list_entries(&sealbox_core::vault::ListFilter::default())
+        .ok()
+        .and_then(|entries| entries.into_iter().find(|entry| entry.id == id))
+        .map(|entry| entry.title)
+        .unwrap_or_default();
+    mail_session_from(&payload, id, &title).ok_or_else(|| "不是邮箱账号".to_string())
+}
+
 fn mail_connect(session: &MailSession) -> Result<sealbox_core::mail::TlsImap, String> {
     if !session.account.supported {
         return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
@@ -1187,6 +1234,19 @@ fn folder_or_inbox(folder: &Option<String>) -> String {
         Some(name) if !name.is_empty() => name.to_string(),
         _ => "INBOX".to_string(),
     }
+}
+
+/// A folder's live unread count, or 0 when the store cannot answer (locked vault).
+fn vault_mail_folder_unread(
+    session: &std::sync::MutexGuard<'_, Session>,
+    entry_id: &str,
+    folder: &str,
+) -> u32 {
+    session
+        .vault()
+        .ok()
+        .and_then(|vault| vault.mail_folder_unread(entry_id, folder).ok())
+        .unwrap_or(0)
 }
 
 fn static_role(role: &str) -> &'static str {
@@ -1242,9 +1302,11 @@ pub fn mail_folders(
                 .into_iter()
                 .map(|folder| sealbox_core::mail::MailFolder {
                     display: sealbox_core::mail_folder::role_display(&folder.role),
+                    // Live count, not the stored snapshot: a folder listed before any sync has no
+                    // snapshot, and a snapshot the user cannot act on is worse than a live count.
+                    unread: vault_mail_folder_unread(&session, &request.entry_id, &folder.name),
                     name: folder.name,
                     role: static_role(&folder.role),
-                    unread: folder.unread,
                 })
                 .collect());
         }
@@ -1256,26 +1318,57 @@ pub fn mail_folders(
         let session = lock_session(&state.session);
         let vault = session.vault().map_err(map_err)?;
         vault.mail_save_folders(&request.entry_id, &folders).map_err(map_err)?;
-        let counts = vault.mail_cached_folders(&request.entry_id).map_err(map_err)?;
+        // Every number comes from the live local count, so the folder row, the badge and the
+        // list always agree.
         for folder in folders.iter_mut() {
-            folder.unread = counts
-                .iter()
-                .find(|cached| cached.name == folder.name)
-                .map(|cached| cached.unread)
-                .unwrap_or(0);
+            folder.unread = vault.mail_folder_unread(&request.entry_id, &folder.name).unwrap_or(0);
         }
     }
     mail_audit(&state, "mail_folders", &request.entry_id, "");
     Ok(folders)
 }
 
+/// One page of a folder, cache first: a folder that has been opened before is served from
+/// SQLite without touching TLS, and only an empty cache pays for a round trip. There is no
+/// background refresher on Android (a phone may be on a metered link), so `mail_sync` is the
+/// caller's way to pull new mail.
 #[tauri::command]
-pub fn mail_list(state: State<AppState>, request: MailListRequest) -> Result<Vec<sealbox_core::mail::MailMessage>, String> {
-    let mail = load_mail_session(&state, &request.entry_id)?;
+pub fn mail_list(state: State<AppState>, request: MailListRequest) -> Result<MailListResult, String> {
     let folder = folder_or_inbox(&request.folder);
     let filter = sealbox_core::mail_folder::MailFilter::parse(request.filter.as_deref().unwrap_or(""))
         .ok_or_else(|| "未知的筛选条件".to_string())?;
+    let local_filter = sealbox_core::mail_store::LocalFilter::parse(filter.as_str())
+        .ok_or_else(|| "未知的筛选条件".to_string())?;
     let keyword = request.keyword.clone().unwrap_or_default();
+    {
+        let mut session = lock_session(&state.session);
+        session.require_unlocked().map_err(map_err)?;
+        let cached = session
+            .vault()
+            .map_err(map_err)?
+            .mail_list_local(
+                &request.entry_id,
+                &folder,
+                request.before_uid,
+                50,
+                local_filter,
+                &keyword,
+            )
+            .map_err(map_err)?;
+        if !cached.is_empty() {
+            let fetched_at = session
+                .vault()
+                .map_err(map_err)?
+                .mail_page_fetched_at(&request.entry_id, &folder)
+                .map_err(map_err)?;
+            return Ok(MailListResult {
+                messages: cached.into_iter().map(cached_to_message).collect(),
+                cached: true,
+                fetched_at,
+            });
+        }
+    }
+    let mail = load_mail_session(&state, &request.entry_id)?;
     let mut io = mail_connect(&mail)?;
     let messages = sealbox_core::mail::list_folder(
         &mut io,
@@ -1288,6 +1381,10 @@ pub fn mail_list(state: State<AppState>, request: MailListRequest) -> Result<Vec
         &keyword,
     )
     .map_err(sealbox_core::mail::failure_message)?;
+    // Nothing to store, but the answer is still live: the server just said this page is empty.
+    if messages.is_empty() {
+        return Ok(MailListResult { messages, cached: false, fetched_at: None });
+    }
     {
         let session = lock_session(&state.session);
         let vault = session.vault().map_err(map_err)?;
@@ -1297,7 +1394,23 @@ pub fn mail_list(state: State<AppState>, request: MailListRequest) -> Result<Vec
             .map_err(map_err)?;
     }
     mail_audit(&state, "mail_list", &request.entry_id, "");
-    Ok(messages)
+    Ok(MailListResult { messages, cached: false, fetched_at: None })
+}
+
+/// A cached row as the reader expects it: merged read state plus the teaser the cache already
+/// holds. The teaser is the only thing a live page cannot supply, so it is the only thing a
+/// cached page adds.
+fn cached_to_message(cached: sealbox_core::mail_store::CachedMessage) -> sealbox_core::mail::MailMessage {
+    sealbox_core::mail::MailMessage {
+        uid: cached.uid,
+        from: cached.from,
+        subject: cached.subject,
+        date: cached.date,
+        has_attachment: cached.has_attachment,
+        seen: cached.seen,
+        flagged: cached.flagged,
+        preview: sealbox_core::mail_store::clamp_preview(&cached.preview),
+    }
 }
 
 #[tauri::command]
@@ -1310,6 +1423,9 @@ pub fn mail_body(state: State<AppState>, request: MailBodyRequest) -> Result<sea
                 .mail_cached_body(&request.entry_id, &folder, request.uid)
                 .map_err(map_err)?
             {
+                if request.mark_seen {
+                    let _ = vault.mail_mark_local_seen(&request.entry_id, &folder, request.uid);
+                }
                 return Ok(body);
             }
         }
@@ -1322,10 +1438,110 @@ pub fn mail_body(state: State<AppState>, request: MailBodyRequest) -> Result<sea
         let session = lock_session(&state.session);
         if let Ok(vault) = session.vault() {
             let _ = vault.mail_save_body(&request.entry_id, &folder, request.uid, &body);
+            if request.mark_seen {
+                let _ = vault.mail_mark_local_seen(&request.entry_id, &folder, request.uid);
+            }
         }
     }
     mail_audit(&state, "mail_body", &request.entry_id, "");
     Ok(body)
+}
+
+/// Warms the body cache for the newest messages of a folder that have none yet.
+///
+/// Returns immediately and does the work on a background thread: this is fired on entering the
+/// reader, and a pass over eight large messages would otherwise keep grabbing the session lock
+/// while the phone is trying to render. The worker builds its own IMAP connection and only takes
+/// the lock to read candidates and to store each body — never across a network round trip.
+///
+/// The count cannot be known before the pass runs, so the return value is the number of passes
+/// *accepted*: 1 when this call queued one, 0 when one for the same account+folder was already
+/// running. There is no event channel to report the body count on Android, so the result is not
+/// surfaced; the reader simply finds the bodies already cached.
+///
+/// Read-only towards the mailbox: `BODY.PEEK` and a read-only folder, cache writes only.
+#[tauri::command]
+pub fn mail_prefetch(state: State<AppState>, request: MailPrefetchRequest) -> Result<u32, String> {
+    let folder = folder_or_inbox(&request.folder);
+    let limit = request.limit.unwrap_or(MAIL_PREFETCH_LIMIT).clamp(1, MAIL_PREFETCH_LIMIT) as usize;
+    let key = format!("prefetch:{}:{}", request.entry_id, folder);
+    if !mail_prefetch_lock().acquire(&key) {
+        return Ok(0);
+    }
+    let session = Arc::clone(&state.session);
+    let entry_id = request.entry_id.clone();
+    std::thread::spawn(move || {
+        let run = || -> Result<(), String> {
+            let candidates = {
+                let mut guard = session.lock().unwrap_or_else(|poison| poison.into_inner());
+                guard.require_unlocked().map_err(map_err)?;
+                guard
+                    .vault()
+                    .map_err(map_err)?
+                    .mail_prefetch_candidates(&entry_id, &folder, limit)
+                    .map_err(map_err)?
+            };
+            if candidates.is_empty() {
+                return Ok(());
+            }
+            let mail = {
+                let mut guard = session.lock().unwrap_or_else(|poison| poison.into_inner());
+                guard.require_unlocked().map_err(map_err)?;
+                let dek = *guard.dek().map_err(map_err)?;
+                let vault = guard.vault().map_err(map_err)?;
+                load_mail_session_with(vault, &dek, &entry_id)?
+            };
+            let mut io = mail_connect(&mail)?;
+            for uid in candidates {
+                // One unreachable message must not abort the rest of the pass.
+                let Ok(body) =
+                    sealbox_core::mail::fetch_body_in(&mut io, &mail.email, &mail.secret, &folder, uid)
+                else {
+                    continue;
+                };
+                let guard = session.lock().unwrap_or_else(|poison| poison.into_inner());
+                let Ok(vault) = guard.vault() else { continue };
+                let _ = vault.mail_save_body(&entry_id, &folder, uid, &body);
+            }
+            Ok(())
+        };
+        let _ = run();
+        mail_prefetch_lock().release(&key);
+    });
+    Ok(1)
+}
+
+/// One prefetch pass per account+folder at a time; repeated calls are folded into the running
+/// pass instead of queueing more network work.
+fn mail_prefetch_lock() -> &'static MailPrefetchLock {
+    static LOCK: std::sync::OnceLock<MailPrefetchLock> = std::sync::OnceLock::new();
+    LOCK.get_or_init(MailPrefetchLock::default)
+}
+
+#[derive(Default)]
+struct MailPrefetchLock {
+    busy: Mutex<std::collections::HashSet<String>>,
+}
+
+impl MailPrefetchLock {
+    /// `true` when the caller now owns the key and must release it.
+    fn acquire(&self, key: &str) -> bool {
+        let mut busy = self.busy.lock().unwrap_or_else(|poison| poison.into_inner());
+        busy.insert(key.to_string())
+    }
+
+    fn release(&self, key: &str) {
+        let mut busy = self.busy.lock().unwrap_or_else(|poison| poison.into_inner());
+        busy.remove(key);
+    }
+}
+
+/// Unread per role from the local cache, so every folder number and the badge agree.
+#[tauri::command]
+pub fn mail_unread_by_role(state: State<AppState>) -> Result<sealbox_core::mail_store::UnreadByRole, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    session.vault().map_err(map_err)?.mail_unread_by_role().map_err(map_err)
 }
 
 #[tauri::command]
@@ -1413,40 +1629,76 @@ pub fn mail_unread_count(state: State<AppState>) -> Result<u32, String> {
     session.vault().map_err(map_err)?.mail_badge_unread().map_err(map_err)
 }
 
+/// How many cached messages a badge folder keeps after a sync: enough for weeks of scrolling
+/// without growing the phone's database without bound.
+const MAIL_SYNC_KEEP: usize = 300;
+
 /// Pulls the newest page of the badge folders for every account so the mobile list can show
 /// cached mail without a live connection. There is no background poller on Android; this runs
 /// only when the page asks for it.
+///
+/// Failures are per folder, mirroring the desktop: a folder that fails is skipped and the rest
+/// still sync, so one broken mailbox does not cost the others their new mail. The function only
+/// fails when the store itself cannot be reached at all.
 #[tauri::command]
 pub fn mail_sync(state: State<AppState>) -> Result<u32, String> {
     let accounts = mail_accounts(state.clone())?;
     for account in accounts.iter().filter(|account| account.supported) {
+        // An unreachable account is reported by the badge command, not by aborting the loop.
         let Ok(mail) = load_mail_session(&state, &account.id) else { continue };
         let Ok(mut io) = mail_connect(&mail) else { continue };
-        let Ok(folders) = sealbox_core::mail::list_folders(&mut io, &mail.email, &mail.secret) else { continue };
+        let Ok(folders) = sealbox_core::mail::list_folders(&mut io, &mail.email, &mail.secret) else {
+            continue;
+        };
         for folder in folders.iter().filter(|folder| matches!(folder.role, "inbox" | "archive")) {
-            let Ok(messages) = sealbox_core::mail::list_folder(
-                &mut io,
-                &mail.email,
-                &mail.secret,
-                &folder.name,
-                None,
-                50,
-                sealbox_core::mail_folder::MailFilter::All,
-                "",
-            ) else {
-                continue;
-            };
-            let unread = sealbox_core::mail::unread_count(&mut io, &mail.email, &mail.secret, &folder.name)
-                .unwrap_or(0);
-            let session = lock_session(&state.session);
-            let Ok(vault) = session.vault() else { continue };
-            let previews = vec![String::new(); messages.len()];
-            let _ = vault.mail_upsert_messages(&account.id, &folder.name, &messages, &previews);
-            let _ = vault.mail_save_folders_unread(&account.id, &folder.name, folder.role, unread);
+            let _ = sync_mail_folder(&state, &account.id, &mail, &mut io, folder);
         }
     }
+    // The badge is a convenience: a store that cannot answer falls back to 0 rather than failing
+    // a sync that already stored what it fetched.
     let session = lock_session(&state.session);
-    session.vault().map_err(map_err)?.mail_badge_unread().map_err(map_err)
+    Ok(session
+        .vault()
+        .ok()
+        .and_then(|vault| vault.mail_badge_unread().ok())
+        .unwrap_or(0))
+}
+
+/// One badge folder. Returns a fixed, credential-free reason on failure; the server's own reply
+/// never leaves this function, and neither does the authorization code.
+fn sync_mail_folder(
+    state: &AppState,
+    entry_id: &str,
+    mail: &MailSession,
+    io: &mut sealbox_core::mail::TlsImap,
+    folder: &sealbox_core::mail::MailFolder,
+) -> Result<(), String> {
+    let messages = sealbox_core::mail::list_folder(
+        io,
+        &mail.email,
+        &mail.secret,
+        &folder.name,
+        None,
+        50,
+        sealbox_core::mail_folder::MailFilter::All,
+        "",
+    )
+    // Mapped to a fixed sentence on purpose: `failure_message` is credential-free, but the point
+    // here is that nothing about the failure reaches the caller at all.
+    .map_err(|_| "部分文件夹同步失败".to_string())?;
+    let unread = sealbox_core::mail::unread_count(io, &mail.email, &mail.secret, &folder.name).unwrap_or(0);
+    let session = lock_session(&state.session);
+    let vault = session.vault().map_err(map_err)?;
+    let previews = vec![String::new(); messages.len()];
+    vault
+        .mail_upsert_messages(entry_id, &folder.name, &messages, &previews)
+        .map_err(map_err)?;
+    vault
+        .mail_save_folders_unread(entry_id, &folder.name, folder.role, unread)
+        .map_err(map_err)?;
+    // Cache only: the phone keeps the newest few hundred and the server keeps everything.
+    let _ = vault.mail_sweep_folder(entry_id, &folder.name, MAIL_SYNC_KEEP, &[]);
+    Ok(())
 }
 
 #[tauri::command]

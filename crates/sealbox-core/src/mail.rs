@@ -128,7 +128,7 @@ pub fn html_to_text(input: &str) -> String {
         .join("\n")
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MailMessage {
     pub uid: u32,
@@ -140,6 +140,14 @@ pub struct MailMessage {
     pub seen: bool,
     /// `\Flagged` (starred).
     pub flagged: bool,
+    /// The list-row teaser, when the body cache already knows one.
+    ///
+    /// A listing never carries it: deriving it would mean fetching every body, which is the one
+    /// thing this client must not do in bulk. It is filled from the cache when a page is served
+    /// from SQLite and stays empty on a live page, where the reader shows no teaser until the
+    /// message has been opened once.
+    #[serde(default)]
+    pub preview: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -596,6 +604,8 @@ fn message_from_fetch(items: &[Item]) -> Result<Option<MailMessage>, MailFailure
         has_attachment: body.is_some_and(has_attachment),
         seen: flags.0,
         flagged: flags.1,
+        // A live ENVELOPE/FETCH carries no body, so there is nothing to tease yet.
+        preview: String::new(),
     }))
 }
 
@@ -668,6 +678,16 @@ pub trait ImapIo {
 }
 
 const MAX_BODY_BYTES: usize = 200 * 1024;
+
+/// Every message this surface can produce. Sync reports one of these (or uses one directly), so a
+/// test can pin that no server reply and no credential can ever reach the caller through an error.
+pub const FAILURE_MESSAGES: [&str; 5] = [
+    "登录失败，请检查授权码和 IMAP 是否已开启",
+    "连接超时，请稍后重试",
+    "这封邮件没有可显示的文本",
+    "首版不支持",
+    "附件过大，已拒绝下载",
+];
 
 /// IMAP quoted string. CR, LF and NUL cannot appear in a quoted string, so callers reject them first.
 /// IMAP quoted string, exposed so sibling modules can build their own SEARCH terms through the
@@ -2733,6 +2753,25 @@ mod tests {
                 !forbidden_save_dir(std::path::Path::new(parent)),
                 "{parent} must stay allowed"
             );
+        }
+    }
+
+    #[test]
+    fn failure_messages_are_fixed_and_carry_nothing_sensitive() {
+        // A sync reports failures to the UI, so this is the boundary where a server reply or an
+        // authorization code must never cross. `failure_message` returns `&'static str`, which
+        // makes that structural rather than a convention — this test keeps it that way.
+        for failure in [
+            MailFailure::Login,
+            MailFailure::Timeout,
+            MailFailure::Protocol,
+            MailFailure::EmptyText,
+            MailFailure::Unsupported,
+            MailFailure::TooLarge,
+        ] {
+            let message = failure_message(failure);
+            assert!(FAILURE_MESSAGES.contains(&message), "unexpected message: {message}");
+            assert!(!message.contains("A1 ") && !message.contains("LOGIN"), "{message}");
         }
     }
 }

@@ -2062,6 +2062,28 @@ pub struct MailBodyRequest {
     pub uid: u32,
     #[serde(default)]
     pub folder: Option<String>,
+    /// Record the read in the local cache once the body is served. Defaults to true so a caller
+    /// that predates this flag still gets the reader's behaviour. It never reaches the server.
+    #[serde(default = "mail_mark_seen_default")]
+    pub mark_seen: bool,
+}
+
+/// Defaults to `true`: reading a message marks it read locally, as the reader always has.
+fn mail_mark_seen_default() -> bool {
+    true
+}
+
+/// A page of a folder as the reader receives it.
+///
+/// `cached` says the rows came straight from the local store and a refresh may still be on its
+/// way, so the UI can label the page instead of pretending it is live. `fetched_at` is the newest
+/// cache write for the page, or `null` when the page came from the server just now.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailListResult {
+    pub messages: Vec<sealbox_core::mail::MailMessage>,
+    pub cached: bool,
+    pub fetched_at: Option<String>,
 }
 
 /// A resolved mailbox: the address and credential plus the server they belong to. Resolved once
@@ -2134,6 +2156,24 @@ fn load_mail_session(state: &AppState, id: &str) -> Result<MailSession, String> 
     mail_session_from(&payload, id, &title).ok_or_else(|| "不是邮箱账号".to_string())
 }
 
+/// The same resolution for callers that already hold a session guard: the background refresh
+/// takes the lock itself, so it cannot borrow the `State` version without deadlocking on it.
+fn load_mail_session_with(
+    vault: &Vault,
+    dek: &[u8; 32],
+    id: &str,
+) -> Result<MailSession, String> {
+    let payload = vault.get_active_secret(dek, id).map_err(map_err)?;
+    let title = vault
+        .list_entries(&crate::vault::ListFilter::default())
+        .map_err(map_err)?
+        .into_iter()
+        .find(|entry| entry.id == id)
+        .map(|entry| entry.title)
+        .unwrap_or_default();
+    mail_session_from(&payload, id, &title).ok_or_else(|| "不是邮箱账号".to_string())
+}
+
 fn mail_connect(session: &MailSession) -> Result<sealbox_core::mail::TlsImap, String> {
     if !session.account.supported {
         return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
@@ -2196,15 +2236,8 @@ pub fn mail_folders(
             .mail_cached_folders(&request.entry_id)
             .map_err(map_err)?;
         if !cached.is_empty() {
-            return Ok(cached
-                .into_iter()
-                .map(|folder| sealbox_core::mail::MailFolder {
-                    display: sealbox_core::mail_folder::role_display(&folder.role),
-                    name: folder.name,
-                    role: static_role(&folder.role),
-                    unread: folder.unread,
-                })
-                .collect());
+            let roles = vault_cached_roles(&session, &request.entry_id);
+            return Ok(folders_with_live_unread(&session, &request.entry_id, cached, &roles));
         }
     }
     let mut io = mail_connect(&mail)?;
@@ -2216,19 +2249,51 @@ pub fn mail_folders(
         vault
             .mail_save_folders(&request.entry_id, &folders)
             .map_err(map_err)?;
-        // Discovery itself carries no counts, so fill them from whatever the cache already knows.
-        // The badge and the per-folder numbers therefore stay populated across restarts.
-        let counts = vault.mail_cached_folders(&request.entry_id).map_err(map_err)?;
+        // Discovery carries no counts of its own, so every number comes from the live local
+        // count. That keeps the folder row, the badge and the list telling one story.
         for folder in folders.iter_mut() {
-            folder.unread = counts
-                .iter()
-                .find(|cached| cached.name == folder.name)
-                .map(|cached| cached.unread)
+            folder.unread = vault
+                .mail_folder_unread(&request.entry_id, &folder.name)
                 .unwrap_or(0);
         }
     }
     mail_audit(&state, "mail_folders", &request.entry_id, "");
     Ok(folders)
+}
+
+/// The role each cached folder belongs to, so a live unread count can be filed correctly.
+fn vault_cached_roles(
+    session: &std::sync::MutexGuard<'_, Session>,
+    entry_id: &str,
+) -> Vec<(String, String)> {
+    session
+        .vault()
+        .ok()
+        .and_then(|vault| vault.mail_cached_folder_roles(entry_id).ok())
+        .unwrap_or_default()
+}
+
+/// Cached folders with the live unread count substituted for the stored snapshot. A folder whose
+/// messages were cached without a folder row still gets counted, because the caller passes the
+/// rows it is about to render.
+fn folders_with_live_unread(
+    session: &std::sync::MutexGuard<'_, Session>,
+    entry_id: &str,
+    cached: Vec<sealbox_core::mail_store::CachedFolder>,
+    _roles: &[(String, String)],
+) -> Vec<sealbox_core::mail::MailFolder> {
+    let vault = session.vault().ok();
+    cached
+        .into_iter()
+        .map(|folder| sealbox_core::mail::MailFolder {
+            display: sealbox_core::mail_folder::role_display(&folder.role),
+            unread: vault
+                .and_then(|vault| vault.mail_folder_unread(entry_id, &folder.name).ok())
+                .unwrap_or(0),
+            name: folder.name,
+            role: static_role(&folder.role),
+        })
+        .collect()
 }
 
 /// Roles are a closed set, so the cached string can be mapped back to the static one.
@@ -2337,35 +2402,191 @@ pub fn mail_test(state: State<AppState>, request: MailProbeRequest) -> Result<Ma
     Ok(MailProbeReport { host, port, folders: probe.folders, unread: probe.unread })
 }
 
+/// One page of a folder, cache first.
+///
+/// Re-entering a folder is the single most common thing the reader does, so it must not wait on
+/// TLS. With rows cached, the page is painted from SQLite immediately and a background pass
+/// refreshes the newest server page; only a folder with nothing cached pays for a round trip on
+/// the calling thread.
 #[tauri::command]
-pub fn mail_list(state: State<AppState>, request: MailListRequest) -> Result<Vec<sealbox_core::mail::MailMessage>, String> {
-    let mail = load_mail_session(&state, &request.entry_id)?;
+pub fn mail_list(app: AppHandle, state: State<AppState>, request: MailListRequest) -> Result<MailListResult, String> {
     let folder = folder_or_inbox(&request.folder);
     let filter = sealbox_core::mail_folder::MailFilter::parse(request.filter.as_deref().unwrap_or(""))
         .ok_or_else(|| "未知的筛选条件".to_string())?;
+    let local_filter = sealbox_core::mail_store::LocalFilter::parse(filter.as_str())
+        .ok_or_else(|| "未知的筛选条件".to_string())?;
     let keyword = request.keyword.clone().unwrap_or_default();
-    let mut io = mail_connect(&mail)?;
-    let messages = sealbox_core::mail::list_folder(
-        &mut io,
-        &mail.email,
-        &mail.secret,
-        &folder,
-        request.before_uid,
-        50,
-        filter,
-        &keyword,
-    )
-    .map_err(sealbox_core::mail::failure_message)?;
+    {
+        let mut session = lock_session(&state.session);
+        session.require_unlocked().map_err(map_err)?;
+        let cached = session
+            .vault()
+            .map_err(map_err)?
+            .mail_list_local(
+                &request.entry_id,
+                &folder,
+                request.before_uid,
+                50,
+                local_filter,
+                &keyword,
+            )
+            .map_err(map_err)?;
+        if !cached.is_empty() {
+            let fetched_at = session
+                .vault()
+                .map_err(map_err)?
+                .mail_page_fetched_at(&request.entry_id, &folder)
+                .map_err(map_err)?;
+            drop(session);
+            start_mail_refresh(
+                app,
+                Arc::clone(&state.session),
+                request.entry_id.clone(),
+                folder.clone(),
+                filter,
+                keyword,
+            );
+            return Ok(MailListResult {
+                messages: cached.into_iter().map(cached_to_message).collect(),
+                cached: true,
+                fetched_at,
+            });
+        }
+    }
+    let messages = mail_fetch_page(&state, &request.entry_id, &folder, request.before_uid, filter, &keyword)?;
+    // Nothing to store, but the answer is still "live": the server just said this page is empty.
+    if messages.is_empty() {
+        return Ok(MailListResult { messages, cached: false, fetched_at: None });
+    }
     {
         let session = lock_session(&state.session);
         let vault = session.vault().map_err(map_err)?;
+        // A folder is normally created by a sync, but a listing has to work on its own: without
+        // a `mail_folders` row the folder is invisible to everything that enumerates folders, and
+        // its unread count has nowhere to live.
+        vault
+            .mail_ensure_folder(&request.entry_id, &folder)
+            .map_err(map_err)?;
         let previews = vec![String::new(); messages.len()];
         vault
             .mail_upsert_messages(&request.entry_id, &folder, &messages, &previews)
             .map_err(map_err)?;
     }
     mail_audit(&state, "mail_list", &request.entry_id, "");
-    Ok(messages)
+    Ok(MailListResult { messages, cached: false, fetched_at: None })
+}
+
+/// One server page of a folder, for the cold path of [`mail_list`]. The background refresh keeps
+/// its own copy so it can hold the session lock across the fetch.
+fn mail_fetch_page(
+    state: &AppState,
+    entry_id: &str,
+    folder: &str,
+    before_uid: Option<u32>,
+    filter: sealbox_core::mail_folder::MailFilter,
+    keyword: &str,
+) -> Result<Vec<sealbox_core::mail::MailMessage>, String> {
+    let mail = load_mail_session(state, entry_id)?;
+    let mut io = mail_connect(&mail)?;
+    let page = sealbox_core::mail::list_folder(&mut io, &mail.email, &mail.secret, folder, before_uid, 50, filter, keyword)
+        .map_err(sealbox_core::mail::failure_message)?;
+    Ok(page)
+}
+
+/// A cached row as the reader expects it: merged read state plus the teaser the cache already
+/// holds. The teaser is the only thing a live page cannot supply, so it is the only thing a
+/// cached page adds.
+fn cached_to_message(cached: sealbox_core::mail_store::CachedMessage) -> sealbox_core::mail::MailMessage {
+    sealbox_core::mail::MailMessage {
+        uid: cached.uid,
+        from: cached.from,
+        subject: cached.subject,
+        date: cached.date,
+        has_attachment: cached.has_attachment,
+        seen: cached.seen,
+        flagged: cached.flagged,
+        preview: sealbox_core::mail_store::clamp_preview(&cached.preview),
+    }
+}
+
+/// Fire-and-forget refresh behind a cache hit. It owns nothing of the caller's, so a slow or
+/// offline server only costs a wasted thread — the page is already on screen.
+///
+/// Only page one is refreshed: scrolling back further is a deliberate act and gets its own cold
+/// path, and refreshing every page would turn scrolling into a mailbox download.
+fn start_mail_refresh(
+    app: AppHandle,
+    session: Arc<Mutex<Session>>,
+    entry_id: String,
+    folder: String,
+    filter: sealbox_core::mail_folder::MailFilter,
+    keyword: String,
+) {
+    if !mail_refresh_lock().acquire(&format!("list:{entry_id}:{folder}")) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let fold = || -> Result<(), String> {
+            let mut guard = session.lock().unwrap_or_else(|poison| poison.into_inner());
+            guard.require_unlocked().map_err(map_err)?;
+            let dek = *guard.dek().map_err(map_err)?;
+            let vault = guard.vault().map_err(map_err)?;
+            let mail = load_mail_session_with(vault, &dek, &entry_id)?;
+            let mut io = mail_connect(&mail)?;
+            let page = sealbox_core::mail::list_folder(
+                &mut io,
+                &mail.email,
+                &mail.secret,
+                &folder,
+                None,
+                50,
+                filter,
+                &keyword,
+            )
+            .map_err(sealbox_core::mail::failure_message)?;
+            // A live page never carries a teaser, so the cached one is preserved rather than
+            // overwritten with a blank.
+            let previews = vec![String::new(); page.len()];
+            vault.mail_upsert_messages(&entry_id, &folder, &page, &previews).map_err(map_err)?;
+            Ok(())
+        };
+        if fold().is_ok() {
+            // The store is now newer than the page already on screen, so the reader may re-read
+            // it. This is a separate event on purpose: `mail-synced` keeps the badge's payload
+            // (accounts/newCount/samples/unread) and is not touched by a folder refresh.
+            let _ = app.emit(
+                "mail-page-refreshed",
+                &serde_json::json!({ "entryId": entry_id, "folder": folder }),
+            );
+        }
+        mail_refresh_lock().release(&format!("list:{entry_id}:{folder}"));
+    });
+}
+
+/// De-duplicates concurrent background work so rapid folder switching does not pile up threads
+/// that all fetch the same thing.
+fn mail_refresh_lock() -> &'static MailRefreshLock {
+    static LOCK: std::sync::OnceLock<MailRefreshLock> = std::sync::OnceLock::new();
+    LOCK.get_or_init(MailRefreshLock::default)
+}
+
+#[derive(Default)]
+struct MailRefreshLock {
+    busy: Mutex<std::collections::HashSet<String>>,
+}
+
+impl MailRefreshLock {
+    /// `true` when the caller now owns the key and must release it.
+    fn acquire(&self, key: &str) -> bool {
+        let mut busy = self.busy.lock().unwrap_or_else(|poison| poison.into_inner());
+        // `insert` reports whether the key was absent, which is exactly "the caller owns it".
+        busy.insert(key.to_string())
+    }
+
+    fn release(&self, key: &str) {
+        let mut busy = self.busy.lock().unwrap_or_else(|poison| poison.into_inner());
+        busy.remove(key);
+    }
 }
 
 #[tauri::command]
@@ -2380,6 +2601,9 @@ pub fn mail_body(state: State<AppState>, request: MailBodyRequest) -> Result<sea
                 .mail_cached_body(&request.entry_id, &folder, request.uid)
                 .map_err(map_err)?
             {
+                if request.mark_seen {
+                    let _ = vault.mail_mark_local_seen(&request.entry_id, &folder, request.uid);
+                }
                 return Ok(body);
             }
         }
@@ -2392,10 +2616,132 @@ pub fn mail_body(state: State<AppState>, request: MailBodyRequest) -> Result<sea
         let session = lock_session(&state.session);
         if let Ok(vault) = session.vault() {
             let _ = vault.mail_save_body(&request.entry_id, &folder, request.uid, &body);
+            if request.mark_seen {
+                let _ = vault.mail_mark_local_seen(&request.entry_id, &folder, request.uid);
+            }
         }
     }
     mail_audit(&state, "mail_body", &request.entry_id, "");
     Ok(body)
+}
+
+/// Warms the body cache for the newest messages of a folder that have none yet.
+///
+/// The command returns immediately and the work happens on a background thread, because this is
+/// fired on entering the reader and a pass over eight large messages would otherwise hold the
+/// session lock in bursts while the user is trying to scroll. The worker builds its own IMAP
+/// connection, takes the session lock only to read candidates and to store each body, and never
+/// holds it across a network round trip.
+///
+/// The count of bodies cannot be known before the pass runs, so the return value is the number
+/// of passes *accepted*: 1 when this call queued a pass, 0 when one for the same account+folder
+/// was already in flight and this call was folded into it. The front end only uses the value to
+/// stay silent, and the number of bodies written arrives as `mail-page-refreshed`'s `bodies`.
+///
+/// Read-only towards the mailbox: `BODY.PEEK` and a read-only folder, cache writes only.
+#[tauri::command]
+pub fn mail_prefetch(app: AppHandle, state: State<AppState>, request: MailPrefetchRequest) -> Result<u32, String> {
+    let folder = folder_or_inbox(&request.folder);
+    let limit = request.limit.unwrap_or(MAIL_PREFETCH_LIMIT).clamp(1, MAIL_PREFETCH_LIMIT) as usize;
+    let queued = start_mail_prefetch(
+        app,
+        Arc::clone(&state.session),
+        request.entry_id,
+        folder,
+        limit,
+    );
+    Ok(u32::from(queued))
+}
+
+/// How many bodies one prefetch pass may fetch. Eight keeps a pass short enough that switching
+/// folders during it still feels instant.
+const MAIL_PREFETCH_LIMIT: u32 = 8;
+
+/// Queues one prefetch pass. One pass per account+folder at a time: repeated calls while a pass
+/// is running are dropped rather than queued, because the pass already covers the newest bodies.
+fn start_mail_prefetch(
+    app: AppHandle,
+    session: Arc<Mutex<Session>>,
+    entry_id: String,
+    folder: String,
+    limit: usize,
+) -> bool {
+    let key = format!("prefetch:{entry_id}:{folder}");
+    if !mail_refresh_lock().acquire(&key) {
+        return false;
+    }
+    std::thread::spawn(move || {
+        let run = || -> Result<u32, String> {
+            let candidates = {
+                let mut guard = session.lock().unwrap_or_else(|poison| poison.into_inner());
+                guard.require_unlocked().map_err(map_err)?;
+                guard
+                    .vault()
+                    .map_err(map_err)?
+                    .mail_prefetch_candidates(&entry_id, &folder, limit)
+                    .map_err(map_err)?
+            };
+            if candidates.is_empty() {
+                return Ok(0);
+            }
+            // The connection and the credential are resolved once, then the lock is released for
+            // the whole fetch loop.
+            let mail = {
+                let mut guard = session.lock().unwrap_or_else(|poison| poison.into_inner());
+                guard.require_unlocked().map_err(map_err)?;
+                let dek = *guard.dek().map_err(map_err)?;
+                let vault = guard.vault().map_err(map_err)?;
+                load_mail_session_with(vault, &dek, &entry_id)?
+            };
+            let mut io = mail_connect(&mail)?;
+            let mut written = 0u32;
+            for uid in candidates {
+                // One unreachable message must not abort the rest of the pass.
+                let Ok(body) =
+                    sealbox_core::mail::fetch_body_in(&mut io, &mail.email, &mail.secret, &folder, uid)
+                else {
+                    continue;
+                };
+                let guard = session.lock().unwrap_or_else(|poison| poison.into_inner());
+                let Ok(vault) = guard.vault() else { continue };
+                if vault.mail_save_body(&entry_id, &folder, uid, &body).is_ok() {
+                    written = written.saturating_add(1);
+                }
+            }
+            Ok(written)
+        };
+        if let Ok(written) = run() {
+            if written > 0 {
+                // The bodies are in the store now, so the reader may re-read the page.
+                let _ = app.emit(
+                    "mail-page-refreshed",
+                    &serde_json::json!({ "entryId": entry_id, "folder": folder, "bodies": written }),
+                );
+            }
+        }
+        mail_refresh_lock().release(&key);
+    });
+    true
+}
+
+/// Unread per role from the local cache, so every folder number and the sidebar badge come from
+/// one source. The badge itself stays scoped to inbox + archive (see [`mail_unread_count`]).
+#[tauri::command]
+pub fn mail_unread_by_role(state: State<AppState>) -> Result<sealbox_core::mail_store::UnreadByRole, String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    session.vault().map_err(map_err)?.mail_unread_by_role().map_err(map_err)
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailPrefetchRequest {
+    pub entry_id: String,
+    #[serde(default)]
+    pub folder: Option<String>,
+    /// Capped at [`MAIL_PREFETCH_LIMIT`]; omitted uses that same cap.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 #[tauri::command]
@@ -2445,7 +2791,15 @@ pub struct MailSyncAccount {
     pub new_count: usize,
     /// Up to two `sender · subject` lines, so the notification reads like an inbox.
     pub samples: Vec<String>,
+    /// True when anything about this account could not be synced. Partial successes still set it.
     pub failed: bool,
+    /// How many folders failed. A sync continues past a broken folder, so one failure is not the
+    /// same as an account that produced nothing.
+    #[serde(default)]
+    pub failed_folders: u32,
+    /// A fixed, credential-free reason for the first failure, for the log. `None` when clean.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Pulls the newest page of the two badge folders for every account and refreshes the unread
@@ -2467,21 +2821,37 @@ pub fn mail_sync_blocking(state: &AppState) -> Result<MailSyncReport, String> {
             new_count: 0,
             samples: Vec::new(),
             failed: false,
+            failed_folders: 0,
+            error: None,
         };
         match sync_account(state, &account.id, &mut entry) {
             Ok(()) => {}
-            Err(_) => entry.failed = true,
+            // The whole account is unreachable (login refused, TLS failed): one fixed sentence,
+            // never the server's own reply.
+            Err(_) => {
+                entry.failed = true;
+                entry.error = Some("账号同步失败".to_string());
+            }
+        }
+        if entry.failed_folders > 0 {
+            entry.failed = true;
         }
         report.accounts.push(entry);
     }
     let session = lock_session(&state.session);
+    // The badge is a convenience; a vault that cannot answer must not fail a sync that already
+    // wrote what it fetched. It falls back to 0 and the next poll fills it in.
     report.unread = session
         .vault()
-        .map_err(map_err)?
-        .mail_badge_unread()
-        .map_err(map_err)?;
+        .ok()
+        .and_then(|vault| vault.mail_badge_unread().ok())
+        .unwrap_or(0);
     Ok(report)
 }
+
+/// How many cached messages a badge folder keeps after a sync. Enough for weeks of scrolling
+/// without letting a mailbox nobody opens grow the local database without bound.
+const MAIL_SYNC_KEEP: usize = 300;
 
 /// One account: list its folders, then the newest page of each badge folder, then the unread
 /// counts. `MailListFilter` is not reused on purpose — this only ever needs the default page.
@@ -2490,48 +2860,82 @@ fn sync_account(state: &AppState, entry_id: &str, report: &mut MailSyncAccount) 
     let mut io = mail_connect(&mail)?;
     let folders = sealbox_core::mail::list_folders(&mut io, &mail.email, &mail.secret)
         .map_err(sealbox_core::mail::failure_message)?;
+    // One connection for the whole account: a per-folder reconnect would triple the handshakes.
     let mut io = mail_connect(&mail)?;
     for folder in folders.iter().filter(|folder| matches!(folder.role, "inbox" | "archive")) {
-        let known: Vec<u32> = {
-            let session = lock_session(&state.session);
-            let vault = session.vault().map_err(map_err)?;
-            vault
-                .mail_recent_messages(entry_id, &folder.name, None, 50)
-                .map_err(map_err)?
-                .into_iter()
-                .map(|cached| cached.uid)
-                .collect()
-        };
-        let messages = sealbox_core::mail::list_folder(
-            &mut io,
-            &mail.email,
-            &mail.secret,
-            &folder.name,
-            None,
-            50,
-            sealbox_core::mail_folder::MailFilter::All,
-            "",
-        )
-        .map_err(sealbox_core::mail::failure_message)?;
-        if folder.role == "inbox" {
-            for message in messages.iter().filter(|message| !known.contains(&message.uid)).take(2) {
-                report.samples.push(format!("{} · {}", message.from, message.subject));
+        // A folder that fails is recorded and skipped. Failing the whole account here would be
+        // wrong twice over: the folders already synced stay synced, and the user would lose the
+        // new-mail counts of folders that did work.
+        match sync_folder(state, entry_id, &mail, &mut io, folder, report) {
+            Ok(()) => {}
+            Err(reason) => {
+                report.failed_folders = report.failed_folders.saturating_add(1);
+                if report.error.is_none() {
+                    report.error = Some(reason);
+                }
             }
-            report.new_count += messages.iter().filter(|message| !known.contains(&message.uid)).count();
         }
-        let unread = sealbox_core::mail::unread_count(&mut io, &mail.email, &mail.secret, &folder.name)
-            .unwrap_or(0);
-        let session = lock_session(&state.session);
-        let vault = session.vault().map_err(map_err)?;
-        let previews = vec![String::new(); messages.len()];
-        vault
-            .mail_upsert_messages(entry_id, &folder.name, &messages, &previews)
-            .map_err(map_err)?;
-        vault
-            .mail_save_folders_unread(entry_id, &folder.name, &folder.role, unread)
-            .map_err(map_err)?;
     }
     mail_audit(state, "mail_sync", entry_id, "");
+    // Partial success is still success for the caller; `failed` carries the detail.
+    Ok(())
+}
+
+/// One badge folder. Returns a fixed, credential-free reason on failure — the server's own reply
+/// never leaves this function, and neither does the authorization code.
+fn sync_folder(
+    state: &AppState,
+    entry_id: &str,
+    mail: &MailSession,
+    io: &mut sealbox_core::mail::TlsImap,
+    folder: &sealbox_core::mail::MailFolder,
+    report: &mut MailSyncAccount,
+) -> Result<(), String> {
+    const FOLDER_FAILED: &str = "部分文件夹同步失败";
+    let known: Vec<u32> = {
+        let session = lock_session(&state.session);
+        let vault = session.vault().map_err(map_err)?;
+        vault
+            .mail_recent_messages(entry_id, &folder.name, None, 50)
+            .map_err(map_err)?
+            .into_iter()
+            .map(|cached| cached.uid)
+            .collect()
+    };
+    let messages = sealbox_core::mail::list_folder(
+        io,
+        &mail.email,
+        &mail.secret,
+        &folder.name,
+        None,
+        50,
+        sealbox_core::mail_folder::MailFilter::All,
+        "",
+    )
+    // The IMAP failure is mapped to a fixed sentence: `failure_message` never echoes the server.
+    .map_err(|failure| {
+        let _ = failure;
+        FOLDER_FAILED.to_string()
+    })?;
+    if folder.role == "inbox" {
+        for message in messages.iter().filter(|message| !known.contains(&message.uid)).take(2) {
+            report.samples.push(format!("{} · {}", message.from, message.subject));
+        }
+        report.new_count += messages.iter().filter(|message| !known.contains(&message.uid)).count();
+    }
+    let unread = sealbox_core::mail::unread_count(io, &mail.email, &mail.secret, &folder.name).unwrap_or(0);
+    let session = lock_session(&state.session);
+    let vault = session.vault().map_err(map_err)?;
+    let previews = vec![String::new(); messages.len()];
+    vault
+        .mail_upsert_messages(entry_id, &folder.name, &messages, &previews)
+        .map_err(map_err)?;
+    vault
+        .mail_save_folders_unread(entry_id, &folder.name, folder.role, unread)
+        .map_err(map_err)?;
+    // Trim what is no longer worth keeping. The badge folders are the ones that grow without
+    // anyone opening them, so they are the ones capped. Cache only: the server keeps everything.
+    let _ = vault.mail_sweep_folder(entry_id, &folder.name, MAIL_SYNC_KEEP, &[]);
     Ok(())
 }
 

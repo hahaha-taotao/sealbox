@@ -175,6 +175,38 @@ export interface MailMessage {
   hasAttachment: boolean;
   seen: boolean;
   flagged: boolean;
+  /** 缓存里的正文摘要，只有本地缓存会填。 */
+  preview?: string;
+}
+
+/** 各角色未读数，统一口径；侧栏角标只算 inbox + archive。 */
+export interface MailUnreadByRole {
+  inbox: number;
+  archive: number;
+  sent: number;
+  drafts: number;
+  trash: number;
+  other: number;
+}
+
+/** `cached` 表示这次列表直接来自本地缓存，`fetchedAt` 是缓存的更新时间（ISO-8601）。 */
+export interface MailListResult {
+  messages: MailMessage[];
+  cached: boolean;
+  fetchedAt: string | null;
+}
+
+/** `mail_list` 目前直接返回一排消息，缓存状态由后端补 `{ messages, cached, fetchedAt }`；两种都认。 */
+export type MailListPayload = MailMessage[] | MailListResult;
+
+export function normalizeMailList(payload: MailListPayload | null | undefined): MailListResult {
+  if (Array.isArray(payload)) return { messages: payload, cached: false, fetchedAt: null };
+  if (payload === null || typeof payload !== "object") return { messages: [], cached: false, fetchedAt: null };
+  return {
+    messages: Array.isArray(payload.messages) ? payload.messages : [],
+    cached: payload.cached === true,
+    fetchedAt: typeof payload.fetchedAt === "string" ? payload.fetchedAt : null,
+  };
 }
 
 export interface MailBody {
@@ -254,11 +286,18 @@ export const api = {
   syncNow: () => invoke<SyncReport>("sync_now"),
   mailAccounts: () => invoke<MailAccount[]>("mail_accounts"),
   mailFolders: (entryId: string, refresh = false) => invoke<MailFolder[]>("mail_folders", { request: { entryId, refresh } }),
+  /** 缓存优先：可能先返回本地缓存、随后后台刷新再返回一次。 */
   mailList: (entryId: string, folder: string, options: { beforeUid?: number; filter?: MailFilter; keyword?: string } = {}) =>
-    invoke<MailMessage[]>("mail_list", {
+    invoke<MailListPayload>("mail_list", {
       request: { entryId, folder, beforeUid: options.beforeUid ?? null, filter: options.filter ?? "all", keyword: options.keyword ?? "" },
     }),
-  mailBody: (entryId: string, uid: number, folder: string) => invoke<MailBody>("mail_body", { request: { entryId, uid, folder } }),
+  /** markSeen 只在本地记已读，不回写服务器。 */
+  mailBody: (entryId: string, uid: number, folder: string, options: { markSeen?: boolean } = {}) =>
+    invoke<MailBody>("mail_body", { request: { entryId, uid, folder, markSeen: options.markSeen === true } }),
+  /** 静默预热正文缓存，返回实际拉取的封数。 */
+  mailPrefetch: (entryId: string, folder: string, limit = 5) =>
+    invoke<number>("mail_prefetch", { request: { entryId, folder, limit } }),
+  mailUnreadByRole: () => invoke<MailUnreadByRole>("mail_unread_by_role"),
   mailAttachments: (entryId: string, uid: number, folder: string) =>
     invoke<MailAttachment[]>("mail_attachments", { request: { entryId, uid, folder } }),
   mailSaveAttachment: (entryId: string, uid: number, part: string, uri: string, folder: string) =>

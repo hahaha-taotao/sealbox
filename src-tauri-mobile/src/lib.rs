@@ -94,6 +94,8 @@ pub fn run() {
             commands::mail_test,
             commands::mail_sync,
             commands::mail_unread_count,
+            commands::mail_prefetch,
+            commands::mail_unread_by_role,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

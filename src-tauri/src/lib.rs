@@ -148,6 +148,8 @@ pub fn run() {
             commands::mail_test,
             commands::mail_sync,
             commands::mail_unread_count,
+            commands::mail_prefetch,
+            commands::mail_unread_by_role,
             commands::mail_search,
             commands::window_control,
             commands::confirm_payload,

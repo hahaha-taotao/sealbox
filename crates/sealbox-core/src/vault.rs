@@ -2360,6 +2360,114 @@ impl Vault {
         Ok(crate::mail_store::badge_unread(&self.conn)?)
     }
 
+    /// Unread per role, so a folder row and the sidebar badge share one local number.
+    pub fn mail_unread_by_role(&self) -> Result<crate::mail_store::UnreadByRole, VaultError> {
+        Ok(crate::mail_store::unread_by_role(&self.conn)?)
+    }
+
+    /// Live unread count of one folder, counted from the cached messages.
+    pub fn mail_folder_unread(&self, account_id: &str, folder: &str) -> Result<u32, VaultError> {
+        Ok(crate::mail_store::folder_unread_count(&self.conn, account_id, folder)?)
+    }
+
+    /// Role names for the folders an account has cached, so a live unread count can be filed
+    /// under the right role without guessing.
+    pub fn mail_cached_folder_roles(
+        &self,
+        account_id: &str,
+    ) -> Result<Vec<(String, String)>, VaultError> {
+        Ok(self
+            .mail_cached_folders(account_id)?
+            .into_iter()
+            .map(|folder| (folder.name, folder.role))
+            .collect())
+    }
+
+    /// Ensures a folder has a row even when only its messages were ever cached, so a folder the
+    /// user has opened is not invisible to anything that enumerates folders.
+    pub fn mail_ensure_folder(&self, account_id: &str, folder: &str) -> Result<(), VaultError> {
+        let role = crate::mail_folder::folder_role(folder);
+        crate::mail_store::save_folders(&self.conn, account_id, &[(folder.to_string(), role.to_string(), None)])?;
+        Ok(())
+    }
+
+    /// A page of one folder served entirely from the cache.
+    pub fn mail_list_local(
+        &self,
+        account_id: &str,
+        folder: &str,
+        before: Option<u32>,
+        limit: usize,
+        filter: crate::mail_store::LocalFilter,
+        keyword: &str,
+    ) -> Result<Vec<crate::mail_store::CachedMessage>, VaultError> {
+        Ok(crate::mail_store::list_local(
+            &self.conn, account_id, folder, before, limit, filter, keyword,
+        )?)
+    }
+
+    /// Every folder's newest cached rows, for a combined "all inboxes" view.
+    pub fn mail_cached_list_all(
+        &self,
+        account_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, crate::mail_store::CachedMessage)>, VaultError> {
+        Ok(crate::mail_store::cached_list_all(&self.conn, account_id, limit)?)
+    }
+
+    /// Records a read in the local cache only. The server is never told: every folder is opened
+    /// read-only and every body is fetched `BODY.PEEK`.
+    pub fn mail_mark_local_seen(&self, account_id: &str, folder: &str, uid: u32) -> Result<(), VaultError> {
+        crate::mail_store::set_local_seen(&self.conn, account_id, folder, uid)?;
+        Ok(())
+    }
+
+    pub fn mail_set_pinned(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uid: u32,
+        pinned: bool,
+    ) -> Result<(), VaultError> {
+        crate::mail_store::set_pinned(&self.conn, account_id, folder, uid, pinned)?;
+        Ok(())
+    }
+
+    /// Trims a folder's cache. Cached metadata and bodies only; the server is not touched.
+    pub fn mail_sweep_folder(
+        &self,
+        account_id: &str,
+        folder: &str,
+        keep: usize,
+        pindowns: &[u32],
+    ) -> Result<usize, VaultError> {
+        Ok(crate::mail_store::sweep(&self.conn, account_id, folder, keep, pindowns)?)
+    }
+
+    /// UIDs whose body is not cached yet, newest first.
+    pub fn mail_prefetch_candidates(
+        &self,
+        account_id: &str,
+        folder: &str,
+        limit: usize,
+    ) -> Result<Vec<u32>, VaultError> {
+        Ok(crate::mail_store::prefetch_candidates(&self.conn, account_id, folder, limit)?)
+    }
+
+    /// Newest cache write for a folder, so a cached page can be labelled with its age.
+    pub fn mail_page_fetched_at(&self, account_id: &str, folder: &str) -> Result<Option<String>, VaultError> {
+        Ok(crate::mail_store::folder_fetched_at(&self.conn, account_id, folder)?)
+    }
+
+    pub fn mail_body_state(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uid: u32,
+    ) -> Result<crate::mail_store::BodyState, VaultError> {
+        Ok(crate::mail_store::body_state(&self.conn, account_id, folder, uid)?)
+    }
+
     pub fn get_setting(&self, key: &str) -> Result<Option<String>, VaultError> {
         Ok(self
             .conn
