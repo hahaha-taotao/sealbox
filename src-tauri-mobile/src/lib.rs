@@ -67,6 +67,7 @@ pub fn run() {
             commands::sync_clear,
             commands::sync_now,
             commands::app_version,
+            commands::android_context_state,
             commands::check_mobile_update,
             commands::download_mobile_update,
             commands::install_mobile_update,

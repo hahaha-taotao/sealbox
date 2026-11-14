@@ -311,4 +311,6 @@ export const api = {
   checkUpdate: () => invoke<MobileRelease>("check_mobile_update"),
   downloadUpdate: (url: string) => invoke<UpdateDownload>("download_mobile_update", { url }),
   installUpdate: (path: string) => invoke("install_mobile_update", { path }),
+  /** 上下文桥状态：安装器、剪贴板、SAF 共用，用来把失败原因说到具体一步。 */
+  androidContextState: () => invoke<{ ready: boolean; detail: string }>("android_context_state"),
 };

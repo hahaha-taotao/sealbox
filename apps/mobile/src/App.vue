@@ -1121,7 +1121,13 @@ async function checkForUpdates(auto = false) {
     }
   } catch (caught) {
     updateStage.value = "error";
-    updateError.value = caught instanceof Error ? caught.message : String(caught);
+    const message = caught instanceof Error ? caught.message : String(caught);
+    // 「Android 上下文未就绪」是三种失败共用的一句话。问一下上下文桥具体卡在哪一步，
+    // 否则用户每次重试都只能看着同一行字猜。
+    const state = await api.androidContextState().catch(() => null);
+    updateError.value = state !== null && !state.ready && state.detail !== ""
+      ? `${message}（上下文桥：${state.detail}）`
+      : message;
     if (auto) {
       updateStage.value = "idle";
       updateError.value = "";

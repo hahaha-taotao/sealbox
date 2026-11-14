@@ -292,9 +292,24 @@ test("Android context bridge publishes the application context before commands c
   const kotlin = readFileSync(new URL("../src-tauri-mobile/android/MobileContext.kt", import.meta.url), "utf8");
   assert.match(kotlin, /@Keep\s+@TauriPlugin\s+class MobileContextPlugin/);
   assert.match(kotlin, /override fun load\(webView: WebView\)/);
-  assert.match(kotlin, /NdkContext\.publish\(activity\)/);
+  assert.match(kotlin, /NdkContext\.initializeQuietly\(activity\.applicationContext\)/);
   assert.match(kotlin, /System\.loadLibrary\("sealbox_mobile_lib"\)/);
   assert.match(kotlin, /@JvmStatic\s+external fun initialize\(context: Context\)/);
+});
+
+test("a ContentProvider publishes the context even when plugin load() never runs", () => {
+  const kotlin = readFileSync(new URL("../src-tauri-mobile/android/MobileContext.kt", import.meta.url), "utf8");
+  // The framework instantiates providers before Application.onCreate, so this path cannot be
+  // skipped by anything the app or Tauri does later.
+  assert.match(kotlin, /@Keep\s+class ContextBootstrapProvider\s*:\s*ContentProvider\(\)/);
+  assert.match(kotlin, /override fun onCreate\(\): Boolean\s*{[^}]*NdkContext\.initializeQuietly\(it\)/);
+  const manifest = patchManifest(
+    '<manifest>\n    <uses-permission android:name="android.permission.INTERNET" />\n    <application android:label="x">\n    </application>\n</manifest>',
+  );
+  assert.match(manifest, /android:name="com\.sealbox\.mobile\.ContextBootstrapProvider"/);
+  assert.match(manifest, /android:exported="false"/);
+  // Inside <application>, or the system never instantiates it.
+  assert.ok(manifest.indexOf("ContextBootstrapProvider") > manifest.indexOf("<application"));
 });
 
 test("Android context bridge cannot break plugin registration or poison the class", () => {
@@ -304,10 +319,9 @@ test("Android context bridge cannot break plugin registration or poison the clas
   assert.match(kotlin, /private fun ensureLoaded\(\): Boolean/);
   assert.match(kotlin, /try\s*\{\s*System\.loadLibrary/);
   // load() must not be able to throw: an escaping exception fails Tauri's plugin registration.
-  assert.match(kotlin, /fun publish\(activity: Activity\)\s*\{/);
+  assert.match(kotlin, /fun initializeQuietly\(context: Context\)\s*\{/);
   assert.match(kotlin, /if \(!ensureLoaded\(\)\) return/);
-  // Framework-driven second chance, independent of Tauri's plugin registration.
+  // Framework-driven extra chance, independent of Tauri's plugin registration.
   assert.match(kotlin, /registerActivityLifecycleCallbacks/);
-  assert.match(kotlin, /override fun onActivityCreated\(activity: Activity, savedInstanceState: Bundle\?\)/);
   assert.match(kotlin, /if \(watching\) return/);
 });

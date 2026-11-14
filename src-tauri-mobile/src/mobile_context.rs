@@ -11,6 +11,9 @@ use std::sync::Once;
 
 static READY: AtomicBool = AtomicBool::new(false);
 static INIT: Once = Once::new();
+/// Fixed description of the last bridge failure, or empty. Never holds a credential or a raw
+/// server/JVM reply: it is shown in the settings page and would otherwise be a leak vector.
+static LAST_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Registers the Kotlin bridge that publishes the Android context.
 ///
@@ -44,6 +47,11 @@ pub fn init<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
 /// outlives a field report.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 fn report(what: &str, detail: &str) {
+    // Only the fixed tag reaches the UI. `detail` can quote the JVM, and the settings page is not a
+    // place to dump that.
+    if let Ok(mut slot) = LAST_ERROR.lock() {
+        *slot = Some(what.to_string());
+    }
     // Always on stderr as well: a Rust panic or an early failure can happen before the JVM lets us
     // talk to it, and `adb logcat -s RustStdoutStderr` shows this form too.
     eprintln!("sealbox context bridge: {what}: {detail}");
@@ -85,6 +93,20 @@ pub fn is_ready() -> bool {
     READY.load(Ordering::SeqCst)
 }
 
+/// The last published failure, for the settings page.
+///
+/// The three callers show one fixed Chinese sentence ("Android 上下文未就绪"), which is right for
+/// the action but says nothing about which step broke. This string is the missing half: a fixed
+/// tag chosen here, never anything the JVM or the server said.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub fn last_error() -> String {
+    LAST_ERROR
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .unwrap_or_default()
+}
+
 /// `com.sealbox.mobile.NdkContext.initialize(applicationContext)`.
 ///
 /// Never unwind into the JVM: a panic across the JNI boundary aborts the app process.
@@ -121,5 +143,8 @@ fn publish(env: &mut jni::JNIEnv<'_>, context: &jni::objects::JObject<'_>) -> jn
         ndk_context::initialize_android_context(vm.get_java_vm_pointer().cast(), raw.cast());
     });
     READY.store(true, Ordering::SeqCst);
+    if let Ok(mut slot) = LAST_ERROR.lock() {
+        *slot = None;
+    }
     Ok(())
 }

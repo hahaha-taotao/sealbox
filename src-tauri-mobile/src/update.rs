@@ -218,7 +218,12 @@ mod install {
 
     fn with_env(f: impl FnOnce(&mut JNIEnv) -> Result<(), String>) -> Result<(), String> {
         if !crate::mobile_context::is_ready() {
-            return Err("Android 上下文未就绪，无法打开安装器。请重启应用后重试，或到发布页手动安装".into());
+            let tag = crate::mobile_context::last_error();
+            return Err(if tag.is_empty() {
+                "Android 上下文未就绪，无法打开安装器。请重启应用后重试，或到发布页手动安装".into()
+            } else {
+                format!("Android 上下文未就绪（{tag}），无法打开安装器。请重启应用后重试，或到发布页手动安装")
+            });
         }
         let context = ndk_context::android_context();
         let vm = unsafe { jni::JavaVM::from_raw(context.vm() as *mut _) }.map_err(|error| error.to_string())?;

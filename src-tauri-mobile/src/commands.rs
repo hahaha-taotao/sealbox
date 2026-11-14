@@ -616,6 +616,27 @@ pub fn app_version() -> String {
     update::current_version()
 }
 
+/// Whether the JNI helpers have an Android context, for the update dialog.
+///
+/// The installer, clipboard and SAF all fail with the same sentence when the context bridge did
+/// not run, and until now the only trace was a logcat line. Exposing the state lets the dialog say
+/// which of the two happened instead of leaving the user to guess.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AndroidContextReport {
+    pub ready: bool,
+    /// Fixed, non-sensitive reason for the last failure, or an empty string.
+    pub detail: String,
+}
+
+#[tauri::command]
+pub fn android_context_state() -> AndroidContextReport {
+    AndroidContextReport {
+        ready: crate::mobile_context::is_ready(),
+        detail: crate::mobile_context::last_error(),
+    }
+}
+
 #[tauri::command]
 pub async fn check_mobile_update() -> Result<MobileRelease, String> {
     tauri::async_runtime::spawn_blocking(update::check)

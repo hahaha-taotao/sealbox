@@ -22,6 +22,18 @@ export function patchManifest(manifest) {
   if (!manifest.includes("application/vnd.android.package-archive")) {
     manifest = manifest.replace("    <application", `${queries}\n\n    <application`);
   }
+  // The context bridge's only unconditional hook. A provider is instantiated by the framework
+  // before `Application.onCreate`, so it runs even when Tauri's plugin registration does not.
+  const provider = '        <provider\n' +
+    '            android:name="com.sealbox.mobile.ContextBootstrapProvider"\n' +
+    '            android:authorities="${applicationId}.context-bootstrap"\n' +
+    '            android:exported="false" />';
+  if (!manifest.includes("ContextBootstrapProvider")) {
+    const applicationOpen = manifest.match(/<application[^>]*>/);
+    if (applicationOpen === null) throw new Error("Could not find the manifest application element");
+    const at = applicationOpen.index + applicationOpen[0].length;
+    manifest = `${manifest.slice(0, at)}\n${provider}${manifest.slice(at)}`;
+  }
   return manifest;
 }
 
@@ -38,6 +50,7 @@ export function patchProguard(rules) {
     "-keep class com.sealbox.mobile.MobileContextPlugin { *; }",
     "-keep class com.sealbox.mobile.DocumentsPlugin { *; }",
     "-keep class com.sealbox.mobile.ApkInstaller { *; }",
+    "-keep class com.sealbox.mobile.ContextBootstrapProvider { *; }",
   ];
   const missing = bridge.filter((rule) => !rules.includes(rule));
   if (missing.length === 0) return rules;
