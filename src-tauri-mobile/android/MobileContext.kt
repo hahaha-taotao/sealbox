@@ -14,26 +14,19 @@ import app.tauri.plugin.Plugin
  * Publishes the Android application context to the Rust JNI helpers.
  *
  * Tauri 2.11 / tao 0.35 no longer initialize `ndk-context` (tao 0.36 restores it), so clipboard,
- * SAF and the update installer would panic on `ndk_context::android_context()`.
+ * SAF and the update installer would panic on `ndk_context::android_context()`. `load` runs while
+ * the webview is created, before any command can be invoked.
  *
- * Two independent paths, because neither is guaranteed on its own:
- *  - [load] is the earliest one, and the only one that runs before the webview can invoke a
- *    command. It is driven by Tauri's plugin registration, which skips or fails it if the
- *    generated project differs from what the Rust side expects.
- *  - [Application.ActivityLifecycleCallbacks.onActivityCreated] fires from the framework itself, so
- *    it does not depend on Tauri at all. It runs slightly later, which is why [load] is tried
- *    first.
- *
- * Neither path may throw: an exception escaping `load` fails plugin registration, and one escaping
- * a lifecycle callback kills the process. A missing context only degrades three features, so every
- * failure here is logged and swallowed.
+ * An exception escaping `load` fails Tauri's plugin registration for this plugin, and the context is
+ * then never published for the whole process — which is exactly the bug this class exists to avoid.
+ * So `load` itself cannot throw, and the framework-driven lifecycle callback is registered as a
+ * second chance in case the plugin is never loaded at all.
  */
 @Keep
 @TauriPlugin
 class MobileContextPlugin(private val activity: Activity) : Plugin(activity) {
     override fun load(webView: WebView) {
-        NdkContext.initializeQuietly(activity.applicationContext)
-        NdkContext.watchActivities(activity.application)
+        NdkContext.publish(activity)
     }
 }
 
@@ -42,51 +35,76 @@ class MobileContextPlugin(private val activity: Activity) : Plugin(activity) {
 object NdkContext {
     private const val TAG = "Sealbox"
 
-    init {
-        try {
-            System.loadLibrary("sealbox_mobile_lib")
-        } catch (error: Throwable) {
-            // Reported, not thrown: a library that failed to load only breaks the three JNI
-            // features, and letting this escape would abort class initialisation for the plugin.
-            report("loadLibrary failed", error)
-        }
-    }
+    /**
+     * Loaded lazily by [publish] rather than in an `init` block.
+     *
+     * `init` runs on first touch of the object, and a failure there poisons the class for the rest
+     * of the process: every later call throws `ExceptionInInitializerError`. Loading inside a
+     * `try` keeps a missing or mismatched library a logged, retryable problem instead.
+     */
+    private var loaded = false
 
     @JvmStatic
     external fun initialize(context: Context)
 
-    /** Never throws. Returns whether the context was published. */
-    fun initializeQuietly(context: Context) {
+    /**
+     * Publishes `activity`'s application context. Never throws.
+     *
+     * Both the `initialize` call and the lifecycle registration are best effort: a failure here
+     * degrades three features and must not take down the plugin or the app.
+     */
+    fun publish(activity: Activity) {
+        if (!ensureLoaded()) return
         try {
-            initialize(context.applicationContext)
+            initialize(activity.applicationContext)
         } catch (error: Throwable) {
             report("initialize failed", error)
+        }
+        watchActivities(activity)
+    }
+
+    private fun ensureLoaded(): Boolean {
+        if (loaded) return true
+        return try {
+            System.loadLibrary("sealbox_mobile_lib")
+            loaded = true
+            true
+        } catch (error: Throwable) {
+            report("loadLibrary failed", error)
+            false
         }
     }
 
     /**
-     * Publishes on the first activity that reaches `onActivityCreated`.
+     * Second chance, independent of Tauri's plugin registration.
      *
-     * Registered once; a second call is a no-op. Only `onActivityCreated` is used, so rotation and
-     * multi-activity apps are covered without keeping any reference of our own — the framework
-     * disposes the callbacks with the application.
+     * `onActivityCreated` is driven by the framework, so it fires even when `load` never does. It
+     * runs slightly later than `load`, which is why `load` still publishes first when it can.
+     * Registered once; a second call is a no-op.
      */
-    fun watchActivities(application: Application) {
+    private fun watchActivities(activity: Activity) {
         if (watching) return
         watching = true
         try {
-            application.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
-                override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {
-                    initializeQuietly(activity.applicationContext)
-                }
+            activity.application.registerActivityLifecycleCallbacks(
+                object : Application.ActivityLifecycleCallbacks {
+                    override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {
+                        if (!ensureLoaded()) return
+                        try {
+                            initialize(activity.applicationContext)
+                        } catch (error: Throwable) {
+                            report("lifecycle initialize failed", error)
+                        }
+                    }
 
-                override fun onActivityStarted(activity: Activity) = Unit
-                override fun onActivityResumed(activity: Activity) = Unit
-                override fun onActivityPaused(activity: Activity) = Unit
-                override fun onActivityStopped(activity: Activity) = Unit
-                override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
-                override fun onActivityDestroyed(activity: Activity) = Unit
-            })
+                    override fun onActivityStarted(activity: Activity) = Unit
+                    override fun onActivityResumed(activity: Activity) = Unit
+                    override fun onActivityPaused(activity: Activity) = Unit
+                    override fun onActivityStopped(activity: Activity) = Unit
+                    override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
+                    override fun onActivityDestroyed(activity: Activity) = Unit
+                },
+            )
         } catch (error: Throwable) {
             report("registerActivityLifecycleCallbacks failed", error)
         }

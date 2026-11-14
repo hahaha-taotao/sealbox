@@ -20,9 +20,11 @@ static INIT: Once = Once::new();
 /// the whole app down over a helper that only three JNI paths need is the wrong trade, so a failure
 /// is logged and the app boots.
 ///
-/// The reliable source is `run_on_android_context`, which hands us the activity and webview
-/// directly from the runtime — no Kotlin and no `load()` involved. `lib.rs` calls [`remember_app`]
-/// from the builder's own `setup` to use it, and the commands retry through [`ensure_ready`].
+/// The second chance is the Kotlin side's own `Application.ActivityLifecycleCallbacks`, registered
+/// from `load`: the framework drives `onActivityCreated` itself, so it survives whatever the plugin
+/// registration did or did not do. There is deliberately no Rust-side fallback — the runtime handle
+/// that could reach the activity (`ManagerBase::runtime`) is sealed inside Tauri, and a path that
+/// cannot be compiled against the real Android target is worse than no path at all.
 pub fn init<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
     tauri::plugin::Builder::new("mobile-context")
         .setup(|_app, _api| {
@@ -75,119 +77,6 @@ fn report(what: &str, detail: &str) {
             let _ = env.exception_clear();
         }
     }
-}
-
-/// Last chance for a command that needs the context.
-///
-/// `MobileContextPlugin.load` and the builder-time attempt both normally publish it before any
-/// command runs, so this is a safety net rather than the common path: it tries once, at most
-/// every five seconds, and never blocks a caller for long. A command that finds `is_ready() ==
-/// false` after this still reports its own fixed sentence, which is better than a UI that waits
-/// seconds on every attempt to copy a password.
-#[cfg(target_os = "android")]
-pub fn ensure_ready() {
-    if is_ready() || app_handle().is_none() {
-        return;
-    }
-    // Concurrent commands would otherwise each queue their own retry behind the same main pipe.
-    let _guard = match RETRY_LOCK.try_lock() {
-        Ok(guard) => guard,
-        Err(_) => return,
-    };
-    if is_ready() {
-        return;
-    }
-    let now = std::time::Instant::now();
-    if RETRY_AT
-        .lock()
-        .map(|last| now.duration_since(*last) < RETRY_INTERVAL)
-        .unwrap_or(false)
-    {
-        return;
-    }
-    if let Ok(mut last) = RETRY_AT.lock() {
-        *last = now;
-    }
-    if let Some(app) = app_handle() {
-        // Bounded, and on the caller's own thread: this is a command, never the main thread.
-        publish_through_runtime(&app);
-    }
-}
-
-/// How often a command may re-attempt the runtime path. Only Android retries.
-#[cfg(target_os = "android")]
-const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
-
-#[cfg(target_os = "android")]
-static RETRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-#[cfg(target_os = "android")]
-static RETRY_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
-#[cfg(target_os = "android")]
-static APP: std::sync::Mutex<Option<tauri::AppHandle<tauri::Wry>>> = std::sync::Mutex::new(None);
-
-/// Remembers the handle for [`ensure_ready`] and makes the first attempt.
-///
-/// The attempt is started, not awaited: `run_on_android_context` posts to the Android main pipe,
-/// so waiting for the answer on the main thread would deadlock against itself. The `setup` hook
-/// that calls this runs on the main thread, hence the detached thread.
-#[cfg(target_os = "android")]
-pub fn remember_app(app: &tauri::AppHandle<tauri::Wry>) {
-    if let Ok(mut slot) = APP.lock() {
-        *slot = Some(app.clone());
-    }
-    let handle = app.clone();
-    std::thread::spawn(move || publish_through_runtime(&handle));
-}
-
-#[cfg(target_os = "android")]
-fn app_handle() -> Option<tauri::AppHandle<tauri::Wry>> {
-    APP.lock().ok().and_then(|slot| slot.clone())
-}
-
-/// One round trip on the Android context thread that hands `publish` the application context.
-///
-/// Must not run on the main thread: see [`remember_app`].
-#[cfg(target_os = "android")]
-fn publish_through_runtime(app: &tauri::AppHandle<tauri::Wry>) {
-    if is_ready() {
-        return;
-    }
-    use tauri::Manager as _;
-    let (done, wait) = std::sync::mpsc::channel();
-    app.runtime_handle()
-        .run_on_android_context(move |env, activity, _webview| {
-            // `ndk-context` holds this reference for the whole process, so it must be the
-            // application context rather than the activity: an activity is destroyed on rotation
-            // or when the task goes away, and every later JNI call would then target a dead
-            // object. The Kotlin bridge passes `activity.applicationContext` for the same reason.
-            let outcome = application_context(env, activity)
-                .and_then(|context| publish(env, &context).map_err(|error| error.to_string()));
-            let _ = done.send(outcome);
-        });
-    match wait.recv_timeout(std::time::Duration::from_millis(5000)) {
-        Ok(Ok(())) => {}
-        Ok(Err(detail)) => report("runtime context publish failed", &detail),
-        Err(_) => report(
-            "runtime context publish timed out",
-            "run_on_android_context did not answer within 5s",
-        ),
-    }
-}
-
-/// `activity.getApplicationContext()`, as a local reference valid for the caller's frame.
-#[cfg(target_os = "android")]
-fn application_context<'local>(
-    env: &mut jni::JNIEnv<'local>,
-    activity: &jni::objects::JObject<'_>,
-) -> Result<jni::objects::JObject<'local>, String> {
-    env.call_method(
-        activity,
-        "getApplicationContext",
-        "()Landroid/content/Context;",
-        &[],
-    )
-    .and_then(|value| value.l())
-    .map_err(|error| format!("getApplicationContext failed: {error}"))
 }
 
 /// Whether the JNI helpers have a context to use. They fail with an error instead of panicking.

@@ -217,10 +217,6 @@ mod install {
     use std::path::Path;
 
     fn with_env(f: impl FnOnce(&mut JNIEnv) -> Result<(), String>) -> Result<(), String> {
-        // The Kotlin hook is only the first chance to publish the context; retry through the
-        // runtime before giving up, or one missed hook disables the installer for the whole
-        // process lifetime.
-        crate::mobile_context::ensure_ready();
         if !crate::mobile_context::is_ready() {
             return Err("Android 上下文未就绪，无法打开安装器。请重启应用后重试，或到发布页手动安装".into());
         }

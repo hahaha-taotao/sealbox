@@ -292,18 +292,21 @@ test("Android context bridge publishes the application context before commands c
   const kotlin = readFileSync(new URL("../src-tauri-mobile/android/MobileContext.kt", import.meta.url), "utf8");
   assert.match(kotlin, /@Keep\s+@TauriPlugin\s+class MobileContextPlugin/);
   assert.match(kotlin, /override fun load\(webView: WebView\)/);
-  assert.match(kotlin, /NdkContext\.initializeQuietly\(activity\.applicationContext\)/);
+  assert.match(kotlin, /NdkContext\.publish\(activity\)/);
   assert.match(kotlin, /System\.loadLibrary\("sealbox_mobile_lib"\)/);
   assert.match(kotlin, /@JvmStatic\s+external fun initialize\(context: Context\)/);
 });
 
-test("Android context bridge survives a failing load() hook", () => {
+test("Android context bridge cannot break plugin registration or poison the class", () => {
   const kotlin = readFileSync(new URL("../src-tauri-mobile/android/MobileContext.kt", import.meta.url), "utf8");
-  // Both the library load and the JNI call are wrapped: an exception escaping load() fails Tauri's
-  // plugin registration, and one escaping a lifecycle callback kills the process.
-  assert.match(kotlin, /try\s*{[^}]*System\.loadLibrary\([^)]*\)[^}]*}\s*catch\s*\(\w+: Throwable\)/);
-  assert.match(kotlin, /fun initializeQuietly\(context: Context\)\s*{[^}]*try\s*{[^}]*initialize\([^)]*\)/);
-  // A framework-driven second path, independent of Tauri's plugin registration.
+  // No init block: a failure inside one throws ExceptionInInitializerError on every later call.
+  assert.equal(/\binit\s*\{/.test(kotlin), false);
+  assert.match(kotlin, /private fun ensureLoaded\(\): Boolean/);
+  assert.match(kotlin, /try\s*\{\s*System\.loadLibrary/);
+  // load() must not be able to throw: an escaping exception fails Tauri's plugin registration.
+  assert.match(kotlin, /fun publish\(activity: Activity\)\s*\{/);
+  assert.match(kotlin, /if \(!ensureLoaded\(\)\) return/);
+  // Framework-driven second chance, independent of Tauri's plugin registration.
   assert.match(kotlin, /registerActivityLifecycleCallbacks/);
   assert.match(kotlin, /override fun onActivityCreated\(activity: Activity, savedInstanceState: Bundle\?\)/);
   assert.match(kotlin, /if \(watching\) return/);
