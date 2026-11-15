@@ -1614,7 +1614,7 @@ onMounted(async () => {
           <div v-if="mailError" class="pad"><p class="error">{{ mailError }}</p></div>
           <div v-if="!mailAccounts.length" class="pad">
             <p v-if="mailBusy" class="hint" role="status">正在读取邮箱账号…</p>
-            <p v-if="!mailBusy && !mailError" class="hint">还没有邮箱账号。先在保险库里新增「邮箱授权码」或「邮箱」条目。</p>
+            <p v-if="!mailBusy && !mailError" class="hint">还没有邮箱账号。先在保险库里新增「邮箱授权码」条目。</p>
           </div>
           <template v-else>
             <div class="mail-controls">

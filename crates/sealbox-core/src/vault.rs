@@ -2357,12 +2357,23 @@ impl Vault {
     }
 
     pub fn mail_badge_unread(&self) -> Result<u32, VaultError> {
-        Ok(crate::mail_store::badge_unread(&self.conn)?)
+        let counts = self.mail_unread_by_role()?;
+        Ok(counts.inbox.saturating_add(counts.archive))
     }
 
     /// Unread per role, so a folder row and the sidebar badge share one local number.
     pub fn mail_unread_by_role(&self) -> Result<crate::mail_store::UnreadByRole, VaultError> {
-        Ok(crate::mail_store::unread_by_role(&self.conn)?)
+        let mut totals = crate::mail_store::UnreadByRole::default();
+        for account in self.list_entries(&ListFilter { kind: Some(EntryKind::MailAuth), ..Default::default() })? {
+            let count = crate::mail_store::unread_by_role_for_account(&self.conn, Some(&account.id))?;
+            totals.inbox = totals.inbox.saturating_add(count.inbox);
+            totals.archive = totals.archive.saturating_add(count.archive);
+            totals.sent = totals.sent.saturating_add(count.sent);
+            totals.drafts = totals.drafts.saturating_add(count.drafts);
+            totals.trash = totals.trash.saturating_add(count.trash);
+            totals.other = totals.other.saturating_add(count.other);
+        }
+        Ok(totals)
     }
 
     /// Live unread count of one folder, counted from the cached messages.

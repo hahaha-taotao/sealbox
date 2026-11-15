@@ -92,6 +92,8 @@ const mailMutationBusy = ref("");
 const mailMutationError = ref("");
 const mailDeleteTarget = ref<InboxMessage | null>(null);
 const mailMessageVersions = new Map<string, number>();
+const mailRemovedKeys = new Set<string>();
+const mailChecking = ref(false);
 /** 列表来自本地缓存（可能断网）：顶部显示「离线缓存 · 最近更新 HH:mm」。 */
 const mailCacheCached = ref(false);
 const mailCacheAt = ref("");
@@ -1898,6 +1900,8 @@ function applyLockedUi() {
   mailMutationError.value = "";
   mailAttachmentError.value = "";
   mailMessageVersions.clear();
+  mailRemovedKeys.clear();
+  mailChecking.value = false;
   mailAccounts.value = [];
   mailAccountId.value = "";
   mailMessages.value = [];
@@ -2102,7 +2106,7 @@ async function openMail() {
   }
 }
 
-/** Switches account: refresh its folder list, then load the inbox. */
+/** Inbox cache and folder discovery start independently; neither waits for the other. */
 async function selectMailAccount(account: MailAccount, seq = ++mailSeq) {
   if (!account.supported) return;
   mailUnified.value = false;
@@ -2117,8 +2121,7 @@ async function selectMailAccount(account: MailAccount, seq = ++mailSeq) {
   mailCacheCached.value = false;
   mailCacheAt.value = "";
   resetMailMessages();
-  await loadMailFolders(seq);
-  if (seq !== mailSeq) return;
+  void loadMailFolders(seq);
   await loadMail(seq);
   if (seq !== mailSeq) return;
   warmMailBodies();
@@ -2144,7 +2147,7 @@ function navigateMail(delta: number) {
   if (message) void openMailMessage(message);
 }
 
-async function fetchMailRows(older = false) {
+async function fetchMailRows(older = false, cacheOnly = false, onPage?: (rows: InboxMessage[], cached: boolean, fetchedAt: string | null) => void) {
   const accounts = mailUnified.value ? mailAccounts.value.filter((account) => account.supported)
     : mailAccounts.value.filter((account) => account.id === mailAccountId.value);
   const unified = mailUnified.value;
@@ -2156,12 +2159,15 @@ async function fetchMailRows(older = false) {
     const key = JSON.stringify([account.id, folder]);
     if (older && mailPageEnds.get(key) === null) return { messages: [], cached: true, fetchedAt: null };
     const result = normalizeMailList(await api.mailList(account.id, folder, {
-      beforeUid: older ? mailPageEnds.get(key) ?? undefined : undefined, filter, keyword,
+      beforeUid: older ? mailPageEnds.get(key) ?? undefined : undefined, filter, keyword, cacheOnly,
     }));
     const end = result.messages.length ? Math.min(...result.messages.map((message) => message.uid)) : null;
-    return { ...result, pageKey: key, pageEnd: end, messages: result.messages.map((message) => ({
+    const messages = result.messages.map((message) => ({
       ...message, entryId: account.id, folder, accountEmail: account.email,
-    })) };
+    }));
+    onPage?.(messages, result.cached, result.fetchedAt);
+    return { ...result, pageKey: key, pageEnd: end, messages };
+
   }));
   const pages = results.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
   if (!pages.length && results.length) throw new Error("邮箱暂时连接失败，请稍后重试");
@@ -2224,24 +2230,43 @@ async function loadMail(seq = ++mailSeq) {
   if (!mailUnified.value && (!entryId || !folder)) return;
   mailBusy.value = true;
   mailPageEnds.clear();
+  mailChecking.value = true;
   try {
-    const result = await fetchMailRows();
+    const showPage = (rows: InboxMessage[], cached: boolean, fetchedAt: string | null) => {
+      if (seq !== mailSeq || !rows.length) return;
+      // Every account paints independently; a slow or offline account never hides another's cache.
+      const versions = new Map(mailMessages.value.map((row) => [mailMessageKey(row), row]));
+      for (const row of rows) {
+        if (mailMessageVersions.has(mailMessageKey(row)) && versions.has(mailMessageKey(row))) {
+          row.seen = versions.get(mailMessageKey(row))!.seen;
+        }
+      }
+      rows = rows.filter((row) => !mailRemovedKeys.has(mailMessageKey(row)));
+      mailMessages.value = mailUnified.value ? mergeMailInbox([...mailMessages.value, ...rows])
+        : mergeMailInbox([...mailMessages.value, ...rows]).sort((left, right) => right.uid - left.uid);
+      mailCacheCached.value ||= cached;
+      if (fetchedAt) mailCacheAt.value = fetchedAt;
+      if (mailCursor.value < 0) mailCursor.value = 0;
+    };
+    const cached = await fetchMailRows(false, true, showPage);
+    if (seq !== mailSeq) return;
+    for (const [key, end] of cached.cursors) if (end !== null) mailPageEnds.set(key, end);
+    mailBusy.value = false;
+    mailSearchNote.value = "正在后台检查新邮件…";
+    // Live responses can finish at different times. Do not reset the reader or the visible cache.
+    const result = await fetchMailRows(false, false, showPage);
     if (seq !== mailSeq) return;
     for (const [key, end] of result.cursors) mailPageEnds.set(key, end);
-    mailMessages.value = result.messages;
-    mailCacheCached.value = result.cached;
-    mailCacheAt.value = result.fetchedAt;
-    mailSearchNote.value = result.failed ? `${result.failed} 个账号暂未加载，已显示其余结果` : "";
-    mailCursor.value = mailMessages.value.length ? 0 : -1;
+    mailSearchNote.value = result.failed ? `${result.failed} 个账号暂未连接，已保留本地邮件` : "";
   } catch (e) {
     if (seq === mailSeq) mailError.value = String(e);
   } finally {
-    if (seq === mailSeq) mailBusy.value = false;
+    if (seq === mailSeq) { mailBusy.value = false; mailChecking.value = false; }
   }
 }
 
 async function loadOlderMail() {
-  if (mailBusy.value || !mailMessages.value.length) return;
+  if (mailBusy.value || mailChecking.value || !mailMessages.value.length) return;
   const seq = mailSeq;
   mailBusy.value = true;
   mailOlderError.value = "";
@@ -2315,7 +2340,7 @@ async function refreshMailNow() {
         ? `收到 ${added} 封新邮件`
         : "已是最新";
     mailUnread.value = report.unread;
-    if (!mailUnified.value) await loadMailFolders(seq, true);
+    if (!mailUnified.value) void loadMailFolders(seq, true);
     if (seq !== mailSeq) return;
     await loadMail(seq);
     if (seq !== mailSeq) return;
@@ -2440,6 +2465,7 @@ async function deleteMailMessage() {
   mailMutationError.value = "";
   try {
     await api.mailDelete(message.entryId, message.uid, message.folder);
+    mailRemovedKeys.add(key);
     mailDeleteTarget.value = null;
     if (seq === mailSeq && status.value?.unlocked) {
       applyMailSeen(message, true);
@@ -3763,7 +3789,7 @@ onMounted(async () => {
               <button type="button" class="mail-folder mail-unified" :class="{ active: mailUnified }" :aria-pressed="mailUnified" @click="selectUnifiedInbox()">
                 <span class="mail-folder-icon">▱</span><span>全部收件箱</span><em v-if="mailRoleCounts?.inbox" class="mail-count">{{ formatMailBadge(mailRoleCounts.inbox) }}</em>
               </button>
-              <p v-if="!mailAccounts.length" class="mail-empty-note">还没有邮箱账号，请到金库添加「邮箱」或「邮箱授权码」。</p>
+              <p v-if="!mailAccounts.length" class="mail-empty-note">还没有邮箱账号，请到金库添加「邮箱授权码」。</p>
               <button v-for="account in mailAccounts" :key="account.id" type="button" class="mail-account"
                 :class="{ active: !mailUnified && account.id === mailAccountId, disabled: !account.supported }"
                 :disabled="!account.supported" :title="`${account.title} · ${account.email} · ${account.providerLabel}`" @click="selectMailAccount(account)">
@@ -3784,7 +3810,7 @@ onMounted(async () => {
                   </button>
                 </details>
               </div>
-              <p v-if="mailFoldersBusy" class="mail-empty-note" role="status">正在读取文件夹…</p>
+              <p v-if="mailFoldersBusy" class="mail-empty-note" role="status">正在后台读取文件夹…</p>
               <p v-if="mailUnified && mailAccounts.length" class="mail-empty-note">已发送、草稿、归档和垃圾箱<br>请先选择具体账号。</p>
             </div>
             <div class="mail-side-footer"><strong>MCP 邮件能力</strong><span>读信、搜索、附件 · 账号由金库管理</span></div>
@@ -3820,8 +3846,8 @@ onMounted(async () => {
                 <span v-if="message.preview" class="mail-preview">{{ message.preview }}</span>
                 <span v-if="mailUnified" class="mail-source">{{ message.accountEmail }}</span>
               </button>
-              <div v-if="!mailBusy && !mailMessages.length && !mailError" class="mail-list-empty"><span>▱</span><strong>{{ mailAppliedKeyword || mailFilter !== 'all' ? '没有符合条件的邮件' : '这里还没有邮件' }}</strong><p>{{ mailAppliedKeyword || mailFilter !== 'all' ? '试试其他关键词，或切换到全部邮件' : '点击右上角刷新收取最新邮件' }}</p></div>
-              <div v-if="mailMessages.length" class="mail-list-bottom"><p v-if="mailOlderError" role="status">{{ mailOlderError }}</p><button class="mail-tool" type="button" :disabled="mailBusy" @click="loadOlderMail">{{ mailBusy ? '正在加载…' : '加载更早邮件' }}</button></div>
+              <div v-if="!mailBusy && !mailMessages.length && !mailError" class="mail-list-empty"><span>▱</span><strong>{{ mailAppliedKeyword || mailFilter !== 'all' ? '没有符合条件的邮件' : mailChecking ? '正在收取邮件' : '这里还没有邮件' }}</strong><p>{{ mailAppliedKeyword || mailFilter !== 'all' ? '试试其他关键词，或切换到全部邮件' : mailChecking ? '服务器连接在后台进行，你可以继续切换账号' : '点击右上角刷新收取最新邮件' }}</p></div>
+              <div v-if="mailMessages.length" class="mail-list-bottom"><p v-if="mailOlderError" role="status">{{ mailOlderError }}</p><button class="mail-tool" type="button" :disabled="mailBusy || mailChecking" @click="loadOlderMail">{{ mailBusy ? '正在加载…' : '加载更早邮件' }}</button></div>
             </div>
           </section>
 

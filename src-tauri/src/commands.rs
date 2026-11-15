@@ -2040,6 +2040,14 @@ pub fn window_control(app: AppHandle, action: String) -> Result<(), String> {
     }
 }
 
+/// Synchronous Tauri commands execute on the IPC dispatch thread. Keep DNS/TLS/IMAP and
+/// attachment disk writes on the blocking pool, not just in an `async fn` without an await.
+async fn mail_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(work).await.map_err(|_| "邮箱任务执行失败".to_string())?
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MailListRequest {
@@ -2053,6 +2061,9 @@ pub struct MailListRequest {
     pub filter: Option<String>,
     #[serde(default)]
     pub keyword: Option<String>,
+    /// Read only the local cache, including an empty page; never queue network work.
+    #[serde(default)]
+    pub cache_only: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -2120,9 +2131,6 @@ pub struct MailSession {
 pub fn mail_endpoint_for_payload(payload: &SecretPayload) -> Option<(String, u16)> {
     match payload {
         SecretPayload::MailAuth { provider, .. } => sealbox_core::mail_provider::server_for_provider(provider),
-        SecretPayload::Mailbox { email, imap_host, imap_port, .. } => {
-            sealbox_core::mail_provider::server_for_mailbox(email, imap_host.as_deref(), *imap_port)
-        }
         _ => None,
     }
 }
@@ -2132,9 +2140,6 @@ fn mail_session_from(payload: &SecretPayload, id: &str, title: &str) -> Option<M
     let (email, provider, secret) = match payload {
         SecretPayload::MailAuth { email, provider, auth_code } => {
             (email.clone(), provider.clone(), auth_code.clone())
-        }
-        SecretPayload::Mailbox { email, password, .. } => {
-            (email.clone(), "custom".to_string(), password.clone())
         }
         _ => return None,
     };
@@ -2193,6 +2198,26 @@ fn load_mail_session_with(
     mail_session_from(&payload, id, &title).ok_or_else(|| "不是邮箱账号".to_string())
 }
 
+/// All values needed across network I/O are owned. The generation also rejects a
+/// lock/unlock into the same vault, whose cache revision might otherwise still match.
+struct MailSnapshot {
+    mail: MailSession,
+    revision: u64,
+    generation: u64,
+}
+
+fn mail_snapshot(session: &Mutex<Session>, entry_id: &str) -> Result<MailSnapshot, String> {
+    let mut guard = lock_session(session);
+    guard.require_unlocked().map_err(map_err)?;
+    let dek = *guard.dek().map_err(map_err)?;
+    let vault = guard.vault().map_err(map_err)?;
+    Ok(MailSnapshot {
+        mail: load_mail_session_with(vault, &dek, entry_id)?,
+        revision: vault.mail_cache_revision().map_err(map_err)?,
+        generation: guard.generation(),
+    })
+}
+
 fn mail_connect(session: &MailSession) -> Result<sealbox_core::mail::TlsImap, String> {
     if !session.account.supported {
         return Err(sealbox_core::mail::failure_message(sealbox_core::mail::MailFailure::Unsupported).into());
@@ -2215,20 +2240,16 @@ fn folder_or_inbox(folder: &Option<String>) -> String {
     }
 }
 
-/// UI-only mailbox mutations. Keep the session locked through the server operation and cache
-/// commit: a lock/unlock or vault switch must not redirect a completed write into another vault.
-/// Refreshes already in flight are handled by the store's delete tombstones on cache upsert.
+/// UI-only mailbox mutations. Resolve credentials under a short lock, then verify the session
+/// generation before committing. Store tombstones reject already-in-flight refresh pages.
 fn mail_mutate(state: &AppState, entry_id: &str, uid: u32, folder: &Option<String>, seen: Option<bool>) -> Result<(), String> {
-    let mut session = lock_session(&state.session);
-    session.require_unlocked().map_err(map_err)?;
+    let snapshot = mail_snapshot(&state.session, entry_id)?;
     if uid == 0 {
         return Err("参数无效".into());
     }
-    let dek = *session.dek().map_err(map_err)?;
-    let vault = session.vault().map_err(map_err)?;
-    let mail = load_mail_session_with(vault, &dek, entry_id)?;
+    let mail = &snapshot.mail;
     let folder = folder_or_inbox(folder);
-    let mut io = mail_connect(&mail)?;
+    let mut io = mail_connect(mail)?;
     let action = if let Some(seen) = seen {
         sealbox_core::mail::set_seen_in(&mut io, &mail.email, &mail.secret, &folder, uid, seen)
             .map_err(|failure| sealbox_core::mail::failure_message(failure).to_string())?;
@@ -2238,6 +2259,11 @@ fn mail_mutate(state: &AppState, entry_id: &str, uid: u32, folder: &Option<Strin
             .map_err(|failure| sealbox_core::mail::failure_message(failure).to_string())?;
         "mail_delete"
     };
+    let session = lock_session(&state.session);
+    if session.generation() != snapshot.generation {
+        return Err("邮箱会话已变更，请重试".into());
+    }
+    let vault = session.vault().map_err(map_err)?;
     // No local changes on a server failure. Delete commits a tombstone even for uncached UIDs.
     let committed = if let Some(seen) = seen {
         vault.mail_set_seen(entry_id, &folder, uid, seen)
@@ -2253,12 +2279,20 @@ fn mail_mutate(state: &AppState, entry_id: &str, uid: u32, folder: &Option<Strin
 }
 
 #[tauri::command]
-pub fn mail_set_seen(state: State<AppState>, request: MailSetSeenRequest) -> Result<(), String> {
+pub async fn mail_set_seen(app: AppHandle, request: MailSetSeenRequest) -> Result<(), String> {
+    mail_blocking(move || mail_set_seen_blocking(&app.state::<AppState>(), request)).await
+}
+
+fn mail_set_seen_blocking(state: &AppState, request: MailSetSeenRequest) -> Result<(), String> {
     mail_mutate(&state, &request.entry_id, request.uid, &request.folder, Some(request.seen))
 }
 
 #[tauri::command]
-pub fn mail_delete(state: State<AppState>, request: MailDeleteRequest) -> Result<(), String> {
+pub async fn mail_delete(app: AppHandle, request: MailDeleteRequest) -> Result<(), String> {
+    mail_blocking(move || mail_delete_blocking(&app.state::<AppState>(), request)).await
+}
+
+fn mail_delete_blocking(state: &AppState, request: MailDeleteRequest) -> Result<(), String> {
     mail_mutate(&state, &request.entry_id, request.uid, &request.folder, None)
 }
 
@@ -2275,7 +2309,7 @@ fn mail_accounts_ref(state: &AppState) -> Result<Vec<sealbox_core::mail::MailAcc
     let entries = vault.list_entries(&crate::vault::ListFilter::default()).map_err(map_err)?;
     let mut accounts = Vec::new();
     for entry in entries {
-        if entry.kind != crate::vault::EntryKind::MailAuth && entry.kind != crate::vault::EntryKind::Mailbox {
+        if entry.kind != crate::vault::EntryKind::MailAuth {
             continue;
         }
         let payload = vault.get_active_secret(&dek, &entry.id).map_err(map_err)?;
@@ -2289,11 +2323,13 @@ fn mail_accounts_ref(state: &AppState) -> Result<Vec<sealbox_core::mail::MailAcc
 /// The folders of one account plus the cached unread counts. Reads the cache first so the page
 /// paints immediately; `refresh` forces a server round trip.
 #[tauri::command]
-pub fn mail_folders(
-    state: State<AppState>,
-    request: MailFoldersRequest,
-) -> Result<Vec<sealbox_core::mail::MailFolder>, String> {
-    let mail = load_mail_session(&state, &request.entry_id)?;
+pub async fn mail_folders(app: AppHandle, request: MailFoldersRequest) -> Result<Vec<sealbox_core::mail::MailFolder>, String> {
+    mail_blocking(move || mail_folders_blocking(&app.state::<AppState>(), request)).await
+}
+
+fn mail_folders_blocking(state: &AppState, request: MailFoldersRequest) -> Result<Vec<sealbox_core::mail::MailFolder>, String> {
+    let snapshot = mail_snapshot(&state.session, &request.entry_id)?;
+    let mail = &snapshot.mail;
     if !request.refresh {
         let session = lock_session(&state.session);
         let cached = session
@@ -2312,6 +2348,11 @@ pub fn mail_folders(
     {
         let session = lock_session(&state.session);
         let vault = session.vault().map_err(map_err)?;
+        if session.generation() != snapshot.generation
+            || vault.mail_cache_revision().map_err(map_err)? != snapshot.revision
+        {
+            return Err("邮箱会话已变更，请重试".into());
+        }
         vault
             .mail_save_folders(&request.entry_id, &folders)
             .map_err(map_err)?;
@@ -2425,8 +2466,9 @@ pub struct MailProbeReport {
 /// Resolves the IMAP server for an address without storing anything, so the form can prefill
 /// `imapHost` / `imapPort` and tell the user which of the three detection steps answered.
 #[tauri::command]
-pub fn mail_discover(request: MailDiscoverRequest) -> Result<sealbox_core::mail_provider::DiscoveredServer, String> {
-    sealbox_core::mail_provider::auto_detect(request.email.trim()).ok_or_else(|| "请输入有效的邮箱地址".to_string())
+pub async fn mail_discover(request: MailDiscoverRequest) -> Result<sealbox_core::mail_provider::DiscoveredServer, String> {
+    mail_blocking(move || sealbox_core::mail_provider::auto_detect(request.email.trim())
+        .ok_or_else(|| "请输入有效的邮箱地址".to_string())).await
 }
 
 #[derive(Clone, Deserialize)]
@@ -2439,7 +2481,11 @@ pub struct MailDiscoverRequest {
 /// stored entry (the usual case) or the values typed into the form, so the button works before
 /// the credential is saved.
 #[tauri::command]
-pub fn mail_test(state: State<AppState>, request: MailProbeRequest) -> Result<MailProbeReport, String> {
+pub async fn mail_test(app: AppHandle, request: MailProbeRequest) -> Result<MailProbeReport, String> {
+    mail_blocking(move || mail_test_blocking(&app.state::<AppState>(), request)).await
+}
+
+fn mail_test_blocking(state: &AppState, request: MailProbeRequest) -> Result<MailProbeReport, String> {
     let (email, secret, host, port) = match request.entry_id.as_deref().filter(|id| !id.is_empty()) {
         Some(id) => {
             let mail = load_mail_session(&state, id)?;
@@ -2475,35 +2521,19 @@ pub fn mail_test(state: State<AppState>, request: MailProbeRequest) -> Result<Ma
 /// refreshes the newest server page; only a folder with nothing cached pays for a round trip on
 /// the calling thread.
 #[tauri::command]
-pub fn mail_list(app: AppHandle, state: State<AppState>, request: MailListRequest) -> Result<MailListResult, String> {
+pub async fn mail_list(app: AppHandle, request: MailListRequest) -> Result<MailListResult, String> {
+    mail_blocking(move || mail_list_blocking(app.clone(), &app.state::<AppState>(), request)).await
+}
+
+fn mail_list_blocking(app: AppHandle, state: &AppState, request: MailListRequest) -> Result<MailListResult, String> {
     let folder = folder_or_inbox(&request.folder);
     let filter = sealbox_core::mail_folder::MailFilter::parse(request.filter.as_deref().unwrap_or(""))
         .ok_or_else(|| "未知的筛选条件".to_string())?;
     let local_filter = sealbox_core::mail_store::LocalFilter::parse(filter.as_str())
         .ok_or_else(|| "未知的筛选条件".to_string())?;
     let keyword = request.keyword.clone().unwrap_or_default();
-    {
-        let mut session = lock_session(&state.session);
-        session.require_unlocked().map_err(map_err)?;
-        let cached = session
-            .vault()
-            .map_err(map_err)?
-            .mail_list_local(
-                &request.entry_id,
-                &folder,
-                request.before_uid,
-                50,
-                local_filter,
-                &keyword,
-            )
-            .map_err(map_err)?;
-        if !cached.is_empty() {
-            let fetched_at = session
-                .vault()
-                .map_err(map_err)?
-                .mail_page_fetched_at(&request.entry_id, &folder)
-                .map_err(map_err)?;
-            drop(session);
+    if let Some(cached) = mail_cached_page(&state.session, &request, &folder, local_filter, &keyword)? {
+        if !request.cache_only {
             start_mail_refresh(
                 app,
                 Arc::clone(&state.session),
@@ -2512,18 +2542,17 @@ pub fn mail_list(app: AppHandle, state: State<AppState>, request: MailListReques
                 filter,
                 keyword,
             );
-            return Ok(MailListResult {
-                messages: cached.into_iter().map(cached_to_message).collect(),
-                cached: true,
-                fetched_at,
-            });
         }
+        return Ok(cached);
     }
-    let revision = lock_session(&state.session).vault().map_err(map_err)?.mail_cache_revision().map_err(map_err)?;
-    let (messages, uid_validity) = mail_fetch_page(&state, &request.entry_id, &folder, request.before_uid, filter, &keyword)?;
+    let snapshot = mail_snapshot(&state.session, &request.entry_id)?;
+    let (messages, uid_validity) = mail_fetch_page(&snapshot.mail, &folder, request.before_uid, filter, &keyword)?;
     {
         let session = lock_session(&state.session);
         let vault = session.vault().map_err(map_err)?;
+        if !session.is_unlocked() || session.generation() != snapshot.generation {
+            return Err("邮箱会话已变更，请重试".into());
+        }
         // A folder is normally created by a sync, but a listing has to work on its own: without
         // a `mail_folders` row the folder is invisible to everything that enumerates folders, and
         // its unread count has nowhere to live.
@@ -2532,7 +2561,7 @@ pub fn mail_list(app: AppHandle, state: State<AppState>, request: MailListReques
             .map_err(map_err)?;
         let previews = vec![String::new(); messages.len()];
         if !vault
-            .mail_upsert_messages_with_uid_validity_if_revision(&request.entry_id, &folder, &messages, &previews, revision, uid_validity)
+            .mail_upsert_messages_with_uid_validity_if_revision(&request.entry_id, &folder, &messages, &previews, snapshot.revision, uid_validity)
             .map_err(map_err)?
         {
             let messages = vault.mail_list_local(&request.entry_id, &folder, request.before_uid, 50, local_filter, &keyword)
@@ -2544,18 +2573,39 @@ pub fn mail_list(app: AppHandle, state: State<AppState>, request: MailListReques
     Ok(MailListResult { messages, cached: false, fetched_at: None })
 }
 
-/// One server page of a folder, for the cold path of [`mail_list`]. The background refresh keeps
-/// its own copy so it can hold the session lock across the fetch.
+fn mail_cached_page(
+    session: &Mutex<Session>,
+    request: &MailListRequest,
+    folder: &str,
+    filter: sealbox_core::mail_store::LocalFilter,
+    keyword: &str,
+) -> Result<Option<MailListResult>, String> {
+    let mut guard = lock_session(session);
+    guard.require_unlocked().map_err(map_err)?;
+    let dek = *guard.dek().map_err(map_err)?;
+    let vault = guard.vault().map_err(map_err)?;
+    load_mail_session_with(vault, &dek, &request.entry_id)?;
+    let cached = vault.mail_list_local(&request.entry_id, folder, request.before_uid, 50, filter, keyword)
+        .map_err(map_err)?;
+    if cached.is_empty() && !request.cache_only {
+        return Ok(None);
+    }
+    Ok(Some(MailListResult {
+        messages: cached.into_iter().map(cached_to_message).collect(),
+        cached: true,
+        fetched_at: vault.mail_page_fetched_at(&request.entry_id, folder).map_err(map_err)?,
+    }))
+}
+
+/// One server page from an owned snapshot; no session lock is held during network I/O.
 fn mail_fetch_page(
-    state: &AppState,
-    entry_id: &str,
+    mail: &MailSession,
     folder: &str,
     before_uid: Option<u32>,
     filter: sealbox_core::mail_folder::MailFilter,
     keyword: &str,
 ) -> Result<(Vec<sealbox_core::mail::MailMessage>, Option<u32>), String> {
-    let mail = load_mail_session(state, entry_id)?;
-    let mut io = mail_connect(&mail)?;
+    let mut io = mail_connect(mail)?;
     let mut tracked = sealbox_core::mail::UidValidityIo::new(&mut io);
     let page = sealbox_core::mail::list_folder(&mut tracked, &mail.email, &mail.secret, folder, before_uid, 50, filter, keyword)
         .map_err(sealbox_core::mail::failure_message)?;
@@ -2595,33 +2645,10 @@ fn start_mail_refresh(
         return;
     }
     std::thread::spawn(move || {
-        let fold = || -> Result<(), String> {
-            let mut guard = session.lock().unwrap_or_else(|poison| poison.into_inner());
-            guard.require_unlocked().map_err(map_err)?;
-            let dek = *guard.dek().map_err(map_err)?;
-            let vault = guard.vault().map_err(map_err)?;
-            let mail = load_mail_session_with(vault, &dek, &entry_id)?;
-            let mut io = mail_connect(&mail)?;
-            let revision = vault.mail_cache_revision().map_err(map_err)?;
-            let mut tracked = sealbox_core::mail::UidValidityIo::new(&mut io);
-            let page = sealbox_core::mail::list_folder(
-                &mut tracked,
-                &mail.email,
-                &mail.secret,
-                &folder,
-                None,
-                50,
-                filter,
-                &keyword,
-            )
-            .map_err(sealbox_core::mail::failure_message)?;
-            // A live page never carries a teaser, so the cached one is preserved rather than
-            // overwritten with a blank.
-            let previews = vec![String::new(); page.len()];
-            vault.mail_upsert_messages_with_uid_validity_if_revision(&entry_id, &folder, &page, &previews, revision, tracked.uid_validity()).map_err(map_err)?;
-            Ok(())
-        };
-        if fold().is_ok() {
+        let fold = || refresh_mail_page_with(&session, &entry_id, &folder, |mail| {
+            mail_fetch_page(mail, &folder, None, filter, &keyword)
+        });
+        if matches!(fold(), Ok(true)) {
             // The store is now newer than the page already on screen, so the reader may re-read
             // it. This is a separate event on purpose: `mail-synced` keeps the badge's payload
             // (accounts/newCount/samples/unread) and is not touched by a folder refresh.
@@ -2632,6 +2659,41 @@ fn start_mail_refresh(
         }
         mail_refresh_lock().release(&format!("list:{entry_id}:{folder}"));
     });
+}
+
+/// The injected fetch is also the regression seam: it runs with no session guard.
+fn refresh_mail_page_with(
+    session: &Mutex<Session>,
+    entry_id: &str,
+    folder: &str,
+    fetch: impl FnOnce(&MailSession) -> Result<(Vec<sealbox_core::mail::MailMessage>, Option<u32>), String>,
+) -> Result<bool, String> {
+    let snapshot = mail_snapshot(session, entry_id)?;
+    let (page, uid_validity) = fetch(&snapshot.mail)?;
+    // Blank previews preserve existing teasers in the store.
+    let previews = vec![String::new(); page.len()];
+    commit_mail_page(session, &snapshot, entry_id, folder, &page, &previews, uid_validity)
+}
+
+/// Returns true only for an accepted write. Stale results must not emit a refreshed event.
+fn commit_mail_page(
+    session: &Mutex<Session>,
+    snapshot: &MailSnapshot,
+    entry_id: &str,
+    folder: &str,
+    page: &[sealbox_core::mail::MailMessage],
+    previews: &[String],
+    uid_validity: Option<u32>,
+) -> Result<bool, String> {
+    let guard = lock_session(session);
+    if !guard.is_unlocked() || guard.generation() != snapshot.generation {
+        return Ok(false);
+    }
+    let vault = guard.vault().map_err(map_err)?;
+    // The store atomically checks revision and retains UIDVALIDITY/tombstone semantics.
+    vault.mail_upsert_messages_with_uid_validity_if_revision(
+        entry_id, folder, page, previews, snapshot.revision, uid_validity,
+    ).map_err(map_err)
 }
 
 /// De-duplicates concurrent background work so rapid folder switching does not pile up threads
@@ -2661,7 +2723,11 @@ impl MailRefreshLock {
 }
 
 #[tauri::command]
-pub fn mail_body(state: State<AppState>, request: MailBodyRequest) -> Result<sealbox_core::mail::MailBody, String> {
+pub async fn mail_body(app: AppHandle, request: MailBodyRequest) -> Result<sealbox_core::mail::MailBody, String> {
+    mail_blocking(move || mail_body_blocking(&app.state::<AppState>(), request)).await
+}
+
+fn mail_body_blocking(state: &AppState, request: MailBodyRequest) -> Result<sealbox_core::mail::MailBody, String> {
     let folder = folder_or_inbox(&request.folder);
     // A cached body is served without touching the network, so reopening a message is instant
     // and works offline. It is still only ever what the server returned earlier.
@@ -2679,16 +2745,22 @@ pub fn mail_body(state: State<AppState>, request: MailBodyRequest) -> Result<sea
             }
         }
     }
-    let revision = lock_session(&state.session).vault().map_err(map_err)?.mail_cache_revision().map_err(map_err)?;
-    let mail = load_mail_session(&state, &request.entry_id)?;
-    let mut io = mail_connect(&mail)?;
+    let snapshot = mail_snapshot(&state.session, &request.entry_id)?;
+    let mail = &snapshot.mail;
+    let mut io = mail_connect(mail)?;
     let body = sealbox_core::mail::fetch_body_in(&mut io, &mail.email, &mail.secret, &folder, request.uid)
         .map_err(sealbox_core::mail::failure_message)?;
     {
         let session = lock_session(&state.session);
+        if session.generation() != snapshot.generation {
+            return Err("邮箱会话已变更，请重试".into());
+        }
         if let Ok(vault) = session.vault() {
+            if vault.mail_cache_revision().map_err(map_err)? != snapshot.revision {
+                return Ok(body);
+            }
             let _ = vault.mail_save_body(&request.entry_id, &folder, request.uid, &body);
-            if request.mark_seen && vault.mail_cache_revision().map_err(map_err)? == revision {
+            if request.mark_seen {
                 let _ = vault.mail_mark_local_seen(&request.entry_id, &folder, request.uid);
             }
         }
@@ -2817,10 +2889,11 @@ pub struct MailPrefetchRequest {
 }
 
 #[tauri::command]
-pub fn mail_attachments(
-    state: State<AppState>,
-    request: MailAttachmentRequest,
-) -> Result<Vec<sealbox_core::mail::MailAttachment>, String> {
+pub async fn mail_attachments(app: AppHandle, request: MailAttachmentRequest) -> Result<Vec<sealbox_core::mail::MailAttachment>, String> {
+    mail_blocking(move || mail_attachments_blocking(&app.state::<AppState>(), request)).await
+}
+
+fn mail_attachments_blocking(state: &AppState, request: MailAttachmentRequest) -> Result<Vec<sealbox_core::mail::MailAttachment>, String> {
     let mail = load_mail_session(&state, &request.entry_id)?;
     let folder = folder_or_inbox(&request.folder);
     let mut io = mail_connect(&mail)?;
@@ -2831,7 +2904,11 @@ pub fn mail_attachments(
 }
 
 #[tauri::command]
-pub fn mail_save_attachment(state: State<AppState>, request: MailSaveAttachmentRequest) -> Result<u64, String> {
+pub async fn mail_save_attachment(app: AppHandle, request: MailSaveAttachmentRequest) -> Result<u64, String> {
+    mail_blocking(move || mail_save_attachment_blocking(&app.state::<AppState>(), request)).await
+}
+
+fn mail_save_attachment_blocking(state: &AppState, request: MailSaveAttachmentRequest) -> Result<u64, String> {
     let mail = load_mail_session(&state, &request.entry_id)?;
     let folder = folder_or_inbox(&request.folder);
     let mut io = mail_connect(&mail)?;
@@ -2878,8 +2955,8 @@ pub struct MailSyncAccount {
 /// counts. Used by both the background timer and the manual refresh; a failure on one account is
 /// reported and never stops the others.
 #[tauri::command]
-pub fn mail_sync(state: State<AppState>) -> Result<MailSyncReport, String> {
-    mail_sync_blocking(&state)
+pub async fn mail_sync(app: AppHandle) -> Result<MailSyncReport, String> {
+    mail_blocking(move || mail_sync_blocking(&app.state::<AppState>())).await
 }
 
 /// The body of [`mail_sync`], callable from the background poller where there is no `State`.
@@ -3074,6 +3151,110 @@ mod tests {
     use super::*;
     use crate::session::Session;
     use crate::vault::Vault;
+
+    #[test]
+    fn mail_accounts_exclude_ordinary_mailbox_credentials() {
+        let ordinary = SecretPayload::Mailbox { email: "test@qq.com".into(), password: "login-password".into(), imap_host: Some("imap.qq.com".into()), imap_port: Some(993), smtp_host: None, smtp_port: None };
+        assert!(mail_endpoint_for_payload(&ordinary).is_none());
+        assert!(mail_session_from(&ordinary, "ordinary", "email info").is_none());
+        let authorized = SecretPayload::MailAuth { email: "test@qq.com".into(), provider: "qq".into(), auth_code: "auth-code".into() };
+        assert!(mail_session_from(&authorized, "auth", "authorized").is_some());
+    }
+
+    fn mail_test_session() -> (Arc<Mutex<Session>>, String) {
+        let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+        let mut entry = sample_site();
+        entry.kind = crate::vault::EntryKind::MailAuth;
+        entry.secret = SecretPayload::MailAuth {
+            email: "test@qq.com".into(), provider: "qq".into(), auth_code: "test-auth-code".into(),
+        };
+        let id = vault.upsert_entry(&dek, entry).unwrap().id;
+        let mut session = Session::default();
+        session.set_unlocked(vault, dek);
+        (Arc::new(Mutex::new(session)), id)
+    }
+
+    fn mail_test_message(uid: u32) -> sealbox_core::mail::MailMessage {
+        sealbox_core::mail::MailMessage {
+            uid, from: "sender".into(), subject: "subject".into(), date: String::new(),
+            seen: false, flagged: false, has_attachment: false, preview: String::new(),
+        }
+    }
+
+    #[test]
+    fn mail_refresh_releases_session_during_network_and_cached_reads_return() {
+        let (session, id) = mail_test_session();
+        let snapshot = mail_snapshot(&session, &id).unwrap();
+        assert!(commit_mail_page(&session, &snapshot, &id, "INBOX", &[mail_test_message(7)], &[String::new()], Some(1)).unwrap());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker_session = session.clone();
+        let worker_id = id.clone();
+        let worker = std::thread::spawn(move || refresh_mail_page_with(&worker_session, &worker_id, "INBOX", |_| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok((vec![mail_test_message(8)], Some(1)))
+        }));
+        started_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(session.try_lock().is_ok(), "network fetch must not own the session mutex");
+        let request: MailListRequest = serde_json::from_value(serde_json::json!({"entryId": id})).unwrap();
+        assert!(!request.cache_only);
+        let now = std::time::Instant::now();
+        let page = mail_cached_page(&session, &request, "INBOX", sealbox_core::mail_store::LocalFilter::All, "").unwrap().unwrap();
+        assert!(now.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(page.messages[0].uid, 7);
+        release_tx.send(()).unwrap();
+        assert!(worker.join().unwrap().unwrap());
+    }
+
+    #[test]
+    fn mail_refresh_discards_revision_and_generation_changes() {
+        let (session, id) = mail_test_session();
+        let accepted = refresh_mail_page_with(&session, &id, "INBOX", |_| {
+            lock_session(&session).vault().unwrap().mail_remove_message(&id, "INBOX", 7).unwrap();
+            Ok((vec![mail_test_message(7)], Some(1)))
+        }).unwrap();
+        assert!(!accepted, "stale refresh must not trigger refreshed event");
+        let accepted = refresh_mail_page_with(&session, &id, "INBOX", |_| {
+            let (vault, dek) = Vault::create_in_memory("correct horse battery staple extra").unwrap();
+            lock_session(&session).set_unlocked(vault, dek);
+            Ok((vec![mail_test_message(7)], Some(1)))
+        }).unwrap();
+        assert!(!accepted, "switching vault must discard the completed network page");
+        assert!(lock_session(&session).vault().unwrap().mail_recent_messages(&id, "INBOX", None, 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn mail_refresh_preserves_tombstones_and_uidvalidity_reset() {
+        let (session, id) = mail_test_session();
+        let fetch = || Ok((vec![mail_test_message(7)], Some(1)));
+        assert!(refresh_mail_page_with(&session, &id, "INBOX", |_| fetch()).unwrap());
+        lock_session(&session).vault().unwrap().mail_remove_message(&id, "INBOX", 7).unwrap();
+        assert!(refresh_mail_page_with(&session, &id, "INBOX", |_| fetch()).unwrap());
+        assert!(lock_session(&session).vault().unwrap().mail_recent_messages(&id, "INBOX", None, 50).unwrap().is_empty());
+        assert!(refresh_mail_page_with(&session, &id, "INBOX", |_| Ok((vec![mail_test_message(7)], Some(2)))).unwrap());
+        assert_eq!(lock_session(&session).vault().unwrap().mail_recent_messages(&id, "INBOX", None, 50).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn mail_blocking_moves_work_off_the_calling_thread() {
+        let caller = std::thread::current().id();
+        let worker = tauri::async_runtime::block_on(mail_blocking(|| Ok(std::thread::current().id()))).unwrap();
+        assert_ne!(caller, worker);
+    }
+
+    #[test]
+    fn mail_cache_only_empty_is_immediate_and_validates_account_and_unlock() {
+        let (session, id) = mail_test_session();
+        let request: MailListRequest = serde_json::from_value(serde_json::json!({"entryId": id,"cacheOnly":true})).unwrap();
+        let page = mail_cached_page(&session, &request, "INBOX", sealbox_core::mail_store::LocalFilter::All, "").unwrap().unwrap();
+        assert!(page.cached && page.messages.is_empty());
+        let mut missing = request.clone();
+        missing.entry_id = "missing".into();
+        assert!(mail_cached_page(&session, &missing, "INBOX", sealbox_core::mail_store::LocalFilter::All, "").is_err());
+        lock_session(&session).lock();
+        assert!(mail_cached_page(&session, &request, "INBOX", sealbox_core::mail_store::LocalFilter::All, "").is_err());
+    }
 
     #[test]
     fn mail_write_requests_require_seen_and_reject_extra_fields() {

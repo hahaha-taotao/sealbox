@@ -647,7 +647,7 @@ export const api = {
    * Cache-first listing: the command may answer from the local store instantly and
    * refresh in the background, so callers must tolerate `messages` arriving twice.
    */
-  mailList: (entryId: string, folder: string, options: { beforeUid?: number; filter?: MailFilter; keyword?: string } = {}) =>
+  mailList: (entryId: string, folder: string, options: { beforeUid?: number; filter?: MailFilter; keyword?: string; cacheOnly?: boolean } = {}) =>
     invoke<MailListPayload>("mail_list", {
       request: {
         entryId,
@@ -655,6 +655,7 @@ export const api = {
         beforeUid: options.beforeUid ?? null,
         filter: options.filter ?? "all",
         keyword: options.keyword ?? "",
+        cacheOnly: options.cacheOnly ?? false,
       },
     }),
   /** `markSeen` records the read state locally only; the server is never written. */

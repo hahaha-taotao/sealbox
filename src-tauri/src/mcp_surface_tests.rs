@@ -242,3 +242,20 @@ fn session_without_a_tool_grant_is_denied() {
         assert_eq!(rpc(&session,&mcp,&caller,tool,json!({}))["isError"],true,"{tool} must be denied");
     }
 }
+
+#[test]
+fn mail_accounts_do_not_expose_ordinary_mailbox_entries() {
+    let (session, _) = session_with_token(true, "github");
+    let mut guard = lock_session(&session);
+    let dek = *guard.dek().unwrap();
+    let entry = guard.vault().unwrap().upsert_entry(&dek, UpsertEntry {
+        id: None, kind: EntryKind::Mailbox, title: "ordinary email".into(), account: None,
+        url: None, folder_id: None, tags: vec![], pinned: false, expires_at: None, notes: None,
+        secret: SecretPayload::Mailbox { email: "test@qq.com".into(), password: "password".into(), imap_host: Some("imap.qq.com".into()), imap_port: Some(993), smtp_host: None, smtp_port: None },
+    }).unwrap();
+    drop(guard);
+    let accounts = call_mail_inner(&session, "mail", &json!({"action":"accounts"}), &||Ok(())).unwrap();
+    assert_eq!(accounts, "[]");
+    assert!(load_mail_resolved(&lock_session(&session), &entry.id).is_err());
+    assert!(call_mail_inner(&session, "mail", &json!({"action":"search","entryId":entry.id,"keyword":"test"}), &||Ok(())).is_err());
+}

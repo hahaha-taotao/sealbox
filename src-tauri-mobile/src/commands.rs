@@ -1198,9 +1198,6 @@ struct MailSession {
 fn mail_endpoint_for(payload: &SecretPayload) -> Option<(String, u16)> {
     match payload {
         SecretPayload::MailAuth { provider, .. } => sealbox_core::mail_provider::server_for_provider(provider),
-        SecretPayload::Mailbox { email, imap_host, imap_port, .. } => {
-            sealbox_core::mail_provider::server_for_mailbox(email, imap_host.as_deref(), *imap_port)
-        }
         _ => None,
     }
 }
@@ -1210,7 +1207,6 @@ fn mail_session_from(payload: &SecretPayload, id: &str, title: &str) -> Option<M
         SecretPayload::MailAuth { email, provider, auth_code } => {
             (email.clone(), provider.clone(), auth_code.clone())
         }
-        SecretPayload::Mailbox { email, password, .. } => (email.clone(), "custom".to_string(), password.clone()),
         _ => return None,
     };
     let endpoint = mail_endpoint_for(payload);
@@ -1357,7 +1353,6 @@ pub fn mail_accounts(state: State<AppState>) -> Result<Vec<sealbox_core::mail::M
     let mut accounts = Vec::new();
     for entry in entries {
         if entry.kind != sealbox_core::vault::EntryKind::MailAuth
-            && entry.kind != sealbox_core::vault::EntryKind::Mailbox
         {
             continue;
         }
@@ -1799,6 +1794,15 @@ fn sync_mail_folder(
 #[cfg(test)]
 mod mail_write_tests {
     use super::*;
+
+    #[test]
+    fn mail_accounts_exclude_ordinary_mailbox_credentials() {
+        let ordinary = SecretPayload::Mailbox { email: "test@qq.com".into(), password: "login-password".into(), imap_host: Some("imap.qq.com".into()), imap_port: Some(993), smtp_host: None, smtp_port: None };
+        assert!(mail_endpoint_for(&ordinary).is_none());
+        assert!(mail_session_from(&ordinary, "ordinary", "email info").is_none());
+        let authorized = SecretPayload::MailAuth { email: "test@qq.com".into(), provider: "qq".into(), auth_code: "auth-code".into() };
+        assert!(mail_session_from(&authorized, "auth", "authorized").is_some());
+    }
 
     #[test]
     fn requests_require_seen_and_keep_inbox_default() {

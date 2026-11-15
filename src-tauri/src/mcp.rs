@@ -776,7 +776,7 @@ fn call_mail_tool(session: &Mutex<Session>, name: &str, args: Value, permit: &Ca
         let dek=s.dek().map_err(|e|e.to_string())?;
         let ids=if entry=="-" {
             vault.list_entries(&crate::vault::ListFilter::default()).map_err(|e|e.to_string())?.into_iter()
-                .filter(|entry| matches!(entry.kind, crate::vault::EntryKind::MailAuth | crate::vault::EntryKind::Mailbox))
+                .filter(|entry| matches!(entry.kind, crate::vault::EntryKind::MailAuth))
                 .map(|entry|entry.id).collect::<Vec<_>>()
         } else {vec![entry.clone()]};
         let mut secrets=zeroize::Zeroizing::new(Vec::new());
@@ -841,7 +841,6 @@ fn call_mail_inner(session: &Mutex<Session>, name: &str, args: &Value, guard: &d
             let mut accounts = Vec::new();
             for entry in entries {
                 if entry.kind != crate::vault::EntryKind::MailAuth
-                    && entry.kind != crate::vault::EntryKind::Mailbox
                 {
                     continue;
                 }
@@ -850,9 +849,6 @@ fn call_mail_inner(session: &Mutex<Session>, name: &str, args: &Value, guard: &d
                 let (email, provider) = match &payload {
                     crate::vault::SecretPayload::MailAuth { email, provider, .. } => {
                         (email.clone(), provider.clone())
-                    }
-                    crate::vault::SecretPayload::Mailbox { email, .. } => {
-                        (email.clone(), "custom".to_string())
                     }
                     _ => continue,
                 };
@@ -893,7 +889,7 @@ fn call_mail_inner(session: &Mutex<Session>, name: &str, args: &Value, guard: &d
                 .map_err(|error| error.to_string())?
                 .get_active_secret(&*session.dek().map_err(|error| error.to_string())?, entry_id)
                 .map_err(|_| "不是邮箱账号".to_string())?;
-            let is_mail = matches!(&payload, crate::vault::SecretPayload::MailAuth { .. } | crate::vault::SecretPayload::Mailbox { .. });
+            let is_mail = matches!(&payload, crate::vault::SecretPayload::MailAuth { .. });
             zeroize::Zeroize::zeroize(&mut payload);
             if !is_mail {
                 return Err("不是邮箱账号".into());
@@ -1025,15 +1021,10 @@ fn load_mail_resolved(
             email.clone(),
             sealbox_core::mail_provider::server_for_provider(provider),
         ),
-        crate::vault::SecretPayload::Mailbox { email, imap_host, imap_port, .. } => (
-            email.clone(),
-            sealbox_core::mail_provider::server_for_mailbox(email, imap_host.as_deref(), *imap_port),
-        ),
         _ => return Err("不是邮箱账号".into()),
     };
     let secret = match payload {
         crate::vault::SecretPayload::MailAuth { auth_code, .. } => auth_code,
-        crate::vault::SecretPayload::Mailbox { password, .. } => password,
         _ => return Err("不是邮箱账号".into()),
     };
     let Some((host, port)) = endpoint else {

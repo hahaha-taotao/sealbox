@@ -10,7 +10,7 @@ const ref = value => ({value});
 const deferred = () => { let resolve, reject; const promise = new Promise((a,b) => {resolve=a;reject=b;}); return {promise,resolve,reject}; };
 function setup(api = {}) {
   const row = {entryId:'a',folder:'INBOX',uid:1,seen:true,subject:'test'};
-  const state = {mailSelected:ref(row),mailMessages:ref([row]),mailFolders:ref([{name:'INBOX',role:'inbox',unread:2}]),mailUnified:ref(false),mailAccountId:ref('a'),mailRoleCounts:ref({inbox:2}),mailMutationBusy:ref(''),mailMutationError:ref(''),mailBodyBusy:ref(false),mailDeleteTarget:ref(row),mailFilter:ref('all'),status:ref({unlocked:true}),mailCursor:ref(0),mailSyncNote:ref(''),mailMessageVersions:new Map(),mailSeq:1,mailMessageKey,refreshMailCounts:()=>{},api:{mailSetSeen:async()=>{},mailDelete:async()=>{},...api}};
+  const state = {mailSelected:ref(row),mailMessages:ref([row]),mailFolders:ref([{name:'INBOX',role:'inbox',unread:2}]),mailUnified:ref(false),mailAccountId:ref('a'),mailRoleCounts:ref({inbox:2}),mailMutationBusy:ref(''),mailMutationError:ref(''),mailBodyBusy:ref(false),mailDeleteTarget:ref(row),mailFilter:ref('all'),status:ref({unlocked:true}),mailCursor:ref(0),mailSyncNote:ref(''),mailMessageVersions:new Map(),mailRemovedKeys:new Set(),mailSeq:1,mailMessageKey,refreshMailCounts:()=>{},api:{mailSetSeen:async()=>{},mailDelete:async()=>{},...api}};
   state.backToMailList=()=>{state.mailSelected.value=null;state.mailDeleteTarget.value=null;};
   const context=vm.createContext(state);
   vm.runInContext(ts.transpileModule(section+'\nglobalThis.actions={toggleMailSeen,deleteMailMessage};',{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.None}}).outputText,context);
