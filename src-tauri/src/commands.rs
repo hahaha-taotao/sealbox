@@ -2068,6 +2068,25 @@ pub struct MailBodyRequest {
     pub mark_seen: bool,
 }
 
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MailSetSeenRequest {
+    pub entry_id: String,
+    pub uid: u32,
+    #[serde(default)]
+    pub folder: Option<String>,
+    pub seen: bool,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MailDeleteRequest {
+    pub entry_id: String,
+    pub uid: u32,
+    #[serde(default)]
+    pub folder: Option<String>,
+}
+
 /// Defaults to `true`: reading a message marks it read locally, as the reader always has.
 fn mail_mark_seen_default() -> bool {
     true
@@ -2194,6 +2213,53 @@ fn folder_or_inbox(folder: &Option<String>) -> String {
         Some(name) if !name.is_empty() => name.to_string(),
         _ => "INBOX".to_string(),
     }
+}
+
+/// UI-only mailbox mutations. Keep the session locked through the server operation and cache
+/// commit: a lock/unlock or vault switch must not redirect a completed write into another vault.
+/// Refreshes already in flight are handled by the store's delete tombstones on cache upsert.
+fn mail_mutate(state: &AppState, entry_id: &str, uid: u32, folder: &Option<String>, seen: Option<bool>) -> Result<(), String> {
+    let mut session = lock_session(&state.session);
+    session.require_unlocked().map_err(map_err)?;
+    if uid == 0 {
+        return Err("参数无效".into());
+    }
+    let dek = *session.dek().map_err(map_err)?;
+    let vault = session.vault().map_err(map_err)?;
+    let mail = load_mail_session_with(vault, &dek, entry_id)?;
+    let folder = folder_or_inbox(folder);
+    let mut io = mail_connect(&mail)?;
+    let action = if let Some(seen) = seen {
+        sealbox_core::mail::set_seen_in(&mut io, &mail.email, &mail.secret, &folder, uid, seen)
+            .map_err(|failure| sealbox_core::mail::failure_message(failure).to_string())?;
+        "mail_set_seen"
+    } else {
+        sealbox_core::mail::delete_message_in(&mut io, &mail.email, &mail.secret, &folder, uid)
+            .map_err(|failure| sealbox_core::mail::failure_message(failure).to_string())?;
+        "mail_delete"
+    };
+    // No local changes on a server failure. Delete commits a tombstone even for uncached UIDs.
+    let committed = if let Some(seen) = seen {
+        vault.mail_set_seen(entry_id, &folder, uid, seen)
+    } else {
+        vault.mail_remove_message(entry_id, &folder, uid)
+    };
+    // Fixed audit fields only: no credentials, subject, folder name or raw server response.
+    let detail = format!("uid={uid} server=ok cache={}", if committed.is_ok() { "ok" } else { "error" });
+    let audited = vault.audit(action, Some(entry_id), &detail);
+    committed.map_err(map_err)?;
+    audited.map_err(map_err)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn mail_set_seen(state: State<AppState>, request: MailSetSeenRequest) -> Result<(), String> {
+    mail_mutate(&state, &request.entry_id, request.uid, &request.folder, Some(request.seen))
+}
+
+#[tauri::command]
+pub fn mail_delete(state: State<AppState>, request: MailDeleteRequest) -> Result<(), String> {
+    mail_mutate(&state, &request.entry_id, request.uid, &request.folder, None)
 }
 
 #[tauri::command]
@@ -2453,11 +2519,8 @@ pub fn mail_list(app: AppHandle, state: State<AppState>, request: MailListReques
             });
         }
     }
-    let messages = mail_fetch_page(&state, &request.entry_id, &folder, request.before_uid, filter, &keyword)?;
-    // Nothing to store, but the answer is still "live": the server just said this page is empty.
-    if messages.is_empty() {
-        return Ok(MailListResult { messages, cached: false, fetched_at: None });
-    }
+    let revision = lock_session(&state.session).vault().map_err(map_err)?.mail_cache_revision().map_err(map_err)?;
+    let (messages, uid_validity) = mail_fetch_page(&state, &request.entry_id, &folder, request.before_uid, filter, &keyword)?;
     {
         let session = lock_session(&state.session);
         let vault = session.vault().map_err(map_err)?;
@@ -2468,9 +2531,14 @@ pub fn mail_list(app: AppHandle, state: State<AppState>, request: MailListReques
             .mail_ensure_folder(&request.entry_id, &folder)
             .map_err(map_err)?;
         let previews = vec![String::new(); messages.len()];
-        vault
-            .mail_upsert_messages(&request.entry_id, &folder, &messages, &previews)
-            .map_err(map_err)?;
+        if !vault
+            .mail_upsert_messages_with_uid_validity_if_revision(&request.entry_id, &folder, &messages, &previews, revision, uid_validity)
+            .map_err(map_err)?
+        {
+            let messages = vault.mail_list_local(&request.entry_id, &folder, request.before_uid, 50, local_filter, &keyword)
+                .map_err(map_err)?.into_iter().map(cached_to_message).collect();
+            return Ok(MailListResult { messages, cached: true, fetched_at: None });
+        }
     }
     mail_audit(&state, "mail_list", &request.entry_id, "");
     Ok(MailListResult { messages, cached: false, fetched_at: None })
@@ -2485,12 +2553,13 @@ fn mail_fetch_page(
     before_uid: Option<u32>,
     filter: sealbox_core::mail_folder::MailFilter,
     keyword: &str,
-) -> Result<Vec<sealbox_core::mail::MailMessage>, String> {
+) -> Result<(Vec<sealbox_core::mail::MailMessage>, Option<u32>), String> {
     let mail = load_mail_session(state, entry_id)?;
     let mut io = mail_connect(&mail)?;
-    let page = sealbox_core::mail::list_folder(&mut io, &mail.email, &mail.secret, folder, before_uid, 50, filter, keyword)
+    let mut tracked = sealbox_core::mail::UidValidityIo::new(&mut io);
+    let page = sealbox_core::mail::list_folder(&mut tracked, &mail.email, &mail.secret, folder, before_uid, 50, filter, keyword)
         .map_err(sealbox_core::mail::failure_message)?;
-    Ok(page)
+    Ok((page, tracked.uid_validity()))
 }
 
 /// A cached row as the reader expects it: merged read state plus the teaser the cache already
@@ -2533,8 +2602,10 @@ fn start_mail_refresh(
             let vault = guard.vault().map_err(map_err)?;
             let mail = load_mail_session_with(vault, &dek, &entry_id)?;
             let mut io = mail_connect(&mail)?;
+            let revision = vault.mail_cache_revision().map_err(map_err)?;
+            let mut tracked = sealbox_core::mail::UidValidityIo::new(&mut io);
             let page = sealbox_core::mail::list_folder(
-                &mut io,
+                &mut tracked,
                 &mail.email,
                 &mail.secret,
                 &folder,
@@ -2547,7 +2618,7 @@ fn start_mail_refresh(
             // A live page never carries a teaser, so the cached one is preserved rather than
             // overwritten with a blank.
             let previews = vec![String::new(); page.len()];
-            vault.mail_upsert_messages(&entry_id, &folder, &page, &previews).map_err(map_err)?;
+            vault.mail_upsert_messages_with_uid_validity_if_revision(&entry_id, &folder, &page, &previews, revision, tracked.uid_validity()).map_err(map_err)?;
             Ok(())
         };
         if fold().is_ok() {
@@ -2608,6 +2679,7 @@ pub fn mail_body(state: State<AppState>, request: MailBodyRequest) -> Result<sea
             }
         }
     }
+    let revision = lock_session(&state.session).vault().map_err(map_err)?.mail_cache_revision().map_err(map_err)?;
     let mail = load_mail_session(&state, &request.entry_id)?;
     let mut io = mail_connect(&mail)?;
     let body = sealbox_core::mail::fetch_body_in(&mut io, &mail.email, &mail.secret, &folder, request.uid)
@@ -2616,7 +2688,7 @@ pub fn mail_body(state: State<AppState>, request: MailBodyRequest) -> Result<sea
         let session = lock_session(&state.session);
         if let Ok(vault) = session.vault() {
             let _ = vault.mail_save_body(&request.entry_id, &folder, request.uid, &body);
-            if request.mark_seen {
+            if request.mark_seen && vault.mail_cache_revision().map_err(map_err)? == revision {
                 let _ = vault.mail_mark_local_seen(&request.entry_id, &folder, request.uid);
             }
         }
@@ -2892,18 +2964,20 @@ fn sync_folder(
     report: &mut MailSyncAccount,
 ) -> Result<(), String> {
     const FOLDER_FAILED: &str = "部分文件夹同步失败";
-    let known: Vec<u32> = {
+    let (known, revision): (Vec<u32>, u64) = {
         let session = lock_session(&state.session);
         let vault = session.vault().map_err(map_err)?;
-        vault
+        let known = vault
             .mail_recent_messages(entry_id, &folder.name, None, 50)
             .map_err(map_err)?
             .into_iter()
             .map(|cached| cached.uid)
-            .collect()
+            .collect();
+        (known, vault.mail_cache_revision().map_err(map_err)?)
     };
+    let mut tracked = sealbox_core::mail::UidValidityIo::new(io);
     let messages = sealbox_core::mail::list_folder(
-        io,
+        &mut tracked,
         &mail.email,
         &mail.secret,
         &folder.name,
@@ -2917,19 +2991,23 @@ fn sync_folder(
         let _ = failure;
         FOLDER_FAILED.to_string()
     })?;
+    let uid_validity = tracked.uid_validity();
+    let unread = sealbox_core::mail::unread_count(&mut tracked, &mail.email, &mail.secret, &folder.name).unwrap_or(0);
+    let session = lock_session(&state.session);
+    let vault = session.vault().map_err(map_err)?;
+    let previews = vec![String::new(); messages.len()];
+    if !vault
+        .mail_upsert_messages_with_uid_validity_if_revision(entry_id, &folder.name, &messages, &previews, revision, uid_validity)
+        .map_err(map_err)?
+    {
+        return Ok(()); // Discard stale unread counts and new-message notifications too.
+    }
     if folder.role == "inbox" {
         for message in messages.iter().filter(|message| !known.contains(&message.uid)).take(2) {
             report.samples.push(format!("{} · {}", message.from, message.subject));
         }
         report.new_count += messages.iter().filter(|message| !known.contains(&message.uid)).count();
     }
-    let unread = sealbox_core::mail::unread_count(io, &mail.email, &mail.secret, &folder.name).unwrap_or(0);
-    let session = lock_session(&state.session);
-    let vault = session.vault().map_err(map_err)?;
-    let previews = vec![String::new(); messages.len()];
-    vault
-        .mail_upsert_messages(entry_id, &folder.name, &messages, &previews)
-        .map_err(map_err)?;
     vault
         .mail_save_folders_unread(entry_id, &folder.name, folder.role, unread)
         .map_err(map_err)?;
@@ -2996,6 +3074,24 @@ mod tests {
     use super::*;
     use crate::session::Session;
     use crate::vault::Vault;
+
+    #[test]
+    fn mail_write_requests_require_seen_and_reject_extra_fields() {
+        let set: MailSetSeenRequest = serde_json::from_value(serde_json::json!({"entryId":"mail", "uid":7,"seen":false})).unwrap();
+        assert!(!set.seen);
+        assert_eq!(folder_or_inbox(&set.folder), "INBOX");
+        assert!(serde_json::from_value::<MailSetSeenRequest>(serde_json::json!({"entryId":"mail","uid":7})).is_err());
+        assert!(serde_json::from_value::<MailDeleteRequest>(serde_json::json!({"entryId":"mail","uid":7,"seen":true})).is_err());
+    }
+
+    #[test]
+    fn mail_writes_require_unlock_before_network_access() {
+        let state = AppState::new();
+        for seen in [None, Some(true), Some(false)] {
+            let error = mail_mutate(&state, "missing", 7, &None, seen).unwrap_err();
+            assert!(error.contains("锁定"), "{error}");
+        }
+    }
 
     fn temp_vault_path() -> (PathBuf, [u8; 32]) {
         let dir = std::env::temp_dir().join(format!("sealbox-lock-{}", uuid::Uuid::new_v4()));

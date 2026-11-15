@@ -2422,6 +2422,33 @@ impl Vault {
         Ok(())
     }
 
+    /// Capture before a network page fetch; pass back to mail_upsert_messages_if_revision.
+    pub fn mail_cache_revision(&self) -> Result<u64, VaultError> {
+        Ok(crate::mail_store::cache_revision(&self.conn)?)
+    }
+
+    /// False means a concurrent explicit mutation made this network response stale.
+    pub fn mail_upsert_messages_if_revision(&self, account_id: &str, folder: &str, messages: &[crate::mail::MailMessage], previews: &[String], revision: u64) -> Result<bool, VaultError> {
+        Ok(crate::mail_store::upsert_messages_if_revision(&self.conn, account_id, folder, messages, previews, revision)?)
+    }
+
+    /// Guard a page and reset its cache namespace when EXAMINE reports a new UIDVALIDITY.
+    pub fn mail_upsert_messages_with_uid_validity_if_revision(&self, account_id: &str, folder: &str, messages: &[crate::mail::MailMessage], previews: &[String], revision: u64, uid_validity: Option<u32>) -> Result<bool, VaultError> {
+        Ok(crate::mail_store::upsert_messages_with_uid_validity_if_revision(&self.conn, account_id, folder, messages, previews, revision, uid_validity)?)
+    }
+
+    /// Cache half of an explicit server mutation; call only after set_seen_in succeeds.
+    pub fn mail_set_seen(&self, account_id: &str, folder: &str, uid: u32, seen: bool) -> Result<(), VaultError> {
+        crate::mail_store::set_seen(&self.conn, account_id, folder, uid, seen)?;
+        Ok(())
+    }
+
+    /// Cache half of a successful UID deletion, including stale-sync resurrection protection.
+    pub fn mail_remove_message(&self, account_id: &str, folder: &str, uid: u32) -> Result<(), VaultError> {
+        crate::mail_store::remove_message(&self.conn, account_id, folder, uid)?;
+        Ok(())
+    }
+
     pub fn mail_set_pinned(
         &self,
         account_id: &str,

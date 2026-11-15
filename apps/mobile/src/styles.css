@@ -188,7 +188,43 @@ textarea { min-height: 72px; resize: vertical; }
 .update-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 16px; }
 .release-link { display: block; margin: 8px auto 0; font-size: 13px; }
 
-/* 邮箱列表行：未读左侧 3px 强调条，发件人 + 相对时间在上，主题加粗，摘要一行。 */
+/* 邮箱使用一层列表滚动，安全区只在页头/页尾计算一次。 */
+.mail-top h1 { min-width: 0; }
+.mail-readonly { font-size: 11px; color: var(--brand); background: var(--soft); border-radius: 6px; padding: 4px 8px; }
+.mail-controls { margin: 12px; padding: 12px; background: #fff; border: 1px solid var(--line); border-radius: 16px; }
+.mail-account-label { display: block; color: #656c79; font-size: 12px; margin-bottom: 6px; }
+.mail-account-info { display: flex; align-items: center; justify-content: space-between; color: #656c79; font-size: 12px; }
+.mail-controls .chips { padding: 4px 0 10px; }
+.mail-controls .mail-folders { border-bottom: 1px solid var(--line); margin-bottom: 8px; }
+.mail-controls .chip { min-height: 40px; }
+.mail-controls .mail-filters { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; }
+.mail-controls .mail-filters .chip { padding: 7px 4px; border-radius: 10px; background: var(--bg); }
+.mail-controls .mail-filters .chip.on { background: var(--soft); }
+.mail-other-label { display: flex; align-items: center; gap: 8px; color: #656c79; font-size: 12px; margin-bottom: 10px; }
+.mail-other-label select { flex: 1; min-width: 0; padding: 8px; }
+.mail-controls .mail-search { padding: 0; gap: 4px; }
+.mail-search input { min-width: 0; flex: 1; }
+.mail-search .ghost { width: auto; flex: none; padding: 0 12px; height: 40px; }
+.mail-search .link { flex: none; padding: 0 6px; }
+.mail-search-scope { margin: 7px 0 0; overflow-wrap: anywhere; }
+.mail-list-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 2px 16px 12px; }
+.mail-list-heading strong { font-size: 15px; }
+.mail-list-heading span { font-size: 12px; color: #656c79; }
+.mail-list { padding-bottom: 0; }
+.mail-list-footer { padding-bottom: calc(14px + var(--safe-bottom)); }
+.mail-reading { padding-bottom: 20px; }
+.mail-reading-subject { margin: 0 0 12px; font-size: 21px; line-height: 1.45; overflow-wrap: anywhere; }
+.mail-reading-from { font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; margin-bottom: 4px; }
+.mail-reading-source { overflow-wrap: anywhere; }
+.mail-reader-nav { display: flex; align-items: center; gap: 12px; padding: 10px calc(12px + var(--safe-right)) calc(10px + var(--safe-bottom)) calc(12px + var(--safe-left)); background: #fff; border-top: 1px solid var(--line); }
+.mail-reader-nav button { flex: 1; width: auto; }
+.mail-reader-nav span { font-size: 12px; color: #656c79; white-space: nowrap; }
+.mail-body-error { padding: 10px; background: #fff1f4; border-radius: 12px; }
+.mail-reading .set { flex-wrap: wrap; padding-inline: 0; }
+.mail-reading .set .t { min-width: 0; overflow-wrap: anywhere; }
+.mail-reading .set .ghost { width: auto; padding: 0 12px; }
+.mail-controls button:disabled, .mail-reader-nav button:disabled, .mail-list-footer button:disabled { opacity: .45; cursor: default; }
+/* 邮箱列表行：发件人、主题、摘要与来源分层。 */
 .mail-item { position: relative; border-left: 3px solid transparent; padding-left: 10px; }
 .mail-item.unread { border-left-color: var(--brand); }
 .mail-item.unread .mail-item-subject { font-weight: 700; color: var(--ink); }
@@ -200,15 +236,37 @@ textarea { min-height: 72px; resize: vertical; }
 }
 .mail-item-when { flex: 0 0 auto; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .mail-item-subject { font-size: 14px; }
-.mail-item-tags { display: flex; gap: 6px; }
-.mail-item-tags > template { display: contents; }
+.mail-item-tags { display: flex; flex-wrap: wrap; gap: 4px 8px; margin-top: 6px; color: #656c79; font-size: 11px; }
+.mail-item-source { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex-basis: 100%; }
+.mail-unread-label { color: var(--brand); font-weight: 650; }
+.mail-item-preview { overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; margin-top: 5px; color: #656c79; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 /* 缓存态提示：列表来自本地缓存时的一行小字。 */
 .mail-cache { color: var(--warn); }
 /* 正文工具栏：字号 + 纯文本切换，按钮保持胶囊按钮的观感但只有一个屏幕宽的一小段。 */
-.mail-tools { display: flex; gap: 8px; margin: 10px 0; }
+.mail-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 14px 0; }
 .mail-tools .mail-tool { width: auto; height: 36px; padding: 0 14px; font-size: 13px; font-weight: 600; border-radius: 999px; }
 .mail-tools .mail-tool.on { background: var(--soft); color: var(--brand); border-color: #c9c9f2; }
-/* 邮箱（只读）：正文 iframe 用固定高度，避免跨域文档量高失败时塌成 0。 */
+/* 正文 iframe 保持独立滚动区域；正文页与列表共用安静的 Sigil 视觉层级。 */
+.mail-scroll { overscroll-behavior-y: contain; scrollbar-width: thin; scrollbar-color: #c9ccd4 transparent; }
+.mail-row { border-bottom: 1px solid var(--line); }
+.mail-row .mail-item { width: 100%; border-bottom: 0; }
+.mail-row-actions { display: flex; align-items: center; gap: 16px; padding: 0 16px 10px 65px; }
+.mail-row-actions button { min-height: 36px; font-size: 12px; }
+.mail-row-actions span { color: var(--muted); font-size: 11px; }
+.mail-delete { color: #b53e50; }
+.mail-tools button:disabled, .mail-row-actions button:disabled { opacity: .45; cursor: default; }
+.mail-mutation-error { display: flex; align-items: center; gap: 12px; padding: 12px 16px; background: #fff1f4; color: #a52d42; font-size: 13px; border-bottom: 1px solid #f3d3db; }
+.mail-mutation-error span { flex: 1; overflow-wrap: anywhere; }
+.mail-mutation-error button { flex: none; }
+.mail-reading-header { padding: 4px 0 18px; border-bottom: 1px solid var(--line); }
+.mail-reading-eyebrow { display: block; margin-bottom: 12px; color: var(--brand); font-size: 11px; font-weight: 650; letter-spacing: .06em; }
+.mail-reading-header .hint { margin-block: 6px; font-size: 12px; }
+.mail-reading-header .mail-reading-source { margin-bottom: 0; }
+.mail-reading .mail-attachment { display: flex; gap: 10px; flex-wrap: nowrap; margin: 8px 0; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.mail-attachment-icon { display: grid; place-items: center; flex: 0 0 34px; height: 40px; border-radius: 8px; color: var(--brand); background: var(--soft); font-size: 24px; }
+.mail-attachment strong { display: block; font-size: 13px; line-height: 1.5; font-weight: 600; }
+.mail-attachment small { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
+.mail-attachment button { flex: none; }
 .mail-frame {
   width: 100%;
   height: 70vh;

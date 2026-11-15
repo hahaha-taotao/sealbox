@@ -89,6 +89,8 @@ pub fn run() {
             commands::mail_folders,
             commands::mail_list,
             commands::mail_body,
+            commands::mail_set_seen,
+            commands::mail_delete,
             commands::mail_attachments,
             commands::mail_save_attachment,
             commands::mail_discover,

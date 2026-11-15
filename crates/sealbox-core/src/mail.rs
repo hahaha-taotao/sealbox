@@ -13,6 +13,8 @@ pub enum MailFailure {
     Protocol,
     Unsupported,
     TooLarge,
+    SafeDeleteUnsupported,
+    DeleteUnconfirmed,
 }
 
 pub fn endpoint(provider: &str) -> Option<(&'static str, u16)> {
@@ -40,6 +42,8 @@ pub fn failure_message(failure: MailFailure) -> &'static str {
         MailFailure::EmptyText => "这封邮件没有可显示的文本",
         MailFailure::Unsupported => "首版不支持",
         MailFailure::TooLarge => "附件过大，已拒绝下载",
+        MailFailure::SafeDeleteUnsupported => "服务器不支持 UIDPLUS 精确删除，邮件未删除",
+        MailFailure::DeleteUnconfirmed => "邮件已标记删除但未确认移除，请刷新后重试",
     }
 }
 
@@ -677,16 +681,57 @@ pub trait ImapIo {
     fn transact(&mut self, command: &str) -> Result<String, MailFailure>;
 }
 
+/// Observes mailbox namespace responses without changing any existing read protocol API.
+/// Use one wrapper per selected folder and persist its UIDVALIDITY alongside the fetched page.
+pub struct UidValidityIo<'a, T: ImapIo> {
+    inner: &'a mut T,
+    uid_validity: Option<u32>,
+}
+
+impl<'a, T: ImapIo> UidValidityIo<'a, T> {
+    pub fn new(inner: &'a mut T) -> Self { Self { inner, uid_validity: None } }
+    pub fn uid_validity(&self) -> Option<u32> { self.uid_validity }
+}
+
+impl<T: ImapIo> ImapIo for UidValidityIo<'_, T> {
+    fn transact(&mut self, command: &str) -> Result<String, MailFailure> {
+        let response = self.inner.transact(command)?;
+        let mut words = command.split_ascii_whitespace();
+        let tag = words.next().ok_or(MailFailure::Protocol)?;
+        if words.next().is_some_and(|word| word.eq_ignore_ascii_case("EXAMINE") || word.eq_ignore_ascii_case("SELECT")) {
+            check_completion(&response, tag, MailFailure::Protocol)?;
+            self.uid_validity = None;
+            for line in response.lines() {
+                // UIDVALIDITY is an OK response code, never message text or a free-text mention.
+                let Some((line_tag, status)) = status_of(line) else { continue };
+                if (line_tag != "*" && line_tag != tag) || status != "OK" { continue; }
+                let mut fields = line.splitn(3, char::is_whitespace);
+                fields.next(); fields.next();
+                let Some(code) = fields.next().map(str::trim_start) else { continue };
+                let Some(end) = code.find(']') else { continue };
+                let mut tokens = code[..end].split_ascii_whitespace();
+                if !tokens.next().is_some_and(|token| token.eq_ignore_ascii_case("[UIDVALIDITY")) { continue; }
+                let value = tokens.next().and_then(|value| value.parse::<u32>().ok()).filter(|value| *value > 0).ok_or(MailFailure::Protocol)?;
+                if tokens.next().is_some() || self.uid_validity.is_some_and(|previous| previous != value) { return Err(MailFailure::Protocol); }
+                self.uid_validity = Some(value);
+            }
+        }
+        Ok(response)
+    }
+}
+
 const MAX_BODY_BYTES: usize = 200 * 1024;
 
 /// Every message this surface can produce. Sync reports one of these (or uses one directly), so a
 /// test can pin that no server reply and no credential can ever reach the caller through an error.
-pub const FAILURE_MESSAGES: [&str; 5] = [
+pub const FAILURE_MESSAGES: [&str; 7] = [
     "登录失败，请检查授权码和 IMAP 是否已开启",
     "连接超时，请稍后重试",
     "这封邮件没有可显示的文本",
     "首版不支持",
     "附件过大，已拒绝下载",
+    "服务器不支持 UIDPLUS 精确删除，邮件未删除",
+    "邮件已标记删除但未确认移除，请刷新后重试",
 ];
 
 /// IMAP quoted string. CR, LF and NUL cannot appear in a quoted string, so callers reject them first.
@@ -747,6 +792,63 @@ fn mailbox_name(folder: &str) -> Option<String> {
         return None;
     }
     Some(quote(folder))
+}
+
+/// Explicit mutations use SELECT; ordinary reads continue to use EXAMINE and PEEK.
+fn login_for_write(io: &mut impl ImapIo, email: &str, auth: &str, folder: &str, uid: u32) -> Result<String, MailFailure> {
+    if uid == 0 {
+        return Err(MailFailure::Protocol);
+    }
+    let mailbox = mailbox_name(folder).ok_or(MailFailure::Protocol)?;
+    if email.is_empty() || auth.is_empty() || email.chars().chain(auth.chars()).any(|ch| matches!(ch, '\r' | '\n' | '\0')) {
+        return Err(MailFailure::Login);
+    }
+    let response = io.transact(&format!("A1 LOGIN {} {}", quote(email), quote(auth)))?;
+    check_completion(&response, "A1", MailFailure::Login)?;
+    Ok(mailbox)
+}
+
+fn select_for_write(io: &mut impl ImapIo, mailbox: &str) -> Result<(), MailFailure> {
+    let response = io.transact(&format!("A3 SELECT {mailbox}"))?;
+    check_completion(&response, "A3", MailFailure::Protocol)?;
+    // A server may successfully open a mailbox read-only despite SELECT.
+    if response.lines().any(|line| line.to_ascii_uppercase().contains("[READ-ONLY]")) {
+        return Err(MailFailure::Protocol);
+    }
+    Ok(())
+}
+
+/// Sets precisely the requested server read state. Callers update the cache only after success.
+pub fn set_seen_in(io: &mut impl ImapIo, email: &str, auth: &str, folder: &str, uid: u32, seen: bool) -> Result<(), MailFailure> {
+    let mailbox = login_for_write(io, email, auth, folder, uid)?;
+    select_for_write(io, &mailbox)?;
+    let op = if seen { "+" } else { "-" };
+    let response = io.transact(&format!("A4 UID STORE {uid} {op}FLAGS.SILENT (\\Seen)"))?;
+    check_completion(&response, "A4", MailFailure::Protocol)
+}
+
+/// Permanently removes exactly one UID (not a move to Trash). Never sends bare EXPUNGE or
+/// CLOSE: either would also expunge other clients' \\Deleted messages. UIDPLUS is required
+/// before even marking the target deleted. A failed/ambiguous expunge leaves cache unchanged.
+pub fn delete_message_in(io: &mut impl ImapIo, email: &str, auth: &str, folder: &str, uid: u32) -> Result<(), MailFailure> {
+    let mailbox = login_for_write(io, email, auth, folder, uid)?;
+    // Query after authentication: capabilities can change after LOGIN.
+    let response = io.transact("A2 CAPABILITY")?;
+    check_completion(&response, "A2", MailFailure::Protocol)?;
+    let uidplus = response.lines().any(|line| {
+        let mut tokens = line.split_ascii_whitespace();
+        tokens.next() == Some("*")
+            && tokens.next().is_some_and(|token| token.eq_ignore_ascii_case("CAPABILITY"))
+            && tokens.any(|token| token.eq_ignore_ascii_case("UIDPLUS"))
+    });
+    if !uidplus {
+        return Err(MailFailure::SafeDeleteUnsupported);
+    }
+    select_for_write(io, &mailbox)?;
+    let response = io.transact(&format!("A4 UID STORE {uid} +FLAGS.SILENT (\\Deleted)"))?;
+    check_completion(&response, "A4", MailFailure::Protocol)?;
+    let response = io.transact(&format!("A5 UID EXPUNGE {uid}")).map_err(|_| MailFailure::DeleteUnconfirmed)?;
+    check_completion(&response, "A5", MailFailure::DeleteUnconfirmed).map_err(|_| MailFailure::DeleteUnconfirmed)
 }
 
 pub fn list_inbox(
@@ -2047,6 +2149,81 @@ mod tests {
             assert!(command.contains(expect), "{command}");
             Ok(response.to_string())
         }
+    }
+
+    #[test]
+    fn uid_validity_observer_reads_only_selected_mailbox_ok_codes() {
+        let mut io = ScriptIo { steps: vec![("LOGIN", "A1 OK\r\n"), ("EXAMINE", "* OK [UIDVALIDITY 42] stable\r\nA2 OK [READ-ONLY]\r\n"), ("UID SEARCH", "* SEARCH\r\nA3 OK\r\n")], seen: vec![] };
+        let mut observer = UidValidityIo::new(&mut io);
+        assert!(list_inbox(&mut observer, "me", "secret", None, 20).unwrap().is_empty());
+        assert_eq!(observer.uid_validity(), Some(42));
+        let mut io = ScriptIo { steps: vec![("EXAMINE", "* OK mention [UIDVALIDITY 90]\r\nA2 OK\r\n")], seen: vec![] };
+        let mut observer = UidValidityIo::new(&mut io);
+        observer.transact("A2 EXAMINE INBOX").unwrap();
+        assert_eq!(observer.uid_validity(), None);
+        let mut io = ScriptIo { steps: vec![("EXAMINE", "* OK [UIDVALIDITY 0]\r\nA2 OK\r\n")], seen: vec![] };
+        assert_eq!(UidValidityIo::new(&mut io).transact("A2 EXAMINE INBOX"), Err(MailFailure::Protocol));
+    }
+
+    #[test]
+    fn explicit_seen_sets_and_clears_only_the_target_uid() {
+        for (seen, expected) in [(true, "A4 UID STORE 9 +FLAGS.SILENT (\\Seen)"), (false, "A4 UID STORE 9 -FLAGS.SILENT (\\Seen)")] {
+            let mut io = ScriptIo { steps: vec![("A1 LOGIN", "A1 OK\r\n"), ("A3 SELECT", "A3 OK [READ-WRITE]\r\n"), (expected, "A4 OK\r\n")], seen: vec![] };
+            set_seen_in(&mut io, "me@test", "secret", "INBOX", 9, seen).unwrap();
+            assert_eq!(io.seen[2], expected);
+            assert!(io.steps.is_empty());
+        }
+    }
+
+    #[test]
+    fn deletion_requires_uidplus_before_store_and_expunges_only_target() {
+        let mut io = ScriptIo { steps: vec![("LOGIN", "A1 OK\r\n"), ("CAPABILITY", "* CAPABILITY IMAP4rev1 uidplus\r\nA2 OK\r\n"), ("SELECT", "A3 OK [READ-WRITE]\r\n"), ("A4 UID STORE 9 +FLAGS.SILENT (\\Deleted)", "A4 OK\r\n"), ("A5 UID EXPUNGE 9", "* 2 EXPUNGE\r\nA5 OK\r\n")], seen: vec![] };
+        delete_message_in(&mut io, "me@test", "secret", "INBOX", 9).unwrap();
+        assert_eq!(io.seen.last().unwrap(), "A5 UID EXPUNGE 9");
+        assert!(io.seen.iter().all(|command| !command.ends_with(" EXPUNGE") && !command.contains("CLOSE")));
+        for capability in ["* CAPABILITY IMAP4rev1 MOVE\r\nA2 OK\r\n", "* OK UIDPLUS\r\nA2 OK\r\n", "* CAPABILITY XUIDPLUS\r\nA2 OK\r\n"] {
+            let mut io = ScriptIo { steps: vec![("LOGIN", "A1 OK\r\n"), ("CAPABILITY", capability)], seen: vec![] };
+            assert_eq!(delete_message_in(&mut io, "me@test", "secret", "INBOX", 9), Err(MailFailure::SafeDeleteUnsupported));
+            assert_eq!(io.seen.len(), 2);
+        }
+        assert!(failure_message(MailFailure::SafeDeleteUnsupported).contains("UIDPLUS"));
+    }
+
+    #[test]
+    fn mutation_inputs_and_server_failures_stop_before_writes() {
+        for (email, auth, folder, uid) in [("me", "secret", "INBOX", 0), ("me\r\nA2", "secret", "INBOX", 1), ("me", "sec\0ret", "INBOX", 1), ("me", "secret", "INBOX\r\nEXPUNGE", 1), ("me", "", "INBOX", 1)] {
+            let mut io = ScriptIo { steps: vec![], seen: vec![] };
+            assert!(set_seen_in(&mut io, email, auth, folder, uid, false).is_err());
+            assert!(delete_message_in(&mut io, email, auth, folder, uid).is_err());
+            assert!(io.seen.is_empty());
+        }
+        let mut io = ScriptIo { steps: vec![("LOGIN", "A1 NO bad secret\r\n")], seen: vec![] };
+        assert_eq!(set_seen_in(&mut io, "me", "secret", "INBOX", 9, true), Err(MailFailure::Login));
+        let mut io = ScriptIo { steps: vec![("LOGIN", "A1 OK\r\n"), ("SELECT", "A3 OK [READ-ONLY]\r\n")], seen: vec![] };
+        assert_eq!(set_seen_in(&mut io, "me", "secret", "INBOX", 9, true), Err(MailFailure::Protocol));
+    }
+
+    #[test]
+    fn offline_and_store_failure_leave_cache_decisions_to_success_only() {
+        struct Offline;
+        impl ImapIo for Offline {
+            fn transact(&mut self, _: &str) -> Result<String, MailFailure> { Err(MailFailure::Timeout) }
+        }
+        assert_eq!(set_seen_in(&mut Offline, "me", "secret", "INBOX", 9, false), Err(MailFailure::Timeout));
+        assert_eq!(delete_message_in(&mut Offline, "me", "secret", "INBOX", 9), Err(MailFailure::Timeout));
+        let mut io = ScriptIo { steps: vec![("LOGIN", "A1 OK\r\n"), ("CAPABILITY", "* CAPABILITY UIDPLUS\r\nA2 OK\r\n"), ("SELECT", "A3 OK\r\n"), ("UID STORE", "A4 NO failed\r\n")], seen: vec![] };
+        assert_eq!(delete_message_in(&mut io, "me", "secret", "INBOX", 9), Err(MailFailure::Protocol));
+        assert_eq!(io.seen.len(), 4);
+        let mut io = ScriptIo { steps: vec![("LOGIN", "A1 OK\r\n"), ("CAPABILITY", "* CAPABILITY UIDPLUS\r\nA2 NO failed\r\n")], seen: vec![] };
+        assert_eq!(delete_message_in(&mut io, "me", "secret", "INBOX", 9), Err(MailFailure::Protocol));
+        assert_eq!(io.seen.len(), 2);
+    }
+
+    #[test]
+    fn failed_uid_expunge_has_no_broad_fallback() {
+        let mut io = ScriptIo { steps: vec![("LOGIN", "A1 OK\r\n"), ("CAPABILITY", "* CAPABILITY UIDPLUS\r\nA2 OK\r\n"), ("SELECT", "A3 OK\r\n"), ("UID STORE", "A4 OK\r\n"), ("UID EXPUNGE 9", "A5 NO failed\r\n")], seen: vec![] };
+        assert_eq!(delete_message_in(&mut io, "me", "secret", "INBOX", 9), Err(MailFailure::DeleteUnconfirmed));
+        assert_eq!(io.seen.len(), 5);
     }
 
     #[test]

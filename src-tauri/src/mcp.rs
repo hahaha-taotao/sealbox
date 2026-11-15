@@ -706,16 +706,6 @@ fn mail_tool_definitions() -> Vec<Value> {
     })]
 }
 
-fn legacy_mail_action(name: &str) -> Option<&'static str> {
-    match name {
-        "mail_accounts" => Some("accounts"),
-        "mail_list" => Some("list"),
-        "mail_read" => Some("read"),
-        "mail_download_attachment" => Some("save"),
-        _ => None,
-    }
-}
-
 fn mail_audit_detail(operation: &str, decision: &str, reason: &str, entry: &str, uid: &str, part: &str) -> String {
     fn token(value: &str) -> String {
         let cleaned: String = value
@@ -778,21 +768,6 @@ fn ensure_mail_keys(args: &Value, allowed: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-fn load_mail_secret(session: &crate::session::Session, entry_id: &str) -> Result<(String, String, zeroize::Zeroizing<String>), String> {
-    let dek = *session.dek().map_err(|error| error.to_string())?;
-    let payload = session
-        .vault()
-        .map_err(|error| error.to_string())?
-        .get_active_secret(&dek, entry_id)
-        .map_err(|error| error.to_string())?;
-    match payload {
-        crate::vault::SecretPayload::MailAuth { email, provider, auth_code } => {
-            Ok((email, provider, zeroize::Zeroizing::new(auth_code)))
-        }
-        _ => Err("不是邮箱授权码".into()),
-    }
-}
-
 fn call_mail_tool(session: &Mutex<Session>, name: &str, args: Value, permit: &Caller, generation: u64) -> Result<String, String> {
     let entry = args.get("entryId").and_then(Value::as_str).unwrap_or("-").to_string();
     let secrets = {
@@ -800,7 +775,9 @@ fn call_mail_tool(session: &Mutex<Session>, name: &str, args: Value, permit: &Ca
         let vault=s.vault().map_err(|e|e.to_string())?;
         let dek=s.dek().map_err(|e|e.to_string())?;
         let ids=if entry=="-" {
-            vault.list_entries(&crate::vault::ListFilter{kind:Some(crate::vault::EntryKind::MailAuth),..Default::default()}).map_err(|e|e.to_string())?.into_iter().map(|entry|entry.id).collect::<Vec<_>>()
+            vault.list_entries(&crate::vault::ListFilter::default()).map_err(|e|e.to_string())?.into_iter()
+                .filter(|entry| matches!(entry.kind, crate::vault::EntryKind::MailAuth | crate::vault::EntryKind::Mailbox))
+                .map(|entry|entry.id).collect::<Vec<_>>()
         } else {vec![entry.clone()]};
         let mut secrets=zeroize::Zeroizing::new(Vec::new());
         for id in ids {
@@ -835,7 +812,10 @@ fn call_mail_tool(session: &Mutex<Session>, name: &str, args: Value, permit: &Ca
 }
 
 fn call_mail_inner(session: &Mutex<Session>, name: &str, args: &Value, guard: &dyn Fn()->Result<(),String>) -> Result<String, String> {
-    let (action, args) = if name == "mail" {
+    if name != "mail" {
+        return Err(format!("未知工具 {name}"));
+    }
+    let (action, args) = {
         let action = args.get("action").and_then(Value::as_str).ok_or_else(|| {
             format!("mail 需要 action：{}", MAIL_ACTIONS.join("、"))
         })?;
@@ -848,11 +828,6 @@ fn call_mail_inner(session: &Mutex<Session>, name: &str, args: &Value, guard: &d
         let mut args = args.clone();
         args.as_object_mut().map(|object| object.remove("action"));
         (action, args)
-    } else {
-        (
-            legacy_mail_action(name).ok_or_else(|| format!("未知工具 {name}"))?,
-            args.clone(),
-        )
     };
     match action {
         "accounts" => {
@@ -913,11 +888,16 @@ fn call_mail_inner(session: &Mutex<Session>, name: &str, args: &Value, guard: &d
             let entry_id = mail_arg_str(&args, "entryId", true)?.unwrap_or("");
             let keyword = mail_arg_str(&args, "keyword", true)?.unwrap_or("");
             let session = lock_session(session);
-            session
+            let mut payload = session
                 .vault()
                 .map_err(|error| error.to_string())?
                 .get_active_secret(&*session.dek().map_err(|error| error.to_string())?, entry_id)
                 .map_err(|_| "不是邮箱账号".to_string())?;
+            let is_mail = matches!(&payload, crate::vault::SecretPayload::MailAuth { .. } | crate::vault::SecretPayload::Mailbox { .. });
+            zeroize::Zeroize::zeroize(&mut payload);
+            if !is_mail {
+                return Err("不是邮箱账号".into());
+            }
             let hits = session
                 .vault()
                 .map_err(|error| error.to_string())?

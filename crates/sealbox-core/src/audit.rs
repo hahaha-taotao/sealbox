@@ -43,6 +43,8 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("mcp_zoomkey_denied", "ZoomKey 调用未成功"),
     ("mail_list", "查看邮件列表"),
     ("mail_body", "阅读邮件"),
+    ("mail_set_seen", "设置邮件已读状态"),
+    ("mail_delete", "永久删除邮件"),
     ("mail_folders", "查看邮箱文件夹"),
     ("mail_sync", "自动收信"),
     ("mail_attachments", "查看邮件附件"),
@@ -487,6 +489,12 @@ mod tests {
             entry_id: None,
         })
     }
+    #[test]
+    fn explicit_mail_mutations_have_human_labels() {
+        assert_eq!(event("mail_set_seen", "uid=1 seen=false").operation, "设置邮件已读状态");
+        assert_eq!(event("mail_delete", "uid=1").operation, "永久删除邮件");
+    }
+
     #[test]
     fn conservative_results_and_free_text() {
         assert_eq!(event("unknown", "ok").result, "recorded");

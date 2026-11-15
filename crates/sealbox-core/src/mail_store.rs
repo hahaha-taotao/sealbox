@@ -233,6 +233,17 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), DbError> {
           body_fetched_at TEXT,
           PRIMARY KEY (account_id, folder, uid)
         );
+        CREATE TABLE IF NOT EXISTS mail_cache_revision (
+          id INTEGER PRIMARY KEY CHECK (id=1),
+          revision INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT OR IGNORE INTO mail_cache_revision (id, revision) VALUES (1, 0);
+        CREATE TABLE IF NOT EXISTS mail_deleted_messages (
+          account_id TEXT NOT NULL,
+          folder TEXT NOT NULL,
+          uid INTEGER NOT NULL,
+          PRIMARY KEY (account_id, folder, uid)
+        );
         CREATE INDEX IF NOT EXISTS mail_messages_recent
           ON mail_messages (account_id, folder, uid DESC);
         "#,
@@ -272,8 +283,8 @@ pub fn save_folders(conn: &Connection, account_id: &str, folders: &[(String, Str
              VALUES (?1,?2,?3,?4,0)
              ON CONFLICT(account_id, name) DO UPDATE SET
                role=excluded.role,
-               uid_validity=excluded.uid_validity,
-               unread=CASE WHEN mail_folders.uid_validity IS excluded.uid_validity
+               uid_validity=COALESCE(excluded.uid_validity, mail_folders.uid_validity),
+               unread=CASE WHEN excluded.uid_validity IS NULL OR mail_folders.uid_validity IS excluded.uid_validity
                            THEN mail_folders.unread ELSE 0 END",
             params![account_id, name, role, uid_validity],
         )?;
@@ -303,6 +314,7 @@ pub fn folders(conn: &Connection, account_id: &str) -> Result<Vec<CachedFolder>,
 /// Drops every cached message of a folder. Used when UIDVALIDITY changes, because the UIDs in
 /// the cache would otherwise point at unrelated messages.
 pub fn clear_folder(conn: &Connection, account_id: &str, folder: &str) -> Result<(), DbError> {
+    conn.execute("DELETE FROM mail_deleted_messages WHERE account_id=?1 AND folder=?2", params![account_id, folder])?;
     conn.execute(
         "DELETE FROM mail_messages WHERE account_id=?1 AND folder=?2",
         params![account_id, folder],
@@ -312,6 +324,7 @@ pub fn clear_folder(conn: &Connection, account_id: &str, folder: &str) -> Result
 
 /// Drops every cached message of an account, for when the credential entry disappears.
 pub fn clear_account(conn: &Connection, account_id: &str) -> Result<(), DbError> {
+    conn.execute("DELETE FROM mail_deleted_messages WHERE account_id=?1", params![account_id])?;
     conn.execute("DELETE FROM mail_messages WHERE account_id=?1", params![account_id])?;
     conn.execute("DELETE FROM mail_folders WHERE account_id=?1", params![account_id])?;
     Ok(())
@@ -332,7 +345,9 @@ pub fn upsert_messages(
         conn.execute(
             "INSERT INTO mail_messages
                (account_id, folder, uid, subject, from_addr, date, seen, flagged, has_attachment, preview)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+             SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10
+             WHERE NOT EXISTS (SELECT 1 FROM mail_deleted_messages
+                               WHERE account_id=?1 AND folder=?2 AND uid=?3)
              ON CONFLICT(account_id, folder, uid) DO UPDATE SET
                subject=excluded.subject,
                from_addr=excluded.from_addr,
@@ -356,6 +371,62 @@ pub fn upsert_messages(
             ],
         )?;
     }
+    Ok(())
+}
+
+/// Capture before a network listing. Explicit mutations advance this SQLite-backed epoch.
+pub fn cache_revision(conn: &Connection) -> Result<u64, DbError> {
+    Ok(conn.query_row("SELECT revision FROM mail_cache_revision WHERE id=1", [], |row| row.get::<_, i64>(0))? as u64)
+}
+
+/// A stale poll must not overwrite an explicit read/unread change. New polls capture the new
+/// epoch and continue accepting server changes, including changes made by another mail client.
+pub fn upsert_messages_if_revision(conn: &Connection, account_id: &str, folder: &str, messages: &[MailMessage], previews: &[String], revision: u64) -> Result<bool, DbError> {
+    upsert_messages_with_uid_validity_if_revision(conn, account_id, folder, messages, previews, revision, None)
+}
+
+/// Atomically detects a rebuilt mailbox, clears old rows/tombstones and applies its new page.
+/// Advancing the revision on namespace reset also rejects other outstanding old-namespace polls.
+pub fn upsert_messages_with_uid_validity_if_revision(conn: &Connection, account_id: &str, folder: &str, messages: &[MailMessage], previews: &[String], revision: u64, uid_validity: Option<u32>) -> Result<bool, DbError> {
+    let tx = conn.unchecked_transaction()?;
+    if cache_revision(&tx)? != revision {
+        return Ok(false);
+    }
+    if let Some(validity) = uid_validity {
+        let previous: Option<Option<u32>> = tx.query_row("SELECT uid_validity FROM mail_folders WHERE account_id=?1 AND name=?2", params![account_id, folder], |row| row.get(0)).optional()?;
+        if previous.flatten() != Some(validity) {
+            clear_folder(&tx, account_id, folder)?;
+            tx.execute("UPDATE mail_cache_revision SET revision=revision+1 WHERE id=1", [])?;
+        }
+        tx.execute("INSERT INTO mail_folders (account_id,name,role,uid_validity) VALUES (?1,?2,?3,?4) ON CONFLICT(account_id,name) DO UPDATE SET uid_validity=excluded.uid_validity", params![account_id, folder, crate::mail_folder::folder_role(folder), validity])?;
+    }
+    upsert_messages(&tx, account_id, folder, messages, previews)?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Apply an explicit, already acknowledged server read-state change to both read-state columns.
+/// This is not the reader's local-only mark operation, and must never run on network failure.
+pub fn set_seen(conn: &Connection, account_id: &str, folder: &str, uid: u32, seen: bool) -> Result<(), DbError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("UPDATE mail_cache_revision SET revision=revision+1 WHERE id=1", [])?;
+    tx.execute(
+        "UPDATE mail_messages SET seen=?4, local_seen=?4 WHERE account_id=?1 AND folder=?2 AND uid=?3",
+        params![account_id, folder, uid, seen as i64],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Remove a single acknowledged deletion and retain a tombstone. Background polls may have
+/// fetched this UID before deletion; their later upsert must not resurrect it. Tombstones last
+/// until the account is removed or clear_folder resets the folder's UID namespace (UIDVALIDITY).
+pub fn remove_message(conn: &Connection, account_id: &str, folder: &str, uid: u32) -> Result<(), DbError> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("UPDATE mail_cache_revision SET revision=revision+1 WHERE id=1", [])?;
+    tx.execute("INSERT OR IGNORE INTO mail_deleted_messages (account_id, folder, uid) VALUES (?1,?2,?3)", params![account_id, folder, uid])?;
+    tx.execute("DELETE FROM mail_messages WHERE account_id=?1 AND folder=?2 AND uid=?3", params![account_id, folder, uid])?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -882,6 +953,81 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn explicit_seen_changes_both_columns_and_preserves_other_rows() {
+        let conn = seeded();
+        upsert_messages(&conn, "acct", "INBOX", &[message(1, "one", "a", false), message(2, "two", "a", false)], &[]).unwrap();
+        set_local_seen(&conn, "acct", "INBOX", 1).unwrap();
+        set_seen(&conn, "acct", "INBOX", 1, false).unwrap();
+        assert_eq!(folder_unread_count(&conn, "acct", "INBOX").unwrap(), 2);
+        set_seen(&conn, "acct", "INBOX", 1, true).unwrap();
+        let states: (i64, i64) = conn.query_row("SELECT seen,local_seen FROM mail_messages WHERE uid=1", [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+        assert_eq!(states, (1, 1));
+        assert_eq!(folder_unread_count(&conn, "acct", "INBOX").unwrap(), 1);
+        set_seen(&conn, "acct", "INBOX", 1, false).unwrap();
+        assert_eq!(folder_unread_count(&conn, "acct", "INBOX").unwrap(), 2);
+    }
+
+    #[test]
+    fn changed_uid_validity_releases_deleted_uid_and_rejects_old_namespace_pages() {
+        let conn = seeded();
+        let page = [message(1, "old", "a", false), message(2, "old", "a", false)];
+        upsert_messages(&conn, "acct", "INBOX", &page, &[]).unwrap();
+        remove_message(&conn, "acct", "INBOX", 1).unwrap();
+        let revision = cache_revision(&conn).unwrap();
+        assert!(upsert_messages_with_uid_validity_if_revision(&conn, "acct", "INBOX", &page, &[], revision, Some(7)).unwrap());
+        assert_eq!(recent_messages(&conn, "acct", "INBOX", None, 20).unwrap().len(), 1);
+        let new_page = [message(1, "new namespace", "b", false)];
+        assert!(upsert_messages_with_uid_validity_if_revision(&conn, "acct", "INBOX", &new_page, &[], revision, Some(8)).unwrap());
+        let rows = recent_messages(&conn, "acct", "INBOX", None, 20).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].subject, "new namespace");
+        assert!(!upsert_messages_with_uid_validity_if_revision(&conn, "acct", "INBOX", &page, &[], revision, Some(7)).unwrap());
+        save_folders(&conn, "acct", &[("INBOX".into(), "inbox".into(), None)]).unwrap();
+        assert_eq!(folders(&conn, "acct").unwrap().into_iter().find(|folder| folder.name == "INBOX").unwrap().uid_validity, Some(8));
+    }
+
+    #[test]
+    fn revision_discards_old_seen_page_but_new_fetch_converges() {
+        let conn = seeded();
+        let page = [message(1, "one", "a", true)];
+        upsert_messages(&conn, "acct", "INBOX", &page, &[]).unwrap();
+        let old_revision = cache_revision(&conn).unwrap();
+        set_seen(&conn, "acct", "INBOX", 1, false).unwrap();
+        assert!(!upsert_messages_if_revision(&conn, "acct", "INBOX", &page, &[], old_revision).unwrap());
+        assert!(!recent_messages(&conn, "acct", "INBOX", None, 20).unwrap()[0].seen);
+        let current = cache_revision(&conn).unwrap();
+        assert!(current > old_revision);
+        assert!(upsert_messages_if_revision(&conn, "acct", "INBOX", &page, &[], current).unwrap());
+        assert!(recent_messages(&conn, "acct", "INBOX", None, 20).unwrap()[0].seen);
+        let current = cache_revision(&conn).unwrap();
+        remove_message(&conn, "acct", "INBOX", 1).unwrap();
+        assert!(!upsert_messages_if_revision(&conn, "acct", "INBOX", &page, &[], current).unwrap());
+    }
+
+    #[test]
+    fn deletion_tombstone_blocks_late_sync_and_is_scoped_to_account_folder_uid() {
+        let conn = seeded();
+        let page = [message(1, "one", "a", false), message(2, "two", "a", false)];
+        upsert_messages(&conn, "acct", "INBOX", &page, &[]).unwrap();
+        remove_message(&conn, "acct", "INBOX", 1).unwrap();
+        remove_message(&conn, "acct", "INBOX", 1).unwrap();
+        // An already-running poll completes after the explicit delete.
+        upsert_messages(&conn, "acct", "INBOX", &page, &[]).unwrap();
+        assert_eq!(recent_messages(&conn, "acct", "INBOX", None, 20).unwrap().iter().map(|row| row.uid).collect::<Vec<_>>(), vec![2]);
+        upsert_messages(&conn, "other", "INBOX", &page[..1], &[]).unwrap();
+        upsert_messages(&conn, "acct", "Sent Messages", &page[..1], &[]).unwrap();
+        assert_eq!(recent_messages(&conn, "other", "INBOX", None, 20).unwrap().len(), 1);
+        assert_eq!(recent_messages(&conn, "acct", "Sent Messages", None, 20).unwrap().len(), 1);
+        assert_eq!(folder_unread_count(&conn, "acct", "INBOX").unwrap(), 1);
+        clear_folder(&conn, "acct", "INBOX").unwrap();
+        upsert_messages(&conn, "acct", "INBOX", &page[..1], &[]).unwrap();
+        assert_eq!(recent_messages(&conn, "acct", "INBOX", None, 20).unwrap().len(), 1);
+        clear_account(&conn, "acct").unwrap();
+        let tombstones: i64 = conn.query_row("SELECT COUNT(*) FROM mail_deleted_messages WHERE account_id='acct'", [], |row| row.get(0)).unwrap();
+        assert_eq!(tombstones, 0);
     }
 
     #[test]

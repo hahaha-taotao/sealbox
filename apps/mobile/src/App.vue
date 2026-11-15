@@ -243,7 +243,7 @@ watch([page, filtersOpen, management], syncBackListener);
 watch(page, (next) => { if (next !== "detail") credentialProfileOpen.value = false; });
 
 // ==== 邮箱（只读） ============================================================
-// 手机端与桌面共用同一套后端命令；这里只做只读浏览，不提供发信、删除或标已读。
+// 手机端只读浏览；正文成功后同步本地已读状态，不回写邮件服务器。
 
 const MAIL_ROLES: { role: string; label: string }[] = [
   { role: "inbox", label: "收件箱" },
@@ -284,7 +284,11 @@ const mailTruncated = ref(false);
 const mailBodyBusy = ref(false);
 const mailAttachments = ref<MailAttachment[]>([]);
 const mailSavingPart = ref("");
-/** 列表来自本地缓存（可能断网）：列表顶部显示「离线缓存 · 最近更新 HH:mm」。 */
+const mailAttachmentsBusy = ref(false);
+const mailAttachmentError = ref("");
+const mailFoldersBusy = ref(false);
+const mailHasMore = ref(true);
+/** cached 只描述列表来源，不代表设备的联网状态。 */
 const mailCacheCached = ref(false);
 const mailCacheAt = ref("");
 /** 正文显示形态：有 HTML 时默认 HTML，切到纯文本只是本次查看的偏好。 */
@@ -294,6 +298,65 @@ const mailFontId = ref<MailFontId>(MAIL_FONT_DEFAULT);
 const mailRoleCounts = ref<MailUnreadByRole | null>(null);
 let mailSeq = 0;
 let mailBodySeq = 0;
+type MailMutationSource = { entryId: string; folder: string; uid: number; seq: number };
+const mailMutationBusy = ref<Record<string, boolean>>({});
+const mailSeenRevisions = new Map<string, number>();
+const mailMutationFailure = ref<(MailMutationSource & { text: string }) | null>(null);
+const mailMutationError = computed(() => {
+  const failure = mailMutationFailure.value;
+  return failure && mailMutationIsCurrent(failure) && (!mailOpenMessage.value || mailOpenMessage.value.uid === failure.uid) ? failure.text : "";
+});
+function mailMutationKey(message: Pick<MailMessage, "uid">): string {
+  return JSON.stringify([mailAccountId.value, mailFolderName.value, message.uid]);
+}
+function mailMessageMutating(message: Pick<MailMessage, "uid">): boolean {
+  return Boolean(mailMutationBusy.value[mailMutationKey(message)]);
+}
+function mailMutationIsCurrent(source: MailMutationSource): boolean {
+  return page.value === "mail" && source.seq === mailSeq && source.entryId === mailAccountId.value && source.folder === mailFolderName.value;
+}
+function adjustMailUnread(delta: number) {
+  const folder = mailFolders.value.find(item => item.name === mailFolderName.value);
+  if (folder) folder.unread = Math.max(0, (folder.unread ?? 0) + delta);
+  const counts = mailRoleCounts.value;
+  const role = mailRole.value as keyof MailUnreadByRole;
+  if (counts && role in counts) counts[role] = Math.max(0, counts[role] + delta);
+}
+async function mutateMailMessage(message: MailMessage, action: "seen" | "delete") {
+  if (!mailAccountId.value || !mailFolderName.value || mailMessageMutating(message)) return;
+  const source = { entryId: mailAccountId.value, folder: mailFolderName.value, uid: message.uid, seq: mailSeq };
+  const key = mailMutationKey(message);
+  // Reserve before the confirmation dialog so repeated events never launch duplicate requests.
+  mailMutationBusy.value = { ...mailMutationBusy.value, [key]: true };
+  const seen = !message.seen;
+  const bodySeq = mailBodySeq;
+  try {
+    if (action === "delete" && !window.confirm(`从服务器删除“${message.subject || "(无主题)"}”？此操作会影响邮箱中的原邮件。`)) return;
+    if (!mailMutationIsCurrent(source)) return;
+    mailMutationFailure.value = null;
+    mailSeenRevisions.set(key, (mailSeenRevisions.get(key) ?? 0) + 1);
+    if (action === "delete") await api.mailDelete(source.entryId, source.uid, source.folder);
+    else await api.mailSetSeen(source.entryId, source.uid, seen, source.folder);
+    if (!mailMutationIsCurrent(source)) return;
+    const row = mailMessages.value.find(item => item.uid === source.uid);
+    if (action === "delete") {
+      if (row && !row.seen) adjustMailUnread(-1);
+      mailMessages.value = mailMessages.value.filter(item => item.uid !== source.uid);
+      mailEmpty.value = mailMessages.value.length === 0;
+      if (bodySeq === mailBodySeq && mailOpenMessage.value?.uid === source.uid) closeMailMessage();
+    } else if (row) {
+      if (row.seen !== seen) adjustMailUnread(seen ? -1 : 1);
+      row.seen = seen;
+      if (mailOpenMessage.value?.uid === source.uid) mailOpenMessage.value.seen = seen;
+    }
+  } catch (error) {
+    if (mailMutationIsCurrent(source)) mailMutationFailure.value = { ...source, text: `${action === "delete" ? "删除" : "已读状态同步"}失败：${String(error)}` };
+  } finally {
+    const next = { ...mailMutationBusy.value };
+    delete next[key];
+    mailMutationBusy.value = next;
+  }
+}
 
 const mailCurrentAccount = computed(
   () => mailAccounts.value.find((account) => account.id === mailAccountId.value) ?? null,
@@ -314,13 +377,40 @@ const mailOtherFolders = computed(() => mailFolders.value.filter((folder) => fol
 
 /** 列表页还是正文页：正文页全屏 push，返回键先回列表。 */
 const mailReading = computed(() => mailOpenMessage.value !== null);
+watch(mailReading, syncBackListener);
 
 /** 缓存态提示：列表来自本地缓存时那行小字。 */
 const mailCacheLabel = computed(() => {
   if (!mailCacheCached.value) return "";
   const stamp = formatMailCacheStamp(mailCacheAt.value);
-  return stamp ? `离线缓存 · 最近更新 ${stamp}` : "离线缓存 · 尚未收取";
+  return stamp ? `本地缓存 · 更新于 ${stamp}` : "本地缓存 · 更新时间未知";
 });
+
+const mailFolderLabel = computed(() => mailRole.value === "other"
+  ? (mailOtherFolders.value.find(folder => folder.name === mailOtherFolder.value)?.display || mailOtherFolder.value)
+  : MAIL_ROLES.find(entry => entry.role === mailRole.value)?.label || "收件箱");
+const mailSourceLabel = computed(() => `${mailCurrentAccount.value?.email || mailCurrentAccount.value?.title || "邮箱"} · ${mailFolderLabel.value}`);
+const mailMessageIndex = computed(() => mailMessages.value.findIndex(message => message.uid === mailOpenMessage.value?.uid));
+function stepMailMessage(delta: number) {
+  const index = mailMessageIndex.value;
+  const message = index < 0 ? undefined : mailMessages.value[index + delta];
+  if (message) void openMailMessage(message);
+}
+function mailSender(raw: string) {
+  const name = raw.match(/^\s*"?(.+?)"?\s*<[^>]+>\s*$/)?.[1]?.replace(/^"|"$/g, "").trim();
+  return name || raw.trim() || "(未知发件人)";
+}
+function chooseMailAccount(event: Event) {
+  const account = mailAccounts.value.find(item => item.id === (event.target as HTMLSelectElement).value);
+  if (account) void selectMailAccount(account);
+}
+function leaveMail() {
+  mailSeq += 1;
+  resetMailList();
+  mailBusy.value = false;
+  mailFoldersBusy.value = false;
+  page.value = "vault";
+}
 
 const mailFont = computed(() => mailFontScale(mailFontId.value));
 const mailTextStyle = computed(() => ({ fontSize: `${mailFont.value.px}px` }));
@@ -330,14 +420,8 @@ const mailFrameStyle = computed(() => ({ zoom: String(mailFont.value.scale) }));
 const mailCanShowHtml = computed(() => mailHtml.value !== "");
 const mailShowHtml = computed(() => mailCanShowHtml.value && !mailPlainText.value);
 
-/** 文件夹旁的数字：优先 mail_unread_by_role，退回该角色文件夹的缓存计数之和。 */
+/** 文件夹数字只计算当前账号；全账号汇总仅用于全局口径。 */
 function mailRoleUnread(role: string): number {
-  const counts = mailRoleCounts.value;
-  if (counts !== null) {
-    if (role === "inbox" || role === "archive" || role === "sent" || role === "drafts" || role === "trash") {
-      return counts[role] ?? 0;
-    }
-  }
   let total = 0;
   for (const folder of mailFolders.value) {
     if (folder.role === role) total += folder.unread ?? 0;
@@ -362,16 +446,24 @@ function warmMailBodies() {
 
 /** 角标与文件夹数字的唯一来源；接口不在时静默退回原有单一口径。 */
 async function refreshMailCounts() {
+  const seq = mailSeq;
   try {
-    mailRoleCounts.value = await api.mailUnreadByRole();
+    const counts = await api.mailUnreadByRole();
+    if (seq === mailSeq) mailRoleCounts.value = counts;
   } catch {
-    mailRoleCounts.value = null;
+    if (seq === mailSeq) mailRoleCounts.value = null;
   }
 }
 
 function resetMailList() {
   mailBodySeq += 1;
   mailMessages.value = [];
+  mailMoreBusy.value = false;
+  mailCacheCached.value = false;
+  mailCacheAt.value = "";
+  mailHasMore.value = true;
+  mailAttachmentsBusy.value = false;
+  mailAttachmentError.value = "";
   mailError.value = "";
   mailNote.value = "";
   mailEmpty.value = false;
@@ -390,6 +482,7 @@ function resetMailList() {
 
 async function openMail() {
   page.value = "mail";
+  mailAccounts.value = [];
   mailAccountId.value = "";
   mailFolders.value = [];
   mailRole.value = "inbox";
@@ -419,6 +512,8 @@ async function openMail() {
 async function selectMailAccount(account: MailAccount, seq = ++mailSeq) {
   if (!account.supported) return;
   mailAccountId.value = account.id;
+  mailFolders.value = [];
+  mailFoldersBusy.value = true;
   mailRole.value = "inbox";
   mailOtherFolder.value = "";
   resetMailList();
@@ -430,9 +525,9 @@ async function selectMailAccount(account: MailAccount, seq = ++mailSeq) {
   } catch (e) {
     if (seq === mailSeq) mailError.value = String(e);
   } finally {
-    if (seq === mailSeq) mailBusy.value = false;
+    if (seq === mailSeq) { mailBusy.value = false; mailFoldersBusy.value = false; }
   }
-  if (seq !== mailSeq) return;
+  if (seq !== mailSeq || mailError.value) return;
   await loadMail(seq);
   if (seq !== mailSeq) return;
   warmMailBodies();
@@ -445,10 +540,10 @@ async function loadMail(seq = ++mailSeq) {
   resetMailList();
   mailCacheCached.value = false;
   mailCacheAt.value = "";
-  if (!entryId || !folder) return;
+  if (!entryId || !folder || mailFoldersBusy.value) { mailBusy.value = false; return; }
   mailBusy.value = true;
   try {
-    // 缓存优先：可能先拿到本地缓存，随后后台刷新再返回一次，两次都照收。
+    // 缓存优先；后台刷新通过事件提示，保留当前列表顺序。
     const result = normalizeMailList(
       await api.mailList(entryId, folder, {
         filter: mailFilter.value,
@@ -458,6 +553,7 @@ async function loadMail(seq = ++mailSeq) {
     if (seq !== mailSeq) return;
     mailMessages.value = result.messages.slice().reverse();
     mailEmpty.value = result.messages.length === 0;
+    mailHasMore.value = result.messages.length > 0;
     mailCacheCached.value = result.cached;
     mailCacheAt.value = result.fetchedAt ?? "";
   } catch (e) {
@@ -471,7 +567,7 @@ async function loadOlderMail() {
   const entryId = mailAccountId.value;
   const folder = mailFolderName.value;
   const oldest = mailMessages.value[mailMessages.value.length - 1]?.uid;
-  if (!entryId || !folder || oldest == null || mailMoreBusy.value) return;
+  if (!entryId || !folder || oldest == null || mailMoreBusy.value || mailBusy.value || !mailHasMore.value) return;
   const seq = mailSeq;
   mailMoreBusy.value = true;
   mailError.value = "";
@@ -487,9 +583,9 @@ async function loadOlderMail() {
     const seen = new Set(mailMessages.value.map((message) => message.uid));
     const older = result.messages.filter((message) => !seen.has(message.uid)).reverse();
     mailMessages.value = [...mailMessages.value, ...older];
-    mailCacheCached.value = result.cached && !older.length;
+    mailCacheCached.value = mailCacheCached.value || result.cached;
     mailCacheAt.value = result.fetchedAt ?? mailCacheAt.value;
-    if (!older.length) mailNote.value = "没有更早的邮件";
+    if (!older.length) { mailNote.value = "没有更早的邮件"; mailHasMore.value = false; }
   } catch (e) {
     if (seq === mailSeq) mailError.value = String(e);
   } finally {
@@ -498,25 +594,27 @@ async function loadOlderMail() {
 }
 
 function chooseMailRole(role: string) {
-  if (mailRole.value === role || mailBusy.value) return;
+  if (mailRole.value === role || mailFoldersBusy.value) return;
   mailRole.value = role;
   mailOtherFolder.value = "";
   void loadMail();
 }
 
 function chooseMailOtherFolder(name: string) {
+  if (mailFoldersBusy.value) return;
   mailRole.value = "other";
   mailOtherFolder.value = name;
   void loadMail();
 }
 
 function chooseMailFilter(filter: MailFilter) {
-  if (mailFilter.value === filter) return;
+  if (mailFilter.value === filter || mailFoldersBusy.value) return;
   mailFilter.value = filter;
   void loadMail();
 }
 
 function submitMailSearch() {
+  if (mailFoldersBusy.value) return;
   mailAppliedKeyword.value = mailKeyword.value.trim();
   void loadMail();
 }
@@ -527,28 +625,20 @@ function clearMailSearch() {
   void loadMail();
 }
 
-/**
- * 打开即本地记已读：列表行立刻变灰、未读数 -1，但不回写服务器（保持只读承诺）。
- * mail_body(markSeen) 失败也忽略，界面不因此报错。
- */
+/** 阅读只记本地已读；显式工具按钮才同步服务器。 */
 function markMailSeenLocally(uid: number) {
-  const message = mailMessages.value.find((item) => item.uid === uid);
-  if (message === undefined || message.seen) return;
+  const message = mailMessages.value.find(item => item.uid === uid);
+  if (!message || message.seen || mailMessageMutating(message)) return;
   message.seen = true;
-  const counts = mailRoleCounts.value;
-  const role = mailRole.value === "other" ? null : mailRole.value;
-  if (counts !== null && role !== null && role in counts) {
-    const key = role as keyof MailUnreadByRole;
-    counts[key] = Math.max(0, (counts[key] ?? 0) - 1);
-  }
-  const folder = mailFolders.value.find((item) => item.role === mailRole.value);
-  if (folder !== undefined && (folder.unread ?? 0) > 0) folder.unread -= 1;
+  adjustMailUnread(-1);
 }
 
 async function openMailMessage(message: MailMessage) {
   const entryId = mailAccountId.value;
   const folder = mailFolderName.value;
   const seq = ++mailBodySeq;
+  const seenKey = mailMutationKey(message);
+  const seenRevision = mailSeenRevisions.get(seenKey) ?? 0;
   mailOpenMessage.value = message;
   mailBodyText.value = "";
   mailHtml.value = "";
@@ -559,27 +649,27 @@ async function openMailMessage(message: MailMessage) {
   mailAttachments.value = [];
   mailPlainText.value = false;
   mailBodyBusy.value = true;
+  mailSavingPart.value = "";
+  mailAttachmentsBusy.value = true;
+  mailAttachmentError.value = "";
   mailError.value = "";
-  markMailSeenLocally(message.uid);
+  // 附件独立请求，网络慢时也不阻塞正文展示与已读更新。
+  void api.mailAttachments(entryId, message.uid, folder).then((items) => {
+    if (seq === mailBodySeq) mailAttachments.value = items;
+  }).catch((caught) => {
+    if (seq === mailBodySeq) mailAttachmentError.value = `附件列表读取失败：${String(caught)}`;
+  }).finally(() => {
+    if (seq === mailBodySeq) mailAttachmentsBusy.value = false;
+  });
   try {
-    const [bodyResult, attachmentResult] = await Promise.allSettled([
-      api.mailBody(entryId, message.uid, folder, { markSeen: true }),
-      api.mailAttachments(entryId, message.uid, folder),
-    ]);
+    const body = await api.mailBody(entryId, message.uid, folder, { markSeen: true });
     if (seq !== mailBodySeq) return;
-    if (bodyResult.status === "fulfilled") {
-      const body = bodyResult.value;
-      mailBodyText.value = body.text;
-      mailHtmlSource.value = body.html ?? "";
-      mailRemoteImages.value = body.html ? hasRemoteImages(body.html) : false;
-      mailHtml.value = body.html ? buildMailDocument(body.html) : "";
-      mailTruncated.value = body.truncated;
-    } else {
-      mailError.value = String(bodyResult.reason);
-    }
-    if (attachmentResult.status === "fulfilled") {
-      mailAttachments.value = attachmentResult.value;
-    }
+    mailBodyText.value = body.text;
+    mailHtmlSource.value = body.html ?? "";
+    mailRemoteImages.value = body.html ? hasRemoteImages(body.html) : false;
+    mailHtml.value = body.html ? buildMailDocument(body.html) : "";
+    mailTruncated.value = body.truncated;
+    if (seenRevision === (mailSeenRevisions.get(seenKey) ?? 0)) markMailSeenLocally(message.uid);
   } catch (e) {
     if (seq === mailBodySeq) mailError.value = String(e);
   } finally {
@@ -591,6 +681,9 @@ function closeMailMessage() {
   mailBodySeq += 1;
   mailOpenMessage.value = null;
   mailBodyBusy.value = false;
+  mailAttachmentsBusy.value = false;
+  mailSavingPart.value = "";
+  mailError.value = "";
   mailPlainText.value = false;
 }
 
@@ -619,14 +712,14 @@ async function saveMailAttachment(item: MailAttachment) {
   if (!entryId || !message || mailSavingPart.value) return;
   const seq = mailBodySeq;
   const filename = item.filename.split(/[/\\]/).filter(Boolean).pop() || "attachment";
+  mailSavingPart.value = item.part;
   try {
     const picked = await api.documentSave(filename, item.mime);
     if (!picked || seq !== mailBodySeq) return;
-    mailSavingPart.value = item.part;
     await api.mailSaveAttachment(entryId, message.uid, item.part, picked.uri, folder);
-    showToast("附件已保存");
+    if (seq === mailBodySeq) showToast("附件已保存");
   } catch (e) {
-    if (seq === mailBodySeq) mailError.value = String(e);
+    if (seq === mailBodySeq) mailAttachmentError.value = `附件保存失败：${String(e)}`;
   } finally {
     if (seq === mailBodySeq) mailSavingPart.value = "";
   }
@@ -1254,12 +1347,12 @@ onMounted(async () => {
     if (page.value !== "mail") return;
     void refreshMailCounts();
   });
-  // 单文件夹后台刷新完成：只更新缓存时间戳，不重排正在读的列表。
+  // 后台刷新只提示有新快照，不重排列表或伪造缓存时间。
   await listen<{ entryId?: string; folder?: string; bodies?: number }>("mail-page-refreshed", (event) => {
-    if (page.value !== "mail") return;
-    if (event.payload?.entryId !== mailAccountId.value) return;
-    mailCacheCached.value = false;
-    mailCacheAt.value = new Date().toISOString();
+    if (page.value !== "mail" || typeof event.payload?.bodies === "number") return;
+    if (event.payload?.entryId !== mailAccountId.value || event.payload?.folder !== mailFolderName.value) return;
+    // 当前画面仍是刚才的缓存快照，不冒充已经展示了后台的新结果。
+    mailNote.value = "后台已更新，可刷新查看最新邮件";
   });
   await listen<{ ok: boolean; error: string | null; report: SyncReport | null }>(
     "sync-finished",
@@ -1508,109 +1601,127 @@ onMounted(async () => {
 
     <template v-else-if="page === 'mail'">
       <div class="view">
-        <div class="top">
-          <button class="link" type="button" @click="page = 'vault'">返回</button>
-          <h1>{{ mailReading ? (mailOpenMessage?.subject || '(无主题)') : '邮箱' }}</h1>
+        <div class="top mail-top">
+          <button class="link" type="button" @click="mailReading ? closeMailMessage() : leaveMail()">{{ mailReading ? '邮件列表' : '返回' }}</button>
+          <h1>{{ mailReading ? '阅读邮件' : '邮箱' }}</h1>
+          <span class="mail-readonly">收件与管理</span>
         </div>
 
-        <div v-if="!mailReading" class="scroll">
+        <div v-if="mailMutationError" class="mail-mutation-error" role="alert">
+          <span>{{ mailMutationError }}</span><button class="link" type="button" @click="mailMutationFailure = null">关闭</button>
+        </div>
+        <div v-if="!mailReading" class="scroll mail-scroll">
           <div v-if="mailError" class="pad"><p class="error">{{ mailError }}</p></div>
           <div v-if="!mailAccounts.length" class="pad">
-            <p class="hint">还没有邮箱账号。先在保险库里新增「邮箱授权码」或「邮箱」条目。</p>
+            <p v-if="mailBusy" class="hint" role="status">正在读取邮箱账号…</p>
+            <p v-if="!mailBusy && !mailError" class="hint">还没有邮箱账号。先在保险库里新增「邮箱授权码」或「邮箱」条目。</p>
           </div>
           <template v-else>
-            <div class="chips folders">
-              <button
-                v-for="account in mailAccounts"
-                :key="account.id"
-                class="chip"
-                :class="{ on: account.id === mailAccountId }"
-                :disabled="!account.supported"
-                @click="selectMailAccount(account)"
-              >
-                {{ account.title || account.email }}
-              </button>
-            </div>
-            <div v-if="mailVisibleRoles.length" class="chips">
+            <div class="mail-controls">
+              <label class="mail-account-label" for="mail-account">邮箱账号</label>
+              <select id="mail-account" :value="mailAccountId" @change="chooseMailAccount">
+                <option v-if="!mailAccountId" value="" disabled>选择可用邮箱</option>
+                <option v-for="account in mailAccounts" :key="account.id" :value="account.id" :disabled="!account.supported">
+                  {{ account.title || account.email }}{{ account.title && account.email && account.title !== account.email ? ` · ${account.email}` : '' }}{{ !account.supported ? '（暂不支持）' : '' }}
+                </option>
+              </select>
+              <div class="mail-account-info"><span>{{ mailCurrentAccount?.providerLabel || '邮箱浏览' }}</span><button v-if="mailCurrentAccount" type="button" class="link" :disabled="mailBusy || mailFoldersBusy" @click="mailFolders.length ? loadMail() : selectMailAccount(mailCurrentAccount)">刷新</button></div>
+            <div v-if="mailVisibleRoles.length" class="chips mail-folders" aria-label="邮件文件夹">
               <button
                 v-for="entry in mailVisibleRoles"
                 :key="entry.role"
                 class="chip"
                 :class="{ on: mailRole === entry.role }"
+                :aria-pressed="mailRole === entry.role"
                 @click="chooseMailRole(entry.role)"
               >
                 {{ entry.label }}<template v-if="mailRoleUnread(entry.role)"> {{ formatMailBadge(mailRoleUnread(entry.role)) }}</template>
               </button>
             </div>
-            <div v-if="mailOtherFolders.length" class="chips">
-              <button
-                v-for="folder in mailOtherFolders"
-                :key="folder.name"
-                class="chip"
-                :class="{ on: mailRole === 'other' && mailOtherFolder === folder.name }"
-                @click="chooseMailOtherFolder(folder.name)"
-              >
-                {{ folder.name }}<template v-if="folder.unread"> {{ formatMailBadge(folder.unread) }}</template>
-              </button>
-            </div>
-            <div class="chips">
+            <label v-if="mailOtherFolders.length" class="mail-other-label">
+              其他文件夹
+              <select :value="mailRole === 'other' ? mailOtherFolder : ''" @change="chooseMailOtherFolder(($event.target as HTMLSelectElement).value)">
+                <option value="" disabled>选择文件夹</option>
+                <option v-for="folder in mailOtherFolders" :key="folder.name" :value="folder.name">{{ folder.display || folder.name }}{{ folder.unread ? ` · ${formatMailBadge(folder.unread)}` : '' }}</option>
+              </select>
+            </label>
+            <div class="chips mail-filters" aria-label="筛选邮件">
               <button
                 v-for="option in MAIL_FILTERS"
                 :key="option.id"
                 class="chip"
                 :class="{ on: mailFilter === option.id }"
+                :aria-pressed="mailFilter === option.id"
+                :disabled="mailFoldersBusy || !mailAccountId"
                 @click="chooseMailFilter(option.id)"
               >
                 {{ option.label }}
               </button>
             </div>
-            <div class="searchbar">
-              <input v-model="mailKeyword" placeholder="搜索主题或发件人" maxlength="200" @keyup.enter="submitMailSearch" />
-              <button class="ghost" type="button" @click="submitMailSearch">搜索</button>
-              <button v-if="mailAppliedKeyword" class="ghost" type="button" @click="clearMailSearch">清除</button>
+            <form class="searchbar mail-search" role="search" @submit.prevent="submitMailSearch">
+              <input v-model="mailKeyword" type="search" aria-label="搜索当前文件夹的主题或发件人" placeholder="搜索主题或发件人" maxlength="200" enterkeyhint="search" />
+              <button class="ghost" type="submit" :disabled="mailFoldersBusy || !mailAccountId">搜索</button>
+              <button v-if="mailKeyword || mailAppliedKeyword" class="link" type="button" :disabled="mailFoldersBusy" @click="clearMailSearch">清除</button>
+            </form>
+            <p class="hint mail-search-scope">搜索当前文件夹{{ mailAppliedKeyword ? ` · “${mailAppliedKeyword}”` : '' }}</p>
             </div>
+            <div class="mail-list-heading"><strong>{{ mailFolderLabel }}</strong><span>已加载 {{ mailMessages.length }} 封</span></div>
             <p v-if="mailCacheLabel" class="hint pad mail-cache">{{ mailCacheLabel }}</p>
-            <p v-if="mailBusy && !mailMessages.length" class="hint pad">正在读取…</p>
+            <p v-if="mailBusy && !mailMessages.length" class="hint pad" role="status">{{ mailFoldersBusy ? '正在读取文件夹…' : '正在读取邮件…' }}</p>
             <p v-if="mailNote" class="hint pad">{{ mailNote }}</p>
             <p v-if="mailEmpty && !mailBusy" class="hint pad">
               {{ mailAppliedKeyword || mailFilter !== 'all' ? '没有符合条件的邮件' : '这个文件夹是空的' }}
             </p>
-            <div class="scroll">
-              <div class="list">
+              <div class="list mail-list" :aria-busy="mailBusy">
+                <div v-for="message in mailMessages" :key="message.uid" class="mail-row">
                 <button
-                  v-for="message in mailMessages"
-                  :key="message.uid"
                   class="item mail-item"
                   :class="{ unread: !message.seen, seen: message.seen }"
                   @click="openMailMessage(message)"
                 >
-                  <span class="letter" :style="{ background: message.seen ? '#c9ccd4' : '#5b5bd6' }">{{ (message.from || '?').slice(0, 1).toUpperCase() }}</span>
+                  <span class="letter" :style="{ background: message.seen ? '#c9ccd4' : '#5b5bd6' }">{{ mailSender(message.from).slice(0, 1).toUpperCase() }}</span>
                   <span class="meta">
                     <span class="mail-item-top">
-                      <span class="mail-item-from">{{ message.from || '(未知发件人)' }}</span>
+                      <span class="mail-item-from">{{ mailSender(message.from) }}</span>
                       <span class="mail-item-when">{{ formatMailDate(message.date) }}</span>
                     </span>
                     <span class="name mail-item-subject">{{ message.subject || '(无主题)' }}</span>
-                    <span class="line mail-item-tags">
-                      <template v-if="message.flagged">★</template>
-                      <template v-if="message.hasAttachment">📎 有附件</template>
-                      <template v-if="message.preview">{{ message.preview }}</template>
+                    <span v-if="message.preview" class="mail-item-preview">{{ message.preview }}</span>
+                    <span class="mail-item-tags">
+                      <span v-if="!message.seen" class="mail-unread-label">未读</span>
+                      <span v-if="message.flagged" aria-label="星标">★ 星标</span>
+                      <span v-if="message.hasAttachment">📎 附件</span>
+                      <span class="mail-item-source">{{ mailSourceLabel }}</span>
                     </span>
                   </span>
                 </button>
+                <div class="mail-row-actions" :aria-label="`${message.subject || '(无主题)'}的管理操作`" :aria-busy="mailMessageMutating(message)">
+                  <button class="link" type="button" :disabled="mailMessageMutating(message)" @click="mutateMailMessage(message, 'seen')">{{ message.seen ? '标为未读' : '标为已读' }}</button>
+                  <button class="link mail-delete" type="button" :disabled="mailMessageMutating(message)" @click="mutateMailMessage(message, 'delete')">删除</button>
+                  <span v-if="mailMessageMutating(message)" role="status">同步中…</span>
+                </div>
+                </div>
               </div>
-            </div>
-            <div class="pad">
-              <button class="ghost" type="button" :disabled="mailMoreBusy || !mailMessages.length" @click="loadOlderMail">加载更早</button>
+            <div class="pad mail-list-footer">
+              <button v-if="mailMessages.length && mailHasMore" class="ghost" type="button" :disabled="mailMoreBusy || mailBusy" @click="loadOlderMail">{{ mailMoreBusy ? '正在加载…' : '加载更早' }}</button>
             </div>
           </template>
         </div>
 
-        <div v-else class="scroll">
-          <div class="pad">
-            <p v-if="mailError" class="error">{{ mailError }}</p>
-            <p class="hint">{{ mailOpenMessage?.from }} · {{ formatMailWhen(mailOpenMessage?.date || '') }}</p>
+        <div v-else class="scroll mail-scroll" :key="mailOpenMessage?.uid">
+          <div class="pad mail-reading">
+            <header class="mail-reading-header">
+            <span class="mail-reading-eyebrow">{{ mailFolderLabel }} · {{ mailOpenMessage?.seen ? '已读' : '未读' }}</span>
+            <h2 class="mail-reading-subject">{{ mailOpenMessage?.subject || '(无主题)' }}</h2>
+            <p class="mail-reading-from">{{ mailOpenMessage?.from || '(未知发件人)' }}</p>
+            <p class="hint">{{ formatMailWhen(mailOpenMessage?.date || '') }}</p>
+            <p class="hint mail-reading-source">来源：{{ mailSourceLabel }}</p>
+            </header>
+            <div v-if="mailError" class="mail-body-error" role="alert"><p class="error">正文读取失败：{{ mailError }}</p><button class="ghost" type="button" :disabled="mailBodyBusy" @click="mailOpenMessage && openMailMessage(mailOpenMessage)">重试正文</button></div>
             <div class="mail-tools" role="toolbar" aria-label="正文工具栏">
+              <button class="ghost mail-tool" type="button" :disabled="!mailOpenMessage || mailMessageMutating(mailOpenMessage)" @click="mailOpenMessage && mutateMailMessage(mailOpenMessage, 'seen')">{{ mailOpenMessage?.seen ? '标为未读' : '标为已读' }}</button>
+              <button class="ghost mail-tool mail-delete" type="button" :disabled="!mailOpenMessage || mailMessageMutating(mailOpenMessage)" @click="mailOpenMessage && mutateMailMessage(mailOpenMessage, 'delete')">删除</button>
+              <span v-if="mailOpenMessage && mailMessageMutating(mailOpenMessage)" class="hint" role="status">同步中…</span>
               <button class="ghost mail-tool" type="button" @click="cycleMailFont">字号：{{ mailFont.label }}</button>
               <button
                 v-if="mailCanShowHtml"
@@ -1624,12 +1735,14 @@ onMounted(async () => {
               </button>
             </div>
             <p v-if="mailTruncated" class="hint">正文过长，已截断。</p>
+            <p v-if="mailAttachmentsBusy" class="hint" role="status">正在读取附件列表…</p>
+            <p v-if="mailAttachmentError" class="error">{{ mailAttachmentError }}</p>
             <template v-if="mailAttachments.length">
               <div class="lbl">附件</div>
-              <div v-for="item in mailAttachments" :key="item.part" class="set">
-                <span class="t">{{ item.filename }}</span>
-                <span>{{ formatMailSize(item.size) }}</span>
-                <button class="ghost" type="button" :disabled="mailSavingPart === item.part" @click="saveMailAttachment(item)">保存</button>
+              <div v-for="item in mailAttachments" :key="item.part" class="set mail-attachment">
+                <span class="mail-attachment-icon" aria-hidden="true">↧</span>
+                <span class="t"><strong>{{ item.filename }}</strong><small>{{ item.mime || '附件' }} · {{ formatMailSize(item.size) }}</small></span>
+                <button class="ghost" type="button" :disabled="Boolean(mailSavingPart)" @click="saveMailAttachment(item)">{{ mailSavingPart === item.part ? '保存中…' : '保存' }}</button>
               </div>
             </template>
             <div v-if="mailShowHtml && mailRemoteImages && !mailImagesAllowed" class="set">
@@ -1647,9 +1760,14 @@ onMounted(async () => {
             />
             <pre v-else-if="mailBodyText" class="mail-text" :style="mailTextStyle">{{ mailBodyText }}</pre>
             <p v-else-if="mailBodyBusy" class="hint">正在读取正文…</p>
-            <p v-else class="hint">这封邮件没有可显示的正文。</p>
+            <p v-else-if="!mailError" class="hint">这封邮件没有可显示的正文。</p>
           </div>
         </div>
+        <nav v-if="mailReading" class="mail-reader-nav" aria-label="邮件翻页">
+          <button class="ghost" type="button" :disabled="mailMessageIndex <= 0" @click="stepMailMessage(-1)">上一封</button>
+          <span>{{ mailMessageIndex + 1 }} / {{ mailMessages.length }}</span>
+          <button class="ghost" type="button" :disabled="mailMessageIndex < 0 || mailMessageIndex >= mailMessages.length - 1" @click="stepMailMessage(1)">下一封</button>
+        </nav>
       </div>
     </template>
 

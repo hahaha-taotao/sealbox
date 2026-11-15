@@ -297,6 +297,10 @@ export const api = {
   /** 静默预热正文缓存，返回实际拉取的封数。 */
   mailPrefetch: (entryId: string, folder: string, limit = 5) =>
     invoke<number>("mail_prefetch", { request: { entryId, folder, limit } }),
+  mailSetSeen: (entryId: string, uid: number, seen: boolean, folder: string) =>
+    invoke<void>("mail_set_seen", { request: { entryId, uid, seen, folder } }),
+  mailDelete: (entryId: string, uid: number, folder: string) =>
+    invoke<void>("mail_delete", { request: { entryId, uid, folder } }),
   mailUnreadByRole: () => invoke<MailUnreadByRole>("mail_unread_by_role"),
   mailAttachments: (entryId: string, uid: number, folder: string) =>
     invoke<MailAttachment[]>("mail_attachments", { request: { entryId, uid, folder } }),

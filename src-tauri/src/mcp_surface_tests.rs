@@ -105,6 +105,42 @@ fn unknown_actions_return_the_legal_action_list() {
 }
 
 #[test]
+fn mail_catalog_advertises_existing_read_capabilities_without_mutations() {
+    let tools = tools_list(&Mutex::new(Session::default()));
+    let mail = tools["tools"].as_array().unwrap().iter().find(|tool| tool["name"] == "mail").unwrap();
+    assert_eq!(mail["inputSchema"]["properties"]["action"]["enum"], json!(["accounts", "folders", "list", "search", "read", "save"]));
+    for key in ["folder", "filter", "keyword", "beforeUid"] {
+        assert!(mail["inputSchema"]["properties"].get(key).is_some(), "{key}");
+    }
+    let (session, id) = session_with_token(true, "github");
+    let mcp = McpState::default();
+    let caller = mcp.open_caller().unwrap();
+    for action in ["delete", "set_seen", "mark", "move", "send"] {
+        assert_eq!(rpc(&session, &mcp, &caller, "mail", json!({"action":action,"entryId":id,"uid":1}))["isError"], true);
+    }
+    for name in ["mail_set_seen", "mail_delete", "mail_folders", "mail_search", "mail_list", "mail_read", "mail_download_attachment"] {
+        assert_eq!(rpc(&session, &mcp, &caller, name, json!({}))["isError"], true);
+        assert!(call_mail_inner(&session, name, &json!({}), &|| Ok(())).is_err());
+    }
+}
+
+#[test]
+fn mail_actions_validate_action_specific_keys_before_network_access() {
+    let (session, id) = session_with_token(true, "github");
+    for args in [
+        json!({"action":"folders","entryId":id,"folder":"INBOX"}),
+        json!({"action":"search","entryId":id,"keyword":"subject","filter":"all"}),
+        json!({"action":"list","entryId":id,"uid":1}),
+        json!({"action":"read","entryId":id,"uid":1,"seen":true}),
+        json!({"action":"save","entryId":id,"uid":1,"part":"1","path":"/tmp/x","seen":true}),
+    ] {
+        assert_eq!(call_mail_inner(&session, "mail", &args, &|| Ok(())).unwrap_err(), "参数无效");
+    }
+    let error = call_mail_inner(&session, "mail", &json!({"action":"search","entryId":id,"keyword":"subject"}), &|| Ok(())).unwrap_err();
+    assert_eq!(error, "不是邮箱账号");
+}
+
+#[test]
 fn github_profile_rpc_keeps_dto_redaction_and_confirmation() {
     let (session,id)=session_with_token(true,"github");let mcp=McpState::default();let caller=mcp.open_caller().unwrap();
     let op=operation(&session,&id,"/user","GET");

@@ -660,9 +660,14 @@ export const api = {
   /** `markSeen` records the read state locally only; the server is never written. */
   mailBody: (entryId: string, uid: number, folder: string, options: { markSeen?: boolean } = {}) =>
     invoke<MailBody>("mail_body", { request: { entryId, uid, folder, markSeen: options.markSeen === true } }),
-  /** Warms the body cache for the newest uncached messages; resolves to how many were fetched. */
+  /** Queues body prefetch; resolves to 1 if queued, 0 if a pass already runs. */
   mailPrefetch: (entryId: string, folder: string, limit = 5) =>
     invoke<number>("mail_prefetch", { request: { entryId, folder, limit } }),
+  /** Explicit user actions write the server first; failed writes leave the cache unchanged. */
+  mailSetSeen: (entryId: string, uid: number, seen: boolean, folder: string) =>
+    invoke<void>("mail_set_seen", { request: { entryId, uid, folder, seen } }),
+  mailDelete: (entryId: string, uid: number, folder: string) =>
+    invoke<void>("mail_delete", { request: { entryId, uid, folder } }),
   mailUnreadByRole: () => invoke<MailUnreadByRole>("mail_unread_by_role"),
   mailAttachments: (entryId: string, uid: number, folder: string) =>
     invoke<MailAttachment[]>("mail_attachments", { request: { entryId, uid, folder } }),
