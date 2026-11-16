@@ -1174,9 +1174,15 @@ async function toggleTrash() {
 }
 
 async function openSettings() {
-  const settings = await api.settings();
-  biometryOn.value = settings.biometry_enabled;
+  // Switch pages first. A failed settings read should show an error on the
+  // settings screen, not make the bottom tab look dead.
   page.value = "settings";
+  try {
+    const settings = await api.settings();
+    biometryOn.value = settings.biometry_enabled;
+  } catch (caught) {
+    showError(caught);
+  }
   if (!appVersion.value) {
     appVersion.value = await api.appVersion().catch(() => "");
   }

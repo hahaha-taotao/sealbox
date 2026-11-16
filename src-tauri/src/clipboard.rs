@@ -72,7 +72,10 @@ fn write_text_private(text: &str) -> bool {
         Some(handle)
     }
 
-    let utf16: Vec<u16> = text.encode_utf16().collect();
+    // CF_UNICODETEXT is a NUL-terminated UTF-16 string. Without the final
+    // code unit, Windows consumers can truncate the copied password by one
+    // character (or read past the allocation while looking for the terminator).
+    let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
     let bytes: Vec<u8> = utf16.iter().flat_map(|unit| unit.to_le_bytes()).collect();
     let names: Vec<Vec<u16>> = PRIVATE_FORMATS
         .iter()
