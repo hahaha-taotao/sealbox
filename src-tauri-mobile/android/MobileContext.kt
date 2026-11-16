@@ -15,18 +15,16 @@ import app.tauri.annotation.TauriPlugin
 import app.tauri.plugin.Plugin
 
 /**
- * Publishes the Android application context to the Rust JNI helpers.
+ * Nudges the Rust side to adopt the Android application context.
  *
- * Tauri 2.11 / tao 0.35 no longer initialize `ndk-context` (tao 0.36 restores it), so clipboard,
- * SAF and the update installer would panic on `ndk_context::android_context()`.
- *
- * Three independent paths, tried in the order they become available:
- *  - [ContextBootstrapProvider] runs before `Application.onCreate` and is declared in the manifest.
- *    The framework instantiates it unconditionally, so this is the one path that cannot be skipped
- *    by anything the app or Tauri does later.
- *  - [MobileContextPlugin.load] runs while the webview is created, which is still before any
- *    command can be invoked.
- *  - [Application.ActivityLifecycleCallbacks] fires for the first activity after that.
+ * These hooks must NOT publish into `ndk-context` themselves. tao 0.37 already calls
+ * `ndk_context::initialize_android_context` from `Activity.onCreate`, and ndk-context 0.1.1
+ * asserts on a second init — that abort was the 0.20.3+ "opens then dies" crash. Rust only
+ * adopts whatever tao already published; these Kotlin paths just retry the adopt early and often:
+ *  - [ContextBootstrapProvider] runs before `Application.onCreate` (usually too early to adopt,
+ *    but harmless and keeps the manifest hook in place).
+ *  - [MobileContextPlugin.load] runs while the webview is created.
+ *  - [Application.ActivityLifecycleCallbacks] fires for the first activity after tao has published.
  *
  * None of them may throw: an exception escaping `load` fails Tauri's plugin registration, and one
  * escaping a provider or lifecycle callback kills the process. A missing context only degrades
