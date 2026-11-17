@@ -85,20 +85,6 @@ pub fn run() {
             commands::sync_preview,
             commands::sync_commit,
             commands::sync_verify_conditional,
-            commands::mail_accounts,
-            commands::mail_folders,
-            commands::mail_list,
-            commands::mail_body,
-            commands::mail_set_seen,
-            commands::mail_delete,
-            commands::mail_attachments,
-            commands::mail_save_attachment,
-            commands::mail_discover,
-            commands::mail_test,
-            commands::mail_sync,
-            commands::mail_unread_count,
-            commands::mail_prefetch,
-            commands::mail_unread_by_role,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
