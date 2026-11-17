@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import { api, type EntryDto, type EntryKind, type FolderDto, type ListFilter, type Status } from "./lib/tauri";
@@ -139,6 +139,12 @@ async function copyHit(row: EntryDto) {
   await hide();
 }
 
+async function scrollActiveIntoView(i: number) {
+  await nextTick();
+  const row = document.querySelectorAll<HTMLElement>(".quick-list .side-item")[i];
+  row?.scrollIntoView({ block: "nearest" });
+}
+
 function onKey(e: KeyboardEvent) {
   if (e.key === "Escape") {
     e.preventDefault();
@@ -155,10 +161,12 @@ function onKey(e: KeyboardEvent) {
   if (e.key === "ArrowDown") {
     e.preventDefault();
     index.value = Math.min(index.value + 1, Math.max(hits.value.length - 1, 0));
+    void scrollActiveIntoView(index.value);
   }
   if (e.key === "ArrowUp") {
     e.preventDefault();
     index.value = Math.max(index.value - 1, 0);
+    void scrollActiveIntoView(index.value);
   }
   if (e.key === "Enter") {
     e.preventDefault();
