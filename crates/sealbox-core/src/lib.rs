@@ -12,6 +12,7 @@ pub mod mail_provider;
 pub mod mail_store;
 pub mod passphrase_words;
 pub mod profile;
+pub mod projects;
 pub mod redact;
 pub mod sync;
 pub mod totp;

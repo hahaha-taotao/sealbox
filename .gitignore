@@ -48,3 +48,4 @@ NUL
 *.njsproj
 *.sln
 *.sw?
+.alma-snapshots

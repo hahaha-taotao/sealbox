@@ -18,6 +18,7 @@ pub mod http_profiles;
 pub mod profile_http;
 pub mod lock;
 pub mod mcp;
+pub mod projects;
 pub mod session;
 pub mod secure_store;
 pub mod transfer;
@@ -153,6 +154,19 @@ pub fn run() {
             commands::mail_prefetch,
             commands::mail_unread_by_role,
             commands::mail_search,
+            projects::project_sources_list,
+            projects::project_search_remote,
+            projects::project_adopt,
+            projects::project_list,
+            projects::project_list_local,
+            projects::project_get,
+            projects::project_set_short_name,
+            projects::project_bind_customer,
+            projects::project_unbind_customer,
+            projects::project_add_jira_range,
+            projects::project_remove_jira_range,
+            projects::project_add_jira_issue,
+            projects::project_unbind_jira_issue,
             commands::window_control,
             commands::confirm_payload,
             commands::confirm_respond,

@@ -31,6 +31,7 @@ fn sweep_mcp(mcp: &McpState) {
     recover_lock(&mcp.fill_token).clear();
     crate::zoomkey::tls::clear_cache();
     crate::zoomkey::crm::clear_cache();
+    crate::projects::clear_session_cache();
 }
 
 /// Pairing window and HTTP response cache belong with the DEK: any session
@@ -38,6 +39,7 @@ fn sweep_mcp(mcp: &McpState) {
 /// has the session mutex.
 pub fn on_session_locked() {
     crate::confirm::deny_pending();
+    crate::projects::clear_session_cache();
     if let Some(mcp) = recover_lock(active_mcp_slot()).as_ref() {
         sweep_mcp(mcp);
     }

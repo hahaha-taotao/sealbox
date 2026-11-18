@@ -114,6 +114,7 @@ fn migrate(conn: &Connection) -> Result<(), DbError> {
     if !has_profile { conn.execute("ALTER TABLE entries ADD COLUMN profile_blob BLOB", [])?; }
     drop_hello_columns(conn)?;
     crate::mail_store::ensure_schema(conn)?;
+    crate::projects::store::ensure_schema(conn)?;
     Ok(())
 }
 

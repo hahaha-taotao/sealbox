@@ -1,0 +1,1151 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>项目查询 · Sealbox 工作台</title>
+<style>
+:root{font:14px/1.55 Inter,"Segoe UI","Microsoft YaHei UI",sans-serif;color:#172339;background:#f4f6fa;--ink:#172339;--muted:#5f6e84;--line:#e1e6ef;--brand:#334fc4;--paper:#fff;--wash:#edf1ff}
+*{box-sizing:border-box}body{margin:0}button,input,select{font:inherit;color:inherit}button{cursor:pointer}button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #8297f2;outline-offset:2px}button:disabled{cursor:default;opacity:.55}h1,h2,h3,p{margin:0}h1{font-size:28px;line-height:1.25;letter-spacing:-.035em}h2{font-size:22px;letter-spacing:-.025em}h3{font-size:15px}.muted,small{color:var(--muted)}small{font-size:12px}.mono{font-family:Consolas,"Cascadia Mono",monospace;letter-spacing:.02em}.row{display:flex;align-items:center;gap:10px}.between{justify-content:space-between}.wrap{flex-wrap:wrap}.stack{display:grid;gap:16px}.right{text-align:right}.nowrap{white-space:nowrap}
+.top{height:56px;background:#121d32;color:#fff;display:flex;align-items:center;justify-content:space-between;padding:0 max(24px,calc((100vw - 1480px)/2));gap:16px}.brand{font-size:16px;font-weight:700;letter-spacing:.035em}.mark{width:28px;height:28px;background:#586ef0;border-radius:8px;display:grid;place-items:center;font:bold 20px/1 Consolas,monospace}.top .divider{border-left:1px solid #4b5570;padding-left:14px;margin-left:5px;color:#d5ddef}.top .demo{color:#e5eaff;background:#293657;border-color:#455377}
+main{max-width:1480px;margin:auto;padding:24px 24px 40px}.pagehead{margin-bottom:18px}.pagehead p{margin-top:6px}.workspace{display:grid;grid-template-columns:280px minmax(0,1fr);gap:18px;align-items:start}.card{background:var(--paper);border:1px solid var(--line);border-radius:13px;box-shadow:0 3px 10px #24345005;min-width:0}.panel{padding:18px 20px}.rail{position:sticky;top:14px;overflow:hidden}.rail-head{padding:16px}.search{width:100%;height:38px;border:1px solid #ccd5e5;background:#fff;border-radius:8px;padding:0 11px}.rail-head .search{margin-top:12px}.rail-head small{display:block;margin-top:9px}.project{background:#fff;border:0;border-top:1px solid var(--line);width:100%;display:block;text-align:left;padding:14px 16px;border-left:3px solid transparent}.project:hover{background:#f8faff}.project[aria-pressed=true]{background:#edf1ff;border-left-color:var(--brand)}.project strong{display:block;margin:4px 0;font-size:14px}.project small{display:block}.rail-foot{border-top:1px solid var(--line);padding:12px 16px;background:#fafbfe}.pill{display:inline-flex;align-items:center;gap:6px;white-space:nowrap;border-radius:6px;padding:2px 8px;font-size:11px;font-weight:650;background:#eff2f8;color:#424f68;border:1px solid #e1e6ef}.pill.live{background:#e7f6ef;color:#176249;border-color:#ccebdc}.pill.warn{background:#fff5de;color:#7a4d09;border-color:#f4e5bf}.pill.blue{background:#ebefff;color:#3146a8;border-color:#d9e0ff}.pill.ghost{background:#f7f8fb;color:#6a768c}.dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+.identity{display:grid;gap:10px;background:linear-gradient(112deg,#fff 58%,#f0f3ff);padding:18px 20px}.identity .meta{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.identity .meta div{padding:8px 10px;border:1px solid #e7ecf6;border-radius:8px;background:#fff}.identity .meta small{display:block}.identity .meta strong{display:block;margin-top:2px;font-size:13px;font-weight:650}.section-head{margin-bottom:12px}.section-head p{margin-top:3px}.navigation{display:flex;gap:20px;padding:0 20px;border-bottom:1px solid var(--line);overflow:auto}.navigation button{background:transparent;border:0;border-bottom:2px solid transparent;padding:13px 2px 10px;color:var(--muted);white-space:nowrap}.navigation button[aria-pressed=true]{color:var(--brand);font-weight:700;border-bottom-color:var(--brand)}
+.kpis{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.kpi{text-align:left;padding:12px 14px;border:1px solid var(--line);border-radius:9px;background:#f9faff;min-width:0}.kpi strong{display:block;font-size:22px;letter-spacing:-.035em;font-variant-numeric:tabular-nums;margin:4px 0}.kpi small{display:block}.kpi.accent{border-color:#b9c6f5;background:linear-gradient(180deg,#f5f7ff,#eef2ff)}.kpi.warn{background:#fffaf0;border-color:#f0dfb5}.btn{border:1px solid #cfd8e8;border-radius:7px;padding:6px 10px;background:white;font-weight:600;white-space:nowrap}.btn:hover{background:#f4f7ff}.btn.primary{background:var(--brand);color:white;border-color:var(--brand)}.btn.primary:hover{background:#283eaa}.btn.danger{background:#aa2b3d;color:white;border-color:#aa2b3d}.link{border:0;background:none;color:var(--brand);padding:3px 0;font-weight:600;text-align:left}.link:hover{text-decoration:underline}.link.remove{color:#a13143}.filter{width:auto;min-width:120px}.toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}.toolbar input{max-width:245px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:8px}.table-wrap:focus-visible{outline:2px solid #8297f2}table{border-collapse:collapse;width:100%;text-align:left}th,td{padding:10px 11px;vertical-align:middle;text-align:left}th{background:#f5f7fc;color:#526079;font-size:12px;white-space:nowrap}td{border-top:1px solid var(--line);font-size:13px}td small{display:block;margin-top:2px}tbody tr:hover{background:#fafbff}.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.delta-pos{color:#176249}.delta-neg{color:#a13143}.actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.notice{padding:9px 12px;border:1px solid #f1e0b8;background:#fff9eb;border-radius:8px;color:#754b0d;font-size:13px}.info{padding:9px 12px;border:1px solid #d5def8;background:#f4f7ff;border-radius:8px;color:#3146a8;font-size:13px}.empty{color:var(--muted);padding:20px;text-align:center}.task-block + .task-block{margin-top:18px}.range-list{display:flex;gap:8px;flex-wrap:wrap}.range{border:1px solid var(--line);border-radius:7px;padding:4px 8px;background:#f7f9ff;display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap}.range .link{margin-left:5px}.footnote{margin-top:9px;font-size:12px;color:var(--muted)}.split{display:grid;grid-template-columns:1fr 1fr;gap:12px}.source-card{border:1px solid var(--line);border-radius:9px;padding:12px 14px;background:#fafbfe}.source-card h3{margin-bottom:6px}.source-card .metric{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-.03em}.facts{display:grid;grid-template-columns:max-content 1fr;gap:7px 14px;margin:0}.facts dt{color:var(--muted)}.facts dd{margin:0;overflow-wrap:anywhere}
+.cost-shell{display:grid;gap:14px}.cost-nav{position:sticky;top:0;z-index:1;display:flex;gap:6px;flex-wrap:wrap;padding:8px;margin:-4px -4px 0;background:color-mix(in srgb,var(--paper) 92%,transparent);backdrop-filter:blur(8px);border:1px solid var(--line);border-radius:10px}.cost-nav button{border:1px solid transparent;border-radius:7px;padding:7px 11px;background:transparent;color:var(--muted);font-weight:600;white-space:nowrap}.cost-nav button:hover{background:#f4f7ff;color:var(--ink)}.cost-nav button[aria-pressed=true]{background:var(--wash);color:var(--brand);border-color:#c9d4f8}.hour-scroll{max-height:min(360px,52vh);overflow:auto;border:1px solid var(--line);border-radius:8px}.hour-scroll:focus-visible{outline:2px solid #8297f2}.hour-scroll table{border:0}.hour-scroll th{position:sticky;top:0;z-index:1;box-shadow:0 1px 0 var(--line)}
+.jira-shell{display:grid;gap:14px}.jira-nav{display:flex;gap:6px;flex-wrap:wrap;padding:8px;background:#f7f9fd;border:1px solid var(--line);border-radius:10px}.jira-nav button{border:1px solid transparent;border-radius:7px;padding:7px 11px;background:transparent;color:var(--muted);font-weight:600}.jira-nav button:hover{background:#f4f7ff;color:var(--ink)}.jira-nav button[aria-pressed=true]{background:var(--wash);color:var(--brand);border-color:#c9d4f8}.short-box{display:flex;gap:8px;flex-wrap:wrap;align-items:end}.short-box label{display:grid;gap:5px;font-weight:600;flex:1;min-width:180px}.short-box input{max-width:220px}
+.ms{position:relative;display:inline-flex;align-items:center;gap:4px;min-width:0}.ms-trigger{display:inline-flex;align-items:center;gap:6px;max-width:220px;min-width:120px;height:38px;padding:0 10px;border:1px solid #ccd5e5;border-radius:8px;background:#fff;font-weight:600;color:var(--ink)}.ms-trigger:hover{background:#f4f7ff}.ms-trigger[aria-expanded=true]{border-color:#8297f2;box-shadow:0 0 0 3px #8297f233}.ms-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;text-align:left;font-weight:600}.ms-caret{flex:none;color:var(--muted);font-size:11px}.ms-clear{flex:none;width:28px;height:28px;border:1px solid #d5deef;border-radius:7px;background:#fff;color:#6a768c;font-size:16px;line-height:1;padding:0}.ms-clear:hover{background:#f8faff;color:#a13143}.ms-clear[hidden]{display:none}.ms-menu{position:absolute;z-index:5;top:calc(100% + 4px);left:0;min-width:max(100%,220px);max-width:min(360px,80vw);max-height:min(280px,50vh);overflow:auto;padding:6px;border:1px solid var(--line);border-radius:10px;background:#fff;box-shadow:0 12px 36px #1526472e}.ms-menu[hidden]{display:none}.ms-option{display:flex;align-items:flex-start;gap:8px;padding:7px 8px;border-radius:7px;cursor:pointer;font-weight:500}.ms-option:hover,.ms-option:focus-within{background:#f4f7ff}.ms-option input{margin-top:3px;flex:none}.ms-option span{min-width:0;overflow-wrap:anywhere}.ms-empty{padding:10px 8px;color:var(--muted);font-size:12px}
+dialog{border:1px solid var(--line);border-radius:13px;padding:0;width:min(560px,calc(100vw - 24px));color:var(--ink);box-shadow:0 22px 80px #1526474a}dialog::backdrop{background:#111c335c}.modal-head,.modal-body,.modal-foot{padding:15px 20px}.modal-head{border-bottom:1px solid var(--line)}.modal-body{display:grid;gap:12px}.modal-foot{border-top:1px solid var(--line);background:#f7f9fd;justify-content:flex-end}.field{display:grid;gap:5px;font-weight:600}.toast{position:fixed;z-index:2;bottom:20px;right:24px;background:#172339;color:#fff;padding:10px 15px;border-radius:8px;box-shadow:0 8px 30px #1526474a}.toast:empty{display:none}
+@media(max-width:1100px){.identity .meta{grid-template-columns:repeat(2,minmax(0,1fr))}.kpis,.split{grid-template-columns:1fr}}@media(max-width:970px){.workspace{grid-template-columns:230px minmax(0,1fr)}}@media(max-width:680px){main{padding:16px 12px}.top{padding:0 12px}.workspace{grid-template-columns:1fr}.rail{position:static}.project-list{max-height:220px;overflow:auto}.panel{padding:14px 12px}.navigation{padding:0 12px}.identity{padding:14px}.top .divider{display:none}.cost-nav,.jira-nav{gap:4px;padding:6px}.cost-nav button,.jira-nav button{padding:7px 9px;font-size:13px}.hour-scroll{max-height:min(300px,46vh)}}@media(prefers-reduced-motion:no-preference){button{transition:background-color .15s,border-color .15s}}
+
+.customer-group{min-width:0}.customer-group+.customer-group{margin-top:8px}.customer-group summary{display:flex;align-items:center;gap:7px;padding:8px;border-radius:7px;background:var(--wash);cursor:pointer;list-style:none}.customer-group summary::-webkit-details-marker{display:none}.customer-group summary::before{content:'›';flex:none;color:var(--muted)}.customer-group[open] summary::before{transform:rotate(90deg)}.customer-group-name{flex:1;min-width:0;overflow-wrap:anywhere;font-weight:600}.customer-group summary .pill{flex:none}.customer-group-projects{display:grid;gap:6px;padding:6px 0 0 6px}
+</style>
+</head>
+<body>
+<header class="top"><div class="row"><span class="mark" aria-hidden="true">S</span><span class="brand">Sealbox</span><span class="divider">项目工作台</span></div><span class="pill demo"><span class="dot"></span> 真实快照 · 2026-11-18 · 待核项已标注</span></header>
+<main>
+  <div class="pagehead"><h1>项目查询</h1><p class="muted">核对 ERP 项目事实、预算与成本分项、工时来源及 Jira 任务。本地关联为模拟编辑，刷新后重置。</p></div>
+  <div class="workspace">
+    <aside class="card rail" aria-label="项目列表">
+      <div class="rail-head"><div class="row between"><h3>项目列表</h3><span class="pill" id="project-count" aria-live="polite"></span></div><input class="search" id="project-query" type="search" aria-label="查询客户或项目" placeholder="客户、项目名称或编号"><small>精确匹配基线；本原型仅含已核实的一条项目</small></div>
+      <div class="project-list" id="projects"></div>
+      <div class="rail-foot"><small>快照读取 · 2026-11-18 · ERP Project / Hour / JIRATask</small></div>
+    </aside>
+    <section id="detail" class="stack" aria-label="项目详情"></section>
+  </div>
+</main>
+<dialog id="dialog" aria-labelledby="dialog-title">
+  <form id="dialog-form"><div class="modal-head"><h3 id="dialog-title"></h3></div><div class="modal-body" id="dialog-body"></div><div class="modal-foot row" id="dialog-actions"></div></form>
+</dialog>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+
+/** 本快照仅含该项目已查到的客户，供本地模拟绑定选用。 */
+const clients = {
+  '11x148029': '江苏徐矿热力有限公司',
+  '11x564023': '江苏徐矿城南热力有限公司'
+};
+const roles = {contract:'签约客户', user:'实际使用方'};
+
+/**
+ * 真实快照：2026-徐矿-新增子公司-城南分公司
+ * 本地客户关联 / 手动 Jira 范围 / 本地补充任务初始为空——ERP 已关联事实 ≠ 本地关系。
+ * 默认项目简称 XKRL，用于自动匹配 Jira 项目 key。
+ */
+const projects = [{
+  id: 'PROJ3733',
+  crmId: '30x564318',
+  title: '2026-徐矿-新增子公司-城南分公司',
+  stage: '启动',
+  owner: '张文宇',
+  start: '2026-08-24',
+  planOnline: '2026-09-15',
+  planDelivery: '2026-10-31',
+  actualEnd: null,
+  fact: {contract: '11x148029', user: '11x564023'},
+  local: {contract: null, user: null},
+  shortName: 'XKRL',
+  manualRanges: [],
+  issues: [],
+  staff: [
+    ['张文宇', '项目经理', 'ERP Members', '55.00', '参与中', '2026-08-19'],
+    ['曹惠峰', '研发工程师', 'ERP Members', '0.00', '参与中', '2026-08-19']
+  ]
+}];
+
+/** 预算 / 成本分项对照。金额源未单独返回币种 → 显示为「金额（ERP）」，不假设货币。 */
+const budgetItems = [
+  ['实施', 7500, 'ERP Project · 实施预算'],
+  ['研发', 6000, 'ERP Project · 研发预算'],
+  ['差旅', 2000, 'ERP Project · 差旅预算'],
+  ['管理', 9600, 'ERP Project · 管理预算'],
+  ['外采', 0, 'ERP Project · 外采预算'],
+  ['税费', null, 'ERP Project · 税费预算字段暂无值']
+];
+const costItems = [
+  ['实施', 8594, 'ERP Project · 实施成本'],
+  ['开发', 1353.13, 'ERP Project · 开发成本'],
+  ['差旅', 1972, 'ERP Project · 差旅成本'],
+  ['管理', 9593.60, 'ERP Project · 管理成本'],
+  ['硬件外采', 40, 'ERP Project · 硬件外采成本'],
+  ['税费', 0, 'ERP Project · 税费成本']
+];
+const projectContractAmount = 60000; // ERP Project · 项目合同额 cf_9778
+const budgetTotal = 25100;
+const costTotal = 21552.73;
+const budgetDiff = 3547.27; // 原型计算：预算 − 总成本
+
+/** 开发成本 1353.13 = 合同内定制 1328.13 + 产品缺陷 25 */
+const devTasks = [
+  {key:'XKRLWXM-56', title:'新增城南子公司走银联支付接口', project:'【微信管理】徐矿热力', hours:5, amount:1093.75, kind:'合同内定制'},
+  {key:'XKRL-269', title:'城南公司收据底图替换', project:'徐矿热力', hours:0.5, amount:78.13, kind:'合同内定制'},
+  {key:'XKRL-270', title:'新增城南子公司合同章', project:'徐矿热力', hours:1, amount:156.25, kind:'合同内定制'},
+  {key:'XKRL-271', title:'技术日志文件未授权访问漏洞修复', project:'徐矿热力', hours:0.1, amount:25, kind:'产品缺陷'}
+];
+
+/**
+ * 工时两来源并列：
+ * A) ERP Project 汇总：总工时 61.60 = 实施 55 + 开发 6.60；出差量 5 天
+ * B) ERP Hour 明细 12 笔：实施合计 55 小时，出差合计 3 人天
+ * 差异路径待核。
+ */
+const hourSummary = {total:61.60, impl:55, dev:6.60, travelDays:5};
+const hourRows = [
+  ['2026-08-28','HO15473',5,0],
+  ['2026-09-04','HO15562',10,0],
+  ['2026-09-11','HO15619',8,0],
+  ['2026-09-18','HO15680',8,0],
+  ['2026-09-26','HO15829',4,0],
+  ['2026-10-04','HO15920',3,0],
+  ['2026-10-10','HO16277',0,0],
+  ['2026-10-18','HO16381',0,0],
+  ['2026-10-25','HO16454',0,0],
+  ['2026-11-01','HO16523',0,0],
+  ['2026-11-08','HO16584',16,3],
+  ['2026-11-15','HO16633',1,0]
+];
+const hourDetailSum = {hours:55, days:3};
+
+/**
+ * Jira 项目目录：
+ * - XKRL / XKRLWXM：本样本已核实且有任务
+ * - XKRLWXV：简称匹配规则示例 / 待验证模拟输入，无任务
+ * 正式版手动范围必须解析到已授权项目稳定 ID；原型允许手输待验证 key。
+ */
+const jiraCatalog = {
+  XKRLWXM: {name: '【微信管理】徐矿热力', status: 'verified'},
+  XKRL: {name: '徐矿热力', status: 'verified'},
+  XKRLWXV: {name: '徐矿热力·规则示例（待验证，无任务）', status: 'example'}
+};
+
+/** ERP JIRATask → Jira 精确查得 4 条，均已关闭；ERP ProjectTask 按项目 0 条。 */
+const crmIssues = [
+  ['XKRLWXM-56','新增城南子公司走银联支付接口','已关闭','—','2026-11-18',5,1093.75],
+  ['XKRL-269','城南公司收据底图替换','已关闭','—','2026-11-18',0.5,78.13],
+  ['XKRL-270','新增城南子公司合同章','已关闭','—','2026-11-18',1,156.25],
+  ['XKRL-271','技术日志文件未授权访问漏洞修复','已关闭','—','2026-11-18',0.1,25]
+];
+
+// 经办人来自此前按任务编号查询的 Jira 快照。其余字段等 Jira 读取成功后补齐。
+const jiraIssueFields = {
+  'XKRLWXM-56': {assignee: '王 子沐'},
+  'XKRL-269': {assignee: '曹 惠峰'},
+  'XKRL-270': {assignee: '曹 惠峰'},
+  'XKRL-271': {assignee: '杨 依逵'}
+};
+const taskColumns = ['Issue / 标题', 'Jira 项目', '状态', '优先级', '批次', '到期日', '经办人'];
+
+const labels = {overview:'概览', cost:'成本', people:'人员', tasks:'Jira'};
+const costViews = {budget:'预算与成本', dev:'Jira 项目成本', hours:'工时与出差'};
+const jiraViews = {project:'项目任务', scope:'范围配置'};
+// 离线原型使用 Sealbox Jira 适配器的状态预设。
+const jiraStatusDefaults = ["开放", "已优选", "待开发设计", "需求设计完成", "需求设计未通过", "待开发", "处理中", "重新打开", "开发完成", "未通过开发评审", "待测试", "测试未通过", "提测退回", "待验证", "验证未通过", "待合并", "待交付客户", "已关闭", "Done", "Closed"];
+const state = {
+  project: projects[0],
+  tab: 'cost',
+  costView: 'budget',
+  jiraView: 'project',
+  projectTaskQuery: '',
+  projectTaskStatuses: [],
+  projectTaskJiraKeys: [],
+  openMs: null
+};
+
+const fmt = new Intl.NumberFormat('zh-CN', {minimumFractionDigits:0, maximumFractionDigits:2});
+const money = n => n === null || n === undefined ? '—' : fmt.format(n);
+const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const match = (value, query) => String(value ?? '').toLowerCase().includes(query.trim().toLowerCase());
+const jiraKey = issue => issue.includes('-') ? issue.slice(0, issue.lastIndexOf('-')) : issue;
+const pill = (text, tone='') => `<span class="pill ${tone}">${esc(text)}</span>`;
+const link = (action, value, text, extra='') => `<button type="button" class="link ${extra}" data-action="${action}" data-value="${esc(value)}">${esc(text)}</button>`;
+const button = (action, value, text, extra='') => `<button type="button" class="btn ${extra}" data-action="${action}" data-value="${esc(value)}">${esc(text)}</button>`;
+const head = (title, desc, action='') => `<div class="section-head row between wrap"><div><h3>${title}</h3>${desc ? `<p class="muted">${desc}</p>` : ''}</div>${action}</div>`;
+
+function table(headCells, rows, empty='暂无记录', numCols=new Set(), wrapClass='table-wrap') {
+  return `<div class="${wrapClass}" tabindex="0" role="region" aria-label="${esc(headCells[0])}数据表"><table><thead><tr>${headCells.map((h,i)=>`<th scope="col"${numCols.has(i)?' class="num"':''}>${h}</th>`).join('')}</tr></thead><tbody>${rows.length ? rows.map(row=>`<tr>${row.map((cell,i)=>`<td${numCols.has(i)?' class="num"':''}>${cell}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${headCells.length}" class="empty">${esc(empty)}</td></tr>`}</tbody></table></div>`;
+}
+
+let toastTimer;
+function toast(message) {
+  clearTimeout(toastTimer);
+  $('toast').textContent = message;
+  toastTimer = setTimeout(() => $('toast').textContent = '', 3800);
+}
+
+/** trim + 大写；空串表示不走自动匹配。 */
+function normalizeShort(value) {
+  return String(value ?? '').trim().toUpperCase();
+}
+
+function autoRangeKeys(shortName) {
+  const needle = normalizeShort(shortName);
+  if (!needle) return [];
+  return Object.keys(jiraCatalog).filter(key => key.toUpperCase().includes(needle));
+}
+
+function catalogMeta(key) {
+  return jiraCatalog[key] || {name: '待验证项目（原型可移除）', status: 'pending'};
+}
+
+function rangeEntries(project) {
+  const auto = new Set(autoRangeKeys(project.shortName));
+  const manual = new Set(project.manualRanges.map(normalizeShort));
+  return [...new Set([...auto, ...manual])].sort().map(key => {
+    const meta = catalogMeta(key);
+    const sources = [];
+    if (auto.has(key)) sources.push('auto');
+    if (manual.has(key)) sources.push('manual');
+    return {key, name: meta.name, status: meta.status, sources};
+  });
+}
+
+function effectiveRangeKeys(project) {
+  return rangeEntries(project).map(entry => entry.key);
+}
+
+function crmIssueMap() {
+  return Object.fromEntries(crmIssues.map(row => [row[0], row]));
+}
+
+function projectTaskKeys(project) {
+  return [...new Set([...crmIssues.map(row => row[0]), ...project.issues])];
+}
+
+function projectTaskCount(project) {
+  return projectTaskKeys(project).length;
+}
+
+function sourcePills(sources, status) {
+  const marks = sources.map(src => src === 'auto'
+    ? pill('自动匹配', 'blue')
+    : pill('手动补充', 'live'));
+  if (status === 'example') marks.push(pill('规则示例 · 待验证', 'warn'));
+  else if (status === 'pending') marks.push(pill('待验证', 'warn'));
+  return marks.join(' ');
+}
+
+const collapsedCustomerGroups = new Set();
+
+function renderProjects() {
+  const list = $('projects');
+  if (list.dataset.searching === 'false') {
+    for (const group of list.querySelectorAll('.customer-group')) {
+      if (group.open) collapsedCustomerGroups.delete(group.dataset.customerId);
+      else collapsedCustomerGroups.add(group.dataset.customerId);
+    }
+  }
+
+  const query = $('project-query').value.trim();
+  const results = projects.filter(project =>
+    [project.id, project.crmId, project.title, project.shortName, ...Object.values(project.fact), ...Object.values(project.local)]
+      .some(value => match(value, query) || match(clients[value], query))
+  );
+  $('project-count').textContent = `${results.length} 个`;
+  list.dataset.searching = String(Boolean(query));
+
+  const groups = new Map();
+  for (const project of results) {
+    const customerId = project.fact.contract || '';
+    if (!groups.has(customerId)) groups.set(customerId, []);
+    groups.get(customerId).push(project);
+  }
+
+  list.innerHTML = [...groups].map(([customerId, members]) => {
+    const customerName = clients[customerId] || customerId || '未填写签约客户';
+    const open = query || !collapsedCustomerGroups.has(customerId);
+    const cards = members.map(project =>
+      `<button class="project" type="button" data-action="project" data-value="${esc(project.id)}" aria-pressed="${project === state.project}">
+        <span class="row between"><small class="mono">${esc(project.id)}</small>${pill(project.stage, 'live')}</span>
+        <strong>${esc(project.title)}</strong>
+        <small>项目经理 · ${esc(project.owner)}</small>
+      </button>`
+    ).join('');
+    return `<details class="customer-group" data-customer-id="${esc(customerId)}"${open ? ' open' : ''}>
+      <summary><span class="customer-group-name">${esc(customerName)}</span>${pill(`${members.length} 个`)}</summary>
+      <div class="customer-group-projects">${cards}</div>
+    </details>`;
+  }).join('') || '<div class="empty">没有匹配的项目</div>';
+}
+
+function costCards() {
+  return `<div class="kpis">
+    <div class="kpi accent"><small>项目合同额</small><strong>${money(projectContractAmount)}</strong><small>金额（ERP）</small></div>
+    <div class="kpi"><small>项目预算</small><strong>${money(budgetTotal)}</strong><small>金额（ERP）· 分项齐全</small></div>
+    <div class="kpi"><small>总成本</small><strong>${money(costTotal)}</strong><small>金额（ERP）</small></div>
+  </div>`;
+}
+
+function customerTable(project) {
+  return table(
+    ['角色', 'ERP 项目事实 · 只读', '本地项目关联', '操作'],
+    Object.keys(roles).map(role => {
+      const remote = project.fact[role];
+      const local = project.local[role];
+      return [
+        roles[role],
+        remote ? `${esc(clients[remote])}<small class="mono">${remote}</small>` : '<span class="muted">ERP 未提供</span>',
+        local ? `${esc(clients[local])}<small class="mono">${local}</small>` : pill('未绑定 · 初始态', 'ghost'),
+        `<div class="actions">${link('customer', role, local ? '修改绑定' : '绑定客户')}${local ? link('unbound-client', role, '取消绑定', 'remove') : ''}</div>`
+      ];
+    })
+  );
+}
+
+function overview(project) {
+  return `
+    <p class="info">ERP 已关联事实来自 Project 字段；本地关联初始为空，下方操作为原型模拟编辑，不代表已有真实本地绑定证据。</p>
+    ${head('客户关系', '签约 / 实际使用方两列独立：左侧只读事实，右侧本地模拟。')}
+    ${customerTable(project)}
+    <div class="task-block" style="margin-top:17px">
+      ${head('项目记录', '来源 ERP Project · 实际结束未填')}
+      <dl class="facts">
+        <dt>ERP 编号</dt><dd class="mono">${esc(project.id)} / ${esc(project.crmId)}</dd>
+        <dt>状态</dt><dd>${esc(project.stage)}</dd>
+        <dt>开始日期</dt><dd>${esc(project.start)}</dd>
+        <dt>计划上线</dt><dd>${esc(project.planOnline)}</dd>
+        <dt>计划交付</dt><dd>${esc(project.planDelivery)}</dd>
+        <dt>实际结束</dt><dd><span class="muted">ERP 未填</span></dd>
+        <dt>项目经理</dt><dd>${esc(project.owner)}</dd>
+        <dt>Jira 简称</dt><dd class="mono">${esc(normalizeShort(project.shortName) || '（空 · 仅手动范围）')}</dd>
+      </dl>
+    </div>
+    <div class="task-block">
+      ${head('不计入成本的口径', '合同 / 回款属收入口径，不与预算成本混算。')}
+      <p class="notice">已排除：合同额 / 回款 60000、回款毛利润 38447.27。预算毛利润原值 3580.87 与预算差额不是同一字段，本页不展示。</p>
+    </div>`;
+}
+
+function costCompareRows() {
+  const budgetMap = Object.fromEntries(budgetItems.map(([k, v, src]) => [k, {v, src}]));
+  const costMap = Object.fromEntries(costItems.map(([k, v, src]) => [k, {v, src}]));
+  /** 预算侧「研发」对照成本侧「开发」；其余按同名对齐。 */
+  const pairs = [
+    ['实施', '实施'],
+    ['研发', '开发'],
+    ['差旅', '差旅'],
+    ['管理', '管理'],
+    ['外采', '硬件外采'],
+    ['税费', '税费']
+  ];
+  return pairs.map(([bKey, cKey]) => {
+    const b = budgetMap[bKey];
+    const c = costMap[cKey];
+    const delta = (b?.v != null && c?.v != null) ? b.v - c.v : null;
+    const deltaCell = delta === null
+      ? '<span class="muted">—</span>'
+      : `<span class="${delta >= 0 ? 'delta-pos' : 'delta-neg'}">${delta >= 0 ? '+' : ''}${money(delta)}</span>`;
+    return [
+      `${esc(bKey)} → ${esc(cKey)}`,
+      b?.v === null ? '—' : money(b?.v),
+      money(c?.v),
+      deltaCell,
+      `<small>${esc(b?.src || '')}</small><small>${esc(c?.src || '')}</small>`
+    ];
+  });
+}
+
+function costBudgetView() {
+  return `
+    ${head('预算与成本分项对照', '金额源未单独返回币种，统一按「金额（ERP）」展示，不假设货币单位。')}
+    <div class="task-block">
+      ${table(
+        ['分项（预算 → 成本）', '预算', '成本', '差额', '字段来源'],
+        costCompareRows(),
+        '暂无分项',
+        new Set([1, 2, 3])
+      )}
+      <p class="footnote">合计：预算 ${money(budgetTotal)} · 成本 ${money(costTotal)} · 差额 ${money(budgetDiff)}（原型计算）。税费预算字段暂无值显示为 —，不按 0 处理。</p>
+    </div>`;
+}
+
+function costJiraProjectsView() {
+  const groups = new Map();
+  let totalHours = 0;
+  let totalAmount = 0;
+  for (const task of devTasks) {
+    const key = jiraKey(task.key);
+    const group = groups.get(key) || {name: task.project, hours: 0, amount: 0};
+    const hours = Math.round(task.hours * 100);
+    const amount = Math.round(task.amount * 100);
+    group.hours += hours;
+    group.amount += amount;
+    totalHours += hours;
+    totalAmount += amount;
+    groups.set(key, group);
+  }
+
+  const rows = Array.from(groups, ([key, group]) => [
+    `${esc(group.name)}<small class="mono">${esc(key)}</small>`,
+    money(group.hours / 100),
+    money(group.amount / 100)
+  ]);
+  if (rows.length) rows.push(['<strong>合计</strong>', money(totalHours / 100), money(totalAmount / 100)]);
+
+  return `
+    ${head('Jira 项目成本', '按 Jira 项目汇总当前 ERP 项目已关联任务的研发工时和开发成本。')}
+    ${table(['Jira 项目', '研发工时（小时）', '开发成本（ERP）'], rows, '暂无项目成本', new Set([1, 2]))}`;
+}
+
+function costHoursView() {
+  return `
+    ${head('工时与出差 · 两来源并列', 'Project 汇总与 Hour 明细并存；出差量 5 天 vs 明细 3 人天，差异路径待核。')}
+    <div class="split">
+      <div class="source-card">
+        <h3>ERP Project 汇总</h3>
+        <div class="metric">${money(hourSummary.total)} h</div>
+        <p class="muted">实施 ${money(hourSummary.impl)} + 开发 ${money(hourSummary.dev)} · 出差量 ${hourSummary.travelDays} 天</p>
+      </div>
+      <div class="source-card">
+        <h3>ERP Hour 明细合计</h3>
+        <div class="metric">${money(hourDetailSum.hours)} h</div>
+        <p class="muted">12 笔 · 实施工时 ${money(hourDetailSum.hours)} · 出差 ${hourDetailSum.days} 人天</p>
+      </div>
+    </div>
+    <p class="notice" style="margin-top:12px">待核：Project 出差量 5 天 ≠ Hour 明细出差合计 3 人天；Project 总工时含开发 6.60，Hour 明细仅覆盖实施 55。</p>
+    <div class="task-block">
+      ${table(
+        ['日期', '工时单号', '工时', '出差人天', '成员'],
+        hourRows.map(([date, id, hours, days]) => [
+          date,
+          `<span class="mono">${id}</span>`,
+          money(hours),
+          money(days),
+          '张文宇'
+        ]),
+        '暂无明细',
+        new Set([2, 3]),
+        'hour-scroll'
+      )}
+      <p class="footnote">12 笔明细在局部列表内滚动；成本子导航保持可达，不锁整页高度。</p>
+    </div>`;
+}
+
+function costs() {
+  const nav = Object.entries(costViews).map(([key, label]) =>
+    `<button type="button" data-action="cost-view" data-value="${key}" aria-pressed="${key === state.costView}">${label}</button>`
+  ).join('');
+  const body = ({budget: costBudgetView, dev: costJiraProjectsView, hours: costHoursView})[state.costView]();
+  return `<div class="cost-shell"><nav class="cost-nav" aria-label="成本子视图">${nav}</nav><div class="cost-pane">${body}</div></div>`;
+}
+
+function people(project) {
+  return `
+    ${head('人员与来源', 'ERP Members · 参与状态与起始日期沿用来源记录。')}
+    ${table(
+      ['姓名', '项目角色', '来源', '成员工时', '参与状态', '起始'],
+      project.staff.map((r, i) => [
+        r[0], r[1], r[2],
+        link('person', i, `${r[3]} h`, 'mono'),
+        pill(r[4], 'live'),
+        r[5]
+      ]),
+      '暂无成员',
+      new Set([3])
+    )}
+    <p class="footnote">成员工时为 ERP 成员记录字段，与 Project 总工时 / Hour 明细为不同口径。</p>`;
+}
+
+/** 范围变化时丢弃已失效的项目筛选；再按仍可用状态收紧状态筛选。 */
+function sanitizeTaskFilters(project) {
+  const ranges = new Set(effectiveRangeKeys(project));
+  const nextProjects = state.projectTaskJiraKeys.filter(key => ranges.has(key));
+  if (nextProjects.length !== state.projectTaskJiraKeys.length) {
+    state.projectTaskJiraKeys = nextProjects;
+  }
+  const available = new Set(availableStatuses(project, state.projectTaskJiraKeys));
+  const nextStatuses = state.projectTaskStatuses.filter(status => available.has(status));
+  if (nextStatuses.length !== state.projectTaskStatuses.length) {
+    state.projectTaskStatuses = nextStatuses;
+  }
+}
+
+/** 当前项目筛选下可用的状态：预设 ∪ 命中任务上的状态。 */
+function availableStatuses(project, selectedProjects = state.projectTaskJiraKeys) {
+  const map = crmIssueMap();
+  const projectFilter = new Set(selectedProjects);
+  const fromTasks = projectTaskKeys(project)
+    .filter(key => !projectFilter.size || projectFilter.has(jiraKey(key)))
+    .map(key => map[key]?.[2])
+    .filter(Boolean);
+  return [...new Set([...jiraStatusDefaults, ...fromTasks])];
+}
+
+function msSummary(selected, allLabel, formatOne) {
+  if (!selected.length) return allLabel;
+  if (selected.length === 1) return formatOne(selected[0]);
+  if (selected.length <= 2) return selected.map(formatOne).join('、');
+  return `已选 ${selected.length} 项`;
+}
+
+function msMarkup({id, label, allLabel, options, selected, formatOne}) {
+  const open = state.openMs === id;
+  const summary = msSummary(selected, allLabel, formatOne);
+  const selectedSet = new Set(selected);
+  const optionHtml = options.length
+    ? options.map(opt => {
+      const checked = selectedSet.has(opt.value) ? ' checked' : '';
+      return `<label class="ms-option"><input type="checkbox" value="${esc(opt.value)}"${checked}><span>${opt.html}</span></label>`;
+    }).join('')
+    : '<div class="ms-empty">暂无可选项</div>';
+  return `<div class="ms" data-ms="${esc(id)}" data-ms-label="${esc(label)}">
+    <button type="button" class="ms-trigger" id="${esc(id)}-trigger" aria-haspopup="listbox" aria-expanded="${open}" aria-controls="${esc(id)}-menu" aria-label="${esc(label)}">
+      <span class="ms-label">${esc(summary)}</span><span class="ms-caret" aria-hidden="true">▾</span>
+    </button>
+    <button type="button" class="ms-clear" data-ms-clear="${esc(id)}" aria-label="清空${esc(label)}"${selected.length ? '' : ' hidden'}>×</button>
+    <div class="ms-menu" id="${esc(id)}-menu" role="listbox" aria-multiselectable="true" aria-label="${esc(label)}"${open ? '' : ' hidden'}>${optionHtml}</div>
+  </div>`;
+}
+
+function syncMsChrome(id, selected, allLabel, formatOne) {
+  const root = document.querySelector(`[data-ms="${id}"]`);
+  if (!root) return;
+  const label = root.querySelector('.ms-label');
+  const clear = root.querySelector('.ms-clear');
+  const trigger = root.querySelector('.ms-trigger');
+  if (label) label.textContent = msSummary(selected, allLabel, formatOne);
+  if (clear) clear.hidden = !selected.length;
+  if (trigger) trigger.setAttribute('aria-expanded', String(state.openMs === id));
+  const menu = root.querySelector('.ms-menu');
+  if (menu) menu.hidden = state.openMs !== id;
+}
+
+function closeMs() {
+  if (!state.openMs) return;
+  const prev = state.openMs;
+  state.openMs = null;
+  const root = document.querySelector(`[data-ms="${prev}"]`);
+  if (!root) return;
+  root.querySelector('.ms-trigger')?.setAttribute('aria-expanded', 'false');
+  const menu = root.querySelector('.ms-menu');
+  if (menu) menu.hidden = true;
+}
+
+function openMs(id) {
+  if (state.openMs && state.openMs !== id) closeMs();
+  state.openMs = id;
+  const root = document.querySelector(`[data-ms="${id}"]`);
+  if (!root) return;
+  root.querySelector('.ms-trigger')?.setAttribute('aria-expanded', 'true');
+  const menu = root.querySelector('.ms-menu');
+  if (menu) {
+    menu.hidden = false;
+    const focusable = menu.querySelector('input[type=checkbox]');
+    focusable?.focus();
+  }
+}
+
+function rebuildStatusMs(project) {
+  const root = document.querySelector('[data-ms="project-task-status"]');
+  if (!root) return;
+  const menu = root.querySelector('.ms-menu');
+  if (!menu) return;
+  const statuses = availableStatuses(project, state.projectTaskJiraKeys);
+  const selected = new Set(state.projectTaskStatuses);
+  menu.innerHTML = statuses.length
+    ? statuses.map(status => `<label class="ms-option"><input type="checkbox" value="${esc(status)}"${selected.has(status) ? ' checked' : ''}><span>${esc(status)}</span></label>`).join('')
+    : '<div class="ms-empty">暂无可选项</div>';
+  syncMsChrome('project-task-status', state.projectTaskStatuses, '全部状态', value => value);
+}
+
+/** 项目任务默认 = ERP ∪ 本地补充；范围内候选需显式切换，不自动并入项目任务。 */
+function projectTaskRows(project) {
+  sanitizeTaskFilters(project);
+  const map = crmIssueMap();
+  const selectedProjects = new Set(state.projectTaskJiraKeys);
+  const selectedStatuses = new Set(state.projectTaskStatuses);
+  let keys = projectTaskKeys(project);
+  if (selectedProjects.size) keys = keys.filter(key => selectedProjects.has(jiraKey(key)));
+  keys = keys.filter(key => {
+    const row = map[key];
+    const title = row ? row[1] : '本地补充（无快照正文）';
+    const status = row ? row[2] : '';
+    return (!selectedStatuses.size || selectedStatuses.has(status))
+      && [key, title].some(v => match(v, state.projectTaskQuery));
+  });
+  const rows = keys.map(key => {
+    const crm = map[key];
+    const title = crm ? crm[1] : '本地补充任务（原型无正文快照）';
+    const fields = jiraIssueFields[key] || {};
+    const status = crm ? crm[2] : '待验证';
+    return [
+      `${link('issue', key, key, 'mono')}<small>${esc(title)}</small>`,
+      esc(jiraKey(key)),
+      pill(status, crm ? 'live' : 'warn'),
+      esc(fields.priority ?? '—'),
+      esc(fields.batch ?? '—'),
+      esc(fields.dueDate ?? '—'),
+      esc(fields.assignee ?? '—')
+    ];
+  });
+  return {keys, rows};
+}
+
+function projectTasksView(project) {
+  sanitizeTaskFilters(project);
+  const {keys, rows} = projectTaskRows(project);
+  const projectOptions = rangeEntries(project).map(({key, name, status}) => {
+    const unavailable = status !== 'verified' ? ' · 待验证' : '';
+    return {value: key, html: `<span class="mono">${esc(key)}</span> · ${esc(name + unavailable)}`};
+  });
+  const statusOptions = availableStatuses(project, state.projectTaskJiraKeys).map(status => ({
+    value: status,
+    html: esc(status)
+  }));
+  return `
+    <div class="toolbar">
+      <input class="search" id="project-task-query" type="search" aria-label="筛选任务" placeholder="Issue 编号或标题" value="${esc(state.projectTaskQuery)}">
+      ${msMarkup({
+        id: 'project-task-jira',
+        label: '筛选 Jira 项目',
+        allLabel: '全部项目',
+        options: projectOptions,
+        selected: state.projectTaskJiraKeys,
+        formatOne: value => value
+      })}
+      ${msMarkup({
+        id: 'project-task-status',
+        label: '筛选任务状态',
+        allLabel: '全部状态',
+        options: statusOptions,
+        selected: state.projectTaskStatuses,
+        formatOne: value => value
+      })}
+      ${button('exact-issue', '', '按 key 精确补充')}
+      <small id="project-task-count" aria-live="polite">${keys.length} 项 · 项目任务合计 ${projectTaskCount(project)}</small>
+    </div>
+    <div id="project-task-rows">${table(
+      taskColumns,
+      rows,
+      '没有满足筛选条件的项目任务'
+    )}</div>
+    <p class="footnote">任务字段来自 Jira 快照。— 表示当前快照未取得对应值。</p>`;
+}
+
+function renderProjectTasks() {
+  const project = state.project;
+  const {keys, rows} = projectTaskRows(project);
+  const count = $('project-task-count');
+  const box = $('project-task-rows');
+  if (count) count.textContent = `${keys.length} 项 · 项目任务合计 ${projectTaskCount(project)}`;
+  if (box) {
+    box.innerHTML = table(
+      taskColumns,
+      rows,
+      '没有满足筛选条件的项目任务'
+    );
+  }
+  syncMsChrome('project-task-jira', state.projectTaskJiraKeys, '全部项目', value => value);
+  syncMsChrome('project-task-status', state.projectTaskStatuses, '全部状态', value => value);
+}
+
+function scopeConfigView(project) {
+  const entries = rangeEntries(project);
+  const rangeChips = entries.map(entry => {
+    const canRemoveManual = entry.sources.includes('manual');
+    const note = entry.sources.includes('auto') && entry.sources.includes('manual')
+      ? '<small>自动+手动</small>'
+      : entry.sources.includes('auto')
+        ? '<small>简称命中</small>'
+        : '<small>仅手动</small>';
+    return `<span class="range">
+      <strong class="mono">${esc(entry.key)}</strong>
+      ${esc(entry.name)}
+      ${sourcePills(entry.sources, entry.status)}
+      ${note}
+      ${canRemoveManual ? link('unbound-range', entry.key, '移除手动', 'remove') : ''}
+    </span>`;
+  }).join('');
+
+  const shortNorm = normalizeShort(project.shortName);
+  return `
+    <section class="task-block">
+      ${head('范围配置', '有效范围 = 简称自动匹配 ∪ 手动补充；空简称只走手动。范围只影响「范围内候选」筛选，不改写项目任务。')}
+      <div class="short-box">
+        <label>项目简称
+          <input class="search" id="short-name" type="text" spellcheck="false" value="${esc(project.shortName)}" placeholder="例如 XKRL；留空=仅手动" aria-label="项目简称">
+        </label>
+        ${button('apply-short', '', '应用简称', 'primary')}
+        <small class="muted">匹配规则：trim 后转大写，对 Jira 项目 key 做 substring 包含。当前规范化：<span class="mono">${esc(shortNorm || '（空）')}</span></small>
+      </div>
+      <div class="range-list" style="margin-top:12px">${rangeChips || '<span class="muted">当前无有效范围。可填写简称自动匹配，或手动添加项目。</span>'}</div>
+      <div class="actions" style="margin-top:12px">
+        ${button('choose-range', '', '添加手动范围')}
+        <small class="muted">已核实有任务：XKRL、XKRLWXM。XKRLWXV 为规则示例/待验证，无任务。正式版须解析到已授权项目 ID。移除范围不会增删 ERP 关联或本地补充。</small>
+      </div>
+    </section>
+    <p class="footnote">搜索、状态筛选、范围内候选与「按 key 精确补充」已统一到「项目任务」子页，避免两处重复列出同一任务。</p>`;
+}
+
+function tasks(project) {
+  const nav = Object.entries(jiraViews).map(([key, label]) =>
+    `<button type="button" data-action="jira-view" data-value="${key}" aria-pressed="${key === state.jiraView}">${label}${key === 'project' ? ` · ${projectTaskCount(project)}` : ''}</button>`
+  ).join('');
+  const body = state.jiraView === 'scope' ? scopeConfigView(project) : projectTasksView(project);
+  return `<div class="jira-shell"><nav class="jira-nav" aria-label="Jira 子视图">${nav}</nav><div class="jira-pane">${body}</div></div>`;
+}
+
+function renderDetail() {
+  const project = state.project;
+  const tabs = Object.keys(labels).map(tab =>
+    `<button type="button" data-action="tab" data-value="${tab}" aria-pressed="${tab === state.tab}">${labels[tab]}${tab === 'tasks' ? ` · ${projectTaskCount(project)}` : ''}</button>`
+  ).join('');
+  $('detail').innerHTML = `
+    <div class="card identity">
+      <div class="row between wrap">
+        <div class="row"><span class="mono muted">${project.id}</span>${pill(project.stage, 'live')}${pill(project.crmId, 'ghost')}</div>
+        ${pill('真实快照 · 2026-11-18', 'blue')}
+      </div>
+      <h2>${esc(project.title)}</h2>
+      <div class="meta">
+        <div><small>签约客户</small><strong>${esc(clients[project.fact.contract])}</strong></div>
+        <div><small>实际使用方</small><strong>${esc(clients[project.fact.user])}</strong></div>
+        <div><small>计划交付</small><strong>${esc(project.planDelivery)}</strong></div>
+      </div>
+    </div>
+    <div class="card panel">${costCards()}</div>
+    <div class="card">
+      <nav class="navigation" aria-label="项目详情视图">${tabs}</nav>
+      <div class="panel">${({overview, cost: costs, people, tasks})[state.tab](project)}</div>
+    </div>`;
+
+}
+
+const modal = $('dialog');
+let dialogSubmit;
+let dialogTrigger;
+
+function showDialog(title, body, {confirm='', danger=false, submit} = {}) {
+  $('dialog-title').textContent = title;
+  $('dialog-body').innerHTML = body;
+  $('dialog-actions').innerHTML = `<button class="btn" type="button" data-close autofocus>${confirm ? '取消' : '关闭'}</button>${confirm ? `<button class="btn ${danger ? 'danger' : 'primary'}" type="submit">${esc(confirm)}</button>` : ''}`;
+  dialogSubmit = submit;
+  dialogTrigger = document.activeElement;
+  modal.showModal();
+}
+
+function facts(entries) {
+  return `<dl class="facts">${entries.map(([key, value]) => `<dt>${esc(key)}</dt><dd>${esc(value)}</dd>`).join('')}</dl>`;
+}
+
+function refresh(message, focusAction) {
+  renderProjects();
+  renderDetail();
+  if (focusAction) {
+    const [action, value] = focusAction;
+    const buttons = [...document.querySelectorAll('[data-action]')];
+    const next = buttons.find(b => b.dataset.action === action && b.dataset.value === value);
+    const activeTab = document.querySelector('.navigation [aria-pressed=true]');
+    (next || activeTab)?.focus();
+  }
+  if (message) toast(message);
+}
+
+function chooseCustomer(project, role) {
+  const remote = project.fact[role];
+  const local = project.local[role];
+  const options = Object.entries(clients).map(([id, name]) =>
+    `<option value="${id}"${local === id ? ' selected' : ''}>${name} · ${id}</option>`
+  ).join('');
+  showDialog(
+    `${local ? '修改' : '绑定'}${roles[role]}`,
+    `${facts([
+      ['当前项目', project.title],
+      ['ERP 事实', remote ? `${clients[remote]} · ${remote}` : 'ERP 未提供'],
+      ['说明', '仅可从本项目已查到的两客户中选择；保存只更新本地模拟关联']
+    ])}<label class="field">本地关联客户<select name="client" class="search" required><option value="">请选择</option>${options}</select></label><small>ERP 列保持只读事实；本地列与 ERP 已关联事实相互独立。</small>`,
+    {confirm: '保存绑定', submit(form) {
+      project.local[role] = form.get('client');
+      return [`已保存${roles[role]}本地绑定（模拟）`, ['customer', role]];
+    }}
+  );
+}
+
+function confirmRemoval(title, entries, description, submit) {
+  showDialog(title, `${facts(entries)}<p class="muted">${esc(description)}</p>`, {confirm: '确认移除', danger: true, submit});
+}
+
+function bindIssue(project, key) {
+  if (crmIssueMap()[key]) {
+    return [`${key} 已由 ERP 关联，无需重复绑定`, ['issue', key]];
+  }
+  if (project.issues.includes(key)) return [`${key} 已在本地补充中`, ['unbound-issue', key]];
+  project.issues.push(key);
+  return [`已本地补充 ${key}（模拟）`, ['unbound-issue', key]];
+}
+
+function issueDetail(project, key) {
+  const row = crmIssueMap()[key];
+  const linked = project.issues.includes(key);
+  const inRange = effectiveRangeKeys(project).includes(jiraKey(key));
+  const taskMeta = devTasks.find(t => t.key === key);
+  if (!row) {
+    showDialog(
+      `${key} · 本地补充`,
+      facts([
+        ['数据来源', '本地补充 · 原型无正文快照'],
+        ['范围内', inRange ? '是' : '否'],
+        ['本地补充', linked ? '是' : '否']
+      ]),
+      linked ? {confirm: '移除本地补充', danger: true, submit: () => {
+        project.issues = project.issues.filter(item => item !== key);
+        return [`已移除 ${key} 的本地补充`, ['jira-view', 'project']];
+      }} : {}
+    );
+    return;
+  }
+  const [, title, status, , date, hours, amount] = row;
+  showDialog(
+    `${key} · ${title}`,
+    facts([
+      ['数据来源', `ERP 既有关联 · ${catalogMeta(jiraKey(key)).name}`],
+      ['状态', status],
+      ['工时', `${hours} h`],
+      ['金额（ERP）', money(amount)],
+      ['归类', taskMeta?.kind || '—'],
+      ['范围内', inRange ? '是' : '否'],
+      ['ERP 关联', '已关联 · 不重复绑定'],
+      ['本地补充', linked ? '是（与 ERP 并存去重）' : '否'],
+      ['快照日期', date]
+    ])
+  );
+}
+
+function applyShortName(project) {
+  const input = $('short-name');
+  const next = input ? input.value : project.shortName;
+  const normalized = normalizeShort(next);
+  project.shortName = next.trim();
+  sanitizeTaskFilters(project);
+  const auto = autoRangeKeys(project.shortName);
+  const msg = normalized
+    ? `已应用简称 ${normalized} · 自动命中 ${auto.join('、') || '无'}`
+    : '简称已清空 · 仅保留手动范围';
+  return [msg, ['apply-short', '']];
+}
+
+function exactIssue(project) {
+  showDialog(
+    '按 Issue key 精确补充',
+    `${facts([
+      ['说明', '用于 ERP 未挂但属于本项目的任务。已在 ERP 关联中的 key 不会重复绑定。'],
+      ['正式版', '必须解析到当前授权来源的稳定 issue ID']
+    ])}
+    <label class="field">Issue key
+      <input class="search" name="issue" type="text" required spellcheck="false" placeholder="例如 XKRL-999" aria-label="Issue key">
+    </label>
+    <small>原型不编造任务正文；补充后仅在项目任务列表显示 key，并可移除。</small>`,
+    {confirm: '补充到项目', submit(form) {
+      const key = String(form.get('issue') || '').trim().toUpperCase();
+      if (!key) return ['请输入 Issue key', ['exact-issue', '']];
+      if (crmIssueMap()[key]) {
+        return [`${key} 已由 ERP 关联，无需重复绑定`, ['jira-view', 'project']];
+      }
+      if (project.issues.includes(key)) {
+        return [`${key} 已在本地补充中（幂等）`, ['unbound-issue', key]];
+      }
+      project.issues.push(key);
+      state.jiraView = 'project';
+      return [`已本地补充 ${key}（模拟 · 无正文快照）`, ['jira-view', 'project']];
+    }}
+  );
+}
+
+function chooseRange(project) {
+  const auto = new Set(autoRangeKeys(project.shortName));
+  const manual = new Set(project.manualRanges.map(normalizeShort));
+  const catalogOptions = Object.entries(jiraCatalog).map(([key, meta]) => {
+    const tags = [];
+    if (auto.has(key)) tags.push('已自动命中');
+    if (manual.has(key)) tags.push('已手动');
+    if (meta.status === 'example') tags.push('规则示例');
+    return `<option value="${key}">${key} · ${meta.name}${tags.length ? `（${tags.join(' · ')}）` : ''}</option>`;
+  }).join('');
+  showDialog(
+    '添加手动 Jira 范围',
+    `${facts([
+      ['当前简称', normalizeShort(project.shortName) || '（空 · 仅手动）'],
+      ['说明', '与自动命中重合时幂等；来源可同时标自动+手动。正式版须解析到已授权项目 ID。']
+    ])}
+    <label class="field">从目录选择
+      <select name="range" class="search">
+        <option value="">请选择（可改用手输）</option>
+        ${catalogOptions}
+      </select>
+    </label>
+    <label class="field">或手输项目 key（原型记为待验证，可移除）
+      <input class="search" name="custom" type="text" spellcheck="false" placeholder="例如 DEMO" aria-label="手输 Jira 项目 key">
+    </label>
+    <small>XKRLWXV 无本样本任务，仅演示匹配规则。手输未知 key 不会编造任务。</small>`,
+    {confirm: '添加手动范围', submit(form) {
+      const custom = normalizeShort(form.get('custom'));
+      const selected = normalizeShort(form.get('range'));
+      const key = custom || selected;
+      if (!key) return ['请选择或输入 Jira 项目 key', ['choose-range', '']];
+      const alreadyManual = project.manualRanges.map(normalizeShort).includes(key);
+      const alreadyAuto = autoRangeKeys(project.shortName).includes(key);
+      if (alreadyManual) {
+        return [`${key} 已在手动范围中（幂等）` + (alreadyAuto ? '；同时由简称自动命中，故仍在范围内' : ''), ['choose-range', '']];
+      }
+      project.manualRanges.push(key);
+      sanitizeTaskFilters(project);
+      if (alreadyAuto) {
+        return [`已记录 ${key} 为手动补充；该项目同时由简称自动命中，仍在范围内（未重复建项）`, ['choose-range', '']];
+      }
+      const meta = catalogMeta(key);
+      const suffix = meta.status === 'pending' ? ' · 待验证（原型可移除）' : meta.status === 'example' ? ' · 规则示例，无任务' : '';
+      return [`已添加手动范围 ${key}${suffix}`, ['choose-range', '']];
+    }}
+  );
+}
+
+const actions = {
+  project(project, id) {
+    if (project.id === id) return;
+    Object.assign(state, {
+      project: projects.find(item => item.id === id),
+      tab: 'cost',
+      costView: 'budget',
+      jiraView: 'project',
+      projectTaskQuery: '',
+      projectTaskStatuses: [],
+      projectTaskJiraKeys: [],
+      openMs: null
+    });
+    refresh('', ['project', id]);
+  },
+  tab(project, tab) {
+    state.tab = tab;
+    state.openMs = null;
+    if (tab === 'cost' && !costViews[state.costView]) state.costView = 'budget';
+    if (tab === 'tasks' && !jiraViews[state.jiraView]) state.jiraView = 'project';
+    refresh('', ['tab', tab]);
+  },
+  'cost-view'(project, view) {
+    state.tab = 'cost';
+    state.costView = costViews[view] ? view : 'budget';
+    refresh('', ['cost-view', state.costView]);
+  },
+  'jira-view'(project, view) {
+    state.tab = 'tasks';
+    state.openMs = null;
+    state.jiraView = jiraViews[view] ? view : 'project';
+    refresh('', ['jira-view', state.jiraView]);
+  },
+  'apply-short'(project) {
+    refresh(...applyShortName(project));
+  },
+  customer: chooseCustomer,
+  'unbound-client'(project, role) {
+    confirmRemoval(
+      `取消${roles[role]}本地绑定`,
+      [['当前项目', project.title], ['本地关联客户', clients[project.local[role]]]],
+      '仅清除该角色的本地模拟关联。ERP 事实与另一角色绑定均保留。',
+      () => { project.local[role] = null; return [`已取消${roles[role]}本地绑定`, ['customer', role]]; }
+    );
+  },
+  person(project, index) {
+    const [name, role, source, hours, status, start] = project.staff[Number(index)];
+    showDialog(`人员来源 · ${name}`, facts([
+      ['项目角色', role],
+      ['来源', source],
+      ['成员工时', `${hours} h`],
+      ['参与状态', status],
+      ['起始', start],
+      ['数据性质', 'ERP Members 真实快照']
+    ]));
+  },
+  'choose-range': chooseRange,
+  'exact-issue': exactIssue,
+  'unbound-range'(project, key) {
+    const norm = normalizeShort(key);
+    const stillAuto = autoRangeKeys(project.shortName).includes(norm);
+    confirmRemoval(
+      '移除手动 Jira 范围',
+      [
+        ['当前项目', project.title],
+        ['手动范围', `${norm} · ${catalogMeta(norm).name}`],
+        ['简称是否仍命中', stillAuto ? `是（${normalizeShort(project.shortName)}）` : '否']
+      ],
+      stillAuto
+        ? '将移除手动标记；因简称仍命中，该项目会留在自动范围。本地补充任务不受影响。'
+        : '移除后该项目退出有效范围。已有本地补充仍可在项目任务中查看。',
+      () => {
+        project.manualRanges = project.manualRanges.filter(item => normalizeShort(item) !== norm);
+        sanitizeTaskFilters(project);
+        const msg = stillAuto
+          ? `已移除 ${norm} 的手动标记；因简称仍命中，保留在自动范围`
+          : `已移除手动范围 ${norm}`;
+        return [msg, ['choose-range', '']];
+      }
+    );
+  },
+  issue: issueDetail,
+  'bind-issue'(project, key) { refresh(...bindIssue(project, key)); },
+  'unbound-issue'(project, key) {
+    if (crmIssueMap()[key] && !project.issues.includes(key)) {
+      toast(`${key} 为 ERP 既有关联，不能通过本地解绑移除`);
+      return;
+    }
+    confirmRemoval(
+      '移除本地补充',
+      [['当前项目', project.title], ['Jira Issue', key]],
+      '只移除本地补充关系。ERP 既有关联与远端记录不受影响。',
+      () => {
+        project.issues = project.issues.filter(item => item !== key);
+        return [`已移除 ${key} 的本地补充`, ['jira-view', 'project']];
+      }
+    );
+  }
+};
+
+function readMsSelection(menu) {
+  return [...menu.querySelectorAll('input[type=checkbox]:checked')].map(input => input.value);
+}
+
+function onProjectMsChange(project) {
+  const prevStatuses = [...state.projectTaskStatuses];
+  state.projectTaskJiraKeys = readMsSelection(document.querySelector('#project-task-jira-menu'));
+  const available = new Set(availableStatuses(project, state.projectTaskJiraKeys));
+  state.projectTaskStatuses = prevStatuses.filter(status => available.has(status));
+  rebuildStatusMs(project);
+  renderProjectTasks();
+}
+
+function onStatusMsChange() {
+  state.projectTaskStatuses = readMsSelection(document.querySelector('#project-task-status-menu'));
+  renderProjectTasks();
+}
+
+function clearMs(id) {
+  if (id === 'project-task-jira') {
+    state.projectTaskJiraKeys = [];
+    const available = new Set(availableStatuses(state.project, []));
+    state.projectTaskStatuses = state.projectTaskStatuses.filter(status => available.has(status));
+    const menu = document.querySelector('#project-task-jira-menu');
+    if (menu) menu.querySelectorAll('input[type=checkbox]').forEach(input => { input.checked = false; });
+    rebuildStatusMs(state.project);
+  } else if (id === 'project-task-status') {
+    state.projectTaskStatuses = [];
+    const menu = document.querySelector('#project-task-status-menu');
+    if (menu) menu.querySelectorAll('input[type=checkbox]').forEach(input => { input.checked = false; });
+  }
+  renderProjectTasks();
+}
+
+document.addEventListener('click', event => {
+  if (event.target.closest('[data-close]')) { modal.close(); return; }
+  const clear = event.target.closest('[data-ms-clear]');
+  if (clear) {
+    event.preventDefault();
+    clearMs(clear.dataset.msClear);
+    return;
+  }
+  const trigger = event.target.closest('.ms-trigger');
+  if (trigger) {
+    const root = trigger.closest('[data-ms]');
+    const id = root?.dataset.ms;
+    if (!id) return;
+    if (state.openMs === id) closeMs();
+    else openMs(id);
+    return;
+  }
+  if (!event.target.closest('.ms')) closeMs();
+  const control = event.target.closest('button[data-action]');
+  if (control) actions[control.dataset.action](state.project, control.dataset.value);
+});
+document.addEventListener('keydown', event => {
+  if (event.key !== 'Escape' || !state.openMs || modal.open) return;
+  const openRoot = document.querySelector(`[data-ms="${state.openMs}"]`);
+  event.preventDefault();
+  closeMs();
+  openRoot?.querySelector('.ms-trigger')?.focus();
+});
+$('dialog-form').addEventListener('submit', event => {
+  event.preventDefault();
+  if (!dialogSubmit) return;
+  const result = dialogSubmit(new FormData(event.currentTarget));
+  modal.close();
+  if (result) refresh(...result);
+});
+modal.addEventListener('close', () => { if (dialogTrigger?.isConnected) dialogTrigger.focus(); });
+$('project-query').addEventListener('input', renderProjects);
+$('detail').addEventListener('input', event => {
+  if (event.target.id === 'project-task-query') { state.projectTaskQuery = event.target.value; renderProjectTasks(); }
+});
+$('detail').addEventListener('change', event => {
+  const option = event.target.closest('.ms-option input[type=checkbox]');
+  if (!option) return;
+  const root = option.closest('[data-ms]');
+  const id = root?.dataset.ms;
+  if (id === 'project-task-jira') onProjectMsChange(state.project);
+  else if (id === 'project-task-status') onStatusMsChange();
+});
+$('detail').addEventListener('keydown', event => {
+  if (event.target.id === 'short-name' && event.key === 'Enter') {
+    event.preventDefault();
+    refresh(...applyShortName(state.project));
+    return;
+  }
+  if (event.key === 'Escape' && state.openMs) {
+    const openRoot = document.querySelector(`[data-ms="${state.openMs}"]`);
+    event.preventDefault();
+    closeMs();
+    openRoot?.querySelector('.ms-trigger')?.focus();
+    return;
+  }
+  const msRoot = event.target.closest('[data-ms]');
+  if (!msRoot) return;
+  const id = msRoot.dataset.ms;
+  const menu = msRoot.querySelector('.ms-menu');
+  const boxes = menu ? [...menu.querySelectorAll('input[type=checkbox]')] : [];
+  if (event.target.classList.contains('ms-trigger') || event.target.closest('.ms-trigger')) {
+    if (event.key === 'ArrowDown' || event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      openMs(id);
+    }
+    return;
+  }
+  if (!boxes.length || menu?.hidden) return;
+  const index = boxes.indexOf(document.activeElement) >= 0
+    ? boxes.indexOf(document.activeElement)
+    : boxes.indexOf(event.target);
+  if (event.key === 'ArrowDown') {
+    event.preventDefault();
+    boxes[(index + 1 + boxes.length) % boxes.length]?.focus();
+  } else if (event.key === 'ArrowUp') {
+    event.preventDefault();
+    boxes[(index - 1 + boxes.length) % boxes.length]?.focus();
+  } else if (event.key === 'Home') {
+    event.preventDefault();
+    boxes[0]?.focus();
+  } else if (event.key === 'End') {
+    event.preventDefault();
+    boxes[boxes.length - 1]?.focus();
+  }
+});
+
+refresh();
+</script>
+</body>
+</html>

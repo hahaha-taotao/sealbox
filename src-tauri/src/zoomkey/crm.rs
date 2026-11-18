@@ -751,24 +751,7 @@ fn run_query(runtime: &EndpointRuntime, args: &Value) -> Result<ToolOutcome, Too
 
 fn retrieve(runtime: &EndpointRuntime, args: &Value) -> Result<ToolOutcome, ToolFailure> {
     let id = as_string(args, "id");
-    if id.is_empty() {
-        return Err(ToolFailure::validation("id 不能为空"));
-    }
-    if !valid_record_id(&id) {
-        return Err(ToolFailure::validation("id 格式不合法"));
-    }
-    let result = with_session(runtime, |session_name| {
-        call_operation(
-            runtime,
-            "GET",
-            &[
-                ("operation", "retrieve".into()),
-                ("sessionName", session_name.to_string()),
-                ("id", id.clone()),
-            ],
-            None,
-        )
-    })?;
+    let result = retrieve_inner(runtime, &id)?;
     let mut payload = result.clone();
     trim_json(&mut payload, 512);
     Ok(ToolOutcome {
@@ -804,11 +787,40 @@ fn is_session_error(error: &ToolFailure) -> bool {
     text.contains("session")
 }
 
-fn run_query_inner(runtime: &EndpointRuntime, sql: &str) -> Result<Vec<Value>, ToolFailure> {
+/// Structured CRM query — returns raw JSON records (not ToolOutcome text).
+/// Used by the desktop project workbench adapters; do not scrape display text.
+pub(crate) fn run_query_inner(runtime: &EndpointRuntime, sql: &str) -> Result<Vec<Value>, ToolFailure> {
     let normalized = normalize_sql(sql)?;
     with_session(runtime, |session_name| {
         raw_query(runtime, session_name, &normalized)
     })
+}
+
+/// Structured CRM retrieve — returns the raw record JSON (not ToolOutcome text).
+pub(crate) fn retrieve_inner(runtime: &EndpointRuntime, id: &str) -> Result<Value, ToolFailure> {
+    if id.is_empty() {
+        return Err(ToolFailure::validation("id 不能为空"));
+    }
+    if !valid_record_id(id) {
+        return Err(ToolFailure::validation("id 格式不合法"));
+    }
+    with_session(runtime, |session_name| {
+        call_operation(
+            runtime,
+            "GET",
+            &[
+                ("operation", "retrieve".into()),
+                ("sessionName", session_name.to_string()),
+                ("id", id.to_string()),
+            ],
+            None,
+        )
+    })
+}
+
+/// Escape a string literal for Vtiger SELECT WHERE clauses built by desktop adapters.
+pub(crate) fn escape_sql_literal(value: &str) -> String {
+    escape_sql(value)
 }
 
 fn raw_query(

@@ -26,6 +26,9 @@ const DONE_STATUSES: [&str; 2] = ["Done", "Closed"];
 /// get_issue 的默认字段：常用字段 + description/reporter（与插件一致）。
 const GET_ISSUE_FIELDS: &str =
     "summary,status,assignee,priority,created,issuetype,updated,description,reporter";
+/// Desktop project workbench issue read — includes `duedate` (design §11 / Q-07).
+const DESKTOP_ISSUE_FIELDS: &str =
+    "summary,status,assignee,priority,duedate,created,issuetype,updated,project,reporter";
 const MAX_DESCRIPTION_BYTES: usize = 4096;
 
 /// 业务预设，与插件保持一致。
@@ -781,24 +784,13 @@ fn field_map_live(runtime: &EndpointRuntime) -> Result<ToolOutcome, ToolFailure>
 
 fn get_issue(runtime: &EndpointRuntime, args: &Value) -> Result<ToolOutcome, ToolFailure> {
     let key = as_string(args, "issueKey").to_uppercase();
-    if key.is_empty() {
-        return Err(ToolFailure::validation("issueKey 不能为空"));
-    }
-    if !valid_issue_key(&key) {
-        return Err(ToolFailure::validation("issueKey 格式不合法"));
-    }
     let requested = as_string(args, "fields");
     let fields = if requested.trim().is_empty() {
         GET_ISSUE_FIELDS.to_string()
     } else {
         sanitize_fields(&requested)?
     };
-    let path = format!(
-        "/rest/api/2/issue/{}?fields={}",
-        encode_component(&key),
-        encode_component(&fields)
-    );
-    let value = get_json(runtime, &path)?;
+    let value = get_issue_raw(runtime, &key, &fields)?;
     let mut summary = summarize_issue(&value);
     if let Some(description) = value
         .get("fields")
@@ -823,6 +815,62 @@ fn get_issue(runtime: &EndpointRuntime, args: &Value) -> Result<ToolOutcome, Too
         count: None,
         detail: format!("key={key}"),
     })
+}
+
+/// Structured project list — raw Jira project objects (id/key/name), not ToolOutcome text.
+pub(crate) fn list_projects_raw(runtime: &EndpointRuntime) -> Result<Vec<Value>, ToolFailure> {
+    let value = get_json(runtime, "/rest/api/2/project")?;
+    value
+        .as_array()
+        .cloned()
+        .ok_or_else(|| ToolFailure::request("JIRA 响应格式不正确", Some(200)))
+}
+
+/// Structured issue read for the desktop workbench (includes `duedate`).
+pub(crate) fn get_issue_desktop(
+    runtime: &EndpointRuntime,
+    issue_key: &str,
+) -> Result<Value, ToolFailure> {
+    get_issue_raw(runtime, issue_key, DESKTOP_ISSUE_FIELDS)
+}
+
+fn get_issue_raw(
+    runtime: &EndpointRuntime,
+    issue_key: &str,
+    fields: &str,
+) -> Result<Value, ToolFailure> {
+    let key = issue_key.trim().to_uppercase();
+    if key.is_empty() {
+        return Err(ToolFailure::validation("issueKey 不能为空"));
+    }
+    if !valid_issue_key(&key) {
+        return Err(ToolFailure::validation("issueKey 格式不合法"));
+    }
+    let path = format!(
+        "/rest/api/2/issue/{}?fields={}",
+        encode_component(&key),
+        encode_component(fields)
+    );
+    get_json(runtime, &path)
+}
+
+/// Structured project statuses — raw issue-type/status tree.
+pub(crate) fn project_statuses_raw(
+    runtime: &EndpointRuntime,
+    project: &str,
+) -> Result<Vec<Value>, ToolFailure> {
+    if project.trim().is_empty() {
+        return Err(ToolFailure::validation("project 不能为空"));
+    }
+    let path = format!(
+        "/rest/api/2/project/{}/statuses",
+        encode_component(project.trim())
+    );
+    let value = get_json(runtime, &path)?;
+    value
+        .as_array()
+        .cloned()
+        .ok_or_else(|| ToolFailure::request("JIRA 响应格式不正确", Some(200)))
 }
 
 #[derive(Clone, Copy)]

@@ -561,10 +561,30 @@ impl EndpointRuntime {
 }
 
 /// Profile-owned endpoint configuration, independent of the legacy global binding.
+/// Requires the ZoomKey MCP switch (used by profile-backed MCP / http_call).
 pub(crate) fn build_profile_runtime(
     session: &Session,
     credential_id: &str,
     profile: &sealbox_core::profile::CredentialProfile,
+) -> Result<EndpointRuntime, ToolFailure> {
+    build_profile_runtime_inner(session, credential_id, profile, true)
+}
+
+/// Desktop project workbench: same Profile/session/target checks as
+/// [`build_profile_runtime`], but **independent of the MCP enable switch**.
+pub(crate) fn build_profile_runtime_for_desktop(
+    session: &Session,
+    credential_id: &str,
+    profile: &sealbox_core::profile::CredentialProfile,
+) -> Result<EndpointRuntime, ToolFailure> {
+    build_profile_runtime_inner(session, credential_id, profile, false)
+}
+
+fn build_profile_runtime_inner(
+    session: &Session,
+    credential_id: &str,
+    profile: &sealbox_core::profile::CredentialProfile,
+    require_mcp_enabled: bool,
 ) -> Result<EndpointRuntime, ToolFailure> {
     let label = match profile.adapter.as_str() {
         "zoomkey_jira" => "jira",
@@ -575,14 +595,20 @@ pub(crate) fn build_profile_runtime(
     if profile.auth.kind != expected_auth {
         return Err(ToolFailure::validation("ZoomKey profile 认证类型与封装协议不匹配"));
     }
-    let vault = session.vault().map_err(|e| ToolFailure::validation(e.to_string()))?;
-    let dek = session.dek().map_err(|e| ToolFailure::validation(e.to_string()))?;
-    let policy = load_policy(vault, dek);
-    if !policy.enabled {
-        return Err(ToolFailure::validation("MCP 未启用。请先在 Sealbox 的 MCP 页面打开。"));
+    if require_mcp_enabled {
+        let vault = session.vault().map_err(|e| ToolFailure::validation(e.to_string()))?;
+        let dek = session.dek().map_err(|e| ToolFailure::validation(e.to_string()))?;
+        let policy = load_policy(vault, dek);
+        if !policy.enabled {
+            return Err(ToolFailure::validation("MCP 未启用。请先在 Sealbox 的 MCP 页面打开。"));
+        }
     }
     let endpoint = ZoomkeyEndpointPolicy {
-        base_url: if label == "crm" { format!("{}/webservice.php", profile.origin) } else { profile.origin.clone() },
+        base_url: if label == "crm" {
+            format!("{}/webservice.php", profile.origin)
+        } else {
+            profile.origin.clone()
+        },
         credential_id: credential_id.to_string(),
         client_cert_id: profile.auth.client_cert_id.clone().unwrap_or_default(),
         ca_bundle_path: profile.auth.ca_bundle_path.clone().unwrap_or_default(),
@@ -592,8 +618,16 @@ pub(crate) fn build_profile_runtime(
     let target = crate::http_guard::parse_http_url(&profile.origin, true)
         .map_err(ToolFailure::validation)?;
     let allowed_hosts = vec![target.host];
-    build_endpoint_runtime(session, label, &endpoint, &allowed_hosts,
-        Some((profile.allowed_methods.clone(), profile.allowed_path_prefixes.clone())))
+    build_endpoint_runtime(
+        session,
+        label,
+        &endpoint,
+        &allowed_hosts,
+        Some((
+            profile.allowed_methods.clone(),
+            profile.allowed_path_prefixes.clone(),
+        )),
+    )
 }
 
 pub(crate) fn profile_navigation(text: &str) -> String {
@@ -610,6 +644,14 @@ pub(crate) fn build_runtime(
 
 /// 页面上的「测试连接」可以在总开关关闭时先验证证书与凭据；MCP 工具调用仍必须启用。
 pub(crate) fn build_runtime_for_test(
+    session: &Session,
+    label: &'static str,
+) -> Result<EndpointRuntime, ToolFailure> {
+    build_runtime_inner(session, label, false)
+}
+
+/// Desktop project workbench reads: Profile/session/target checks stay, MCP switch does not.
+pub(crate) fn build_runtime_for_desktop(
     session: &Session,
     label: &'static str,
 ) -> Result<EndpointRuntime, ToolFailure> {

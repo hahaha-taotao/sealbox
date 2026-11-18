@@ -1,5 +1,5 @@
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -36,7 +36,7 @@ pub enum CryptoError {
     Truncated,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Encrypted {
     pub nonce: [u8; NONCE_LEN],
     pub ciphertext: Vec<u8>,
@@ -139,6 +139,50 @@ pub fn decrypt(key: &[u8; KEY_LEN], enc: &Encrypted) -> Result<Vec<u8>, CryptoEr
         .map_err(|_| CryptoError::Decrypt)
 }
 
+/// AES-GCM with authenticated associated data. Existing [`encrypt`]/[`decrypt`] stay
+/// AAD-free so vault secret blobs keep decrypting; project records use these helpers.
+pub fn encrypt_with_aad(
+    key: &[u8; KEY_LEN],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<Encrypted, CryptoError> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::Encrypt)?;
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|_| CryptoError::Encrypt)?;
+    Ok(Encrypted {
+        nonce: nonce_bytes,
+        ciphertext,
+    })
+}
+
+pub fn decrypt_with_aad(
+    key: &[u8; KEY_LEN],
+    enc: &Encrypted,
+    aad: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| CryptoError::Decrypt)?;
+    let nonce = Nonce::from_slice(&enc.nonce);
+    cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: enc.ciphertext.as_ref(),
+                aad,
+            },
+        )
+        .map_err(|_| CryptoError::Decrypt)
+}
+
 pub fn wrap_key(kek: &[u8; KEY_LEN], dek: &[u8; KEY_LEN]) -> Result<Encrypted, CryptoError> {
     encrypt(kek, dek)
 }
@@ -151,4 +195,62 @@ pub fn unwrap_key(kek: &[u8; KEY_LEN], enc: &Encrypted) -> Result<[u8; KEY_LEN],
     let mut key = [0u8; KEY_LEN];
     key.copy_from_slice(&bytes);
     Ok(key)
+}
+
+pub fn wrap_key_with_aad(
+    kek: &[u8; KEY_LEN],
+    key: &[u8; KEY_LEN],
+    aad: &[u8],
+) -> Result<Encrypted, CryptoError> {
+    encrypt_with_aad(kek, key, aad)
+}
+
+pub fn unwrap_key_with_aad(
+    kek: &[u8; KEY_LEN],
+    enc: &Encrypted,
+    aad: &[u8],
+) -> Result<[u8; KEY_LEN], CryptoError> {
+    let bytes = decrypt_with_aad(kek, enc, aad)?;
+    if bytes.len() != KEY_LEN {
+        return Err(CryptoError::BadKeyLength);
+    }
+    let mut key = [0u8; KEY_LEN];
+    key.copy_from_slice(&bytes);
+    Ok(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_encrypt_decrypt_round_trip_without_aad() {
+        let key = random_key();
+        let enc = encrypt(&key, b"vault-secret").unwrap();
+        assert_eq!(decrypt(&key, &enc).unwrap(), b"vault-secret");
+        // AAD API must not decrypt legacy ciphertext that was sealed without AAD.
+        assert!(decrypt_with_aad(&key, &enc, b"anything").is_err());
+    }
+
+    #[test]
+    fn aad_binds_context_and_rejects_wrong_aad() {
+        let key = random_key();
+        let aad = b"sealbox-projects|workspace|ws-1|v1";
+        let enc = encrypt_with_aad(&key, b"project-payload", aad).unwrap();
+        assert_eq!(decrypt_with_aad(&key, &enc, aad).unwrap(), b"project-payload");
+        assert!(decrypt_with_aad(&key, &enc, b"tampered-aad").is_err());
+        // Plain decrypt (empty AAD) must not open an AAD-sealed blob.
+        assert!(decrypt(&key, &enc).is_err());
+    }
+
+    #[test]
+    fn wrap_key_with_aad_round_trip() {
+        let kek = random_key();
+        let business = random_key();
+        let aad = b"sealbox-projects|keywrap|ws-1|v1";
+        let wrapped = wrap_key_with_aad(&kek, &business, aad).unwrap();
+        assert_eq!(unwrap_key_with_aad(&kek, &wrapped, aad).unwrap(), business);
+        assert!(unwrap_key_with_aad(&kek, &wrapped, b"other").is_err());
+        assert!(unwrap_key(&kek, &wrapped).is_err());
+    }
 }

@@ -6,6 +6,8 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import packageJson from "../package.json";
 import { DB_ENGINES } from "./lib/entry-options";
 import CredentialProfileEditor from "./components/CredentialProfileEditor.vue";
+import ProjectWorkbench from "./features/projects/ProjectWorkbench.vue";
+import { resetProjectFixtures } from "./lib/project-api";
 import { auditDateBounds, createAuditRequestGuard } from "./lib/audit-request";
 import { mailMessageKey, mergeMailInbox, type InboxMessage } from "./lib/mail-inbox.mjs";
 import { buildMailDocument, hasRemoteImages } from "./lib/mail-html";
@@ -108,7 +110,7 @@ let mailBodySeq = 0;
 // 每个 srcdoc 文档只挂一次链接转发监听；文档换掉后自然失效。
 const mailLinkedDocuments = new WeakSet<Document>();
 const mailRecipient = computed(() => mailAccounts.value.find((account) => account.id === (mailSelected.value?.entryId ?? mailAccountId.value))?.email ?? "");
-  type Page = "home" | "vault" | "audit" | "settings" | "mcp" | "plugin" | "mail";
+  type Page = "home" | "vault" | "audit" | "settings" | "mcp" | "plugin" | "mail" | "projects";
 const page = ref<Page>("vault");
 const history = ref<Page[]>(["vault"]);
 const historyIndex = ref(0);
@@ -251,6 +253,7 @@ const crumb = computed(() => {
   if (page.value === "mcp") return "MCP";
   if (page.value === "plugin") return "插件";
   if (page.value === "mail") return "邮箱";
+  if (page.value === "projects") return "项目";
   if (filter.trash) return "回收站";
   const selectedKinds = selectedKindIds.value;
   if (selectedKinds.length === 1) {
@@ -1875,6 +1878,7 @@ function clearSecrets() {
 
 function applyLockedUi() {
   if (status.value) status.value = { ...status.value, unlocked: false };
+  resetProjectFixtures();
   clearVaultSearchTimer();
   vaultSeq += 1;
   clearSecrets();
@@ -3229,6 +3233,16 @@ onMounted(async () => {
           <span>邮箱</span>
           <em v-if="mailBadgeLabel" class="rail-badge">{{ mailBadgeLabel }}</em>
         </button>
+        <button class="rail-btn" :class="{ active: page === 'projects' }" @click="goPage('projects')">
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 7h16v12H4z" />
+              <path d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+              <path d="M4 12h16" />
+            </svg>
+          </span>
+          <span>项目</span>
+        </button>
         <div class="spacer" />
         <button class="rail-btn" :class="{ active: page === 'settings' }" @click="goPage('settings')">
           <span class="icon" aria-hidden="true">
@@ -3884,6 +3898,10 @@ onMounted(async () => {
             <div v-else class="mail-reader-empty"><span>✉</span><h2>选择一封邮件</h2><p>在左侧列表中选择邮件，在这里阅读正文和下载附件。</p><div class="mail-shortcuts"><span v-for="hint in MAIL_SHORTCUT_HINTS" :key="hint.keys"><kbd>{{ hint.keys }}</kbd>{{ hint.label }}</span></div></div>
           </article>
         </div>
+      </section>
+
+      <section class="main" v-else-if="page === 'projects'">
+        <ProjectWorkbench />
       </section>
 
       <section class="main" v-else-if="page === 'audit'">

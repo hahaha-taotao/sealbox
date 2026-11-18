@@ -1,5 +1,14 @@
 //! Portable encrypted backups. Filesystem adapters must not decrypt secrets themselves.
+//!
+//! Envelope versions:
+//! - v1 / v2: vault snapshot + tombstones + settings (no projects).
+//! - v3: adds optional `projects` extension with its own `schema_version`.
+//!
+//! Exports always write **v3**. `projects` is `Some` when the vault has workspaces,
+//! otherwise `None`. A missing / `None` projects field on restore must **not** wipe
+//! project tables already present on the target (design §9.5.2).
 use crate::crypto::{decrypt, derive_kek, encrypt, unwrap_key, wrap_key, ArgonParams, Encrypted};
+use crate::projects::ProjectsBackupExtension;
 use crate::vault::{BackupSnapshot, SecretPayload, EntryKind, Tombstone, Vault, VaultError};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -14,6 +23,8 @@ pub struct RestoreOptions {
 
 const MAGIC: &[u8; 5] = b"SBOX1";
 pub const MAX_BACKUP_BYTES: usize = 128 * 1024 * 1024;
+/// Current BackupEnvelope version written by export.
+pub const BACKUP_ENVELOPE_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct BackupFile {
@@ -37,6 +48,10 @@ pub struct BackupEnvelope {
     pub tombstones: Vec<Tombstone>,
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
+    /// Present on v3 when the source vault had project workspaces. Absent on v1/v2
+    /// and on v3 exports with no project data — restore must leave target projects alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projects: Option<ProjectsBackupExtension>,
 }
 
 /// Secret-free inspection result. Inspection authenticates and validates every record.
@@ -49,6 +64,9 @@ pub struct BackupInspection {
     pub tags: usize,
     pub tombstones: usize,
     pub includes_settings: bool,
+    pub includes_projects: bool,
+    pub project_workspaces: usize,
+    pub project_records: usize,
     pub warnings: Vec<String>,
 }
 
@@ -66,12 +84,15 @@ pub fn export(vault: &Vault, dek: &[u8; 32], password: &str, include_settings: b
             if let Some(value) = vault.get_setting(key)? { settings.insert(key.to_string(), value); }
         }
     }
+    let projects = vault.export_projects_extension(dek)?;
     let env = BackupEnvelope {
-        version: 2,
+        // Always v3 so restore paths share one decoder; projects may still be None.
+        version: BACKUP_ENVELOPE_VERSION,
         wrapped_dek: wrap_key(&kek, dek)?,
         snapshot: vault.snapshot_for_backup()?,
         tombstones: vault.sync_tombstones()?,
         settings,
+        projects,
     };
     validate(&env, dek)?;
     let blob = encrypt(&kek, &serde_json::to_vec(&env)?)?;
@@ -106,7 +127,9 @@ fn decode(bytes: &[u8], password: &str) -> Result<(BackupEnvelope, Zeroizing<[u8
 
 fn validate(env: &BackupEnvelope, dek: &[u8; 32]) -> Result<(), VaultError> {
     let corrupt = || VaultError::CorruptBackup;
-    if !(1..=2).contains(&env.version) || env.snapshot.entries.len() > 100_000 || env.snapshot.folders.len() > 100_000 || env.snapshot.tags.len() > 100_000 || env.tombstones.len() > 100_000 { return Err(corrupt()); }
+    if !(1..=3).contains(&env.version) || env.snapshot.entries.len() > 100_000 || env.snapshot.folders.len() > 100_000 || env.snapshot.tags.len() > 100_000 || env.tombstones.len() > 100_000 { return Err(corrupt()); }
+    // v1/v2 must not carry a projects block (forward-compat: ignore would risk silent data loss on old tools).
+    if env.version < 3 && env.projects.is_some() { return Err(corrupt()); }
     let mut folders = HashSet::new();
     let mut names = HashSet::new();
     for f in &env.snapshot.folders {
@@ -141,12 +164,39 @@ fn validate(env: &BackupEnvelope, dek: &[u8; 32]) -> Result<(), VaultError> {
         let seconds = value.parse::<u64>().map_err(|_| corrupt())?;
         if !match key.as_str() { "idle_secs" => seconds >= 60, "clipboard_secs" => (5..=120).contains(&seconds), _ => false } { return Err(corrupt()); }
     }
+    if let Some(projects) = &env.projects {
+        crate::projects::backup::validate_extension(projects, dek).map_err(|_| corrupt())?;
+    }
     Ok(())
 }
 
 pub fn inspect(bytes: &[u8], password: &str) -> Result<BackupInspection, VaultError> {
     let (env, _) = decode(bytes, password)?;
-    Ok(BackupInspection { version: env.version, entries: env.snapshot.entries.len(), trash: env.snapshot.entries.iter().filter(|e| e.deleted_at.is_some()).count(), folders: env.snapshot.folders.len(), tags: env.snapshot.tags.len(), tombstones: env.tombstones.len(), includes_settings: !env.settings.is_empty(), warnings: if env.version == 1 { vec!["旧版备份：缺失文件夹引用按未分类处理，缺失标签声明由条目补齐".into()] } else { vec![] } })
+    let (project_workspaces, project_records) = env
+        .projects
+        .as_ref()
+        .map(|p| (p.workspaces.len(), p.records.len()))
+        .unwrap_or((0, 0));
+    let mut warnings = Vec::new();
+    if env.version == 1 {
+        warnings.push("旧版备份：缺失文件夹引用按未分类处理，缺失标签声明由条目补齐".into());
+    }
+    if env.version < 3 {
+        warnings.push("此备份不含项目工作台数据；恢复不会修改目标金库中已有的项目".into());
+    }
+    Ok(BackupInspection {
+        version: env.version,
+        entries: env.snapshot.entries.len(),
+        trash: env.snapshot.entries.iter().filter(|e| e.deleted_at.is_some()).count(),
+        folders: env.snapshot.folders.len(),
+        tags: env.snapshot.tags.len(),
+        tombstones: env.tombstones.len(),
+        includes_settings: !env.settings.is_empty(),
+        includes_projects: env.projects.as_ref().map(|p| !p.is_empty()).unwrap_or(false),
+        project_workspaces,
+        project_records,
+        warnings,
+    })
 }
 
 pub fn restore_into(vault: &Vault, dest_dek: &[u8; 32], bytes: &[u8], password: &str, overwrite: bool) -> Result<(usize, usize), VaultError> {
@@ -155,8 +205,18 @@ pub fn restore_into(vault: &Vault, dest_dek: &[u8; 32], bytes: &[u8], password: 
 
 pub fn restore_into_with_options(vault: &Vault, dest_dek: &[u8; 32], bytes: &[u8], password: &str, options: RestoreOptions) -> Result<(usize, usize), VaultError> {
     let (env, source_dek) = decode(bytes, password)?;
-    let settings = if options.restore_settings { env.settings } else { BTreeMap::new() };
-    vault.import_backup_bundle(&source_dek, dest_dek, &env.snapshot, &env.tombstones, &settings, options.overwrite, false)
+    let settings = if options.restore_settings { env.settings.clone() } else { BTreeMap::new() };
+    // env.projects stays None for v1/v2 → existing target projects are preserved.
+    vault.import_backup_bundle(
+        &source_dek,
+        dest_dek,
+        &env.snapshot,
+        &env.tombstones,
+        &settings,
+        options.overwrite,
+        false,
+        env.projects.as_ref(),
+    )
 }
 
 pub fn import_envelope(vault: &Vault, dest_dek: &[u8; 32], bytes: &[u8], password: &str, overwrite: bool) -> Result<(usize, usize), VaultError> {
@@ -183,7 +243,16 @@ pub fn restore_new_with_options(path: &str, bytes: &[u8], password: &str, new_pa
     let result = (|| {
         let (vault, dek) = Vault::initialize_backup_temp(temp_path, password)?;
         let settings = if options.restore_settings { env.settings.clone() } else { BTreeMap::new() };
-        vault.import_backup_bundle(&source_dek, &dek, &env.snapshot, &env.tombstones, &settings, true, true)?;
+        vault.import_backup_bundle(
+            &source_dek,
+            &dek,
+            &env.snapshot,
+            &env.tombstones,
+            &settings,
+            true,
+            true,
+            env.projects.as_ref(),
+        )?;
         vault.prepare_backup_publication()?;
         drop(vault);
         let verified = Vault::open(temp_path)?;
@@ -248,10 +317,11 @@ mod tests {
         let env = BackupEnvelope {
             wrapped_dek: wrap_key(&kek, dek).unwrap(),
             version: 1, tombstones: vec![], settings: BTreeMap::new(), snapshot,
+            projects: None,
         };
         // Write the exact original SBOX1 envelope shape, without extension fields.
         let mut value = serde_json::to_value(&env).unwrap();
-        for key in ["version", "tombstones", "settings"] { value.as_object_mut().unwrap().remove(key); }
+        for key in ["version", "tombstones", "settings", "projects"] { value.as_object_mut().unwrap().remove(key); }
         let blob = encrypt(&kek, &serde_json::to_vec(&value).unwrap()).unwrap();
         let file = BackupFile {
             salt: params.salt,
@@ -294,14 +364,15 @@ mod tests {
         let mut snapshot = src.snapshot_for_backup().unwrap();
         snapshot.tags.push("空标签".into());
         let tombstones = vec![Tombstone { kind: "folder".into(), id: "deleted-folder".into(), deleted_at: "2026-01-01T00:00:00Z".into() }, Tombstone { kind: "tag".into(), id: "deleted-tag".into(), deleted_at: "2026-01-01T00:00:00Z".into() }];
-        src.import_backup_bundle(&dek, &dek, &snapshot, &tombstones, &BTreeMap::new(), true, false).unwrap();
+        src.import_backup_bundle(&dek, &dek, &snapshot, &tombstones, &BTreeMap::new(), true, false, None).unwrap();
         src.set_setting("idle_secs", "600").unwrap();
         src.set_setting("clipboard_secs", "30").unwrap();
         src.set_setting("device_id", "never-export-me").unwrap();
         src.set_setting("sync_secret", "never-export-me").unwrap();
         let bytes = export_envelope(&src, &dek, password).unwrap();
         let summary = inspect(&bytes, password).unwrap();
-        assert_eq!(summary.version, 2);
+        assert_eq!(summary.version, 3);
+        assert!(!summary.includes_projects);
         assert_eq!(summary.entries, 8);
         assert_eq!(summary.trash, 1);
         let (env, _) = decode(&bytes, password).unwrap();
@@ -629,6 +700,106 @@ mod tests {
         match import_envelope(&dst, &ddek, &almost, "export password long", false) {
             Err(VaultError::CorruptBackup) => {}
             other => panic!("expected CorruptBackup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn projects_extension_round_trips_through_restore_new() {
+        use crate::projects::model::{LocalProject, ENTITY_LOCAL_PROJECT};
+        use crate::projects::store::{create_workspace, get_record, put_record, PutRecord};
+
+        let password = "export password long";
+        let (src, dek) = Vault::create_in_memory(password).unwrap();
+        let ws = create_workspace(src.project_conn(), &dek).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let project = LocalProject {
+            id: "local-proj-1".into(),
+            workspace_id: ws.id.clone(),
+            short_name: Some("XKRL".into()),
+            alias: Some("城南热力".into()),
+            owner: None,
+            archived: false,
+            revision: 0,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        let meta = put_record(
+            src.project_conn(),
+            &dek,
+            PutRecord {
+                workspace_id: &ws.id,
+                record_id: Some("local-proj-1"),
+                entity_type: ENTITY_LOCAL_PROJECT,
+                schema_version: 1,
+                expected_revision: None,
+            },
+            &project,
+        )
+        .unwrap();
+
+        let bytes = export_envelope(&src, &dek, password).unwrap();
+        let summary = inspect(&bytes, password).unwrap();
+        assert_eq!(summary.version, 3);
+        assert!(summary.includes_projects);
+        assert_eq!(summary.project_workspaces, 1);
+        assert_eq!(summary.project_records, 1);
+
+        // Prefer restore_new (full disk publish). Some Windows temp volumes refuse hard_link
+        // (ACCESS_DENIED); fall back to the same import_backup_bundle path restore_new uses.
+        let (dst, new_dek) = match try_restore_new_or_memory(&bytes, password) {
+            Ok(pair) => pair,
+            Err(err) => panic!("restore failed: {err:?}"),
+        };
+
+        let (got_meta, got): (_, LocalProject) =
+            get_record(dst.project_conn(), &new_dek, &ws.id, &meta.id).unwrap();
+        assert_eq!(got_meta.revision, 1);
+        assert_eq!(got.short_name.as_deref(), Some("XKRL"));
+        assert_eq!(got.alias.as_deref(), Some("城南热力"));
+
+        // A backup without projects must not wipe an existing workspace on restore_into.
+        let (empty_src, empty_dek) = Vault::create_in_memory("empty source password").unwrap();
+        let empty_bytes = export_envelope(&empty_src, &empty_dek, "empty source password").unwrap();
+        let (env, _) = decode(&empty_bytes, "empty source password").unwrap();
+        assert!(env.projects.is_none());
+        restore_into(&dst, &new_dek, &empty_bytes, "empty source password", false).unwrap();
+        let (_, still): (_, LocalProject) =
+            get_record(dst.project_conn(), &new_dek, &ws.id, &meta.id).unwrap();
+        assert_eq!(still.alias.as_deref(), Some("城南热力"));
+    }
+
+    /// restore_new when the OS allows hard_link; otherwise decode + in-memory import
+    /// (same bundle path, without the filesystem publish step).
+    fn try_restore_new_or_memory(
+        bytes: &[u8],
+        password: &str,
+    ) -> Result<(Vault, [u8; 32]), VaultError> {
+        let dir = std::env::temp_dir().join(format!("sealbox-projects-{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("vault.db");
+        let path_str = path.to_str().ok_or(VaultError::CorruptBackup)?;
+        match restore_new(path_str, bytes, password, Some("new password long")) {
+            Ok(new_dek) => {
+                let dst = Vault::open(path_str)?;
+                assert_eq!(dst.unlock("new password long")?, new_dek);
+                Ok((dst, new_dek))
+            }
+            Err(VaultError::Io(_)) => {
+                let (env, source_dek) = decode(bytes, password)?;
+                let (dst, new_dek) = Vault::create_in_memory("new password long")?;
+                dst.import_backup_bundle(
+                    &source_dek,
+                    &new_dek,
+                    &env.snapshot,
+                    &env.tombstones,
+                    &BTreeMap::new(),
+                    true,
+                    true,
+                    env.projects.as_ref(),
+                )?;
+                Ok((dst, new_dek))
+            }
+            Err(err) => Err(err),
         }
     }
 }

@@ -75,6 +75,8 @@ pub enum VaultError {
     SameOrganizationTarget,
     #[error("审计查询参数无效：分页须为 1–100 条、非负偏移，日期须为有效且递增的 RFC3339 时间")]
     InvalidAuditQuery,
+    #[error("project store: {0}")]
+    Project(#[from] crate::projects::ProjectError),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1686,6 +1688,7 @@ impl Vault {
         settings: &std::collections::BTreeMap<String, String>,
         overwrite: bool,
         preserve_folder_ids: bool,
+        projects: Option<&crate::projects::ProjectsBackupExtension>,
     ) -> Result<(usize, usize), VaultError> {
         self.conn.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
@@ -1731,6 +1734,18 @@ impl Vault {
                 if !matches!(key.as_str(), "idle_secs" | "clipboard_secs") { return Err(VaultError::CorruptBackup); }
                 self.set_setting(key, value)?;
             }
+            // Missing projects extension must leave existing project tables alone.
+            if let Some(ext) = projects {
+                let (p_imp, p_skip) = crate::projects::backup::import_extension(
+                    &self.conn,
+                    source_dek,
+                    dest_dek,
+                    ext,
+                    overwrite,
+                )?;
+                imported += p_imp;
+                skipped += p_skip;
+            }
             self.audit("import", None, &format!("imported={imported} skipped={skipped} overwrite={overwrite}"))?;
             Ok((imported, skipped))
         })();
@@ -1744,6 +1759,19 @@ impl Vault {
             }
             Err(error) => { let _ = self.conn.execute_batch("ROLLBACK"); Err(error) }
         }
+    }
+
+    /// Export the optional projects BackupEnvelope extension (None when no workspaces).
+    pub(crate) fn export_projects_extension(
+        &self,
+        dek: &[u8; 32],
+    ) -> Result<Option<crate::projects::ProjectsBackupExtension>, VaultError> {
+        Ok(crate::projects::backup::export_extension(&self.conn, dek)?)
+    }
+
+    /// Connection handle for project-store helpers used by Tauri commands later.
+    pub fn project_conn(&self) -> &Connection {
+        &self.conn
     }
 
     /// Initialize only a temporary file exclusively reserved by the backup module.
