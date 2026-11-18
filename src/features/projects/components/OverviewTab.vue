@@ -42,12 +42,12 @@ function localSub(binding: LocalCustomerBinding): string {
 <template>
   <div>
     <p class="pq-info">
-      ERP 已关联事实来自 Project 字段；本地关联初始为空，下方操作为原型模拟编辑，不代表已有真实本地绑定证据。
+      ERP 已关联事实来自 Project 字段；本地关联写入加密项目库，与 ERP 列独立，纳入项目后可长期保留。
     </p>
 
     <div class="pq-section-head">
       <h3>客户关系</h3>
-      <p>签约 / 实际使用方两列独立：左侧只读事实，右侧本地模拟。</p>
+      <p>签约 / 实际使用方两列独立：左侧只读事实，右侧本地关联。</p>
     </div>
 
     <div class="pq-table-wrap" tabindex="0" role="region" aria-label="客户关系数据表">

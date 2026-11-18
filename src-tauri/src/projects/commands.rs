@@ -39,7 +39,7 @@ fn with_remote_session<T>(
 pub fn project_sources_list(
     state: State<'_, AppState>,
 ) -> Result<Vec<SourceBindingSummaryDto>, String> {
-    with_project_store(&state, service::sources_list)
+    with_remote_session(&state, |session| service::sources_list(session))
 }
 
 #[tauri::command]

@@ -1,8 +1,9 @@
 //! Project workbench service: vault session + sealbox-core encrypted store.
 //!
-//! Remote reads try structured ZoomKey adapters first when a real SourceBinding
-//! / profile is available (MCP switch not required). On missing creds or adapter
-//! errors, fall back to the PROJ3733 fixture with a warning in the DTO.
+//! Remote reads use structured ZoomKey adapters when a real SourceBinding /
+//! credential is available (MCP switch not required). Without credentials the
+//! offline PROJ3733 fixture is used. Live bindings never silently fall back to
+//! the fixture on network/auth failure.
 
 use std::sync::Mutex;
 
@@ -20,6 +21,8 @@ use sealbox_core::projects::{
 use uuid::Uuid;
 
 use crate::session::Session;
+use crate::vault::SecretPayload;
+use crate::zoomkey;
 
 use super::adapters::{self, crm as crm_adapter, jira as jira_adapter};
 use super::dto::{
@@ -101,100 +104,321 @@ pub fn ensure_workspace(conn: &Connection, dek: &[u8; 32]) -> Result<String, Str
     Ok(ws.id)
 }
 
-struct FixtureBindings {
+struct WorkspaceBindings {
     crm: SourceBinding,
     jira: SourceBinding,
 }
 
-fn ensure_fixture_bindings(
+/// Origin (scheme://host[:port]) from a ZoomKey base URL; empty input → empty.
+fn site_from_base(base_url: &str) -> String {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let without_suffix = trimmed
+        .split(['#', '?'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim_end_matches('/');
+    let (scheme, rest) = if let Some(rest) = without_suffix.strip_prefix("https://") {
+        ("https", rest)
+    } else if let Some(rest) = without_suffix.strip_prefix("http://") {
+        ("http", rest)
+    } else {
+        return without_suffix.to_string();
+    };
+    let hostport = rest.split('/').next().unwrap_or("").trim();
+    if hostport.is_empty() {
+        without_suffix.to_string()
+    } else {
+        format!("{scheme}://{hostport}")
+    }
+}
+
+fn account_scope_for(
+    session: &Session,
+    credential_id: &str,
+    candidate_account: Option<&str>,
+) -> String {
+    if let Some(account) = candidate_account.map(str::trim).filter(|s| !s.is_empty()) {
+        return account.to_string();
+    }
+    if let (Ok(vault), Ok(dek)) = (session.vault(), session.dek()) {
+        if let Ok(SecretPayload::ApiToken {
+            account: Some(account),
+            ..
+        }) = vault.get_active_secret(dek, credential_id)
+        {
+            let account = account.trim();
+            if !account.is_empty() {
+                return account.to_string();
+            }
+        }
+    }
+    format!("cred:{credential_id}")
+}
+
+fn find_platform_binding<'a>(
+    bindings: &'a [SourceBinding],
+    platform: PlatformKind,
+) -> Option<&'a SourceBinding> {
+    let matched: Vec<&'a SourceBinding> = bindings
+        .iter()
+        .filter(|b| b.platform == platform)
+        .collect();
+    matched
+        .iter()
+        .copied()
+        .find(|b| !adapters::is_fixture_binding(b) && b.status == BindingStatus::Active)
+        .or_else(|| {
+            matched
+                .iter()
+                .copied()
+                .find(|b| !adapters::is_fixture_binding(b))
+        })
+        .or_else(|| {
+            matched
+                .iter()
+                .copied()
+                .find(|b| adapters::is_fixture_binding(b))
+        })
+}
+
+fn upsert_live_binding(
     conn: &Connection,
     dek: &[u8; 32],
     workspace_id: &str,
-) -> Result<FixtureBindings, String> {
-    let bindings: Vec<(_, SourceBinding)> =
+    platform: PlatformKind,
+    site: &str,
+    account_scope: &str,
+    credential_entry_id: &str,
+) -> Result<SourceBinding, String> {
+    let listed: Vec<(sealbox_core::projects::RecordMeta, SourceBinding)> =
         list_records_by_type(conn, dek, workspace_id, ENTITY_SOURCE_BINDING).map_err(map_err)?;
 
-    let mut crm = bindings
-        .iter()
-        .find(|(_, b)| {
-            b.platform == PlatformKind::ZoomkeyCrm
-                && b.site == FIXTURE_CRM_SITE
-                && b.account_scope == FIXTURE_ACCOUNT_SCOPE
-        })
-        .map(|(_, b)| b.clone());
-    let mut jira = bindings
-        .iter()
-        .find(|(_, b)| {
-            b.platform == PlatformKind::ZoomkeyJira
-                && b.site == FIXTURE_JIRA_SITE
-                && b.account_scope == FIXTURE_ACCOUNT_SCOPE
-        })
-        .map(|(_, b)| b.clone());
+    if let Some((meta, mut existing)) = listed.into_iter().find(|(_, b)| {
+        b.platform == platform
+            && !adapters::is_fixture_binding(b)
+            && (b.credential_entry_id == credential_entry_id
+                || (b.site == site && b.account_scope == account_scope))
+    }) {
+        let dirty = existing.site != site
+            || existing.account_scope != account_scope
+            || existing.credential_entry_id != credential_entry_id
+            || existing.status != BindingStatus::Active;
+        if dirty {
+            existing.site = site.to_string();
+            existing.account_scope = account_scope.to_string();
+            existing.credential_entry_id = credential_entry_id.to_string();
+            existing.status = BindingStatus::Active;
+            existing.updated_at = now_rfc3339();
+            put_record(
+                conn,
+                dek,
+                PutRecord {
+                    workspace_id,
+                    record_id: Some(&meta.id),
+                    entity_type: ENTITY_SOURCE_BINDING,
+                    schema_version: meta.schema_version,
+                    expected_revision: Some(meta.revision),
+                },
+                &existing,
+            )
+            .map_err(map_err)?;
+        }
+        return Ok(existing);
+    }
 
-    if crm.is_none() {
-        let now = now_rfc3339();
-        let binding = SourceBinding {
-            id: Uuid::new_v4().to_string(),
-            workspace_id: workspace_id.to_string(),
-            platform: PlatformKind::ZoomkeyCrm,
-            site: FIXTURE_CRM_SITE.into(),
-            account_scope: FIXTURE_ACCOUNT_SCOPE.into(),
-            credential_entry_id: FIXTURE_CREDENTIAL_REF.into(),
-            auth_revision: 1,
-            status: BindingStatus::Active,
-            revision: 0,
-            created_at: now.clone(),
-            updated_at: now,
-        };
-        put_record(
-            conn,
-            dek,
-            PutRecord {
-                workspace_id,
-                record_id: Some(&binding.id),
-                entity_type: ENTITY_SOURCE_BINDING,
-                schema_version: DEFAULT_ENTITY_SCHEMA_VERSION,
-                expected_revision: None,
-            },
-            &binding,
-        )
-        .map_err(map_err)?;
-        crm = Some(binding);
+    let now = now_rfc3339();
+    let binding = SourceBinding {
+        id: Uuid::new_v4().to_string(),
+        workspace_id: workspace_id.to_string(),
+        platform,
+        site: site.to_string(),
+        account_scope: account_scope.to_string(),
+        credential_entry_id: credential_entry_id.to_string(),
+        auth_revision: 1,
+        status: BindingStatus::Active,
+        revision: 0,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    put_record(
+        conn,
+        dek,
+        PutRecord {
+            workspace_id,
+            record_id: Some(&binding.id),
+            entity_type: ENTITY_SOURCE_BINDING,
+            schema_version: DEFAULT_ENTITY_SCHEMA_VERSION,
+            expected_revision: None,
+        },
+        &binding,
+    )
+    .map_err(map_err)?;
+    Ok(binding)
+}
+
+fn ensure_fixture_platform(
+    conn: &Connection,
+    dek: &[u8; 32],
+    workspace_id: &str,
+    platform: PlatformKind,
+) -> Result<SourceBinding, String> {
+    let (site, _) = match platform {
+        PlatformKind::ZoomkeyCrm => (FIXTURE_CRM_SITE, FIXTURE_ACCOUNT_SCOPE),
+        PlatformKind::ZoomkeyJira => (FIXTURE_JIRA_SITE, FIXTURE_ACCOUNT_SCOPE),
+        PlatformKind::Unknown => {
+            return Err("未知平台，无法创建夹具绑定".into());
+        }
+    };
+    let listed: Vec<(_, SourceBinding)> =
+        list_records_by_type(conn, dek, workspace_id, ENTITY_SOURCE_BINDING).map_err(map_err)?;
+    if let Some((_, existing)) = listed.iter().find(|(_, b)| {
+        b.platform == platform
+            && b.site == site
+            && b.account_scope == FIXTURE_ACCOUNT_SCOPE
+            && adapters::is_fixture_binding(b)
+    }) {
+        return Ok(existing.clone());
     }
-    if jira.is_none() {
-        let now = now_rfc3339();
-        let binding = SourceBinding {
-            id: Uuid::new_v4().to_string(),
-            workspace_id: workspace_id.to_string(),
-            platform: PlatformKind::ZoomkeyJira,
-            site: FIXTURE_JIRA_SITE.into(),
-            account_scope: FIXTURE_ACCOUNT_SCOPE.into(),
-            credential_entry_id: FIXTURE_CREDENTIAL_REF.into(),
-            auth_revision: 1,
-            status: BindingStatus::Active,
-            revision: 0,
-            created_at: now.clone(),
-            updated_at: now,
-        };
-        put_record(
-            conn,
-            dek,
-            PutRecord {
-                workspace_id,
-                record_id: Some(&binding.id),
-                entity_type: ENTITY_SOURCE_BINDING,
-                schema_version: DEFAULT_ENTITY_SCHEMA_VERSION,
-                expected_revision: None,
-            },
-            &binding,
-        )
-        .map_err(map_err)?;
-        jira = Some(binding);
+
+    let now = now_rfc3339();
+    let binding = SourceBinding {
+        id: Uuid::new_v4().to_string(),
+        workspace_id: workspace_id.to_string(),
+        platform,
+        site: site.into(),
+        account_scope: FIXTURE_ACCOUNT_SCOPE.into(),
+        credential_entry_id: FIXTURE_CREDENTIAL_REF.into(),
+        auth_revision: 1,
+        status: BindingStatus::Active,
+        revision: 0,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    put_record(
+        conn,
+        dek,
+        PutRecord {
+            workspace_id,
+            record_id: Some(&binding.id),
+            entity_type: ENTITY_SOURCE_BINDING,
+            schema_version: DEFAULT_ENTITY_SCHEMA_VERSION,
+            expected_revision: None,
+        },
+        &binding,
+    )
+    .map_err(map_err)?;
+    Ok(binding)
+}
+
+fn pick_credential(
+    policy_credential_id: &str,
+    candidates: &[zoomkey::ZoomkeyCredentialOption],
+) -> Option<(String, Option<String>)> {
+    let policy_id = policy_credential_id.trim();
+    if !policy_id.is_empty() {
+        let account = candidates
+            .iter()
+            .find(|c| c.id == policy_id)
+            .and_then(|c| c.account.clone());
+        return Some((policy_id.to_string(), account));
     }
-    Ok(FixtureBindings {
-        crm: crm.expect("crm binding"),
-        jira: jira.expect("jira binding"),
-    })
+    candidates
+        .first()
+        .map(|c| (c.id.clone(), c.account.clone()))
+}
+
+/// Resolve CRM/Jira SourceBindings from ZoomKey policy + vault candidates.
+/// Prefers live credentials; seeds fixture bindings only when none are available.
+fn resolve_bindings(session: &Session) -> Result<WorkspaceBindings, String> {
+    let dek = *session.dek().map_err(|e| e.to_string())?;
+    let (workspace_id, policy) = {
+        let vault = session.vault().map_err(|e| e.to_string())?;
+        let workspace_id = ensure_workspace(vault.project_conn(), &dek)?;
+        let policy = zoomkey::load_policy(vault, &dek);
+        (workspace_id, policy)
+    };
+    let candidates = zoomkey::list_candidates(session)?;
+
+    // Resolve account scopes before borrowing project_conn (Session vault is unique).
+    let crm_plan =
+        pick_credential(&policy.crm.credential_id, &candidates.crm_credentials).map(
+            |(cred_id, account)| {
+                let mut site = site_from_base(&policy.crm.base_url);
+                if site.is_empty() {
+                    site = site_from_base(zoomkey::DEFAULT_CRM_BASE);
+                }
+                let scope = account_scope_for(session, &cred_id, account.as_deref());
+                (site, scope, cred_id)
+            },
+        );
+    let jira_plan =
+        pick_credential(&policy.jira.credential_id, &candidates.jira_credentials).map(
+            |(cred_id, account)| {
+                let mut site = site_from_base(&policy.jira.base_url);
+                if site.is_empty() {
+                    site = site_from_base(zoomkey::DEFAULT_JIRA_BASE);
+                }
+                let scope = account_scope_for(session, &cred_id, account.as_deref());
+                (site, scope, cred_id)
+            },
+        );
+
+    let vault = session.vault().map_err(|e| e.to_string())?;
+    let conn = vault.project_conn();
+
+    let crm = if let Some((site, scope, cred_id)) = crm_plan {
+        upsert_live_binding(
+            conn,
+            &dek,
+            &workspace_id,
+            PlatformKind::ZoomkeyCrm,
+            &site,
+            &scope,
+            &cred_id,
+        )?
+    } else {
+        ensure_fixture_platform(conn, &dek, &workspace_id, PlatformKind::ZoomkeyCrm)?
+    };
+
+    let jira = if let Some((site, scope, cred_id)) = jira_plan {
+        upsert_live_binding(
+            conn,
+            &dek,
+            &workspace_id,
+            PlatformKind::ZoomkeyJira,
+            &site,
+            &scope,
+            &cred_id,
+        )?
+    } else {
+        ensure_fixture_platform(conn, &dek, &workspace_id, PlatformKind::ZoomkeyJira)?
+    };
+
+    Ok(WorkspaceBindings { crm, jira })
+}
+
+/// Prefer an existing live binding, else fixture — for adopt/mutations that only have conn.
+fn load_workspace_bindings(
+    conn: &Connection,
+    dek: &[u8; 32],
+    workspace_id: &str,
+) -> Result<WorkspaceBindings, String> {
+    let listed: Vec<(_, SourceBinding)> =
+        list_records_by_type(conn, dek, workspace_id, ENTITY_SOURCE_BINDING).map_err(map_err)?;
+    let bindings: Vec<SourceBinding> = listed.into_iter().map(|(_, b)| b).collect();
+
+    let crm = match find_platform_binding(&bindings, PlatformKind::ZoomkeyCrm) {
+        Some(b) => b.clone(),
+        None => ensure_fixture_platform(conn, dek, workspace_id, PlatformKind::ZoomkeyCrm)?,
+    };
+    let jira = match find_platform_binding(&bindings, PlatformKind::ZoomkeyJira) {
+        Some(b) => b.clone(),
+        None => ensure_fixture_platform(conn, dek, workspace_id, PlatformKind::ZoomkeyJira)?,
+    };
+    Ok(WorkspaceBindings { crm, jira })
 }
 
 fn binding_summary(b: &SourceBinding) -> SourceBindingSummaryDto {
@@ -216,15 +440,12 @@ fn binding_summary(b: &SourceBinding) -> SourceBindingSummaryDto {
         account_scope: b.account_scope.clone(),
         status: status.into(),
         credential_entry_id: b.credential_entry_id.clone(),
+        is_fixture: adapters::is_fixture_binding(b),
     }
 }
 
-pub fn sources_list(
-    conn: &Connection,
-    dek: &[u8; 32],
-) -> Result<Vec<SourceBindingSummaryDto>, String> {
-    let workspace_id = ensure_workspace(conn, dek)?;
-    let bindings = ensure_fixture_bindings(conn, dek, &workspace_id)?;
+pub fn sources_list(session: &Session) -> Result<Vec<SourceBindingSummaryDto>, String> {
+    let bindings = resolve_bindings(session)?;
     Ok(vec![
         binding_summary(&bindings.crm),
         binding_summary(&bindings.jira),
@@ -380,20 +601,16 @@ fn search_remote_fixture(
     Ok((items, warnings))
 }
 
-/// Desktop remote search. Tries live structured CRM when the binding has real
-/// credentials; otherwise (or on error) falls back to the PROJ3733 fixture.
+/// Desktop remote search. Live bindings never fall back to the fixture on error.
 pub fn search_remote(
     session: &Session,
     request: SearchRemoteRequest,
 ) -> Result<RemoteSearchPageDto, String> {
     let dek = *session.dek().map_err(|e| e.to_string())?;
+    let bindings = resolve_bindings(session)?;
     let workspace_id = {
         let vault = session.vault().map_err(|e| e.to_string())?;
         ensure_workspace(vault.project_conn(), &dek)?
-    };
-    let bindings = {
-        let vault = session.vault().map_err(|e| e.to_string())?;
-        ensure_fixture_bindings(vault.project_conn(), &dek, &workspace_id)?
     };
     let source_binding_id = request
         .source_binding_id
@@ -412,44 +629,56 @@ pub fn search_remote(
         });
     }
 
-    // Network first (Session only), then stamp adopted flags via project_conn.
-    let skip_live = adapters::is_fixture_binding(&bindings.crm);
-    let live = if skip_live {
-        Err("fixture binding".into())
-    } else {
-        search_remote_live_fetch(session, &bindings.crm, &request.keyword)
-    };
-    let vault = session.vault().map_err(|e| e.to_string())?;
-    let conn = vault.project_conn();
-    let (items, warnings) = match live {
+    let is_fixture = adapters::is_fixture_binding(&bindings.crm);
+    if is_fixture {
+        let vault = session.vault().map_err(|e| e.to_string())?;
+        let (items, warnings) = search_remote_fixture(
+            vault.project_conn(),
+            &dek,
+            &workspace_id,
+            &bindings.crm,
+            &request.keyword,
+            vec![],
+        )?;
+        return Ok(RemoteSearchPageDto {
+            items,
+            next_cursor: None,
+            complete: true,
+            fetched_at,
+            source_binding_id,
+            warnings,
+        });
+    }
+
+    match search_remote_live_fetch(session, &bindings.crm, &request.keyword) {
         Ok((records, warnings)) => {
-            stamp_search_adopted(conn, &dek, &workspace_id, &bindings.crm, &records, warnings)?
-        }
-        Err(err) => {
-            let extra = if skip_live {
-                vec![]
-            } else {
-                vec![format!("live CRM unavailable, using fixture: {err}")]
-            };
-            search_remote_fixture(
-                conn,
+            let vault = session.vault().map_err(|e| e.to_string())?;
+            let (items, warnings) = stamp_search_adopted(
+                vault.project_conn(),
                 &dek,
                 &workspace_id,
                 &bindings.crm,
-                &request.keyword,
-                extra,
-            )?
+                &records,
+                warnings,
+            )?;
+            Ok(RemoteSearchPageDto {
+                items,
+                next_cursor: None,
+                complete: true,
+                fetched_at,
+                source_binding_id,
+                warnings,
+            })
         }
-    };
-
-    Ok(RemoteSearchPageDto {
-        items,
-        next_cursor: None,
-        complete: true,
-        fetched_at,
-        source_binding_id,
-        warnings,
-    })
+        Err(err) => Ok(RemoteSearchPageDto {
+            items: vec![],
+            next_cursor: None,
+            complete: true,
+            fetched_at,
+            source_binding_id,
+            warnings: vec![format!("实时 ERP 查询失败：{err}")],
+        }),
+    }
 }
 
 pub fn adopt(
@@ -461,10 +690,9 @@ pub fn adopt(
     let remote = fixture::find_remote(remote_id)
         .ok_or_else(|| format!("项目不存在：{remote_id}"))?;
     let workspace_id = ensure_workspace(conn, dek)?;
-    let bindings = ensure_fixture_bindings(conn, dek, &workspace_id)?;
+    let bindings = load_workspace_bindings(conn, dek, &workspace_id)?;
     let crm_binding_id = source_binding_id.unwrap_or(bindings.crm.id.as_str());
     if crm_binding_id != bindings.crm.id {
-        // MVP only has the fixture CRM binding.
         return Err("来源绑定不可用".into());
     }
 
@@ -745,6 +973,8 @@ fn build_detail_fixture(
         adopted: is_adopted,
         local_project_id,
         revision,
+        data_source: "fixture".into(),
+        warnings: vec![],
     }))
 }
 
@@ -845,7 +1075,7 @@ fn assemble_live_detail(
             &parts.mapped.remote_id,
             "",
         )?;
-    let _ = parts.warnings;
+    let warnings = parts.warnings;
     let dev_tasks: Vec<DevTaskDto> = parts
         .erp_issues
         .iter()
@@ -891,6 +1121,8 @@ fn assemble_live_detail(
         adopted: is_adopted,
         local_project_id,
         revision,
+        data_source: "live".into(),
+        warnings,
     })
 }
 
@@ -906,11 +1138,11 @@ fn build_detail(
 
 pub fn get_detail(session: &Session, id: &str) -> Result<Option<ProjectDetailDto>, String> {
     let dek = *session.dek().map_err(|e| e.to_string())?;
-    let (workspace_id, bindings, resolved_remote) = {
+    let bindings = resolve_bindings(session)?;
+    let (workspace_id, resolved_remote) = {
         let vault = session.vault().map_err(|e| e.to_string())?;
         let conn = vault.project_conn();
         let workspace_id = ensure_workspace(conn, &dek)?;
-        let bindings = ensure_fixture_bindings(conn, &dek, &workspace_id)?;
         let resolved = if let Some(adopted) =
             resolve_adopted(conn, &dek, &workspace_id, &bindings.crm, id)?
         {
@@ -918,25 +1150,34 @@ pub fn get_detail(session: &Session, id: &str) -> Result<Option<ProjectDetailDto
         } else {
             id.trim().to_string()
         };
-        (workspace_id, bindings, resolved)
+        (workspace_id, resolved)
     };
 
-    let live = if adapters::is_fixture_binding(&bindings.crm) {
-        Err("fixture binding".into())
-    } else {
-        fetch_live_detail_parts(session, &bindings.crm, &bindings.jira, &resolved_remote)
-    };
-    let vault = session.vault().map_err(|e| e.to_string())?;
-    let conn = vault.project_conn();
-    match live {
-        Ok(parts) => Ok(Some(assemble_live_detail(
-            conn,
+    if adapters::is_fixture_binding(&bindings.crm) {
+        let vault = session.vault().map_err(|e| e.to_string())?;
+        return build_detail_fixture(
+            vault.project_conn(),
             &dek,
             &workspace_id,
             &bindings.crm,
-            parts,
-        )?)),
-        Err(_err) => build_detail_fixture(conn, &dek, &workspace_id, &bindings.crm, id),
+            id,
+        );
+    }
+
+    match fetch_live_detail_parts(session, &bindings.crm, &bindings.jira, &resolved_remote) {
+        Ok(parts) => {
+            let vault = session.vault().map_err(|e| e.to_string())?;
+            Ok(Some(assemble_live_detail(
+                vault.project_conn(),
+                &dek,
+                &workspace_id,
+                &bindings.crm,
+                parts,
+            )?))
+        }
+        Err(err) => Err(format!(
+            "实时 ERP 项目详情加载失败：{err}。请检查 ZoomKey CRM 凭据与网络后重试。"
+        )),
     }
 }
 
@@ -1079,7 +1320,7 @@ pub fn set_short_name(
     request: SetShortNameRequest,
 ) -> Result<ProjectDetailDto, String> {
     let workspace_id = ensure_workspace(conn, dek)?;
-    let bindings = ensure_fixture_bindings(conn, dek, &workspace_id)?;
+    let bindings = load_workspace_bindings(conn, dek, &workspace_id)?;
     let adopted = require_adopted(conn, dek, &workspace_id, &bindings.crm, &request.id)?;
     let short = request.short_name.trim().to_string();
     update_local_project(conn, dek, &workspace_id, &adopted.local_project_id, |p| {
@@ -1210,7 +1451,7 @@ pub fn bind_customer(
     request: BindCustomerRequest,
 ) -> Result<ProjectDetailDto, String> {
     let workspace_id = ensure_workspace(conn, dek)?;
-    let bindings = ensure_fixture_bindings(conn, dek, &workspace_id)?;
+    let bindings = load_workspace_bindings(conn, dek, &workspace_id)?;
     let adopted = require_adopted(conn, dek, &workspace_id, &bindings.crm, &request.id)?;
     upsert_customer_link(
         conn,
@@ -1248,7 +1489,7 @@ pub fn add_jira_range(
     request: JiraRangeRequest,
 ) -> Result<MutationMessageDto, String> {
     let workspace_id = ensure_workspace(conn, dek)?;
-    let bindings = ensure_fixture_bindings(conn, dek, &workspace_id)?;
+    let bindings = load_workspace_bindings(conn, dek, &workspace_id)?;
     let adopted = require_adopted(conn, dek, &workspace_id, &bindings.crm, &request.id)?;
     let key = normalize_short_name(&request.key);
     if key.is_empty() {
@@ -1341,7 +1582,7 @@ pub fn remove_jira_range(
     request: JiraRangeRequest,
 ) -> Result<MutationMessageDto, String> {
     let workspace_id = ensure_workspace(conn, dek)?;
-    let bindings = ensure_fixture_bindings(conn, dek, &workspace_id)?;
+    let bindings = load_workspace_bindings(conn, dek, &workspace_id)?;
     let adopted = require_adopted(conn, dek, &workspace_id, &bindings.crm, &request.id)?;
     let key = normalize_short_name(&request.key);
     let still_auto =
@@ -1400,7 +1641,7 @@ pub fn add_jira_issue(
     request: JiraIssueRequest,
 ) -> Result<MutationMessageDto, String> {
     let workspace_id = ensure_workspace(conn, dek)?;
-    let bindings = ensure_fixture_bindings(conn, dek, &workspace_id)?;
+    let bindings = load_workspace_bindings(conn, dek, &workspace_id)?;
     let adopted = require_adopted(conn, dek, &workspace_id, &bindings.crm, &request.id)?;
     let key = request.issue_key.trim().to_uppercase();
     if key.is_empty() {
@@ -1473,7 +1714,7 @@ pub fn unbind_jira_issue(
     request: JiraIssueRequest,
 ) -> Result<ProjectDetailDto, String> {
     let workspace_id = ensure_workspace(conn, dek)?;
-    let bindings = ensure_fixture_bindings(conn, dek, &workspace_id)?;
+    let bindings = load_workspace_bindings(conn, dek, &workspace_id)?;
     let adopted = require_adopted(conn, dek, &workspace_id, &bindings.crm, &request.id)?;
     let key = request.issue_key.trim().to_uppercase();
     if fixture::is_erp_issue(&key) {
@@ -1515,7 +1756,7 @@ pub fn list_summaries(
     dek: &[u8; 32],
 ) -> Result<Vec<ProjectSummaryDto>, String> {
     let workspace_id = ensure_workspace(conn, dek)?;
-    let _bindings = ensure_fixture_bindings(conn, dek, &workspace_id)?;
+    let _bindings = load_workspace_bindings(conn, dek, &workspace_id)?;
     let adopted = list_adopted(conn, dek, &workspace_id)?;
     let mut out = Vec::new();
     for a in adopted {
@@ -1577,7 +1818,7 @@ mod tests {
         let conn = vault.project_conn();
         // Fixture-path unit test (no live Session credentials).
         let workspace_id = ensure_workspace(conn, &dek).unwrap();
-        let bindings = ensure_fixture_bindings(conn, &dek, &workspace_id).unwrap();
+        let bindings = load_workspace_bindings(conn, &dek, &workspace_id).unwrap();
         let (items, warnings) = search_remote_fixture(
             conn,
             &dek,

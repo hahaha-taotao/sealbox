@@ -17,6 +17,7 @@ import {
   formatMoney,
   getProjectDetail,
   listClients,
+  listProjectSources,
   normalizeShort,
   projectTaskCount,
   removeLocalIssue,
@@ -35,6 +36,7 @@ import {
   type ProjectStaffDto,
   type ProjectSummaryDto,
   type ProjectTab,
+  type SourceBindingSummaryDto,
 } from "../../lib/project-api";
 import "./styles.css";
 
@@ -50,6 +52,21 @@ const toastMsg = ref("");
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
 
 const clients = ref<ErpClientDto[]>([]);
+const sources = ref<SourceBindingSummaryDto[]>([]);
+const searchWarnings = ref<string[]>([]);
+
+const dataMode = computed<"live" | "fixture">(() => {
+  if (detail.value?.dataSource === "live") return "live";
+  if (detail.value?.dataSource === "fixture") return "fixture";
+  const crm = sources.value.find((s) => s.platform === "zoomkey_crm");
+  return crm && !crm.isFixture ? "live" : "fixture";
+});
+
+const modeBanner = computed(() =>
+  dataMode.value === "live"
+    ? "实时 ERP · 使用 ZoomKey CRM/Jira 凭据"
+    : "离线夹具 · PROJ3733 演示数据（未绑定 ZoomKey 凭据时）",
+);
 
 // Modal state
 type ModalKind =
@@ -87,8 +104,18 @@ function toast(message: string) {
   }, 3800);
 }
 
+async function refreshSources() {
+  try {
+    sources.value = await listProjectSources();
+  } catch {
+    sources.value = [];
+  }
+}
+
 async function refreshList() {
-  projects.value = await searchProjects(query.value);
+  const page = await searchProjects(query.value);
+  projects.value = page.items;
+  searchWarnings.value = page.warnings ?? [];
 }
 
 async function openProject(id: string) {
@@ -99,6 +126,9 @@ async function openProject(id: string) {
   loading.value = true;
   try {
     detail.value = await getProjectDetail(id);
+  } catch (e) {
+    detail.value = null;
+    toast(String(e));
   } finally {
     loading.value = false;
   }
@@ -106,8 +136,31 @@ async function openProject(id: string) {
 
 async function reloadDetail() {
   if (!selectedId.value) return;
-  detail.value = await getProjectDetail(selectedId.value);
+  try {
+    detail.value = await getProjectDetail(selectedId.value);
+  } catch (e) {
+    toast(String(e));
+  }
   await refreshList();
+}
+
+async function refreshAll() {
+  loading.value = true;
+  try {
+    await refreshSources();
+    await refreshList();
+    if (selectedId.value) {
+      try {
+        detail.value = await getProjectDetail(selectedId.value);
+      } catch (e) {
+        toast(String(e));
+      }
+    } else if (projects.value.length) {
+      await openProject(projects.value[0].id);
+    }
+  } finally {
+    loading.value = false;
+  }
 }
 
 watch(query, () => {
@@ -116,6 +169,7 @@ watch(query, () => {
 
 onMounted(async () => {
   clients.value = await listClients();
+  await refreshSources();
   await refreshList();
   if (projects.value.length) {
     await openProject(projects.value[0].id);
@@ -196,7 +250,7 @@ async function confirmBind() {
   detail.value = await bindLocalCustomer(detail.value.crmId, modalRole.value, binding);
   await refreshList();
   closeModal();
-  toast(`已保存${ROLE_LABELS[modalRole.value]}本地绑定（模拟）`);
+  toast(`已保存${ROLE_LABELS[modalRole.value]}本地绑定`);
 }
 
 async function confirmUnbind() {
@@ -339,10 +393,30 @@ const rangeCatalogOptions = computed(() => {
 <template>
   <div class="pq-page">
     <div class="pq-pagehead">
-      <h1>项目查询</h1>
-      <p class="pq-muted">
-        核对 ERP 项目事实、预算与成本分项、工时来源及 Jira 任务。本地关联为模拟编辑，刷新后重置。
+      <div class="pq-row pq-between pq-wrap">
+        <div>
+          <h1>项目查询</h1>
+          <p class="pq-muted">
+            核对 ERP 项目事实、预算与成本分项、工时来源及 Jira 任务。本地关联写入加密项目库，桌面端刷新后仍保留。
+          </p>
+        </div>
+        <button class="btn" type="button" :disabled="loading" @click="refreshAll">
+          {{ loading ? "刷新中…" : "刷新" }}
+        </button>
+      </div>
+      <p :class="dataMode === 'live' ? 'pq-info' : 'pq-notice'" style="margin-top: 10px">
+        {{ modeBanner }}
       </p>
+      <ul v-if="searchWarnings.length" class="pq-notice" style="margin-top: 8px; list-style: disc; padding-left: 1.4em">
+        <li v-for="(w, i) in searchWarnings" :key="i">{{ w }}</li>
+      </ul>
+      <ul
+        v-if="detail?.warnings?.length"
+        class="pq-notice"
+        style="margin-top: 8px; list-style: disc; padding-left: 1.4em"
+      >
+        <li v-for="(w, i) in detail.warnings" :key="`d-${i}`">{{ w }}</li>
+      </ul>
     </div>
 
     <div class="pq-workspace">
@@ -363,9 +437,12 @@ const rangeCatalogOptions = computed(() => {
                 <span class="pq-pill live">{{ detail.stage }}</span>
                 <span class="pq-pill ghost">{{ detail.crmId }}</span>
                 <span v-if="detail.adopted" class="pq-pill blue">已纳入</span>
+                <span class="pq-pill" :class="dataMode === 'live' ? 'blue' : 'ghost'">
+                  {{ dataMode === "live" ? "实时 ERP" : "离线夹具" }}
+                </span>
               </div>
               <div class="pq-row">
-                <span class="pq-pill blue">真实快照 · {{ detail.snapshotDate }}</span>
+                <span class="pq-pill blue">快照 · {{ detail.snapshotDate }}</span>
                 <button class="btn primary" type="button" @click="onAdopt">
                   {{ detail.adopted ? "打开我的项目" : "纳入我的项目" }}
                 </button>
@@ -480,7 +557,7 @@ const rangeCatalogOptions = computed(() => {
         <dt>ERP 事实</dt>
         <dd>{{ factLabel(modalRole) }}</dd>
         <dt>说明</dt>
-        <dd>可从本项目已查到的客户中选择，或手工录入本地名称；保存只更新本地模拟关联</dd>
+        <dd>可从本项目已查到的客户中选择，或手工录入本地名称；保存只更新本地关联</dd>
       </dl>
       <label class="pq-field">
         绑定方式
@@ -526,7 +603,7 @@ const rangeCatalogOptions = computed(() => {
         <dt>本地关联客户</dt>
         <dd>{{ localBindingLabel(modalRole) }}</dd>
       </dl>
-      <p class="pq-muted">仅清除该角色的本地模拟关联。ERP 事实与另一角色绑定均保留。</p>
+      <p class="pq-muted">仅清除该角色的本地关联。ERP 事实与另一角色绑定均保留。</p>
     </ProjectModal>
 
     <!-- Person hours -->

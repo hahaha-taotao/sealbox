@@ -131,6 +131,16 @@ export interface JiraTaskDto {
   snapshotDate?: string;
 }
 
+export interface SourceBindingSummaryDto {
+  id: string;
+  platform: string;
+  site: string;
+  accountScope: string;
+  status: string;
+  credentialEntryId: string;
+  isFixture: boolean;
+}
+
 export interface ProjectDetailDto {
   id: string;
   crmId: string;
@@ -157,6 +167,9 @@ export interface ProjectDetailDto {
   adopted: boolean;
   localProjectId: string | null;
   revision: number;
+  /** "live" | "fixture" */
+  dataSource: string;
+  warnings: string[];
 }
 
 export interface AdoptResultDto {
@@ -305,6 +318,8 @@ function toDetail(project: FixtureProject): ProjectDetailDto {
     adopted: Boolean(adopted),
     localProjectId: adopted?.localProjectId ?? null,
     revision: adopted?.revision ?? 0,
+    dataSource: "fixture",
+    warnings: [],
   };
 }
 
@@ -400,7 +415,7 @@ export const JIRA_VIEW_LABELS: Record<JiraView, string> = {
 
 // ─── API (Tauri invoke with fixture fallback) ────────────────────────────────
 
-interface RemoteSearchPage {
+export interface RemoteSearchPage {
   items: ProjectSummaryDto[];
   nextCursor: string | null;
   complete: boolean;
@@ -413,13 +428,39 @@ async function stubDelay<T>(value: T): Promise<T> {
   return value;
 }
 
-/** Search ERP projects. Tauri: `project_search_remote`; browser: fixture fuzzy match. */
-export async function searchProjects(query = ""): Promise<ProjectSummaryDto[]> {
+/** List CRM/Jira source bindings (marks fixture vs live). */
+export async function listProjectSources(): Promise<SourceBindingSummaryDto[]> {
   if (canInvoke()) {
-    const page = await invoke<RemoteSearchPage>("project_search_remote", {
+    return invoke<SourceBindingSummaryDto[]>("project_sources_list");
+  }
+  return stubDelay([
+    {
+      id: "fixture-crm",
+      platform: "zoomkey_crm",
+      site: "https://fixture.sealbox.local/zoomkey-crm",
+      accountScope: "fixture-readonly",
+      status: "active",
+      credentialEntryId: "fixture:proj3733",
+      isFixture: true,
+    },
+    {
+      id: "fixture-jira",
+      platform: "zoomkey_jira",
+      site: "https://fixture.sealbox.local/zoomkey-jira",
+      accountScope: "fixture-readonly",
+      status: "active",
+      credentialEntryId: "fixture:proj3733",
+      isFixture: true,
+    },
+  ]);
+}
+
+/** Search ERP projects (includes warnings from live/fixture adapters). */
+export async function searchProjects(query = ""): Promise<RemoteSearchPage> {
+  if (canInvoke()) {
+    return invoke<RemoteSearchPage>("project_search_remote", {
       request: { keyword: query },
     });
-    return page.items;
   }
   const q = query.trim();
   const results = fixtureStore.projects.filter((project) => {
@@ -439,7 +480,14 @@ export async function searchProjects(query = ""): Promise<ProjectSummaryDto[]> {
     ];
     return haystack.some((v) => matchValue(v, q));
   });
-  return stubDelay(results.map(toSummary));
+  return stubDelay({
+    items: results.map(toSummary),
+    nextCursor: null,
+    complete: true,
+    fetchedAt: new Date().toISOString(),
+    sourceBindingId: "fixture-crm",
+    warnings: ["remote adapter: fixture PROJ3733 (offline fallback)"],
+  });
 }
 
 /** Load full project detail by number (PROJ3733) or CRM id (30x564318). */

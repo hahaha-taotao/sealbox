@@ -15,8 +15,9 @@
 //!    id, `site` matches the profile origin, and `status = Active`.
 //! 3. Do **not** use the `fixture:` credential prefix or `fixture.sealbox.local`
 //!    site — those always select the offline PROJ3733 snapshot.
-//! 4. Unlock the vault; project search/detail will try the live adapter first
-//!    and fall back to the fixture with a warning if auth/network fails.
+//! 4. Unlock the vault; project search/detail use the live adapter for real
+//!    bindings. Live failures return empty/error with a warning — they do not
+//!    silently fall back to the fixture.
 
 pub mod crm;
 pub mod jira;

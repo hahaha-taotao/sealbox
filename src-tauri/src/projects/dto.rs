@@ -49,6 +49,9 @@ pub struct SourceBindingSummaryDto {
     pub status: String,
     /// Credential entry id only — never the secret.
     pub credential_entry_id: String,
+    /// True when this is the offline PROJ3733 demo binding.
+    #[serde(default)]
+    pub is_fixture: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -223,6 +226,11 @@ pub struct ProjectDetailDto {
     pub adopted: bool,
     pub local_project_id: Option<String>,
     pub revision: u64,
+    /// "live" | "fixture"
+    #[serde(default)]
+    pub data_source: String,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
