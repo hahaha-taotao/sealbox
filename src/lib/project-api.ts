@@ -178,9 +178,19 @@ export interface AdoptResultDto {
   created: boolean;
 }
 
+export interface AdoptInput {
+  remoteId: string;
+  remoteKey?: string;
+  remoteName?: string;
+  owner?: string;
+  shortName?: string;
+  stage?: string;
+}
+
 export interface LocalProjectDto {
   localProjectId: string;
   remoteId: string;
+  title: string;
   shortName: string;
   revision: number;
 }
@@ -190,6 +200,7 @@ export interface LocalProjectDto {
 interface AdoptedProject {
   localProjectId: string;
   remoteId: string;
+  shortName: string;
   revision: number;
 }
 
@@ -503,32 +514,68 @@ export async function getProjectDetail(remoteOrNumber: string): Promise<ProjectD
 }
 
 /** Idempotent adopt: one local project per remote CRM id. */
-export async function adoptProject(remoteId: string): Promise<AdoptResultDto> {
+export async function adoptProject(input: string | AdoptInput): Promise<AdoptResultDto> {
+  const req: AdoptInput = typeof input === "string" ? { remoteId: input } : input;
   if (canInvoke()) {
     return invoke<AdoptResultDto>("project_adopt", {
-      request: { remoteId },
+      request: {
+        remoteId: req.remoteId,
+        remoteKey: req.remoteKey ?? null,
+        remoteName: req.remoteName ?? null,
+        owner: req.owner ?? null,
+        shortName: req.shortName ?? null,
+        stage: req.stage ?? null,
+      },
     });
   }
-  const project = findProject(remoteId);
-  if (!project) throw new Error(`项目不存在：${remoteId}`);
+  const project = findProject(req.remoteId);
+  if (!project) throw new Error(`项目不存在：${req.remoteId}`);
   const existing = fixtureStore.adopted.get(project.crmId);
   if (existing) {
     return stubDelay({
       localProjectId: existing.localProjectId,
-      remoteId: project.crmId,
+      remoteId: existing.remoteId,
       created: false,
     });
   }
-  const localProjectId = crypto.randomUUID();
+  const localProjectId = `local-${project.crmId}`;
   fixtureStore.adopted.set(project.crmId, {
     localProjectId,
     remoteId: project.crmId,
+    shortName: project.shortName || "XKRL",
     revision: 1,
   });
   return stubDelay({ localProjectId, remoteId: project.crmId, created: true });
 }
 
 /** List locally adopted projects. */
+
+/** Followed projects only (ERP-bound + local shells). */
+export async function listMyProjects(): Promise<ProjectSummaryDto[]> {
+  if (canInvoke()) {
+    return invoke<ProjectSummaryDto[]>("project_list");
+  }
+  const adopted = [...fixtureStore.adopted.values()];
+  return stubDelay(
+    adopted
+      .map((a) => {
+        const project = findProject(a.remoteId);
+        return project ? toSummary(project) : null;
+      })
+      .filter((x): x is ProjectSummaryDto => Boolean(x)),
+  );
+}
+
+export async function createLocalProject(title: string, shortName?: string): Promise<AdoptResultDto> {
+  if (canInvoke()) {
+    return invoke<AdoptResultDto>("project_create_local", {
+      request: { title, shortName: shortName || null },
+    });
+  }
+  const id = `local-${Date.now()}`;
+  return stubDelay({ localProjectId: id, remoteId: "", created: true });
+}
+
 export async function listLocalProjects(): Promise<LocalProjectDto[]> {
   if (canInvoke()) {
     return invoke<LocalProjectDto[]>("project_list_local");
@@ -539,8 +586,9 @@ export async function listLocalProjects(): Promise<LocalProjectDto[]> {
       return {
         localProjectId: a.localProjectId,
         remoteId: a.remoteId,
-        shortName: project?.shortName ?? "",
-        revision: a.revision,
+        title: project?.title ?? a.remoteId,
+        shortName: project?.shortName ?? a.shortName ?? "",
+        revision: a.revision ?? 0,
       };
     }),
   );

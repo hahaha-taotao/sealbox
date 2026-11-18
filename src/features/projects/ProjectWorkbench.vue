@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import ProjectSearchRail from "./components/ProjectSearchRail.vue";
 import OverviewTab from "./components/OverviewTab.vue";
 import CostTab from "./components/CostTab.vue";
@@ -14,9 +14,11 @@ import {
   autoRangeKeys,
   bindLocalCustomer,
   catalogMeta,
+  createLocalProject,
   formatMoney,
   getProjectDetail,
   listClients,
+  listMyProjects,
   listProjectSources,
   normalizeShort,
   projectTaskCount,
@@ -71,6 +73,8 @@ const modeBanner = computed(() =>
 // Modal state
 type ModalKind =
   | null
+  | "bind-erp"
+  | "create-local"
   | "bind-customer"
   | "unbind-customer"
   | "person"
@@ -91,6 +95,12 @@ const bindManualName = ref("");
 const exactKeyInput = ref("");
 const rangeSelect = ref("");
 const rangeCustom = ref("");
+const bindKeyword = ref("");
+const bindResults = ref<ProjectSummaryDto[]>([]);
+const bindBusy = ref(false);
+const bindError = ref("");
+const createTitle = ref("");
+const createShort = ref("");
 
 const tabs = Object.entries(TAB_LABELS) as [ProjectTab, string][];
 
@@ -113,9 +123,8 @@ async function refreshSources() {
 }
 
 async function refreshList() {
-  const page = await searchProjects(query.value);
-  projects.value = page.items;
-  searchWarnings.value = page.warnings ?? [];
+  projects.value = await listMyProjects();
+  // Keep searchWarnings for bind modal / source issues only; rail filter is local.
 }
 
 async function openProject(id: string) {
@@ -163,9 +172,82 @@ async function refreshAll() {
   }
 }
 
-watch(query, () => {
-  void refreshList();
-});
+// query only filters the local rail list — no ERP round-trip.
+
+async function openBindModal() {
+  bindKeyword.value = "";
+  bindResults.value = [];
+  bindError.value = "";
+  modalKind.value = "bind-erp";
+}
+
+async function openCreateModal() {
+  createTitle.value = "";
+  createShort.value = "";
+  modalKind.value = "create-local";
+}
+
+async function runBindSearch() {
+  const kw = bindKeyword.value.trim();
+  if (!kw) {
+    bindError.value = "请输入项目编号或名称";
+    return;
+  }
+  bindBusy.value = true;
+  bindError.value = "";
+  try {
+    const page = await searchProjects(kw);
+    bindResults.value = page.items;
+    searchWarnings.value = page.warnings ?? [];
+    if (!page.items.length) {
+      bindError.value = (page.warnings && page.warnings[0]) || "没有匹配的 ERP 项目";
+    }
+  } catch (e) {
+    bindResults.value = [];
+    bindError.value = String(e);
+  } finally {
+    bindBusy.value = false;
+  }
+}
+
+async function bindRemote(summary: ProjectSummaryDto) {
+  bindBusy.value = true;
+  try {
+    const result = await adoptProject({
+      remoteId: summary.crmId || summary.id,
+      remoteKey: summary.id,
+      remoteName: summary.title,
+      owner: summary.owner,
+      shortName: summary.shortName,
+      stage: summary.stage,
+    });
+    toast(result.created ? "已绑定到我的项目" : "已在我的项目中");
+    modalKind.value = null;
+    await refreshList();
+    await openProject(summary.crmId || summary.id);
+  } catch (e) {
+    bindError.value = String(e);
+  } finally {
+    bindBusy.value = false;
+  }
+}
+
+async function submitCreateLocal() {
+  const title = createTitle.value.trim();
+  if (!title) {
+    toast("请填写项目名称");
+    return;
+  }
+  try {
+    const result = await createLocalProject(title, createShort.value.trim() || undefined);
+    toast("已新建本地关注");
+    modalKind.value = null;
+    await refreshList();
+    await openProject(result.localProjectId);
+  } catch (e) {
+    toast(String(e));
+  }
+}
 
 onMounted(async () => {
   clients.value = await listClients();
@@ -426,6 +508,8 @@ const rangeCatalogOptions = computed(() => {
         :query="query"
         @update:query="query = $event"
         @select="openProject"
+        @bind="openBindModal"
+        @create="openCreateModal"
       />
 
       <section class="pq-detail" aria-label="项目详情">
@@ -539,11 +623,47 @@ const rangeCatalogOptions = computed(() => {
           </div>
         </template>
         <div v-else-if="loading" class="pq-empty">加载中…</div>
-        <div v-else class="pq-empty">选择左侧项目查看详情</div>
+        <div v-else class="pq-empty">从左侧选择已关注项目，或点击「绑定 ERP / 新建关注」</div>
       </section>
     </div>
 
     <!-- Bind customer -->
+    <ProjectModal
+      :open="modalKind === 'bind-erp'"
+      title="绑定 ERP 项目"
+      @close="closeModal"
+    >
+      <p class="pq-muted">按项目编号或名称精确查询后纳入「我的项目」。不会在打开页面时拉取全部 ERP 项目。</p>
+      <div class="pq-row" style="gap:8px;margin:10px 0">
+        <input class="pq-search" v-model="bindKeyword" placeholder="例如 PROJ3733" @keyup.enter="runBindSearch" />
+        <button class="btn primary" type="button" :disabled="bindBusy" @click="runBindSearch">查询</button>
+      </div>
+      <p v-if="bindError" class="pq-warn">{{ bindError }}</p>
+      <div v-for="item in bindResults" :key="item.crmId || item.id" class="pq-row pq-between" style="margin-top:8px;gap:8px">
+        <div>
+          <div class="pq-mono">{{ item.id }} · {{ item.crmId }}</div>
+          <strong>{{ item.title }}</strong>
+          <div class="pq-muted">{{ item.stage }} · {{ item.owner }}</div>
+        </div>
+        <button class="btn primary" type="button" :disabled="bindBusy" @click="bindRemote(item)">纳入</button>
+      </div>
+    </ProjectModal>
+
+    <ProjectModal
+      :open="modalKind === 'create-local'"
+      title="新建本地关注"
+      confirm-label="创建"
+      @close="closeModal"
+      @confirm="submitCreateLocal"
+    >
+      <label>项目名称
+        <input class="pq-search" v-model="createTitle" placeholder="显示名称" required />
+      </label>
+      <label style="display:block;margin-top:8px">简称（可选，用于 Jira 自动匹配）
+        <input class="pq-search" v-model="createShort" placeholder="例如 XKRL" />
+      </label>
+    </ProjectModal>
+
     <ProjectModal
       :open="modalKind === 'bind-customer'"
       :title="`${detail?.local[modalRole].kind !== 'none' ? '修改' : '绑定'}${ROLE_LABELS[modalRole]}`"

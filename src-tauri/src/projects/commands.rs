@@ -6,7 +6,7 @@ use crate::commands::AppState;
 use crate::lock::lock_session;
 
 use super::dto::{
-    AdoptRequest, AdoptResultDto, BindCustomerRequest, JiraIssueRequest, JiraRangeRequest,
+    AdoptRequest, AdoptResultDto, BindCustomerRequest, CreateLocalProjectRequest, JiraIssueRequest, JiraRangeRequest,
     LocalProjectDto, MutationMessageDto, ProjectDetailDto, ProjectRefRequest, ProjectSummaryDto,
     RemoteSearchPageDto, SearchRemoteRequest, SetShortNameRequest, SourceBindingSummaryDto,
     UnbindCustomerRequest,
@@ -61,7 +61,22 @@ pub fn project_adopt(
             dek,
             &request.remote_id,
             request.source_binding_id.as_deref(),
+            request.remote_key.as_deref(),
+            request.remote_name.as_deref(),
+            request.owner.as_deref(),
+            request.short_name.as_deref(),
+            request.stage.as_deref(),
         )
+    })
+}
+
+#[tauri::command]
+pub fn project_create_local(
+    state: State<'_, AppState>,
+    request: CreateLocalProjectRequest,
+) -> Result<AdoptResultDto, String> {
+    with_project_store(&state, |conn, dek| {
+        service::create_local_project(conn, dek, &request.title, request.short_name.as_deref())
     })
 }
 

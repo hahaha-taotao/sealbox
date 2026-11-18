@@ -28,7 +28,7 @@ use super::adapters::{self, crm as crm_adapter, jira as jira_adapter};
 use super::dto::{
     AdoptResultDto, BindCustomerRequest, CustomerRoleDto, DevTaskDto, JiraIssueRequest,
     JiraRangeRequest, LocalCustomerBindingDto, LocalCustomerKind, LocalCustomersDto,
-    LocalProjectDto, MutationMessageDto, ProjectDetailDto, ProjectSummaryDto, RemoteSearchPageDto,
+    FactCustomersDto, LocalProjectDto, MutationMessageDto, ProjectDetailDto, ProjectSummaryDto, RemoteSearchPageDto,
     SearchRemoteRequest, SetShortNameRequest, SourceBindingSummaryDto, UnbindCustomerRequest,
 };
 use super::fixture::{self, FIXTURE_ACCOUNT_SCOPE, FIXTURE_CREDENTIAL_REF, FIXTURE_CRM_SITE,
@@ -686,9 +686,12 @@ pub fn adopt(
     dek: &[u8; 32],
     remote_id: &str,
     source_binding_id: Option<&str>,
+    remote_key: Option<&str>,
+    remote_name: Option<&str>,
+    owner: Option<&str>,
+    short_name: Option<&str>,
+    _stage: Option<&str>,
 ) -> Result<AdoptResultDto, String> {
-    let remote = fixture::find_remote(remote_id)
-        .ok_or_else(|| format!("项目不存在：{remote_id}"))?;
     let workspace_id = ensure_workspace(conn, dek)?;
     let bindings = load_workspace_bindings(conn, dek, &workspace_id)?;
     let crm_binding_id = source_binding_id.unwrap_or(bindings.crm.id.as_str());
@@ -696,8 +699,17 @@ pub fn adopt(
         return Err("来源绑定不可用".into());
     }
 
+    let fixture = fixture::find_remote(remote_id);
+    let resolved_remote_id = fixture
+        .as_ref()
+        .map(|f| f.remote_id.to_string())
+        .unwrap_or_else(|| remote_id.trim().to_string());
+    if resolved_remote_id.is_empty() {
+        return Err("项目 ID 不能为空".into());
+    }
+
     if let Some(existing) =
-        find_adopted_by_remote(conn, dek, &workspace_id, &bindings.crm, remote.remote_id)?
+        find_adopted_by_remote(conn, dek, &workspace_id, &bindings.crm, &resolved_remote_id)?
     {
         return Ok(AdoptResultDto {
             local_project_id: existing.local_project_id,
@@ -706,14 +718,34 @@ pub fn adopt(
         });
     }
 
+    let number = fixture
+        .as_ref()
+        .map(|f| f.number.to_string())
+        .or_else(|| remote_key.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| resolved_remote_id.clone());
+    let title = fixture
+        .as_ref()
+        .map(|f| f.title.to_string())
+        .or_else(|| remote_name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| number.clone());
+    let owner_val = fixture
+        .as_ref()
+        .map(|f| f.owner.to_string())
+        .or_else(|| owner.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+    let short = fixture
+        .as_ref()
+        .map(|f| f.short_name.to_string())
+        .or_else(|| short_name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+        .unwrap_or_default();
+
     let now = now_rfc3339();
     let local_id = Uuid::new_v4().to_string();
     let project = LocalProject {
         id: local_id.clone(),
         workspace_id: workspace_id.clone(),
-        short_name: Some(remote.short_name.into()),
-        alias: None,
-        owner: Some(remote.owner.into()),
+        short_name: if short.is_empty() { None } else { Some(short.clone()) },
+        alias: Some(title.clone()),
+        owner: owner_val.clone(),
         archived: false,
         revision: 0,
         created_at: now.clone(),
@@ -739,9 +771,9 @@ pub fn adopt(
         local_project_id: local_id.clone(),
         source_binding_id: bindings.crm.id.clone(),
         remote_module: "Project".into(),
-        remote_id: remote.remote_id.into(),
-        remote_key: Some(remote.number.into()),
-        remote_name: Some(remote.title.into()),
+        remote_id: resolved_remote_id.clone(),
+        remote_key: Some(number),
+        remote_name: Some(title),
         revision: 0,
         created_at: now.clone(),
         updated_at: now,
@@ -760,26 +792,83 @@ pub fn adopt(
     )
     .map_err(map_err)?;
 
-    // Seed auto Jira ranges from the default short name.
-    recompute_auto_ranges(conn, dek, &workspace_id, &local_id, remote.short_name, &bindings.jira)?;
+    if !short.is_empty() {
+        recompute_auto_ranges(conn, dek, &workspace_id, &local_id, &short, &bindings.jira)?;
+    }
 
     Ok(AdoptResultDto {
         local_project_id: local_id,
-        remote_id: remote.remote_id.into(),
+        remote_id: resolved_remote_id,
+        created: true,
+    })
+}
+
+pub fn create_local_project(
+    conn: &Connection,
+    dek: &[u8; 32],
+    title: &str,
+    short_name: Option<&str>,
+) -> Result<AdoptResultDto, String> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err("项目名称不能为空".into());
+    }
+    let workspace_id = ensure_workspace(conn, dek)?;
+    let now = now_rfc3339();
+    let local_id = Uuid::new_v4().to_string();
+    let short = short_name
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let project = LocalProject {
+        id: local_id.clone(),
+        workspace_id: workspace_id.clone(),
+        short_name: short.clone(),
+        alias: Some(title.to_string()),
+        owner: None,
+        archived: false,
+        revision: 0,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    put_record(
+        conn,
+        dek,
+        PutRecord {
+            workspace_id: &workspace_id,
+            record_id: Some(&local_id),
+            entity_type: ENTITY_LOCAL_PROJECT,
+            schema_version: DEFAULT_ENTITY_SCHEMA_VERSION,
+            expected_revision: None,
+        },
+        &project,
+    )
+    .map_err(map_err)?;
+
+    if let Some(ref s) = short {
+        let bindings = load_workspace_bindings(conn, dek, &workspace_id)?;
+        recompute_auto_ranges(conn, dek, &workspace_id, &local_id, s, &bindings.jira)?;
+    }
+
+    Ok(AdoptResultDto {
+        local_project_id: local_id,
+        remote_id: String::new(),
         created: true,
     })
 }
 
 pub fn list_local(conn: &Connection, dek: &[u8; 32]) -> Result<Vec<LocalProjectDto>, String> {
-    let workspace_id = ensure_workspace(conn, dek)?;
-    let adopted = list_adopted(conn, dek, &workspace_id)?;
-    Ok(adopted
+    let summaries = list_summaries(conn, dek)?;
+    Ok(summaries
         .into_iter()
-        .map(|a| LocalProjectDto {
-            local_project_id: a.local_project_id,
-            remote_id: a.remote_id,
-            short_name: a.short_name,
-            revision: a.revision,
+        .filter_map(|s| {
+            let local_id = s.local_project_id?;
+            Some(LocalProjectDto {
+                local_project_id: local_id,
+                remote_id: s.crm_id,
+                title: s.title,
+                short_name: s.short_name,
+                revision: 0,
+            })
         })
         .collect())
 }
@@ -1152,6 +1241,63 @@ pub fn get_detail(session: &Session, id: &str) -> Result<Option<ProjectDetailDto
         };
         (workspace_id, resolved)
     };
+
+    // Local-only follow (no ERP link).
+    {
+        let vault = session.vault().map_err(|e| e.to_string())?;
+        let conn = vault.project_conn();
+        let links: Vec<(_, ProjectSourceLink)> =
+            list_records_by_type(conn, &dek, &workspace_id, ENTITY_PROJECT_SOURCE_LINK)
+                .map_err(map_err)?;
+        let has_link = links.iter().any(|(_, l)| l.local_project_id == id.trim());
+        if !has_link {
+            if let Ok((meta, project)) =
+                get_record::<LocalProject>(conn, &dek, &workspace_id, id.trim())
+            {
+                let title = project
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| "未命名项目".into());
+                return Ok(Some(ProjectDetailDto {
+                    id: project.id.clone(),
+                    crm_id: String::new(),
+                    title,
+                    stage: "本地".into(),
+                    owner: project.owner.clone().unwrap_or_default(),
+                    start: String::new(),
+                    plan_online: String::new(),
+                    plan_delivery: String::new(),
+                    actual_end: None,
+                    short_name: project.short_name.clone().unwrap_or_default(),
+                    fact: FactCustomersDto {
+                        contract: None,
+                        user: None,
+                    },
+                    local: LocalCustomersDto {
+                        contract: LocalCustomerBindingDto::default(),
+                        user: LocalCustomerBindingDto::default(),
+                    },
+                    manual_ranges: Vec::new(),
+                    local_issues: Vec::new(),
+                    staff: Vec::new(),
+                    amounts: fixture::amounts(),
+                    hours: fixture::hours(),
+                    jira_catalog: std::collections::BTreeMap::new(),
+                    jira_status_defaults: Vec::new(),
+                    erp_issues: Vec::new(),
+                    dev_tasks: Vec::new(),
+                    snapshot_date: String::new(),
+                    adopted: true,
+                    local_project_id: Some(project.id),
+                    revision: meta.revision,
+                    data_source: "local".into(),
+                    warnings: vec![
+                        "这是本地关注项，尚未绑定 ERP。请先在 MCP→ZoomKey 配置 CRM 凭据与客户端证书，再用「绑定 ERP」关联。".into(),
+                    ],
+                }));
+            }
+        }
+    }
 
     if adapters::is_fixture_binding(&bindings.crm) {
         let vault = session.vault().map_err(|e| e.to_string())?;
@@ -1750,39 +1896,73 @@ pub fn unbind_jira_issue(
         .ok_or_else(|| "项目不存在".to_string())
 }
 
-/// Summaries for adopted projects (merged with fixture remote snapshot when known).
+/// Summaries for followed projects: ERP-bound + local-only shells.
 pub fn list_summaries(
     conn: &Connection,
     dek: &[u8; 32],
 ) -> Result<Vec<ProjectSummaryDto>, String> {
     let workspace_id = ensure_workspace(conn, dek)?;
     let _bindings = load_workspace_bindings(conn, dek, &workspace_id)?;
-    let adopted = list_adopted(conn, dek, &workspace_id)?;
+    let projects: Vec<(_, LocalProject)> =
+        list_records_by_type(conn, dek, &workspace_id, ENTITY_LOCAL_PROJECT).map_err(map_err)?;
+    let links: Vec<(_, ProjectSourceLink)> =
+        list_records_by_type(conn, dek, &workspace_id, ENTITY_PROJECT_SOURCE_LINK).map_err(map_err)?;
+
     let mut out = Vec::new();
-    for a in adopted {
-        if fixture::find_remote(&a.remote_id).is_some() {
-            out.push(fixture::to_summary(
-                true,
-                Some(a.local_project_id),
-                &a.short_name,
-            ));
-        } else {
+    for (_meta, project) in projects {
+        if project.archived { continue; }
+        let link = links
+            .iter()
+            .find(|(_, l)| l.local_project_id == project.id)
+            .map(|(_, l)| l.clone());
+        if let Some(ref link) = link {
+            if fixture::find_remote(&link.remote_id).is_some() {
+                out.push(fixture::to_summary(
+                    true,
+                    Some(project.id.clone()),
+                    project.short_name.as_deref().unwrap_or(fixture::DEFAULT_SHORT_NAME),
+                ));
+                continue;
+            }
+            let number = link.remote_key.clone().unwrap_or_else(|| link.remote_id.clone());
+            let title = project
+                .alias
+                .clone()
+                .or_else(|| link.remote_name.clone())
+                .unwrap_or_else(|| number.clone());
             out.push(ProjectSummaryDto {
-                id: a.remote_id.clone(),
-                crm_id: a.remote_id.clone(),
-                title: a.remote_id.clone(),
-                stage: String::new(),
-                owner: String::new(),
+                id: link.remote_id.clone(),
+                crm_id: link.remote_id.clone(),
+                title,
+                stage: "已关注".into(),
+                owner: project.owner.clone().unwrap_or_default(),
                 contract_customer_id: None,
                 contract_customer_name: None,
                 user_customer_id: None,
                 user_customer_name: None,
-                short_name: a.short_name,
+                short_name: project.short_name.clone().unwrap_or_default(),
                 adopted: true,
-                local_project_id: Some(a.local_project_id),
+                local_project_id: Some(project.id.clone()),
+            });
+        } else {
+            let title = project.alias.clone().unwrap_or_else(|| "未命名项目".into());
+            out.push(ProjectSummaryDto {
+                id: project.id.clone(),
+                crm_id: String::new(),
+                title,
+                stage: "本地".into(),
+                owner: project.owner.clone().unwrap_or_default(),
+                contract_customer_id: None,
+                contract_customer_name: None,
+                user_customer_id: None,
+                user_customer_name: None,
+                short_name: project.short_name.clone().unwrap_or_default(),
+                adopted: true,
+                local_project_id: Some(project.id.clone()),
             });
         }
     }
+    out.sort_by(|a, b| a.title.cmp(&b.title));
     Ok(out)
 }
 
@@ -1800,9 +1980,9 @@ mod tests {
     fn adopt_is_idempotent_per_remote_identity() {
         let (vault, dek) = open_vault();
         let conn = vault.project_conn();
-        let first = adopt(conn, &dek, fixture::REMOTE_ID, None).unwrap();
+        let first = adopt(conn, &dek, fixture::REMOTE_ID, None, None, None, None, None, None).unwrap();
         assert!(first.created);
-        let second = adopt(conn, &dek, fixture::PROJECT_NUMBER, None).unwrap();
+        let second = adopt(conn, &dek, fixture::PROJECT_NUMBER, None, None, None, None, None, None).unwrap();
         assert!(!second.created);
         assert_eq!(first.local_project_id, second.local_project_id);
         assert_eq!(first.remote_id, fixture::REMOTE_ID);
@@ -1832,7 +2012,7 @@ mod tests {
         assert!(!items[0].adopted);
         assert!(warnings.iter().any(|w| w.contains("fixture PROJ3733")));
 
-        let adopted = adopt(conn, &dek, "PROJ3733", None).unwrap();
+        let adopted = adopt(conn, &dek, "PROJ3733", None, None, None, None, None, None).unwrap();
         assert!(adopted.created);
 
         set_short_name(

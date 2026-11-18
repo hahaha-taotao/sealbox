@@ -402,8 +402,8 @@ pub(crate) fn search_projects(
     let limit = limit.clamp(1, 100);
     let mut warnings = Vec::new();
     if q.is_empty() {
-        let sql = format!("select * from Project limit {limit};");
-        return Ok((zoomkey_crm::run_query_inner(runtime, &sql)?, warnings));
+        warnings.push("请输入项目编号或名称后再查询".into());
+        return Ok((Vec::new(), warnings));
     }
 
     // Prefer exact project_no, then id, then name.

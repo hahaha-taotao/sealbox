@@ -260,6 +260,7 @@ pub struct AdoptResultDto {
 pub struct LocalProjectDto {
     pub local_project_id: String,
     pub remote_id: String,
+    pub title: String,
     pub short_name: String,
     pub revision: u64,
 }
@@ -290,6 +291,24 @@ pub struct AdoptRequest {
     pub remote_id: String,
     #[serde(default)]
     pub source_binding_id: Option<String>,
+    #[serde(default)]
+    pub remote_key: Option<String>,
+    #[serde(default)]
+    pub remote_name: Option<String>,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub short_name: Option<String>,
+    #[serde(default)]
+    pub stage: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateLocalProjectRequest {
+    pub title: String,
+    #[serde(default)]
+    pub short_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

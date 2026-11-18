@@ -157,6 +157,7 @@ pub fn run() {
             projects::project_sources_list,
             projects::project_search_remote,
             projects::project_adopt,
+            projects::project_create_local,
             projects::project_list,
             projects::project_list_local,
             projects::project_get,
