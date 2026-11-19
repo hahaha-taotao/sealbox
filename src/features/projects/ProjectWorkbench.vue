@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import ProjectSearchRail from "./components/ProjectSearchRail.vue";
 import OverviewTab from "./components/OverviewTab.vue";
 import CostTab from "./components/CostTab.vue";
@@ -99,6 +99,8 @@ const bindKeyword = ref("");
 const bindResults = ref<ProjectSummaryDto[]>([]);
 const bindBusy = ref(false);
 const bindError = ref("");
+let bindTimer: ReturnType<typeof setTimeout> | null = null;
+let bindSeq = 0;
 const createTitle = ref("");
 const createShort = ref("");
 
@@ -190,25 +192,38 @@ async function openCreateModal() {
 async function runBindSearch() {
   const kw = bindKeyword.value.trim();
   if (!kw) {
-    bindError.value = "请输入项目编号或名称";
+    bindResults.value = [];
+    bindError.value = "";
+    bindBusy.value = false;
     return;
   }
+  const seq = ++bindSeq;
   bindBusy.value = true;
   bindError.value = "";
   try {
     const page = await searchProjects(kw);
+    if (seq !== bindSeq) return;
     bindResults.value = page.items;
     searchWarnings.value = page.warnings ?? [];
     if (!page.items.length) {
       bindError.value = (page.warnings && page.warnings[0]) || "没有匹配的 ERP 项目";
     }
   } catch (e) {
+    if (seq !== bindSeq) return;
     bindResults.value = [];
     bindError.value = String(e);
   } finally {
-    bindBusy.value = false;
+    if (seq === bindSeq) bindBusy.value = false;
   }
 }
+
+// 输入即搜：防抖 260ms，避免每个字符都打 ERP。
+watch(bindKeyword, () => {
+  if (bindTimer) clearTimeout(bindTimer);
+  bindTimer = setTimeout(() => {
+    void runBindSearch();
+  }, 260);
+});
 
 async function bindRemote(summary: ProjectSummaryDto) {
   bindBusy.value = true;
@@ -259,6 +274,8 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  if (bindTimer) clearTimeout(bindTimer);
+  bindSeq++;
   if (toastTimer) clearTimeout(toastTimer);
 });
 
@@ -635,8 +652,8 @@ const rangeCatalogOptions = computed(() => {
     >
       <p class="pq-muted">按项目编号或名称精确查询后纳入「我的项目」。不会在打开页面时拉取全部 ERP 项目。</p>
       <div class="pq-row" style="gap:8px;margin:10px 0">
-        <input class="pq-search" v-model="bindKeyword" placeholder="例如 PROJ3733" @keyup.enter="runBindSearch" />
-        <button class="btn primary" type="button" :disabled="bindBusy" @click="runBindSearch">查询</button>
+        <input class="pq-search" v-model="bindKeyword" placeholder="输入项目编号或名称，自动查询…" />
+        <span class="pq-pill" v-if="bindBusy">查询中…</span>
       </div>
       <p v-if="bindError" class="pq-warn">{{ bindError }}</p>
       <div v-for="item in bindResults" :key="item.crmId || item.id" class="pq-row pq-between" style="margin-top:8px;gap:8px">
