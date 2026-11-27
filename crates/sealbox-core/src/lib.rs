@@ -17,3 +17,4 @@ pub mod redact;
 pub mod sync;
 pub mod totp;
 pub mod vault;
+pub mod vpn;

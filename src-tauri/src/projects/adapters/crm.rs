@@ -3,6 +3,8 @@
 //! Field IDs follow design §4 / §5.1. Missing values become empty / unread /
 //! explicit zero — never invented numbers.
 
+use std::collections::HashSet;
+
 use serde_json::Value;
 
 use crate::projects::dto::{
@@ -162,13 +164,12 @@ fn money_item(key: &str, amount: Option<f64>, source: &str) -> MoneyItemDto {
 
 /// Map a raw CRM Project JSON record into a summary DTO.
 pub(crate) fn map_project_summary(
-    record: &Value,
+    mapped: &MappedProject,
     adopted: bool,
     local_project_id: Option<String>,
     short_name: &str,
-) -> Result<ProjectSummaryDto, String> {
-    let mapped = map_project(record)?;
-    Ok(ProjectSummaryDto {
+) -> ProjectSummaryDto {
+    ProjectSummaryDto {
         id: mapped.number.clone(),
         crm_id: mapped.remote_id.clone(),
         title: mapped.title.clone(),
@@ -181,11 +182,21 @@ pub(crate) fn map_project_summary(
         short_name: short_name.to_string(),
         adopted,
         local_project_id,
-    })
+    }
+}
+
+fn record_id(record: &Value) -> Option<&str> {
+    record
+        .get("id")?
+        .as_str()
+        .map(str::trim)
+        .filter(|id| zoomkey_crm::valid_record_id(id))
 }
 
 pub(crate) fn map_project(record: &Value) -> Result<MappedProject, String> {
-    let remote_id = str_field(record, "id").ok_or_else(|| "Project 缺少 id".to_string())?;
+    let remote_id = record_id(record)
+        .ok_or_else(|| "ERP 项目缺少有效的 CRM 记录 ID".to_string())?
+        .to_string();
     let number = str_field(record, fields::PROJECT_NO).unwrap_or_default();
     let title = str_field(record, fields::PROJECT_NAME).unwrap_or_default();
     if number.is_empty() && title.is_empty() {
@@ -392,44 +403,149 @@ fn sql_eq(field: &str, value: &str) -> String {
     )
 }
 
-/// Search projects by exact project_no / id / name (design: exact match baseline).
+fn sql_contains(field: &str, value: &str) -> String {
+    // MySQL LIKE uses backslash to escape metacharacters in the pattern.
+    let literal = zoomkey_crm::escape_sql_literal(&value.replace('\\', "\\\\"))
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("{field} like '%{literal}%'")
+}
+
+// Keep the potentially restricted customer fields out of the SELECT list so
+// that an unavailable customer role does not break direct project searches.
+const PROJECT_SEARCH_FIELDS: &str = "id, project_no, projectname, projectstatus, assigned_user_id";
+
 pub(crate) fn search_projects(
     runtime: &EndpointRuntime,
     keyword: &str,
-    limit: u64,
+    limit: usize,
+) -> Result<(Vec<Value>, Vec<String>), ToolFailure> {
+    search_projects_with(keyword, limit, |sql| {
+        zoomkey_crm::run_query_inner(runtime, sql)
+    })
+}
+
+fn search_projects_with(
+    keyword: &str,
+    limit: usize,
+    mut query: impl FnMut(&str) -> Result<Vec<Value>, ToolFailure>,
 ) -> Result<(Vec<Value>, Vec<String>), ToolFailure> {
     let q = keyword.trim();
     let limit = limit.clamp(1, 100);
-    let mut warnings = Vec::new();
     if q.is_empty() {
-        warnings.push("请输入项目编号或名称后再查询".into());
-        return Ok((Vec::new(), warnings));
+        return Ok((vec![], vec![]));
     }
 
-    // Prefer exact project_no, then id, then name.
-    let by_no = format!(
-        "select * from Project where {} limit {limit};",
-        sql_eq(fields::PROJECT_NO, q)
-    );
-    let mut records = zoomkey_crm::run_query_inner(runtime, &by_no)?;
-    if records.is_empty() && q.contains('x') {
-        let by_id = format!(
-            "select * from Project where {} limit {limit};",
-            sql_eq("id", q)
-        );
-        records = zoomkey_crm::run_query_inner(runtime, &by_id)?;
+    let exact_id = zoomkey_crm::valid_record_id(q);
+    let conditions = if exact_id {
+        sql_eq("id", q)
+    } else {
+        format!(
+            "{} or {}",
+            sql_contains(fields::PROJECT_NO, q),
+            sql_contains(fields::PROJECT_NAME, q)
+        )
+    };
+    let mut records = Vec::new();
+    let mut seen = HashSet::new();
+    let mut invalid_id = false;
+    let mut limited = false;
+    let mut append = |rows: Vec<Value>| {
+        limited |= rows.len() >= limit;
+        for row in rows {
+            let Some(id) = record_id(&row) else {
+                invalid_id = true;
+                continue;
+            };
+            if seen.insert(id.to_string()) {
+                if records.len() == limit {
+                    limited = true;
+                } else {
+                    records.push(row);
+                }
+            }
+        }
+    };
+    append(query(&format!(
+        "select {PROJECT_SEARCH_FIELDS} from Project where {conditions} limit {limit};"
+    ))?);
+
+    let mut warnings = Vec::new();
+    if !exact_id {
+        // Resolve company names in Accounts, then follow only the actual CRM
+        // reference fields. A denied role must not hide direct project matches.
+        const ACCOUNT_LIMIT: usize = 20;
+        let condition = sql_contains("accountname", q);
+        match query(&format!(
+            "select id from Accounts where {condition} limit {ACCOUNT_LIMIT};"
+        )) {
+            Ok(accounts) => {
+                if accounts.len() >= ACCOUNT_LIMIT {
+                    warnings
+                        .push("匹配客户较多，仅查找了前 20 个客户的项目，请缩小关键词范围".into());
+                }
+                let ids = accounts.iter().filter_map(record_id).collect::<Vec<_>>();
+                if ids.len() != accounts.len() {
+                    warnings.push("部分客户缺少有效的 CRM 记录 ID，未查询其关联项目".into());
+                }
+                if !ids.is_empty() {
+                    let values = ids
+                        .iter()
+                        .map(|id| format!("'{id}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    for (field, role) in [
+                        (fields::CONTRACT_CUSTOMER, "签约"),
+                        (fields::USER_CUSTOMER, "实际使用方"),
+                    ] {
+                        match query(&format!("select {PROJECT_SEARCH_FIELDS} from Project where {field} in ({values}) limit {limit};")) {
+                            Ok(rows) => append(rows),
+                            Err(_) => warnings.push(format!("ERP {role}客户关联查询失败")),
+                        }
+                    }
+                }
+            }
+            Err(_) => warnings.push("ERP 客户名称查询失败，无法按公司名匹配项目".into()),
+        }
     }
-    if records.is_empty() {
-        let by_name = format!(
-            "select * from Project where {} limit {limit};",
-            sql_eq(fields::PROJECT_NAME, q)
-        );
-        records = zoomkey_crm::run_query_inner(runtime, &by_name)?;
+    if invalid_id {
+        warnings.push("部分 ERP 项目缺少有效的 CRM 记录 ID，不能绑定".into());
     }
-    if records.is_empty() {
-        warnings.push("ERP 精确匹配无结果（project_no / id / projectname）".into());
+    if limited {
+        warnings.push(format!(
+            "匹配项目较多，最多显示 {limit} 条，请缩小关键词范围"
+        ));
+    }
+    if records.is_empty() && warnings.is_empty() {
+        warnings.push("没有匹配的 ERP 项目（项目编号、名称、CRM ID 或客户名称）".into());
     }
     Ok((records, warnings))
+}
+
+pub(crate) fn project_id_by_number(
+    runtime: &EndpointRuntime,
+    number: &str,
+) -> Result<String, ToolFailure> {
+    project_id_by_number_with(number, |sql| zoomkey_crm::run_query_inner(runtime, sql))
+}
+
+fn project_id_by_number_with(
+    number: &str,
+    query: impl FnOnce(&str) -> Result<Vec<Value>, ToolFailure>,
+) -> Result<String, ToolFailure> {
+    let condition = sql_eq(fields::PROJECT_NO, number);
+    let rows = query(&format!(
+        "select id from Project where {condition} limit 2;"
+    ))?;
+    match rows.as_slice() {
+        [row] => record_id(row)
+            .map(str::to_string)
+            .ok_or_else(|| ToolFailure::validation("ERP 项目缺少有效的 CRM 记录 ID")),
+        [] => Err(ToolFailure::validation("当前 ERP 来源中找不到该项目编号")),
+        _ => Err(ToolFailure::validation(
+            "项目编号不唯一，请使用 CRM 记录 ID",
+        )),
+    }
 }
 
 pub(crate) fn retrieve_project(
@@ -487,6 +603,9 @@ pub(crate) fn fetch_project_bundle(
     let mut warnings = Vec::new();
     let project_json = retrieve_project(runtime, remote_id)?;
     let mapped = map_project(&project_json).map_err(ToolFailure::validation)?;
+    if mapped.remote_id != remote_id {
+        return Err(ToolFailure::validation("CRM 返回的项目 ID 与请求不符"));
+    }
     warnings.extend(mapped.warnings.iter().cloned());
 
     let staff = match query_members(runtime, remote_id, 100) {
@@ -662,6 +781,98 @@ mod tests {
         assert_eq!(hours.summary.total, 61.6);
         assert_eq!(hours.detail_sum.hours, 5.0);
         assert_eq!(hours.rows.len(), 1);
+    }
+
+    #[test]
+    fn search_combines_project_fragments_and_both_company_roles() {
+        let company = "测试客户";
+        let by_name = json!({"id": "30x10", "project_no": "PROJ10", "projectname": "测试客户升级"});
+        let by_company = json!({"id": "30x11", "project_no": "PROJ11", "projectname": "新建站点"});
+        let mut calls = 0;
+        let (rows, warnings) = search_projects_with(company, 50, |sql| {
+            calls += 1;
+            match calls {
+                1 => {
+                    assert!(sql
+                        .contains("project_no like '%测试客户%' or projectname like '%测试客户%'"));
+                    Ok(vec![by_name.clone()])
+                }
+                2 => {
+                    assert!(sql.contains("from Accounts where accountname like '%测试客户%'"));
+                    Ok(vec![json!({"id": "11x20"})])
+                }
+                3 => {
+                    assert!(sql.contains("linktoaccountscontacts in ('11x20')"));
+                    Ok(vec![by_name.clone(), by_company.clone()])
+                }
+                4 => {
+                    assert!(sql.contains("cf_nrl_accounts271_id in ('11x20')"));
+                    Ok(vec![by_company.clone()])
+                }
+                _ => panic!("unexpected query"),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 4);
+        assert_eq!(rows, vec![by_name, by_company]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn search_by_full_crm_id_skips_company_and_reports_invalid_records() {
+        let mut calls = 0;
+        let (rows, warnings) = search_projects_with(" 30x10 ", 50, |sql| {
+            calls += 1;
+            assert!(sql.contains("from Project where id = '30x10'"));
+            Ok(vec![json!({"id": 10, "project_no": "PROJ10"})])
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert!(rows.is_empty());
+        assert!(warnings[0].contains("CRM 记录 ID"));
+    }
+
+    #[test]
+    fn search_distinguishes_company_query_failure_from_no_match() {
+        let (rows, warnings) = search_projects_with("片段", 50, |sql| {
+            if sql.contains("from Accounts") {
+                Err(ToolFailure::validation("not allowed"))
+            } else {
+                Ok(vec![json!({"id": "30x10"})])
+            }
+        })
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("客户名称查询失败"));
+        let (rows, warnings) = search_projects_with("片段", 50, |_| Ok(vec![])).unwrap();
+        assert!(rows.is_empty());
+        assert!(warnings[0].contains("没有匹配"));
+    }
+
+    #[test]
+    fn contains_escapes_quotes_wildcards_and_backslashes() {
+        assert_eq!(
+            sql_contains("projectname", r"O'Brien\50%_"),
+            r"projectname like '%O''Brien\\\\50\%\_%'"
+        );
+    }
+
+    #[test]
+    fn project_number_resolves_only_to_a_unique_valid_id() {
+        let resolve = |rows| {
+            project_id_by_number_with("PROJ42", |sql| {
+                assert_eq!(
+                    sql,
+                    "select id from Project where project_no = 'PROJ42' limit 2;"
+                );
+                Ok(rows)
+            })
+        };
+        assert_eq!(resolve(vec![json!({"id": "30x21"})]).unwrap(), "30x21");
+        assert!(resolve(vec![]).is_err());
+        assert!(resolve(vec![json!({"id": 21})]).is_err());
+        assert!(resolve(vec![json!({"id": "30x21"}), json!({"id": "30x22"})]).is_err());
     }
 
     #[test]

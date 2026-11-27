@@ -8,7 +8,8 @@ export type EntryKind =
   | "mail_auth"
   | "server"
   | "database"
-  | "client_cert";
+  | "client_cert"
+  | "vpn";
 
 export interface EntryDto {
   id: string;
@@ -48,6 +49,7 @@ export interface Counts {
   server: number;
   database: number;
   client_cert: number;
+  vpn: number;
   trash: number;
 }
 
@@ -126,6 +128,7 @@ export const KINDS: { id: EntryKind; label: string; count: keyof Counts }[] = [
   { id: "server", label: "服务器", count: "server" },
   { id: "database", label: "数据库", count: "database" },
   { id: "client_cert", label: "证书", count: "client_cert" },
+  { id: "vpn", label: "VPN", count: "vpn" },
 ];
 
 export function kindLabel(kind: EntryKind) {
@@ -139,6 +142,7 @@ export function kindLabel(kind: EntryKind) {
       server: "服务器",
       database: "数据库",
       client_cert: "客户端证书",
+      vpn: "VPN 账号",
     } as const
   )[kind];
 }

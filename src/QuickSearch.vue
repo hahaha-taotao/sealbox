@@ -77,6 +77,7 @@ function kindLabel(k: EntryKind) {
     case "server": return "服务器";
     case "database": return "数据库";
     case "client_cert": return "客户端证书";
+    case "vpn": return "VPN";
   }
 }
 

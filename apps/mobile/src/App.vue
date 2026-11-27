@@ -476,6 +476,8 @@ function fillFromPayload(payload: Record<string, unknown>) {
   form.database = String(payload.database ?? "");
   form.username = String(payload.username ?? "");
   form.totp = String(payload.totp_secret ?? "");
+  if (payload.login_url) form.url = String(payload.login_url);
+  if (payload.username) form.account = String(payload.username);
 }
 
 function secretPayload() {
@@ -501,6 +503,8 @@ function visibleSecretPayload(): Record<string, unknown> {
       return { type: "database", engine: form.engine, host: form.host, port, database: form.database, username: form.username, password: form.password };
     case "client_cert":
       return { type: "client_cert", cert_pem: form.certPem, key_pem: form.keyPem, passphrase: form.passphrase || null };
+    case "vpn":
+      return { type: "vpn", username: form.account || null, password: form.password, login_url: form.url || null };
   }
 }
 
@@ -1153,6 +1157,12 @@ onMounted(async () => {
           <div v-if="form.kind === 'database'" class="field"><label>{{ dbFields.databaseLabel }}</label><input v-model="form.database" /></div>
           <div v-if="form.kind === 'server' || dbFields.username" class="field"><label>{{ form.engine === 'redis' && form.kind === 'database' ? '用户名，可选' : '用户名' }}</label><input v-model="form.username" /></div>
           <div class="field"><label>密码</label><input v-model="form.password" type="password" /></div>
+        </template>
+        <template v-else-if="form.kind === 'vpn'">
+          <p class="hint">此设备只保存 VPN 账号。连接客户端只在 Windows 桌面端提供。</p>
+          <div class="field"><label>账号</label><input v-model="form.account" /></div>
+          <div class="field"><label>密码</label><input v-model="form.password" type="password" /></div>
+          <div class="field"><label>登录网站，可选</label><input v-model="form.url" placeholder="https://" /></div>
         </template>
         <template v-else>
           <div class="field"><label>证书文件</label><button class="ghost" @click="chooseCert('cert')">{{ certDocument?.name || '从系统文档选择证书' }}</button></div>

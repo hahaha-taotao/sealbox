@@ -352,6 +352,7 @@ pub(crate) fn reject_embedded_secret(profile: &CredentialProfile, secret: &crate
         SecretPayload::MailAuth { email, auth_code, .. } => { values.push(auth_code); basic = Some((email, auth_code)); }
         SecretPayload::Server { username, password, .. } | SecretPayload::Database { username, password, .. } => { values.push(password); basic = Some((username, password)); }
         SecretPayload::ClientCert { key_pem, passphrase, .. } => { values.push(key_pem); values.extend(passphrase.as_deref()); }
+        SecretPayload::Vpn { username, password, .. } => { values.push(password); basic = username.as_deref().map(|a| (a, password.as_str())); }
     }
     let encoded = basic.map(|(account, password)| zeroize::Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(format!("{account}:{password}"))));
     if let Some(encoded) = &encoded { values.push(encoded.as_str()); }

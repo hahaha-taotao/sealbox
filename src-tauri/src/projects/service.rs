@@ -26,10 +26,11 @@ use crate::zoomkey;
 
 use super::adapters::{self, crm as crm_adapter, jira as jira_adapter};
 use super::dto::{
-    AdoptResultDto, BindCustomerRequest, CustomerRoleDto, DevTaskDto, JiraIssueRequest,
-    JiraRangeRequest, LocalCustomerBindingDto, LocalCustomerKind, LocalCustomersDto,
-    FactCustomersDto, LocalProjectDto, MutationMessageDto, ProjectDetailDto, ProjectSummaryDto, RemoteSearchPageDto,
-    SearchRemoteRequest, SetShortNameRequest, SourceBindingSummaryDto, UnbindCustomerRequest,
+    AdoptRequest, AdoptResultDto, BindCustomerRequest, CustomerRoleDto, DevTaskDto,
+    FactCustomersDto, JiraIssueRequest, JiraRangeRequest, LocalCustomerBindingDto,
+    LocalCustomerKind, LocalCustomersDto, LocalProjectDto, MutationMessageDto, ProjectDetailDto,
+    ProjectSummaryDto, RemoteSearchPageDto, SearchRemoteRequest, SetShortNameRequest,
+    SourceBindingSummaryDto, UnbindCustomerRequest,
 };
 use super::fixture::{self, FIXTURE_ACCOUNT_SCOPE, FIXTURE_CREDENTIAL_REF, FIXTURE_CRM_SITE,
     FIXTURE_JIRA_SITE};
@@ -109,30 +110,17 @@ struct WorkspaceBindings {
     jira: SourceBinding,
 }
 
-/// Origin (scheme://host[:port]) from a ZoomKey base URL; empty input → empty.
+/// Instance identity, retaining any CRM installation path before webservice.php.
 fn site_from_base(base_url: &str) -> String {
-    let trimmed = base_url.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let without_suffix = trimmed
+    let base = base_url
+        .trim()
         .split(['#', '?'])
         .next()
-        .unwrap_or(trimmed)
+        .unwrap_or_default()
         .trim_end_matches('/');
-    let (scheme, rest) = if let Some(rest) = without_suffix.strip_prefix("https://") {
-        ("https", rest)
-    } else if let Some(rest) = without_suffix.strip_prefix("http://") {
-        ("http", rest)
-    } else {
-        return without_suffix.to_string();
-    };
-    let hostport = rest.split('/').next().unwrap_or("").trim();
-    if hostport.is_empty() {
-        without_suffix.to_string()
-    } else {
-        format!("{scheme}://{hostport}")
-    }
+    base.strip_suffix("/webservice.php")
+        .unwrap_or(base)
+        .to_string()
 }
 
 fn account_scope_for(
@@ -199,16 +187,12 @@ fn upsert_live_binding(
     if let Some((meta, mut existing)) = listed.into_iter().find(|(_, b)| {
         b.platform == platform
             && !adapters::is_fixture_binding(b)
-            && (b.credential_entry_id == credential_entry_id
-                || (b.site == site && b.account_scope == account_scope))
+            && b.site == site
+            && b.account_scope == account_scope
     }) {
-        let dirty = existing.site != site
-            || existing.account_scope != account_scope
-            || existing.credential_entry_id != credential_entry_id
+        let dirty = existing.credential_entry_id != credential_entry_id
             || existing.status != BindingStatus::Active;
         if dirty {
-            existing.site = site.to_string();
-            existing.account_scope = account_scope.to_string();
             existing.credential_entry_id = credential_entry_id.to_string();
             existing.status = BindingStatus::Active;
             existing.updated_at = now_rfc3339();
@@ -330,8 +314,38 @@ fn pick_credential(
         .map(|c| (c.id.clone(), c.account.clone()))
 }
 
+fn select_crm_credential<'a>(
+    policy_id: &str,
+    candidates: &'a [zoomkey::ZoomkeyCredentialOption],
+    mut profile_origin: impl FnMut(&str) -> Result<Option<String>, String>,
+) -> Result<Option<(&'a zoomkey::ZoomkeyCredentialOption, Option<String>)>, String> {
+    let policy_id = policy_id.trim();
+    if !policy_id.is_empty() {
+        let selected = candidates
+            .iter()
+            .find(|c| c.id == policy_id)
+            .ok_or_else(|| "已选 ZoomKey CRM 凭据已失效或服务类型不符，请重新选择".to_string())?;
+        return Ok(Some((selected, profile_origin(&selected.id)?)));
+    }
+    let mut selected = None;
+    for candidate in candidates {
+        if let Some(origin) = profile_origin(&candidate.id)? {
+            if selected.is_some() {
+                return Err(
+                    "有多条已配置的 ZoomKey CRM 凭据，请在 ZoomKey 设置中明确选择一条".into(),
+                );
+            }
+            selected = Some((candidate, Some(origin)));
+        }
+    }
+    if selected.is_none() && !candidates.is_empty() {
+        return Err("请为 ZoomKey CRM 凭据配置 Profile，或在 ZoomKey 设置中选择凭据和证书".into());
+    }
+    Ok(selected)
+}
+
 /// Resolve CRM/Jira SourceBindings from ZoomKey policy + vault candidates.
-/// Prefers live credentials; seeds fixture bindings only when none are available.
+/// A live configuration error is not an excuse to switch CRM accounts or use a fixture.
 fn resolve_bindings(session: &Session) -> Result<WorkspaceBindings, String> {
     let dek = *session.dek().map_err(|e| e.to_string())?;
     let (workspace_id, policy) = {
@@ -342,18 +356,24 @@ fn resolve_bindings(session: &Session) -> Result<WorkspaceBindings, String> {
     };
     let candidates = zoomkey::list_candidates(session)?;
 
-    // Resolve account scopes before borrowing project_conn (Session vault is unique).
-    let crm_plan =
-        pick_credential(&policy.crm.credential_id, &candidates.crm_credentials).map(
-            |(cred_id, account)| {
-                let mut site = site_from_base(&policy.crm.base_url);
-                if site.is_empty() {
-                    site = site_from_base(zoomkey::DEFAULT_CRM_BASE);
-                }
-                let scope = account_scope_for(session, &cred_id, account.as_deref());
-                (site, scope, cred_id)
-            },
-        );
+    let vault = session.vault().map_err(|e| e.to_string())?;
+    let crm_plan = select_crm_credential(
+        &policy.crm.credential_id,
+        &candidates.crm_credentials,
+        |id| {
+            let profile = vault
+                .credential_profile(&dek, id)
+                .map_err(|_| "无法读取 ZoomKey CRM 凭据的 Profile".to_string())?;
+            Ok(profile
+                .filter(|p| p.adapter == "zoomkey_crm")
+                .map(|p| p.origin))
+        },
+    )?
+    .map(|(credential, origin)| {
+        let site = site_from_base(origin.as_deref().unwrap_or(&policy.crm.base_url));
+        let scope = account_scope_for(session, &credential.id, credential.account.as_deref());
+        (site, scope, credential.id.clone())
+    });
     let jira_plan =
         pick_credential(&policy.jira.credential_id, &candidates.jira_credentials).map(
             |(cred_id, account)| {
@@ -459,6 +479,14 @@ struct AdoptedRef {
     revision: u64,
 }
 
+fn same_crm_source(left: &SourceBinding, right: &SourceBinding) -> bool {
+    left.platform == PlatformKind::ZoomkeyCrm
+        && right.platform == PlatformKind::ZoomkeyCrm
+        && left.site == right.site
+        && left.account_scope == right.account_scope
+        && adapters::is_fixture_binding(left) == adapters::is_fixture_binding(right)
+}
+
 fn find_adopted_by_remote(
     conn: &Connection,
     dek: &[u8; 32],
@@ -478,8 +506,7 @@ fn find_adopted_by_remote(
         else {
             continue;
         };
-        if binding.site != crm_binding.site || binding.account_scope != crm_binding.account_scope
-        {
+        if !same_crm_source(&binding, crm_binding) {
             continue;
         }
         let (proj_meta, project): (_, LocalProject) =
@@ -532,13 +559,7 @@ fn search_remote_live_fetch(
     }
     let runtime =
         adapters::open_desktop_runtime(session, crm_binding).map_err(|e| e.message)?;
-    let (records, mut warnings) =
-        crm_adapter::search_projects(&runtime, keyword, 50).map_err(|e| e.message)?;
-    warnings.insert(
-        0,
-        "remote adapter: ZoomKey CRM structured DTO (desktop, MCP-independent)".into(),
-    );
-    Ok((records, warnings))
+    crm_adapter::search_projects(&runtime, keyword, 50).map_err(|e| e.message)
 }
 
 fn stamp_search_adopted(
@@ -551,8 +572,14 @@ fn stamp_search_adopted(
 ) -> Result<(Vec<ProjectSummaryDto>, Vec<String>), String> {
     let mut items = Vec::new();
     for record in records {
-        let Ok(mapped) = crm_adapter::map_project(record) else {
-            continue;
+        let mapped = match crm_adapter::map_project(record) {
+            Ok(mapped) => mapped,
+            Err(e) => {
+                if !warnings.contains(&e) {
+                    warnings.push(e);
+                }
+                continue;
+            }
         };
         let adopted =
             find_adopted_by_remote(conn, dek, workspace_id, crm, &mapped.remote_id)?;
@@ -560,15 +587,12 @@ fn stamp_search_adopted(
             .as_ref()
             .map(|a| a.short_name.clone())
             .unwrap_or_default();
-        match crm_adapter::map_project_summary(
-            record,
+        items.push(crm_adapter::map_project_summary(
+            &mapped,
             adopted.is_some(),
             adopted.as_ref().map(|a| a.local_project_id.clone()),
             &short,
-        ) {
-            Ok(summary) => items.push(summary),
-            Err(e) => warnings.push(e),
-        }
+        ));
     }
     Ok((items, warnings))
 }
@@ -579,10 +603,7 @@ fn search_remote_fixture(
     workspace_id: &str,
     crm: &SourceBinding,
     keyword: &str,
-    extra_warnings: Vec<String>,
 ) -> Result<(Vec<ProjectSummaryDto>, Vec<String>), String> {
-    let mut warnings = extra_warnings;
-    warnings.push("remote adapter: fixture PROJ3733 (offline fallback)".into());
     let adopted =
         find_adopted_by_remote(conn, dek, workspace_id, crm, fixture::REMOTE_ID)?;
     let items = if fixture::keyword_matches(keyword) {
@@ -595,6 +616,11 @@ fn search_remote_fixture(
             adopted.as_ref().map(|a| a.local_project_id.clone()),
             short,
         )]
+    } else {
+        vec![]
+    };
+    let warnings = if items.is_empty() {
+        vec!["离线演示数据中没有匹配项目".into()]
     } else {
         vec![]
     };
@@ -612,10 +638,14 @@ pub fn search_remote(
         let vault = session.vault().map_err(|e| e.to_string())?;
         ensure_workspace(vault.project_conn(), &dek)?
     };
-    let source_binding_id = request
+    let source_binding_id = bindings.crm.id.clone();
+    if request
         .source_binding_id
-        .clone()
-        .unwrap_or_else(|| bindings.crm.id.clone());
+        .as_deref()
+        .is_some_and(|id| id != source_binding_id)
+    {
+        return Err("所选 ERP 来源已变更，请重新查询".into());
+    }
     let fetched_at = now_rfc3339();
 
     if request.cursor.as_deref() == Some("done") {
@@ -638,7 +668,6 @@ pub fn search_remote(
             &workspace_id,
             &bindings.crm,
             &request.keyword,
-            vec![],
         )?;
         return Ok(RemoteSearchPageDto {
             items,
@@ -681,11 +710,38 @@ pub fn search_remote(
     }
 }
 
-pub fn adopt(
+pub fn adopt_from_session(
+    session: &Session,
+    request: AdoptRequest,
+) -> Result<AdoptResultDto, String> {
+    let bindings = resolve_bindings(session)?;
+    if request
+        .source_binding_id
+        .as_deref()
+        .is_some_and(|id| id != bindings.crm.id)
+    {
+        return Err("所选 ERP 来源已变更，请重新查询后绑定".into());
+    }
+    let vault = session.vault().map_err(|e| e.to_string())?;
+    let dek = session.dek().map_err(|e| e.to_string())?;
+    adopt(
+        vault.project_conn(),
+        dek,
+        &bindings,
+        &request.remote_id,
+        request.remote_key.as_deref(),
+        request.remote_name.as_deref(),
+        request.owner.as_deref(),
+        request.short_name.as_deref(),
+        request.stage.as_deref(),
+    )
+}
+
+fn adopt(
     conn: &Connection,
     dek: &[u8; 32],
+    bindings: &WorkspaceBindings,
     remote_id: &str,
-    source_binding_id: Option<&str>,
     remote_key: Option<&str>,
     remote_name: Option<&str>,
     owner: Option<&str>,
@@ -693,19 +749,18 @@ pub fn adopt(
     _stage: Option<&str>,
 ) -> Result<AdoptResultDto, String> {
     let workspace_id = ensure_workspace(conn, dek)?;
-    let bindings = load_workspace_bindings(conn, dek, &workspace_id)?;
-    let crm_binding_id = source_binding_id.unwrap_or(bindings.crm.id.as_str());
-    if crm_binding_id != bindings.crm.id {
-        return Err("来源绑定不可用".into());
-    }
-
-    let fixture = fixture::find_remote(remote_id);
+    let fixture = if adapters::is_fixture_binding(&bindings.crm) {
+        Some(fixture::find_remote(remote_id).ok_or_else(|| "离线夹具中没有该项目".to_string())?)
+    } else {
+        None
+    };
     let resolved_remote_id = fixture
         .as_ref()
-        .map(|f| f.remote_id.to_string())
-        .unwrap_or_else(|| remote_id.trim().to_string());
-    if resolved_remote_id.is_empty() {
-        return Err("项目 ID 不能为空".into());
+        .map(|f| f.remote_id)
+        .unwrap_or_else(|| remote_id.trim())
+        .to_string();
+    if !zoomkey::crm::valid_record_id(&resolved_remote_id) {
+        return Err("绑定 ERP 需要有效的 CRM 记录 ID，请重新查询并选择项目".into());
     }
 
     if let Some(existing) =
@@ -884,12 +939,16 @@ fn resolve_adopted(
     if needle.is_empty() {
         return Ok(None);
     }
-    if let Some(remote) = fixture::find_remote(needle) {
-        return find_adopted_by_remote(conn, dek, workspace_id, crm, remote.remote_id);
+    if Uuid::parse_str(needle).is_ok() {
+        let adopted = list_adopted(conn, dek, workspace_id)?;
+        return Ok(adopted.into_iter().find(|a| a.local_project_id == needle));
     }
-    // Local project UUID path.
-    let adopted = list_adopted(conn, dek, workspace_id)?;
-    Ok(adopted.into_iter().find(|a| a.local_project_id == needle))
+    if adapters::is_fixture_binding(crm) {
+        if let Some(remote) = fixture::find_remote(needle) {
+            return find_adopted_by_remote(conn, dek, workspace_id, crm, remote.remote_id);
+        }
+    }
+    find_adopted_by_remote(conn, dek, workspace_id, crm, needle)
 }
 
 fn load_local_overlays(
@@ -1084,15 +1143,20 @@ fn fetch_live_detail_parts(
     session: &Session,
     crm: &SourceBinding,
     jira: &SourceBinding,
-    remote_id: &str,
+    reference: &str,
 ) -> Result<LiveDetailParts, String> {
     if adapters::is_fixture_binding(crm) {
         return Err("fixture binding".into());
     }
     let crm_runtime =
         adapters::open_desktop_runtime(session, crm).map_err(|e| e.message)?;
+    let remote_id = if zoomkey::crm::valid_record_id(reference) {
+        reference.to_string()
+    } else {
+        crm_adapter::project_id_by_number(&crm_runtime, reference).map_err(|e| e.message)?
+    };
     let snapshot_date = chrono::Utc::now().date_naive().to_string();
-    let bundle = crm_adapter::fetch_project_bundle(&crm_runtime, remote_id, &snapshot_date)
+    let bundle = crm_adapter::fetch_project_bundle(&crm_runtime, &remote_id, &snapshot_date)
         .map_err(|e| e.message)?;
     let mapped = bundle
         .project
@@ -1100,8 +1164,8 @@ fn fetch_live_detail_parts(
 
     let mut erp_issues = bundle.erp_issues;
     let mut warnings = bundle.warnings;
-    let mut jira_catalog = fixture::jira_catalog();
-    let mut jira_status_defaults = fixture::jira_status_defaults();
+    let mut jira_catalog = std::collections::BTreeMap::new();
+    let mut jira_status_defaults = Vec::new();
 
     if !adapters::is_fixture_binding(jira) {
         match adapters::open_desktop_runtime(session, jira) {
@@ -1127,13 +1191,13 @@ fn fetch_live_detail_parts(
         }
     }
 
-    let amounts = bundle.amounts.unwrap_or_else(fixture::amounts);
-    let hours = bundle.hours.unwrap_or_else(fixture::hours);
-    let staff = if bundle.staff.is_empty() {
-        fixture::staff()
-    } else {
-        bundle.staff
-    };
+    let amounts = bundle
+        .amounts
+        .ok_or_else(|| "ERP 项目金额未返回".to_string())?;
+    let hours = bundle
+        .hours
+        .ok_or_else(|| "ERP 项目工时未返回".to_string())?;
+    let staff = bundle.staff;
 
     Ok(LiveDetailParts {
         mapped,
@@ -1154,6 +1218,7 @@ fn assemble_live_detail(
     workspace_id: &str,
     crm: &SourceBinding,
     parts: LiveDetailParts,
+    stored_remote_id: Option<&str>,
 ) -> Result<ProjectDetailDto, String> {
     let (short_name, local, manual_ranges, local_issues, revision, local_project_id, is_adopted) =
         overlays_for_adopted(
@@ -1161,7 +1226,7 @@ fn assemble_live_detail(
             dek,
             workspace_id,
             crm,
-            &parts.mapped.remote_id,
+            stored_remote_id.unwrap_or(&parts.mapped.remote_id),
             "",
         )?;
     let warnings = parts.warnings;
@@ -1225,32 +1290,59 @@ fn build_detail(
     build_detail_fixture(conn, dek, workspace_id, crm, id)
 }
 
+fn live_project_reference<'a>(
+    id: &'a str,
+    link: Option<&'a ProjectSourceLink>,
+) -> Result<&'a str, String> {
+    let Some(link) = link else {
+        return Ok(id);
+    };
+    let remote_id = link.remote_id.trim();
+    if zoomkey::crm::valid_record_id(remote_id) {
+        return Ok(remote_id);
+    }
+    // Old links may carry a project number (or a raw DB ID) as remote_id.
+    // Only use a known project number to recover the canonical ID from CRM.
+    let number = link
+        .remote_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !zoomkey::crm::valid_record_id(s));
+    let legacy_number = remote_id
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("PROJ"))
+        && remote_id.len() > 4
+        && remote_id[4..].bytes().all(|b| b.is_ascii_digit());
+    number
+        .or(legacy_number.then_some(remote_id))
+        .ok_or_else(|| "已绑定项目缺少有效的 CRM 记录 ID 和项目编号，请重新查询并绑定".to_string())
+}
+
 pub fn get_detail(session: &Session, id: &str) -> Result<Option<ProjectDetailDto>, String> {
     let dek = *session.dek().map_err(|e| e.to_string())?;
-    let bindings = resolve_bindings(session)?;
-    let (workspace_id, resolved_remote) = {
+    let id = id.trim();
+    if id.is_empty() {
+        return Ok(None);
+    }
+    let (workspace_id, link) = {
         let vault = session.vault().map_err(|e| e.to_string())?;
         let conn = vault.project_conn();
         let workspace_id = ensure_workspace(conn, &dek)?;
-        let resolved = if let Some(adopted) =
-            resolve_adopted(conn, &dek, &workspace_id, &bindings.crm, id)?
-        {
-            adopted.remote_id
-        } else {
-            id.trim().to_string()
-        };
-        (workspace_id, resolved)
+        let links: Vec<(_, ProjectSourceLink)> =
+            list_records_by_type(conn, &dek, &workspace_id, ENTITY_PROJECT_SOURCE_LINK)
+                .map_err(map_err)?;
+        let link = links
+            .into_iter()
+            .map(|(_, link)| link)
+            .find(|l| l.local_project_id == id);
+        (workspace_id, link)
     };
 
     // Local-only follow (no ERP link).
     {
         let vault = session.vault().map_err(|e| e.to_string())?;
         let conn = vault.project_conn();
-        let links: Vec<(_, ProjectSourceLink)> =
-            list_records_by_type(conn, &dek, &workspace_id, ENTITY_PROJECT_SOURCE_LINK)
-                .map_err(map_err)?;
-        let has_link = links.iter().any(|(_, l)| l.local_project_id == id.trim());
-        if !has_link {
+        if link.is_none() {
             if let Ok((meta, project)) =
                 get_record::<LocalProject>(conn, &dek, &workspace_id, id.trim())
             {
@@ -1299,18 +1391,41 @@ pub fn get_detail(session: &Session, id: &str) -> Result<Option<ProjectDetailDto
         }
     }
 
-    if adapters::is_fixture_binding(&bindings.crm) {
-        let vault = session.vault().map_err(|e| e.to_string())?;
-        return build_detail_fixture(
-            vault.project_conn(),
-            &dek,
-            &workspace_id,
-            &bindings.crm,
-            id,
-        );
+    let vault = session.vault().map_err(|e| e.to_string())?;
+    let conn = vault.project_conn();
+    let linked_source = link
+        .as_ref()
+        .map(|link| {
+            get_record::<SourceBinding>(conn, &dek, &workspace_id, &link.source_binding_id)
+                .map(|(_, binding)| binding)
+                .map_err(|_| "此项目的 ERP 来源记录不可用，请重新绑定".to_string())
+        })
+        .transpose()?;
+    if let Some(source) = linked_source
+        .as_ref()
+        .filter(|b| adapters::is_fixture_binding(b))
+    {
+        return build_detail_fixture(conn, &dek, &workspace_id, source, id);
+    }
+    if link.is_none() && Uuid::parse_str(id).is_ok() {
+        return Ok(None);
     }
 
-    match fetch_live_detail_parts(session, &bindings.crm, &bindings.jira, &resolved_remote) {
+    let bindings = resolve_bindings(session)?;
+    if linked_source
+        .as_ref()
+        .is_some_and(|source| !same_crm_source(source, &bindings.crm))
+    {
+        return Err(
+            "此项目绑定的 ERP 来源与当前配置不一致，请切回原来源或在当前来源中重新查询绑定".into(),
+        );
+    }
+    if adapters::is_fixture_binding(&bindings.crm) {
+        return build_detail_fixture(conn, &dek, &workspace_id, &bindings.crm, id);
+    }
+
+    let reference = live_project_reference(id, link.as_ref())?;
+    match fetch_live_detail_parts(session, &bindings.crm, &bindings.jira, reference) {
         Ok(parts) => {
             let vault = session.vault().map_err(|e| e.to_string())?;
             Ok(Some(assemble_live_detail(
@@ -1319,11 +1434,10 @@ pub fn get_detail(session: &Session, id: &str) -> Result<Option<ProjectDetailDto
                 &workspace_id,
                 &bindings.crm,
                 parts,
+                link.as_ref().map(|link| link.remote_id.as_str()),
             )?))
         }
-        Err(err) => Err(format!(
-            "实时 ERP 项目详情加载失败：{err}。请检查 ZoomKey CRM 凭据与网络后重试。"
-        )),
+        Err(err) => Err(format!("实时 ERP 项目详情加载失败：{err}")),
     }
 }
 
@@ -1902,7 +2016,6 @@ pub fn list_summaries(
     dek: &[u8; 32],
 ) -> Result<Vec<ProjectSummaryDto>, String> {
     let workspace_id = ensure_workspace(conn, dek)?;
-    let _bindings = load_workspace_bindings(conn, dek, &workspace_id)?;
     let projects: Vec<(_, LocalProject)> =
         list_records_by_type(conn, dek, &workspace_id, ENTITY_LOCAL_PROJECT).map_err(map_err)?;
     let links: Vec<(_, ProjectSourceLink)> =
@@ -1916,7 +2029,11 @@ pub fn list_summaries(
             .find(|(_, l)| l.local_project_id == project.id)
             .map(|(_, l)| l.clone());
         if let Some(ref link) = link {
-            if fixture::find_remote(&link.remote_id).is_some() {
+            let from_fixture =
+                get_record::<SourceBinding>(conn, dek, &workspace_id, &link.source_binding_id)
+                    .ok()
+                    .is_some_and(|(_, binding)| adapters::is_fixture_binding(&binding));
+            if from_fixture && fixture::find_remote(&link.remote_id).is_some() {
                 out.push(fixture::to_summary(
                     true,
                     Some(project.id.clone()),
@@ -1931,7 +2048,7 @@ pub fn list_summaries(
                 .or_else(|| link.remote_name.clone())
                 .unwrap_or_else(|| number.clone());
             out.push(ProjectSummaryDto {
-                id: link.remote_id.clone(),
+                id: number,
                 crm_id: link.remote_id.clone(),
                 title,
                 stage: "已关注".into(),
@@ -1980,9 +2097,33 @@ mod tests {
     fn adopt_is_idempotent_per_remote_identity() {
         let (vault, dek) = open_vault();
         let conn = vault.project_conn();
-        let first = adopt(conn, &dek, fixture::REMOTE_ID, None, None, None, None, None, None).unwrap();
+        let workspace_id = ensure_workspace(conn, &dek).unwrap();
+        let bindings = load_workspace_bindings(conn, &dek, &workspace_id).unwrap();
+        let first = adopt(
+            conn,
+            &dek,
+            &bindings,
+            fixture::REMOTE_ID,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(first.created);
-        let second = adopt(conn, &dek, fixture::PROJECT_NUMBER, None, None, None, None, None, None).unwrap();
+        let second = adopt(
+            conn,
+            &dek,
+            &bindings,
+            fixture::PROJECT_NUMBER,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(!second.created);
         assert_eq!(first.local_project_id, second.local_project_id);
         assert_eq!(first.remote_id, fixture::REMOTE_ID);
@@ -1993,26 +2134,132 @@ mod tests {
     }
 
     #[test]
+    fn live_project_summary_keeps_number_and_crm_id_separate() {
+        let (vault, dek) = open_vault();
+        let conn = vault.project_conn();
+        let workspace = ensure_workspace(conn, &dek).unwrap();
+        let mut bindings = load_workspace_bindings(conn, &dek, &workspace).unwrap();
+        bindings.crm = upsert_live_binding(
+            conn,
+            &dek,
+            &workspace,
+            PlatformKind::ZoomkeyCrm,
+            "https://crm.example.test",
+            "read-only",
+            "test-credential",
+        )
+        .unwrap();
+        assert!(adopt(conn, &dek, &bindings, "PROJ42", None, None, None, None, None).is_err());
+        let adopted = adopt(
+            conn,
+            &dek,
+            &bindings,
+            "30x721",
+            Some("PROJ42"),
+            Some("Test project"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let summaries = list_summaries(conn, &dek).unwrap();
+        assert_eq!(summaries[0].id, "PROJ42");
+        assert_eq!(summaries[0].crm_id, "30x721");
+        assert_eq!(
+            summaries[0].local_project_id.as_deref(),
+            Some(adopted.local_project_id.as_str())
+        );
+        let mut links: Vec<(_, ProjectSourceLink)> =
+            list_records_by_type(conn, &dek, &workspace, ENTITY_PROJECT_SOURCE_LINK).unwrap();
+        let (_, mut link) = links.pop().unwrap();
+        assert_eq!(link.source_binding_id, bindings.crm.id);
+        assert_eq!(
+            live_project_reference(&adopted.local_project_id, Some(&link)).unwrap(),
+            "30x721"
+        );
+        link.remote_id = "721".into();
+        assert_eq!(
+            live_project_reference(&adopted.local_project_id, Some(&link)).unwrap(),
+            "PROJ42"
+        );
+        link.remote_key = None;
+        assert!(live_project_reference(&adopted.local_project_id, Some(&link)).is_err());
+        link.remote_id = "PROJ42".into();
+        assert_eq!(
+            live_project_reference(&adopted.local_project_id, Some(&link)).unwrap(),
+            "PROJ42"
+        );
+
+        let other = upsert_live_binding(
+            conn,
+            &dek,
+            &workspace,
+            PlatformKind::ZoomkeyCrm,
+            "https://crm.example.test/another-instance",
+            "read-only",
+            "test-credential",
+        )
+        .unwrap();
+        assert_ne!(other.id, link.source_binding_id);
+        assert!(!same_crm_source(&other, &bindings.crm));
+        assert_eq!(
+            site_from_base("https://crm.example.test/crm/webservice.php"),
+            "https://crm.example.test/crm"
+        );
+    }
+
+    #[test]
+    fn crm_selection_prefers_explicit_then_the_only_configured_profile() {
+        let candidates =
+            ["unconfigured", "configured"].map(|id| zoomkey::ZoomkeyCredentialOption {
+                id: id.into(),
+                title: String::new(),
+                account: None,
+            });
+        let profile =
+            |id: &str| Ok((id == "configured").then(|| "https://crm.example.test".to_string()));
+        let (selected, origin) = select_crm_credential("", &candidates, profile)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.id, "configured");
+        assert_eq!(origin.as_deref(), Some("https://crm.example.test"));
+        let (selected, origin) = select_crm_credential("unconfigured", &candidates, profile)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.id, "unconfigured");
+        assert_eq!(origin, None); // explicitly selected legacy endpoint
+        assert!(select_crm_credential("deleted", &candidates, profile).is_err());
+        assert!(select_crm_credential("", &candidates, |_| Ok(Some(
+            "https://crm.example.test".into()
+        )))
+        .is_err());
+    }
+
+    #[test]
     fn search_fixture_keyword_and_detail_overlays() {
         let (vault, dek) = open_vault();
         let conn = vault.project_conn();
         // Fixture-path unit test (no live Session credentials).
         let workspace_id = ensure_workspace(conn, &dek).unwrap();
         let bindings = load_workspace_bindings(conn, &dek, &workspace_id).unwrap();
-        let (items, warnings) = search_remote_fixture(
-            conn,
-            &dek,
-            &workspace_id,
-            &bindings.crm,
-            "徐矿",
-            vec![],
-        )
-        .unwrap();
+        let (items, warnings) =
+            search_remote_fixture(conn, &dek, &workspace_id, &bindings.crm, "徐矿").unwrap();
         assert_eq!(items.len(), 1);
         assert!(!items[0].adopted);
-        assert!(warnings.iter().any(|w| w.contains("fixture PROJ3733")));
+        assert!(warnings.is_empty());
 
-        let adopted = adopt(conn, &dek, "PROJ3733", None, None, None, None, None, None).unwrap();
+        let adopted = adopt(
+            conn,
+            &dek,
+            &bindings,
+            fixture::PROJECT_NUMBER,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(adopted.created);
 
         set_short_name(

@@ -222,6 +222,7 @@ fn validate_secret_patch(kind: &EntryKind, patch: &serde_json::Map<String, serde
         EntryKind::Server => ["host", "port", "protocol", "username", "password"].into_iter().collect(),
         EntryKind::Database => ["engine", "host", "port", "database", "username", "password"].into_iter().collect(),
         EntryKind::ClientCert => ["passphrase"].into_iter().collect(),
+        EntryKind::Vpn => ["username", "password", "login_url"].into_iter().collect(),
     };
     for key in patch.keys() {
         if !allowed.contains(key.as_str()) { return Err(invalid(format!("secret field {key} is not patchable"))); }
@@ -233,7 +234,7 @@ fn nullable_secret_field(key: &str) -> bool {
     matches!(
         key,
         "url" | "username" | "totp_secret" | "account" | "passphrase" | "public_fingerprint"
-            | "imap_host" | "imap_port" | "smtp_host" | "smtp_port" | "port"
+            | "imap_host" | "imap_port" | "smtp_host" | "smtp_port" | "port" | "login_url"
     )
 }
 

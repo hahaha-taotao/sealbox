@@ -1,5 +1,40 @@
 import { invoke } from "@tauri-apps/api/core";
 
+export interface VpnConnection {
+  id: string;
+  client: "atrust" | "easy_connect" | "open_vpn_connect" | "clash" | "tailscale";
+  label: string;
+  gateway: string;
+}
+export interface VpnPortal {
+  id: string;
+  name: string;
+  target_kind: "url" | "app";
+  target: string;
+  connection_id: string;
+  account_ids: string[];
+  default_account_id: string | null;
+  ask_each_time: boolean;
+  auto_submit: boolean;
+}
+export interface VpnWorkbench {
+  connections: VpnConnection[];
+  portals: VpnPortal[];
+}
+export interface VpnDeskView {
+  workbench: VpnWorkbench;
+  accounts: { id: string; title: string; account: string | null; url: string | null; alive: boolean }[];
+  clients: { client: VpnConnection["client"]; installed: boolean; path: string | null }[];
+  windows: boolean;
+  fill_mode: string;
+  fill_note: string;
+}
+export interface VpnConnectResult {
+  session_id: number;
+  started: boolean;
+  message: string;
+}
+
 export type EntryKind =
   | "website"
   | "api_token"
@@ -8,7 +43,8 @@ export type EntryKind =
   | "mail_auth"
   | "server"
   | "database"
-  | "client_cert";
+  | "client_cert"
+  | "vpn";
 
 export interface EntryDto {
   id: string;
@@ -284,6 +320,7 @@ export interface Counts {
   server: number;
   database: number;
   client_cert: number;
+  vpn: number;
   trash: number;
 }
 
@@ -508,7 +545,8 @@ export type SecretPayload =
       username: string;
       password: string;
     }
-  | { type: "client_cert"; cert_pem: string; key_pem: string; passphrase?: string | null };
+  | { type: "client_cert"; cert_pem: string; key_pem: string; passphrase?: string | null }
+  | { type: "vpn"; username?: string | null; password: string; login_url?: string | null };
 
 export interface UpsertEntry {
   id?: string | null;
@@ -526,6 +564,13 @@ export interface UpsertEntry {
 
 export const api = {
   status: () => invoke<Status>("get_status"),
+  vpnGet: () => invoke<VpnDeskView>("vpn_workbench_get"),
+  vpnSave: (workbench: VpnWorkbench) => invoke<VpnWorkbench>("vpn_workbench_save", { workbench }),
+  vpnConnect: (connectionId: string) => invoke<VpnConnectResult>("vpn_connect", { connectionId }),
+  vpnCancel: (sessionId: number) => invoke("vpn_cancel", { sessionId }),
+  vpnFinishOpen: (sessionId: number) => invoke("vpn_finish_open", { sessionId }),
+  vpnPlan: (portalId: string, reachable: boolean, explicitSwitch: boolean) =>
+    invoke<string>("vpn_plan", { portalId, reachable, explicitSwitch }),
   setup: (password: string) => invoke("setup_vault", { password }),
   unlock: (password: string) => invoke("unlock_vault", { password }),
   list: (filter: ListFilter) => invoke<EntryDto[]>("list_entries", { filter }),

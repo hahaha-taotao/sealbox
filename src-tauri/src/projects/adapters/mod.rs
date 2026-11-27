@@ -65,7 +65,10 @@ pub(crate) fn open_desktop_runtime(
         return Err(ToolFailure::validation("SourceBinding 缺少凭据引用"));
     }
 
-    if let Ok(Some(profile)) = vault.credential_profile(dek, cred) {
+    if let Some(profile) = vault
+        .credential_profile(dek, cred)
+        .map_err(|_| ToolFailure::validation("无法读取所选 ZoomKey 凭据的 Profile"))?
+    {
         let expected = if label == "jira" {
             "zoomkey_jira"
         } else {
@@ -87,6 +90,6 @@ pub(crate) fn open_desktop_runtime(
     }
 
     Err(ToolFailure::validation(format!(
-        "凭据 {cred} 没有可用的 ZoomKey {label} Profile，也未匹配 MCP 策略凭据"
+        "所选凭据没有可用的 ZoomKey {label} Profile，也未匹配 ZoomKey 设置"
     )))
 }

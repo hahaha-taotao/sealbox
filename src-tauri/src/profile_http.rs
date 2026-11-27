@@ -560,6 +560,7 @@ impl Secrets {
                 for line in key_pem.lines().filter(|line| !line.starts_with("-----") && line.len() >= 16).take(256) { self.add(line); }
             }
             SecretPayload::Ssh { private_key, passphrase, .. } => { self.add(private_key); if let Some(passphrase) = passphrase { self.add(passphrase); } }
+            SecretPayload::Vpn { username, password, .. } => { self.add(password); if let Some(username) = username { self.add(username); } }
         }
     }
 

@@ -236,7 +236,8 @@ pub fn bind_origins(
         SecretPayload::Mailbox { .. }
         | SecretPayload::Server { .. }
         | SecretPayload::Database { .. }
-        | SecretPayload::ClientCert { .. } => {
+        | SecretPayload::ClientCert { .. }
+        | SecretPayload::Vpn { .. } => {
             Err("该类型凭据不能用于 http_request，请选 API Token 或网站账号".into())
         }
     }

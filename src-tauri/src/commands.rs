@@ -97,7 +97,7 @@ pub fn persisted_hotkey(path: &Path) -> Option<String> {
     }
 }
 
-fn map_err(e: impl ToString) -> String {
+pub(crate) fn map_err(e: impl ToString) -> String {
     e.to_string()
 }
 
@@ -733,6 +733,7 @@ fn primary_secret(payload: &SecretPayload) -> Result<String, String> {
         SecretPayload::Server { password, .. } => Ok(password.clone()),
         SecretPayload::Database { password, .. } => Ok(password.clone()),
         SecretPayload::ClientCert { .. } => Err("客户端证书私钥不能通过通用复制功能导出".into()),
+        SecretPayload::Vpn { password, .. } => Ok(password.clone()),
     }
 }
 
@@ -746,6 +747,7 @@ fn account_of(payload: &SecretPayload) -> Option<String> {
         SecretPayload::Server { username, .. } => Some(username.clone()),
         SecretPayload::Database { username, .. } => Some(username.clone()),
         SecretPayload::ClientCert { .. } => None,
+        SecretPayload::Vpn { username, .. } => username.clone(),
     }
 }
 

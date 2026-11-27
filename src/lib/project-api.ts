@@ -180,6 +180,7 @@ export interface AdoptResultDto {
 
 export interface AdoptInput {
   remoteId: string;
+  sourceBindingId?: string;
   remoteKey?: string;
   remoteName?: string;
   owner?: string;
@@ -336,7 +337,8 @@ function toDetail(project: FixtureProject): ProjectDetailDto {
 
 function findProject(remoteOrNumber: string): FixtureProject | undefined {
   return fixtureStore.projects.find(
-    (p) => p.id === remoteOrNumber || p.crmId === remoteOrNumber,
+    (p) => p.id === remoteOrNumber || p.crmId === remoteOrNumber ||
+      fixtureStore.adopted.get(p.crmId)?.localProjectId === remoteOrNumber,
   );
 }
 
@@ -497,18 +499,16 @@ export async function searchProjects(query = ""): Promise<RemoteSearchPage> {
     complete: true,
     fetchedAt: new Date().toISOString(),
     sourceBindingId: "fixture-crm",
-    warnings: ["remote adapter: fixture PROJ3733 (offline fallback)"],
+    warnings: results.length ? [] : ["离线演示数据中没有匹配项目"],
   });
 }
 
-/** Load full project detail by number (PROJ3733) or CRM id (30x564318). */
-export async function getProjectDetail(remoteOrNumber: string): Promise<ProjectDetailDto | null> {
+/** Load project detail by local project ID, CRM record ID, or project number. */
+export async function getProjectDetail(id: string): Promise<ProjectDetailDto | null> {
   if (canInvoke()) {
-    return invoke<ProjectDetailDto | null>("project_get", {
-      request: { id: remoteOrNumber },
-    });
+    return invoke<ProjectDetailDto | null>("project_get", { request: { id } });
   }
-  const project = findProject(remoteOrNumber);
+  const project = findProject(id);
   if (!project) return stubDelay(null);
   return stubDelay(toDetail(project));
 }
@@ -520,6 +520,7 @@ export async function adoptProject(input: string | AdoptInput): Promise<AdoptRes
     return invoke<AdoptResultDto>("project_adopt", {
       request: {
         remoteId: req.remoteId,
+        sourceBindingId: req.sourceBindingId ?? null,
         remoteKey: req.remoteKey ?? null,
         remoteName: req.remoteName ?? null,
         owner: req.owner ?? null,

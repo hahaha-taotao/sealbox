@@ -432,6 +432,7 @@ fn primary_secret(payload: &SecretPayload) -> Result<String, String> {
         SecretPayload::Server { password, .. } => Ok(password.clone()),
         SecretPayload::Database { password, .. } => Ok(password.clone()),
         SecretPayload::ClientCert { .. } => Err("客户端证书私钥不能复制".into()),
+        SecretPayload::Vpn { password, .. } => Ok(password.clone()),
     }
 }
 
@@ -442,6 +443,7 @@ fn account_of(payload: &SecretPayload) -> Option<String> {
         SecretPayload::Mailbox { email, .. } | SecretPayload::MailAuth { email, .. } => Some(email.clone()),
         SecretPayload::Server { username, .. } | SecretPayload::Database { username, .. } => Some(username.clone()),
         SecretPayload::Ssh { .. } | SecretPayload::ClientCert { .. } => None,
+        SecretPayload::Vpn { username, .. } => username.clone(),
     }
 }
 

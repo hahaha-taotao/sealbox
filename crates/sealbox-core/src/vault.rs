@@ -90,6 +90,7 @@ pub enum EntryKind {
     Server,
     Database,
     ClientCert,
+    Vpn,
 }
 
 impl EntryKind {
@@ -103,6 +104,7 @@ impl EntryKind {
             Self::Server => "server",
             Self::Database => "database",
             Self::ClientCert => "client_cert",
+            Self::Vpn => "vpn",
         }
     }
 
@@ -116,6 +118,7 @@ impl EntryKind {
             "server" => Ok(Self::Server),
             "database" => Ok(Self::Database),
             "client_cert" => Ok(Self::ClientCert),
+            "vpn" => Ok(Self::Vpn),
             _ => Err(VaultError::InvalidKind),
         }
     }
@@ -132,6 +135,7 @@ impl SecretPayload {
             Self::Server { .. } => EntryKind::Server,
             Self::Database { .. } => EntryKind::Database,
             Self::ClientCert { .. } => EntryKind::ClientCert,
+            Self::Vpn { .. } => EntryKind::Vpn,
         }
     }
 }
@@ -285,6 +289,12 @@ pub enum SecretPayload {
         cert_pem: String,
         key_pem: String,
         passphrase: Option<String>,
+    },
+    /// VPN 账号。密码只进加密 payload，不写入入口设置。
+    Vpn {
+        username: Option<String>,
+        password: String,
+        login_url: Option<String>,
     },
 }
 
@@ -634,6 +644,16 @@ impl Vault {
                     .map(|metadata| metadata.fingerprint.clone()),
                 input.account.clone(),
                 input.url.clone(),
+            ),
+            SecretPayload::Vpn {
+                username,
+                login_url,
+                ..
+            } => (
+                false,
+                None,
+                username.clone().or(input.account.clone()),
+                login_url.clone().or(input.url.clone()),
             ),
         };
         // Upserts preserve an existing profile, but may not change the secret
@@ -1989,6 +2009,7 @@ impl Vault {
                 "server" => counts.server = n,
                 "database" => counts.database = n,
                 "client_cert" => counts.client_cert = n,
+                "vpn" => counts.vpn = n,
                 _ => {}
             }
             counts.total += n;
@@ -2112,6 +2133,7 @@ impl Vault {
                 EntryKind::Server => counts.server += 1,
                 EntryKind::Database => counts.database += 1,
                 EntryKind::ClientCert => counts.client_cert += 1,
+                EntryKind::Vpn => counts.vpn += 1,
             }
             counts.total += 1;
         }
@@ -2237,6 +2259,14 @@ impl Vault {
                 Self::push_port(&mut fields, "端口", port);
                 Self::push_field(&mut fields, "库名", Some(database.as_str()));
                 Self::push_field(&mut fields, "用户名", Some(username.as_str()));
+            }
+            SecretPayload::Vpn {
+                username,
+                login_url,
+                ..
+            } => {
+                Self::push_field(&mut fields, "账号", username.as_deref());
+                Self::push_field(&mut fields, "登录网站", login_url.as_deref());
             }
             SecretPayload::ClientCert {
                 cert_pem,
@@ -2816,6 +2846,7 @@ pub struct Counts {
     pub server: i64,
     pub database: i64,
     pub client_cert: i64,
+    pub vpn: i64,
     pub trash: i64,
 }
 

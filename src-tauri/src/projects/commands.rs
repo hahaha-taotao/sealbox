@@ -55,18 +55,8 @@ pub fn project_adopt(
     state: State<'_, AppState>,
     request: AdoptRequest,
 ) -> Result<AdoptResultDto, String> {
-    with_project_store(&state, |conn, dek| {
-        service::adopt(
-            conn,
-            dek,
-            &request.remote_id,
-            request.source_binding_id.as_deref(),
-            request.remote_key.as_deref(),
-            request.remote_name.as_deref(),
-            request.owner.as_deref(),
-            request.short_name.as_deref(),
-            request.stage.as_deref(),
-        )
+    with_remote_session(&state, |session| {
+        service::adopt_from_session(session, request)
     })
 }
 

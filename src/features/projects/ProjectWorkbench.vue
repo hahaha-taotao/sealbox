@@ -55,7 +55,7 @@ let toastTimer: ReturnType<typeof setTimeout> | null = null;
 
 const clients = ref<ErpClientDto[]>([]);
 const sources = ref<SourceBindingSummaryDto[]>([]);
-const searchWarnings = ref<string[]>([]);
+const sourcesError = ref("");
 
 const dataMode = computed<"live" | "fixture">(() => {
   if (detail.value?.dataSource === "live") return "live";
@@ -64,11 +64,13 @@ const dataMode = computed<"live" | "fixture">(() => {
   return crm && !crm.isFixture ? "live" : "fixture";
 });
 
-const modeBanner = computed(() =>
-  dataMode.value === "live"
-    ? "实时 ERP · 使用 ZoomKey CRM/Jira 凭据"
-    : "离线夹具 · PROJ3733 演示数据（未绑定 ZoomKey 凭据时）",
-);
+const modeBanner = computed(() => {
+  if (sourcesError.value) return `ERP 来源配置不可用：${sourcesError.value}`;
+  if (!sources.value.length) return "ERP 来源尚未加载";
+  return dataMode.value === "live"
+    ? "实时 ERP · 通过已配置的 ZoomKey 凭据查询"
+    : "离线夹具 · PROJ3733 演示数据（未配置 ZoomKey 凭据时）";
+});
 
 // Modal state
 type ModalKind =
@@ -99,8 +101,11 @@ const bindKeyword = ref("");
 const bindResults = ref<ProjectSummaryDto[]>([]);
 const bindBusy = ref(false);
 const bindError = ref("");
+const bindWarnings = ref<string[]>([]);
+const bindSourceId = ref<string>();
 let bindTimer: ReturnType<typeof setTimeout> | null = null;
 let bindSeq = 0;
+let detailSeq = 0;
 const createTitle = ref("");
 const createShort = ref("");
 
@@ -117,69 +122,74 @@ function toast(message: string) {
 }
 
 async function refreshSources() {
+  sourcesError.value = "";
   try {
     sources.value = await listProjectSources();
-  } catch {
+  } catch (e) {
     sources.value = [];
+    sourcesError.value = String(e);
   }
 }
 
 async function refreshList() {
   projects.value = await listMyProjects();
-  // Keep searchWarnings for bind modal / source issues only; rail filter is local.
+}
+
+async function loadDetail(id: string) {
+  const seq = ++detailSeq;
+  loading.value = true;
+  try {
+    const next = await getProjectDetail(id);
+    if (seq === detailSeq) detail.value = next;
+  } catch (e) {
+    if (seq === detailSeq) {
+      detail.value = null;
+      toast(String(e));
+    }
+  } finally {
+    if (seq === detailSeq) loading.value = false;
+  }
 }
 
 async function openProject(id: string) {
   selectedId.value = id;
+  detail.value = null;
   tab.value = "cost";
   costView.value = "budget";
   jiraView.value = "project";
-  loading.value = true;
-  try {
-    detail.value = await getProjectDetail(id);
-  } catch (e) {
-    detail.value = null;
-    toast(String(e));
-  } finally {
-    loading.value = false;
-  }
+  await loadDetail(id);
 }
 
 async function reloadDetail() {
   if (!selectedId.value) return;
-  try {
-    detail.value = await getProjectDetail(selectedId.value);
-  } catch (e) {
-    toast(String(e));
-  }
+  await loadDetail(selectedId.value);
   await refreshList();
 }
 
 async function refreshAll() {
-  loading.value = true;
-  try {
-    await refreshSources();
-    await refreshList();
-    if (selectedId.value) {
-      try {
-        detail.value = await getProjectDetail(selectedId.value);
-      } catch (e) {
-        toast(String(e));
-      }
-    } else if (projects.value.length) {
-      await openProject(projects.value[0].id);
-    }
-  } finally {
-    loading.value = false;
-  }
+  await refreshSources();
+  await refreshList();
+  const first = projects.value[0];
+  if (selectedId.value) await loadDetail(selectedId.value);
+  else if (first) await openProject(first.localProjectId || first.crmId || first.id);
 }
 
 // query only filters the local rail list — no ERP round-trip.
 
-async function openBindModal() {
-  bindKeyword.value = "";
+function resetBindSearch() {
+  if (bindTimer) clearTimeout(bindTimer);
+  bindTimer = null;
+  bindSeq++;
   bindResults.value = [];
+  bindSourceId.value = undefined;
   bindError.value = "";
+  bindWarnings.value = [];
+  bindBusy.value = false;
+}
+
+function openBindModal() {
+  resetBindSearch();
+  bindKeyword.value = "";
   modalKind.value = "bind-erp";
 }
 
@@ -189,47 +199,45 @@ async function openCreateModal() {
   modalKind.value = "create-local";
 }
 
-async function runBindSearch() {
-  const kw = bindKeyword.value.trim();
-  if (!kw) {
-    bindResults.value = [];
-    bindError.value = "";
-    bindBusy.value = false;
-    return;
-  }
-  const seq = ++bindSeq;
-  bindBusy.value = true;
-  bindError.value = "";
+async function runBindSearch(keyword: string, seq: number) {
   try {
-    const page = await searchProjects(kw);
+    const page = await searchProjects(keyword);
     if (seq !== bindSeq) return;
     bindResults.value = page.items;
-    searchWarnings.value = page.warnings ?? [];
-    if (!page.items.length) {
-      bindError.value = (page.warnings && page.warnings[0]) || "没有匹配的 ERP 项目";
+    bindSourceId.value = page.sourceBindingId;
+    bindWarnings.value = page.warnings ?? [];
+    if (!page.items.length && !bindWarnings.value.length) {
+      bindError.value = "没有匹配的 ERP 项目";
     }
   } catch (e) {
-    if (seq !== bindSeq) return;
-    bindResults.value = [];
-    bindError.value = String(e);
+    if (seq === bindSeq) bindError.value = String(e);
   } finally {
     if (seq === bindSeq) bindBusy.value = false;
   }
 }
 
-// 输入即搜：防抖 260ms，避免每个字符都打 ERP。
-watch(bindKeyword, () => {
-  if (bindTimer) clearTimeout(bindTimer);
+// Invalidate in-flight results immediately, not when the next debounce fires.
+watch(bindKeyword, (value) => {
+  resetBindSearch();
+  const keyword = value.trim();
+  if (modalKind.value !== "bind-erp" || !keyword) return;
+  const seq = bindSeq;
+  bindBusy.value = true;
   bindTimer = setTimeout(() => {
-    void runBindSearch();
+    bindTimer = null;
+    void runBindSearch(keyword, seq);
   }, 260);
-});
+}, { flush: "sync" });
 
 async function bindRemote(summary: ProjectSummaryDto) {
+  if (bindBusy.value || !summary.crmId || !bindSourceId.value) return;
+  const seq = bindSeq;
   bindBusy.value = true;
+  bindError.value = "";
   try {
     const result = await adoptProject({
-      remoteId: summary.crmId || summary.id,
+      remoteId: summary.crmId,
+      sourceBindingId: bindSourceId.value,
       remoteKey: summary.id,
       remoteName: summary.title,
       owner: summary.owner,
@@ -237,13 +245,15 @@ async function bindRemote(summary: ProjectSummaryDto) {
       stage: summary.stage,
     });
     toast(result.created ? "已绑定到我的项目" : "已在我的项目中");
-    modalKind.value = null;
     await refreshList();
-    await openProject(summary.crmId || summary.id);
+    if (seq === bindSeq) {
+      closeModal();
+      await openProject(result.localProjectId);
+    }
   } catch (e) {
-    bindError.value = String(e);
+    if (seq === bindSeq) bindError.value = String(e);
   } finally {
-    bindBusy.value = false;
+    if (seq === bindSeq) bindBusy.value = false;
   }
 }
 
@@ -266,20 +276,18 @@ async function submitCreateLocal() {
 
 onMounted(async () => {
   clients.value = await listClients();
-  await refreshSources();
-  await refreshList();
-  if (projects.value.length) {
-    await openProject(projects.value[0].id);
-  }
+  await refreshAll();
 });
 
 onBeforeUnmount(() => {
   if (bindTimer) clearTimeout(bindTimer);
   bindSeq++;
+  detailSeq++;
   if (toastTimer) clearTimeout(toastTimer);
 });
 
 function closeModal() {
+  if (modalKind.value === "bind-erp") resetBindSearch();
   modalKind.value = null;
   modalStaff.value = null;
   modalTask.value = null;
@@ -506,9 +514,6 @@ const rangeCatalogOptions = computed(() => {
       <p :class="dataMode === 'live' ? 'pq-info' : 'pq-notice'" style="margin-top: 10px">
         {{ modeBanner }}
       </p>
-      <ul v-if="searchWarnings.length" class="pq-notice" style="margin-top: 8px; list-style: disc; padding-left: 1.4em">
-        <li v-for="(w, i) in searchWarnings" :key="i">{{ w }}</li>
-      </ul>
       <ul
         v-if="detail?.warnings?.length"
         class="pq-notice"
@@ -644,19 +649,21 @@ const rangeCatalogOptions = computed(() => {
       </section>
     </div>
 
-    <!-- Bind customer -->
     <ProjectModal
       :open="modalKind === 'bind-erp'"
       title="绑定 ERP 项目"
       @close="closeModal"
     >
-      <p class="pq-muted">按项目编号或名称精确查询后纳入「我的项目」。不会在打开页面时拉取全部 ERP 项目。</p>
+      <p class="pq-muted">输入项目编号、项目名称或客户公司名称的片段，也可以输入完整 CRM ID。</p>
       <div class="pq-row" style="gap:8px;margin:10px 0">
-        <input class="pq-search" v-model="bindKeyword" placeholder="输入项目编号或名称，自动查询…" />
-        <span class="pq-pill" v-if="bindBusy">查询中…</span>
+        <input class="pq-search" v-model="bindKeyword" placeholder="输入项目或客户关键词，自动查询…" />
+        <span class="pq-pill" v-if="bindBusy">{{ bindResults.length ? "绑定中…" : "查询中…" }}</span>
       </div>
       <p v-if="bindError" class="pq-warn">{{ bindError }}</p>
-      <div v-for="item in bindResults" :key="item.crmId || item.id" class="pq-row pq-between" style="margin-top:8px;gap:8px">
+      <ul v-if="bindWarnings.length" class="pq-notice" aria-live="polite">
+        <li v-for="warning in bindWarnings" :key="warning">{{ warning }}</li>
+      </ul>
+      <div v-for="item in bindResults" :key="item.crmId" class="pq-row pq-between" style="margin-top:8px;gap:8px">
         <div>
           <div class="pq-mono">{{ item.id }} · {{ item.crmId }}</div>
           <strong>{{ item.title }}</strong>

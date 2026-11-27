@@ -23,6 +23,7 @@ pub mod session;
 pub mod secure_store;
 pub mod transfer;
 pub mod zoomkey;
+pub mod vpn_desk;
 
 use commands::AppState;
 use tauri::menu::{Menu, MenuItem};
@@ -171,6 +172,12 @@ pub fn run() {
             commands::window_control,
             commands::confirm_payload,
             commands::confirm_respond,
+            vpn_desk::vpn_workbench_get,
+            vpn_desk::vpn_workbench_save,
+            vpn_desk::vpn_connect,
+            vpn_desk::vpn_cancel,
+            vpn_desk::vpn_finish_open,
+            vpn_desk::vpn_plan,
         ])
         .setup(|app| {
             let show_app = app.handle().clone();

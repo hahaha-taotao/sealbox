@@ -171,6 +171,7 @@ impl Drop for SyncEntry {
                     engine.zeroize(); host.zeroize(); database.zeroize(); username.zeroize(); password.zeroize();
                 }
                 SecretPayload::ClientCert { cert_pem, key_pem, passphrase } => { cert_pem.zeroize(); key_pem.zeroize(); passphrase.zeroize(); }
+                SecretPayload::Vpn { username, password, login_url } => { username.zeroize(); password.zeroize(); login_url.zeroize(); }
             }
         }
     }

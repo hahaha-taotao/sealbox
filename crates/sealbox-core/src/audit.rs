@@ -356,6 +356,7 @@ pub fn format_event(raw: AuditEvent) -> AuditDisplay {
                         ("server", "服务器"),
                         ("database", "数据库"),
                         ("client_cert", "客户端证书"),
+                        ("vpn", "VPN 账号"),
                     ],
                     kind,
                 ) {

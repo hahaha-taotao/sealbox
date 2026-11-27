@@ -7,6 +7,7 @@ import packageJson from "../package.json";
 import { DB_ENGINES } from "./lib/entry-options";
 import CredentialProfileEditor from "./components/CredentialProfileEditor.vue";
 import ProjectWorkbench from "./features/projects/ProjectWorkbench.vue";
+import VpnWorkbench from "./features/vpn/VpnWorkbench.vue";
 import { resetProjectFixtures } from "./lib/project-api";
 import { auditDateBounds, createAuditRequestGuard } from "./lib/audit-request";
 import { mailMessageKey, mergeMailInbox, type InboxMessage } from "./lib/mail-inbox.mjs";
@@ -110,7 +111,7 @@ let mailBodySeq = 0;
 // 每个 srcdoc 文档只挂一次链接转发监听；文档换掉后自然失效。
 const mailLinkedDocuments = new WeakSet<Document>();
 const mailRecipient = computed(() => mailAccounts.value.find((account) => account.id === (mailSelected.value?.entryId ?? mailAccountId.value))?.email ?? "");
-  type Page = "home" | "vault" | "audit" | "settings" | "mcp" | "plugin" | "mail" | "projects";
+  type Page = "home" | "vault" | "audit" | "settings" | "mcp" | "plugin" | "mail" | "projects" | "vpn";
 const page = ref<Page>("vault");
 const history = ref<Page[]>(["vault"]);
 const historyIndex = ref(0);
@@ -240,6 +241,7 @@ const KIND_ITEMS: { id: EntryKind; label: string }[] = [
   { id: "server", label: "服务器" },
   { id: "database", label: "数据库" },
   { id: "client_cert", label: "客户端证书" },
+  { id: "vpn", label: "VPN 账号" },
 ];
 const selectedKindIds = computed(() => {
   const ids = [...(filter.kinds ?? [])];
@@ -254,6 +256,7 @@ const crumb = computed(() => {
   if (page.value === "plugin") return "插件";
   if (page.value === "mail") return "邮箱";
   if (page.value === "projects") return "项目";
+  if (page.value === "vpn") return "VPN";
   if (filter.trash) return "回收站";
   const selectedKinds = selectedKindIds.value;
   if (selectedKinds.length === 1) {
@@ -277,6 +280,7 @@ function kindLabel(k: EntryKind) {
     case "server": return "服务器";
     case "database": return "数据库";
     case "client_cert": return "客户端证书";
+    case "vpn": return "VPN 账号";
   }
 }
 function kindCount(k: EntryKind) {
@@ -1121,6 +1125,10 @@ async function openEdit(row: EntryDto) {
     form.db_name = secret.database;
     form.account = secret.username;
     form.password = secret.password;
+  } else if (secret.type === "vpn") {
+    form.password = secret.password;
+    form.account = secret.username || form.account;
+    form.url = secret.login_url || form.url;
   } else if (secret.type === "ssh") {
     form.private_key = secret.private_key;
     form.key_type = secret.key_type;
@@ -1178,6 +1186,16 @@ function buildSecret(): SecretPayload {
   }
   if (form.kind === "client_cert") {
     throw new Error("客户端证书请使用文件导入");
+  }
+  if (form.kind === "vpn") {
+    const login = form.url.trim();
+    if (login && !login.startsWith("https://")) throw new Error("VPN 登录网站必须是 https:// 地址");
+    return {
+      type: "vpn",
+      username: form.account || null,
+      password: form.password,
+      login_url: login || null,
+    };
   }
   return {
     type: "ssh",
@@ -3233,6 +3251,14 @@ onMounted(async () => {
           <span>邮箱</span>
           <em v-if="mailBadgeLabel" class="rail-badge">{{ mailBadgeLabel }}</em>
         </button>
+        <button class="rail-btn" :class="{ active: page === 'vpn' }" @click="goPage('vpn')">
+          <span class="icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3 5 6v6c0 4.5 3 7 7 9 4-2 7-4.5 7-9V6l-7-3z" />
+            </svg>
+          </span>
+          <span>VPN</span>
+        </button>
         <button class="rail-btn" :class="{ active: page === 'projects' }" @click="goPage('projects')">
           <span class="icon" aria-hidden="true">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -3900,6 +3926,9 @@ onMounted(async () => {
         </div>
       </section>
 
+      <section class="main" v-else-if="page === 'vpn'">
+        <VpnWorkbench />
+      </section>
       <section class="main" v-else-if="page === 'projects'">
         <ProjectWorkbench />
       </section>
@@ -4175,11 +4204,13 @@ onMounted(async () => {
             <option value="server">服务器账号</option>
             <option value="database">数据库</option>
             <option value="client_cert">客户端证书</option>
+            <option value="vpn">VPN 账号</option>
           </select>
         </div>
         <div class="field"><label>键名</label><input v-model="form.title" /></div>
         <div class="field" v-if="form.kind !== 'ssh' && form.kind !== 'mailbox' && form.kind !== 'mail_auth' && form.kind !== 'client_cert'"><label>{{ form.kind === 'server' || form.kind === 'database' ? '用户名' : '账号' }}</label><input v-model="form.account" @input="form.kind === 'website' && clearWebsiteDuplicateState()" /></div>
         <div class="field" v-if="form.kind === 'website'"><label>网址</label><input v-model="form.url" @input="clearWebsiteDuplicateState" /></div>
+        <div class="field" v-if="form.kind === 'vpn'"><label>登录网站（可选，https）</label><input v-model="form.url" placeholder="https://vpn.example/login" /></div>
         <div v-if="form.kind === 'website' && websiteDuplicates.length" class="duplicate-warning">
           <strong>已有 {{ websiteDuplicates.length }} 条同站同账号</strong>
           <p class="crumb">不会自动覆盖。请选择已有条目，或明确确认仍然新建。</p>
@@ -4195,7 +4226,7 @@ onMounted(async () => {
             <button class="btn danger" type="button" @click="continueWithWebsiteDuplicate">仍然新建</button>
           </div>
         </div>
-        <div class="field" v-if="form.kind === 'website' || form.kind === 'mailbox' || form.kind === 'server' || form.kind === 'database'">
+        <div class="field" v-if="form.kind === 'website' || form.kind === 'mailbox' || form.kind === 'server' || form.kind === 'database' || form.kind === 'vpn'">
           <label>密码</label>
           <div class="secret-row generator-row">
             <input v-model="form.password" type="password" />

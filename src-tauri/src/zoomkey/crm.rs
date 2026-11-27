@@ -820,7 +820,7 @@ pub(crate) fn retrieve_inner(runtime: &EndpointRuntime, id: &str) -> Result<Valu
 
 /// Escape a string literal for Vtiger SELECT WHERE clauses built by desktop adapters.
 pub(crate) fn escape_sql_literal(value: &str) -> String {
-    escape_sql(value)
+    escape_sql(&value.replace('\\', "\\\\"))
 }
 
 fn raw_query(
@@ -1013,7 +1013,8 @@ fn call_operation(
         }
         Err(ureq::Error::Transport(error)) => {
             return Err(ToolFailure {
-                message: format!("CRM 网络请求失败: {error}"),
+                // Transport's Display can contain the URL with sessionName and query.
+                message: format!("CRM 网络请求失败（{:?}）", error.kind()),
                 status: None,
                 reason: "network",
                 detail: String::new(),
@@ -1207,13 +1208,14 @@ fn normalize_sql(raw: &str) -> Result<String, ToolFailure> {
     Ok(format!("{without_trailing};"))
 }
 
-fn valid_record_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
+pub(crate) fn valid_record_id(id: &str) -> bool {
+    fn digits(part: &str) -> bool {
+        !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())
+    }
+    id.len() <= 64
         && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == 'x' || c == 'X')
-        && id.contains('x')
+            .split_once('x')
+            .is_some_and(|(module, record)| digits(module) && digits(record))
 }
 
 fn non_json_message(status: u16, body: &[u8], base_url: &str) -> String {
@@ -1279,6 +1281,101 @@ fn encode_component(value: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn workbench_queries_and_retrieves_through_crm_session() {
+        use crate::projects::adapters::crm::{project_id_by_number, search_projects};
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let runtime = EndpointRuntime {
+            base_url: format!("{origin}/webservice.php"),
+            origin,
+            agent: ureq::builder().timeout(Duration::from_secs(3)).build(),
+            username: "fixture-user".into(),
+            secret: zeroize::Zeroizing::new("fixture-secret".into()),
+            cache_key: "workbench-loopback".into(),
+            limits: Some((
+                vec!["GET".into(), "POST".into()],
+                vec!["/webservice.php".into()],
+            )),
+        };
+        let webservice = std::thread::spawn(move || {
+            for (operation, sql, result) in [
+                ("getchallenge", "", json!({"token": "fixture-challenge"})),
+                ("login", "", json!({"sessionName": "fixture-session"})),
+                (
+                    "query",
+                    "projectname like '%项目%'",
+                    json!([{"id": "30x21", "project_no": "PROJ42", "projectname": "测试项目"}]),
+                ),
+                ("query", "from Accounts", json!([])),
+                ("query", "project_no = 'PROJ42'", json!([{"id": "30x21"}])),
+                (
+                    "retrieve",
+                    "",
+                    json!({"id": "30x21", "project_no": "PROJ42", "projectname": "测试项目"}),
+                ),
+            ] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut socket);
+                let mut request = String::new();
+                reader.read_line(&mut request).unwrap();
+                let mut len = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = value.trim().parse().unwrap();
+                    }
+                }
+                if operation == "login" {
+                    assert!(request.starts_with("POST /webservice.php "));
+                    let mut body = vec![0; len];
+                    reader.read_exact(&mut body).unwrap();
+                    let digest = hex::encode(Md5::digest(b"fixture-challengefixture-secret"));
+                    assert!(
+                        body == format!("operation=login&username=fixture-user&accessKey={digest}")
+                            .as_bytes()
+                    );
+                } else {
+                    assert!(
+                        request.starts_with(&format!("GET /webservice.php?operation={operation}"))
+                    );
+                    if operation == "query" || operation == "retrieve" {
+                        assert!(request.contains("sessionName=fixture-session"));
+                    }
+                    if !sql.is_empty() {
+                        assert!(request.contains(&encode_component(sql)));
+                    }
+                    if operation == "retrieve" {
+                        assert!(request.contains("&id=30x21 "));
+                    }
+                }
+                let body = json!({"success": true, "result": result}).to_string();
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let (rows, warnings) = search_projects(&runtime, "项目", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(warnings.is_empty());
+        let id = project_id_by_number(&runtime, rows[0]["project_no"].as_str().unwrap()).unwrap();
+        let detail = retrieve_inner(&runtime, &id).unwrap();
+        assert_eq!(detail["id"], "30x21");
+        webservice.join().unwrap();
+    }
 
     #[test]
     fn all_ten_tools_are_read_only_and_closed() {

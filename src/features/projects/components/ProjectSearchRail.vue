@@ -113,8 +113,8 @@ watch(
               :key="project.localProjectId || project.id"
               class="pq-project"
               type="button"
-              :aria-pressed="project.id === selectedId"
-              @click="emit('select', project.id)"
+              :aria-pressed="(project.localProjectId || project.crmId || project.id) === selectedId"
+              @click="emit('select', project.localProjectId || project.crmId || project.id)"
             >
               <span class="pq-row pq-between">
                 <small class="pq-mono">{{ project.crmId || project.id }}</small>
